@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: UPL-1.0 OR BSD-3-Clause
+# Compatibility delta to the UPL-1.0/BSD-3-Clause JMC 9.1.2 sources.
+diff -urN a/org/openjdk/jmc/flightrecorder/writer/ConstantPool.java b/org/openjdk/jmc/flightrecorder/writer/ConstantPool.java
+--- a/org/openjdk/jmc/flightrecorder/writer/ConstantPool.java	2026-09-21 11:34:03.327360928 +0300
++++ b/org/openjdk/jmc/flightrecorder/writer/ConstantPool.java	2026-09-21 11:34:03.346345567 +0300
+@@ -117,7 +117,14 @@
+ 								writeValueType(writer, t, t.getType().hasConstantPool());
+ 							}
+ 						} else {
+-							writeValueType(writer, fieldValue.getValue(), field.getType().hasConstantPool());
++							if (type.isSame(TypesImpl.JDK.SYMBOL)) {
++								// async-profiler's JFR reader requires encoding 3 even for an empty symbol;
++								// compact UTF would otherwise use its special empty/null encodings.
++								Object symbol = fieldValue.getValue().getValue();
++								writer.writeByte((byte) 3).writeUTF(symbol != null ? (String) symbol : "");
++							} else {
++								writeValueType(writer, fieldValue.getValue(), field.getType().hasConstantPool());
++							}
+ 						}
+ 					}
+ 				}
+diff -urN a/org/openjdk/jmc/flightrecorder/writer/TypesImpl.java b/org/openjdk/jmc/flightrecorder/writer/TypesImpl.java
+--- a/org/openjdk/jmc/flightrecorder/writer/TypesImpl.java	2026-09-21 11:34:03.325414563 +0300
++++ b/org/openjdk/jmc/flightrecorder/writer/TypesImpl.java	2026-09-21 11:34:03.346151723 +0300
+@@ -128,7 +128,8 @@
+ 		});
+ 		getOrAdd(JDK.THREAD, typeBuilder -> {
+ 			typeBuilder.addField("osName", getType(Builtin.STRING)).addField("osThreadId", getType(Builtin.LONG))
+-					.addField("javaName", getType(Builtin.STRING)).addField("group", threadGroupType);
++					.addField("javaName", getType(Builtin.STRING)).addField("javaThreadId", getType(Builtin.LONG))
++					.addField("group", threadGroupType);
+ 		});
+ 		TypeImpl symbol = getOrAdd(JDK.SYMBOL, builder -> {
+ 			builder.addField("string", Builtin.STRING);
+@@ -154,7 +155,8 @@
+ 		getOrAdd(JDK.FRAME_TYPE, builder -> {
+ 			builder.addField("description", Builtin.STRING);
+ 		});
+-		getOrAdd(JDK.STACK_FRAME, builder -> {
++		// Stack frames are inline elements of StackTrace.frames, not a second constant pool.
++		getOrAdd(JDK.STACK_FRAME.getTypeName(), false, builder -> {
+ 			builder.addField("method", methodType).addField("lineNumber", Builtin.INT)
+ 					.addField("bytecodeIndex", Builtin.INT).addField("type", JDK.FRAME_TYPE);
+ 		});

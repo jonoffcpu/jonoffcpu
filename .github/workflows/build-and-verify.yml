@@ -1,0 +1,152 @@
+name: Build and verify
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Gradle project version used to build and test the Java artifacts
+        required: false
+        default: 1.0.0
+        type: string
+      native_artifact_prefix:
+        description: Prefix for the architecture-specific native bundle artifacts
+        required: true
+        type: string
+      runnable_artifact_name:
+        description: Name of the artifact containing the executable JARs and the forked jfr-converter.jar
+        required: false
+        default: jonoffcpu-runnable-jars
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  native-build-and-verify:
+    name: Build and verify on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-26.04
+            host-arch: x86_64
+            artifact-suffix: x86_64
+            native-architecture: x86_64
+          - name: Linux arm64
+            runner: ubuntu-26.04-arm
+            host-arch: aarch64
+            artifact-suffix: aarch64
+            native-architecture: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      ORG_GRADLE_PROJECT_version: ${{ inputs.version }}
+    steps:
+      - name: Verify native runner architecture
+        env:
+          EXPECTED_HOST_ARCH: ${{ matrix.host-arch }}
+        run: test "$(uname -m)" = "$EXPECTED_HOST_ARCH"
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: corretto
+          java-version: 25
+      - uses: dtolnay/rust-toolchain@8d8cc9a8e0d47b64af669de71110e76860d6afbd # 1.91.0
+        if: matrix.native-architecture == 'x86_64'
+        with:
+          components: rustfmt
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-provider: basic
+      - name: Check native collector formatting
+        if: matrix.native-architecture == 'x86_64'
+        run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
+      - name: Build and run checks
+        env:
+          NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
+        run: >-
+          ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
+          -PnativeArchitectures="$NATIVE_ARCHITECTURE"
+          --no-daemon
+      - name: Run packaged agent end-to-end smoke test
+        run: |
+          python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
+            --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
+            --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
+            --test-classes jonoffcpu-agent/build/classes/java/test \
+            --java-home "$JAVA_HOME" \
+            --output jonoffcpu-agent/build/packaged-smoke
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-${{ matrix.artifact-suffix }}
+          path: jonoffcpu-agent/build/native/linux-${{ matrix.artifact-suffix }}/
+          if-no-files-found: error
+
+  package:
+    name: Package combined Java artifacts
+    needs: native-build-and-verify
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    env:
+      ORG_GRADLE_PROJECT_version: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: corretto
+          java-version: 25
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-provider: basic
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-x86_64
+          path: jonoffcpu-agent/build/native/linux-x86_64
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-aarch64
+          path: jonoffcpu-agent/build/native/linux-aarch64
+      - name: Package and verify both native architectures
+        run: >-
+          ./gradlew
+          :jonoffcpu-agent:verifyRuntimeJar
+          :jonoffcpu-correlator:verifyRuntimeJar
+          -PprebuiltNative=true
+          -PnativeArchitectures=all
+          --no-daemon
+      - name: Build the forked jfr-converter.jar
+        run: make -C async-profiler build/jar/jfr-converter.jar
+      - name: Verify the converter renders a collapsed off-CPU profile
+        run: |
+          printf 'a;b;c 1500\na;b;d 500\n' > converter-check.collapsed
+          java -jar async-profiler/build/jar/jfr-converter.jar \
+            --title "Off-CPU time" --units µs converter-check.collapsed converter-check.html
+          grep -q 'Off-CPU time' converter-check.html
+      - name: Prepare downloadable executable JARs
+        run: |
+          mkdir workflow-downloads
+          mapfile -t agent_jars < <(find jonoffcpu-agent/build/libs -maxdepth 1 -type f \
+            -name 'jonoffcpu-agent-*.jar' ! -name '*-plain.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+          mapfile -t correlator_jars < <(find jonoffcpu-correlator/build/libs -maxdepth 1 -type f \
+            -name 'jonoffcpu-correlator-*.jar' ! -name '*-plain.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+          if [[ ${#agent_jars[@]} -ne 1 || ${#correlator_jars[@]} -ne 1 ]]; then
+            echo "Expected exactly one executable JAR from each module" >&2
+            printf 'Agent JARs: %s\n' "${agent_jars[*]}" >&2
+            printf 'Correlator JARs: %s\n' "${correlator_jars[*]}" >&2
+            exit 1
+          fi
+          cp "${agent_jars[0]}" workflow-downloads/jonoffcpu-agent.jar
+          cp "${correlator_jars[0]}" workflow-downloads/jonoffcpu-correlator.jar
+          cp async-profiler/build/jar/jfr-converter.jar workflow-downloads/jfr-converter.jar
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.runnable_artifact_name }}
+          path: workflow-downloads/*.jar
+          if-no-files-found: error

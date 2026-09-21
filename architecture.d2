@@ -1,0 +1,273 @@
+# jonoffcpu architecture diagram. Render with the bundled TALA engine:
+#   d2 --layout=tala architecture.d2 architecture.svg
+#
+# Layout rules learned the hard way (d2 v0.9 + TALA). Read before restructuring:
+#
+# 1. TALA ignores `direction` on nested containers. To force "A left of B" or
+#    "A above B", put them in a grid (`grid-columns` / `grid-rows`) instead.
+# 2. Grid fill order: `grid-columns: N` alone fills COLUMN-major (top to bottom,
+#    then next column); `grid-rows: N` alone fills row-major. Declaration order
+#    inside the container is the cell order.
+# 3. Cells in the same grid row/column are stretched to a common size. To keep a
+#    panel at its natural size, wrap it in a hidden container (`style.opacity: 0`
+#    with an empty "" label) and let the wrapper absorb the stretch.
+# 4. Left-alignment between rows depends on identical nesting: every panel in
+#    `runtime` and `offrow` sits inside one hidden wrapper so their padding
+#    matches. Adding a wrapper on one side only shifts that row sideways.
+# 5. d2 (not TALA) routes any edge whose endpoint sits in a grid cell that is
+#    not on the exit side of the grid, and it draws those as straight diagonal
+#    lines. Panels whose children have edges to the outside must therefore NOT
+#    be grids themselves; that is why `jvm` is laid out by TALA while the hidden
+#    row groups and `outputs` (edges only enter it) are grids.
+# 6. TALA re-solves the whole layout when any label size changes; enlarging
+#    edge-label fonts can reshuffle panels. Use --tala-seeds to pin a result.
+# 7. A `|` inside a block-string label terminates it; use plain "\n" strings.
+# 8. Each component is a small container: a bold title label plus one `shape: text`
+#    child for details, because d2 cannot mix font sizes inside one label.
+# 9. Empty "" labels matter on hidden containers: a named label still reserves
+#    vertical space even when invisible.
+
+direction: right
+
+vars: {
+  d2-config: {
+    layout-engine: tala
+    theme-id: 0
+  }
+}
+
+classes: {
+  # Panels (top-level groupings)
+  panel-blue: {
+    style.fill: "#eff6ff"
+    style.stroke: "#2563eb"
+    style.stroke-width: 2
+    style.border-radius: 16
+    style.font-color: "#0f172a"
+    style.font-size: 26
+    style.bold: true
+  }
+  panel-teal: {
+    style.fill: "#f0fdfa"
+    style.stroke: "#0f766e"
+    style.stroke-width: 2
+    style.border-radius: 16
+    style.font-color: "#0f172a"
+    style.font-size: 26
+    style.bold: true
+  }
+  panel-violet: {
+    style.fill: "#faf5ff"
+    style.stroke: "#7c3aed"
+    style.stroke-width: 2
+    style.border-radius: 16
+    style.font-color: "#0f172a"
+    style.font-size: 26
+    style.bold: true
+  }
+
+  # Components: container with a bold title; details go in a `detail` text child (rule 8).
+  comp: {
+    label.near: top-center
+    style.border-radius: 10
+    style.font-color: "#0f172a"
+    style.font-size: 22
+    style.bold: true
+  }
+  comp-neutral: {style.fill: "#f8fafc"; style.stroke: "#cbd5e1"}
+  comp-blue: {style.fill: "#dbeafe"; style.stroke: "#93c5fd"}
+  comp-teal: {style.fill: "#ccfbf1"; style.stroke: "#5eead4"}
+  comp-violet: {style.fill: "#ede9fe"; style.stroke: "#c4b5fd"}
+
+  # Artifacts (files)
+  file: {
+    shape: page
+    label.near: top-center
+    style.font-color: "#0f172a"
+    style.font-size: 22
+    style.bold: true
+  }
+  file-cyan: {style.fill: "#ecfeff"; style.stroke: "#67e8f9"}
+  file-teal: {style.fill: "#f0fdfa"; style.stroke: "#5eead4"}
+  file-neutral: {style.fill: "#ffffff"; style.stroke: "#cbd5e1"}
+  file-green: {style.fill: "#dcfce7"; style.stroke: "#4ade80"; style.font-color: "#14532d"; style.font-size: 24}
+
+  # Detail text inside a component or file
+  detail: {
+    shape: text
+    style.font-size: 20
+    style.bold: false
+    style.font-color: "#334155"
+  }
+  detail-green: {style.font-color: "#166534"; style.font-size: 22}
+  note: {
+    shape: text
+    style.font-size: 20
+    style.font-color: "#475569"
+  }
+
+  # Flows
+  flow-blue: {style.stroke: "#2563eb"; style.stroke-width: 2; style.font-color: "#334155"; style.font-size: 18}
+  flow-teal: {style.stroke: "#0f766e"; style.stroke-width: 2; style.font-color: "#334155"; style.font-size: 18}
+  flow-violet: {style.stroke: "#7c3aed"; style.stroke-width: 2; style.font-color: "#334155"; style.font-size: 18}
+  flow-green: {style.stroke: "#16a34a"; style.stroke-width: 2; style.font-color: "#334155"; style.font-size: 18}
+  flow-dashed: {style.stroke-dash: 5}
+}
+
+# ---------------------------------------------------------------- Runtime row (hidden grid)
+# Invisible 2-column grid: JVM on the left, kernel on the right (rules 1, 2).
+runtime: "" {
+  style.opacity: 0
+  grid-columns: 2
+  grid-gap: 80
+
+  # Hidden wrapper: equalises padding with the row below (rule 4).
+  jvmcol: "" {
+    style.opacity: 0
+
+    # Deliberately NOT a grid: its children have edges to other panels (rule 5).
+    jvm: Target JVM process {
+      class: panel-blue
+
+      app: Application threads {
+        class: [comp; comp-neutral]
+        detail: "Resume and receive the signal\ncarrying the correlation key" {class: detail}
+      }
+      agent: jonoffcpu Java agent {
+        class: [comp; comp-blue]
+        detail: "jonoffcpu-agent.jar\nOwns the capture lifecycle" {class: detail}
+      }
+      bridge: JNI bridge {
+        class: [comp; comp-blue]
+        detail: "libjonoffcpu.so" {class: detail}
+      }
+      collector: Native collector {
+        class: [comp; comp-teal]
+        detail: "libjonoffcpu_native.so (Rust, libbpf-rs)\nLoads eBPF · drains observations\nResolves native stacks" {class: detail}
+      }
+      ap: async-profiler (lhotari fork) {
+        class: [comp; comp-violet]
+        detail: "libasyncProfiler.so\nProfiles the JVM and records\nprofiler.SignalSample with the correlation key" {class: detail}
+      }
+    }
+  }
+
+  # Hidden wrapper: absorbs the grid-cell stretch so the panel keeps its size (rule 3).
+  kercol: "" {
+    style.opacity: 0
+
+    kernel: Linux kernel {
+      class: panel-teal
+
+      bpf: CO-RE eBPF program {
+        class: [comp; comp-teal]
+        detail: "jonoffcpu_cookie.bpf.c\nsched_switch → sched_exit_tp\nEmits interval start/end + key to the ring buffer\nSignals the thread with only the 64-bit key" {class: detail}
+      }
+    }
+  }
+}
+
+# ---------------------------------------------------------------- Offline row (hidden grid)
+# Same structure as `runtime` so "Capture artifacts" left-aligns with "Target JVM process".
+offrow: "" {
+  style.opacity: 0
+  grid-columns: 2
+  grid-gap: 80
+
+  # Hidden wrapper: keeps the panel at natural height instead of the row height (rule 3).
+  capcol: "" {
+    style.opacity: 0
+
+    capture: Capture artifacts {
+      class: panel-teal
+
+      jfr: Combined JFR recording {
+        class: [file; file-cyan]
+        detail: "async-profiler + profiler.SignalSample\n+ JDK JFR events" {class: detail}
+      }
+      ndjson: Correlation stream {
+        class: [file; file-teal]
+        detail: "NDJSON: off-CPU intervals (durations),\nnative stacks, loss counters, finalized footer" {class: detail}
+      }
+      manifest: Audit manifest {
+        class: [file; file-neutral]
+        detail: "manifest.json" {class: detail}
+      }
+    }
+  }
+
+  # ---------------------------------------------------------------- Analysis column (hidden grid)
+  # Single-column grid: correlator above outputs (rule 1).
+  analysis: "" {
+    style.opacity: 0
+    grid-columns: 1
+    grid-gap: 80
+
+    offline: Offline correlation {
+      class: panel-violet
+
+      correlator: OffCpuCorrelator {
+        class: [comp; comp-violet]
+        detail: "jonoffcpu-correlator.jar\nJoins each SignalSample (JVM stack) with its\noff-CPU interval + native stack by correlation key\nWeights stacks by off-CPU duration" {class: detail}
+      }
+      note: "JFR sample = which Java code was blocked\nObservation = for how long, in which kernel path\nUnmatched rows are kept as loss, never dropped" {class: note}
+    }
+
+    # Grid is safe here: edges only enter this panel, none leave it (rule 5).
+    # Column-major fill: left column report/rows/complete, right column flame graph/synthetic/spacer (rule 2).
+    outputs: Analysis outputs {
+      class: panel-violet
+      grid-columns: 2
+      grid-gap: 40
+
+      report: Report {
+        class: [file; file-neutral]
+        detail: "report.json" {class: detail}
+      }
+      rows: Row-level audit {
+        class: [file; file-neutral]
+        detail: "classified-records.jsonl\nmatches.jsonl" {class: detail}
+      }
+      complete: Completion marker {
+        class: [file; file-neutral]
+        detail: "complete.json" {class: detail}
+      }
+      collapsed: Off-CPU flame graph {
+        class: [file; file-green]
+        detail: "collapsed stack text format" {class: [detail; detail-green]}
+      }
+      synthetic: Synthetic JFR {
+        class: [file; file-neutral]
+        detail: "jdk.ExecutionSample view" {class: detail}
+      }
+      # Invisible spacer balances the columns (3 + 3) so no cell is stretched (rule 3).
+      spacer: "" {style.opacity: 0}
+    }
+  }
+}
+
+# ---------------------------------------------------------------- Control flow
+runtime.jvmcol.jvm.agent -> runtime.jvmcol.jvm.bridge: JNI {class: flow-blue}
+runtime.jvmcol.jvm.bridge -> runtime.jvmcol.jvm.collector: prepare · enable · stop · close {class: flow-blue}
+runtime.jvmcol.jvm.bridge -> runtime.jvmcol.jvm.ap: asprof start · status · stop {class: flow-blue}
+runtime.jvmcol.jvm.collector -> runtime.kercol.kernel.bpf: load + attach {class: [flow-teal; flow-dashed]}
+
+# ---------------------------------------------------------------- Capture flow
+runtime.kercol.kernel.bpf -> runtime.jvmcol.jvm.collector: ring buffer: interval start/end, key, stacks {class: flow-teal}
+runtime.kercol.kernel.bpf -> runtime.jvmcol.jvm.app: signal carrying only the key {class: flow-teal}
+runtime.jvmcol.jvm.app -> runtime.jvmcol.jvm.ap: handler captures stack {class: flow-violet}
+
+# ---------------------------------------------------------------- Artifact writes
+runtime.jvmcol.jvm.collector -> offrow.capcol.capture.ndjson: observations {class: flow-teal}
+runtime.jvmcol.jvm.agent -> offrow.capcol.capture.ndjson: finalized footer {class: flow-blue}
+runtime.jvmcol.jvm.agent -> offrow.capcol.capture.manifest: checkpoints {class: [flow-blue; flow-dashed]}
+runtime.jvmcol.jvm.ap -> offrow.capcol.capture.jfr: recording {class: flow-violet}
+
+# ---------------------------------------------------------------- Offline flow
+offrow.capcol.capture.jfr -> offrow.analysis.offline.correlator: {class: flow-violet}
+offrow.capcol.capture.ndjson -> offrow.analysis.offline.correlator: {class: flow-teal}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.report: {class: flow-violet}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.rows: {class: flow-violet}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.collapsed: {class: flow-green}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.synthetic: {class: flow-violet}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.complete: {class: flow-violet}

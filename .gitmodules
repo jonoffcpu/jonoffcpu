@@ -1,0 +1,4 @@
+[submodule "async-profiler"]
+	path = async-profiler
+	url = https://github.com/lhotari/async-profiler.git
+	branch = jonoffcpu-dev

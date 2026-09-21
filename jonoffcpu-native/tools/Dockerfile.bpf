@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4
+
+RUN rustup component add rustfmt clippy \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       autoconf \
+       automake \
+       autopoint \
+       binutils \
+       bison \
+       bpftool \
+       clang \
+       flex \
+       gawk \
+       gcc \
+       libelf-dev \
+       libtool \
+       llvm \
+       make \
+       pkg-config \
+       zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work/jonoffcpu-native

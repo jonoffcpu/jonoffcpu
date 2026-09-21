@@ -1,0 +1,8 @@
+FROM ubuntu:24.04
+
+# SPDX-License-Identifier: MIT
+# Runtime for opt-in privileged native-agent integration. Mount a matching glibc JDK,
+# agent distribution and async-profiler library; no Java/compiler downloads here.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y libelf1t64 zlib1g libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*

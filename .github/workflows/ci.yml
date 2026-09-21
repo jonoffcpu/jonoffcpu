@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    name: Native build and verification
+    uses: ./.github/workflows/build-and-verify.yml
+    with:
+      native_artifact_prefix: native
+      runnable_artifact_name: jonoffcpu-runnable-jars

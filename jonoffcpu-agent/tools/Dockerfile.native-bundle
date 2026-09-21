@@ -1,0 +1,108 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+
+# Keep the same Corretto toolchain in Gradle and native container builds. The
+# multi-architecture digest selects the matching x86-64 or arm64 JDK.
+FROM amazoncorretto:25@sha256:ec395950366b60da545925171be5e8f457f7b33d034ee12b3a0110657da285fc AS java-toolchain
+
+# Toolchain changes are deliberately isolated from either source tree. BuildKit
+# can retain this relatively expensive package layer across normal development.
+FROM rust:1.85-bookworm@sha256:e51d0265072d2d9d5d320f6a44dde6b9ef13653b035098febd68cce8fa7c0bc4 AS toolchain
+
+COPY --from=java-toolchain /usr/lib/jvm/java-25-amazon-corretto /opt/amazon-corretto-25
+ENV JAVA_HOME=/opt/amazon-corretto-25
+ENV PATH="$JAVA_HOME/bin:$PATH"
+
+RUN rustup component add rustfmt \
+    && apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+       autoconf \
+       automake \
+       autopoint \
+       binutils \
+       bison \
+       bpftool \
+       clang \
+       flex \
+       g++ \
+       gawk \
+       gcc \
+       libelf-dev \
+       libtool \
+       llvm \
+       make \
+       pkg-config \
+       zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# This stage depends only on the pinned async-profiler submodule. Collector and
+# JNI changes therefore reuse the complete async-profiler build layer.
+FROM toolchain AS async-profiler-build
+WORKDIR /work
+COPY async-profiler async-profiler
+RUN mkdir -p async-profiler/build/lib \
+    && make -C async-profiler -j"$(nproc)" build/lib/libasyncProfiler.so
+
+# Resolve registry inputs before copying source. Cargo downloads stay reusable
+# when collector implementation files change.
+FROM toolchain AS collector-dependencies
+WORKDIR /work
+COPY jonoffcpu-native/Cargo.toml jonoffcpu-native/Cargo.lock jonoffcpu-native/
+RUN mkdir -p jonoffcpu-native/src/bin \
+    && touch jonoffcpu-native/src/lib.rs \
+       jonoffcpu-native/src/bin/transport_proof.rs \
+       jonoffcpu-native/src/bin/kprobe_gate.rs \
+       jonoffcpu-native/src/bin/finish_fentry_proof.rs \
+       jonoffcpu-native/src/bin/sched_exit_proof.rs \
+       jonoffcpu-native/src/bin/sequence_boundary_proof.rs \
+       jonoffcpu-native/src/bin/endpoint_boundary_measurement.rs \
+       jonoffcpu-native/src/bin/collector_smoke.rs \
+       jonoffcpu-native/src/bin/task_lifetime_proof.rs \
+       jonoffcpu-native/src/bin/time_namespace_negative.rs \
+       jonoffcpu-native/src/bin/signal_latency.rs \
+       jonoffcpu-native/src/bin/target_exit_proof.rs
+RUN --mount=type=cache,id=jonoffcpu-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    cargo fetch --locked --manifest-path jonoffcpu-native/Cargo.toml
+
+FROM collector-dependencies AS collector-build
+ARG TARGETARCH
+COPY jonoffcpu-native jonoffcpu-native
+# Vendored C objects use GCC's outlined AArch64 atomics. Rust's cdylib link
+# does not otherwise retain the static libgcc implementation.
+RUN --mount=type=cache,id=jonoffcpu-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    set -eux; \
+    if [ "$TARGETARCH" = arm64 ]; then \
+      export RUSTFLAGS="-C link-arg=-lgcc"; \
+    fi; \
+    cargo build --locked --release --lib \
+      --manifest-path jonoffcpu-native/Cargo.toml \
+      --target-dir jonoffcpu-native/target; \
+    if [ "$TARGETARCH" = arm64 ] \
+      && readelf -Ws jonoffcpu-native/target/release/libjonoffcpu_native.so \
+        | grep -Eq 'UND +__aarch64_'; then \
+      echo "libjonoffcpu_native.so has unresolved AArch64 runtime helpers" >&2; \
+      exit 1; \
+    fi
+
+# Relinking the small JNI bridge does not invalidate either expensive native
+# build. The three colocated DSOs are the complete runtime bundle.
+FROM toolchain AS agent-link
+WORKDIR /work
+COPY async-profiler/src/asprof.h async-profiler/src/asprof.h
+COPY jonoffcpu-native/include jonoffcpu-native/include
+COPY jonoffcpu-agent/src/main/c jonoffcpu-agent/src/main/c
+COPY --from=async-profiler-build /work/async-profiler/build/lib/libasyncProfiler.so /work/lib/
+COPY --from=collector-build /work/jonoffcpu-native/target/release/libjonoffcpu_native.so /work/lib/
+RUN set -eux; \
+    mkdir /out; \
+    cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+      -Ijonoffcpu-native/include -Iasync-profiler/src \
+      -Wl,-z,defs -Wl,-rpath,'$ORIGIN' -L/work/lib \
+      -o /out/libjonoffcpu.so jonoffcpu-agent/src/main/c/native_collector_jni.c \
+      -ljonoffcpu_native -ldl -lpthread; \
+    cp /work/lib/libjonoffcpu_native.so /out/; \
+    cp /work/lib/libasyncProfiler.so /out/
+
+FROM scratch
+COPY --from=agent-link /out/ /

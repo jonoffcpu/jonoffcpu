@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT
+FROM rust:1.85-alpine3.21@sha256:4333721398de61f53ccbe53b0b855bcc4bb49e55828e8f652d7a8ac33dd0c118
+
+RUN rustup component add rustfmt \
+    && apk add --no-cache \
+       autoconf \
+       automake \
+       bash \
+       binutils \
+       bison \
+       bpftool \
+       clang \
+       coreutils \
+       curl \
+       elfutils-dev \
+       flex \
+       g++ \
+       gcc \
+       libtool \
+       linux-headers \
+       llvm \
+       make \
+       musl-dev \
+       openjdk17-jdk \
+       patch \
+       patchelf \
+       pax-utils \
+       pkgconf \
+       python3 \
+       tar \
+       util-linux \
+       xz-static \
+       zlib-dev \
+       zlib-static \
+       zstd-dev \
+       zstd-static
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+WORKDIR /work

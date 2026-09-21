@@ -1,0 +1,72 @@
+[workspace]
+members = ["."]
+resolver = "2"
+
+[package]
+name = "jonoffcpu-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "jonoffcpu-cookie-transport-proof"
+path = "src/bin/transport_proof.rs"
+
+[[bin]]
+name = "jonoffcpu-cookie-kprobe-gate"
+path = "src/bin/kprobe_gate.rs"
+
+[[bin]]
+name = "jonoffcpu-cookie-finish-fentry-proof"
+path = "src/bin/finish_fentry_proof.rs"
+
+[[bin]]
+name = "jonoffcpu-cookie-sched-exit-proof"
+path = "src/bin/sched_exit_proof.rs"
+
+[[bin]]
+name = "jonoffcpu-cookie-sequence-boundary-proof"
+path = "src/bin/sequence_boundary_proof.rs"
+
+[[bin]]
+name = "jonoffcpu-endpoint-boundary-measurement"
+path = "src/bin/endpoint_boundary_measurement.rs"
+
+[[bin]]
+name = "jonoffcpu-native-collector-smoke"
+path = "src/bin/collector_smoke.rs"
+
+[[bin]]
+name = "jonoffcpu-task-lifetime-proof"
+path = "src/bin/task_lifetime_proof.rs"
+
+[[bin]]
+name = "jonoffcpu-time-namespace-negative"
+path = "src/bin/time_namespace_negative.rs"
+
+[[bin]]
+name = "jonoffcpu-native-signal-latency"
+path = "src/bin/signal_latency.rs"
+
+[[bin]]
+name = "jonoffcpu-target-exit-proof"
+path = "src/bin/target_exit_proof.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+libbpf-rs = { version = "=0.27.1", features = ["vendored"] }
+libc = "0.2.189"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[build-dependencies]
+anyhow = "1.0.104"
+cc = "1.4.7"
+libbpf-cargo = "=0.27.1"
+
+[profile.release]
+panic = "abort"
