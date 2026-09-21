@@ -132,7 +132,7 @@ Download the latest
 contains the three executable JARs:
 
 ```sh
-gh release download -R lhotari/jonoffcpu
+gh release download -p '*.jar' -R lhotari/jonoffcpu
 ```
 
 Pass a tag such as `v1.0.0` after `download` to pick a specific release
