@@ -354,7 +354,7 @@ public final class PartialCorrelatorTest {
             public void start(JsonObject captureStart) {}
 
             @Override
-            public void stack(long stackId, int frameCount) {}
+            public void stack(long stackId, CaptureProto.Stack stack) {}
 
             @Override
             public void observation(int rowNumber, CaptureProto.Observation observation) {}

@@ -173,7 +173,7 @@ final class CaptureInput {
                         require(stack.getFrameCount() <= limits.maxFrames(), "Stack frame count limit exceeded");
                         require(!announcedStacks.contains(stackId), "Duplicate stack record");
                         announcedStacks.put(stackId, stack.getFrameCount());
-                        visitor.stack(stackId, stack.getFrameCount());
+                        visitor.stack(stackId, stack);
                     }
                     case "observation" -> {
                         require(start != null && end == null, "Observation outside source capture");
@@ -668,7 +668,7 @@ final class CaptureInput {
 
         void start(JsonObject captureStart) throws IOException;
 
-        void stack(long stackId, int frameCount) throws IOException;
+        void stack(long stackId, CaptureProto.Stack stack) throws IOException;
 
         void observation(int rowNumber, CaptureProto.Observation observation) throws IOException;
     }

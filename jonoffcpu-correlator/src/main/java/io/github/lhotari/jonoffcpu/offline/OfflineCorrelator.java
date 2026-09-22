@@ -188,12 +188,8 @@ final class OfflineCorrelator {
         public void start(JsonObject captureStart) {}
 
         @Override
-        public void stack(long stackId, int frameCount) throws IOException {
-            CaptureProto.Stack.Builder stack = CaptureProto.Stack.newBuilder().setId(stackId);
-            for (int frame = 0; frame < frameCount; frame++) {
-                stack.addFrame(CaptureProto.Frame.getDefaultInstance());
-            }
-            JsonObject row = CaptureStream.stackRow(stack.build());
+        public void stack(long stackId, CaptureProto.Stack stack) throws IOException {
+            JsonObject row = CaptureStream.stackRow(stack);
             budget.charge(row);
             stacks.put(stackId, row.getAsJsonArray("frames"));
         }
