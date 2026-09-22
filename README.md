@@ -8,6 +8,7 @@ ordinary async-profiler JFR.
 
 ## Table of contents
 
+- [What is off-CPU profiling?](#what-is-off-cpu-profiling)
 - [The problem](#the-problem)
 - [How it works](#how-it-works)
   - [Why two files?](#why-two-files)
@@ -26,6 +27,47 @@ ordinary async-profiler JFR.
 - [Building from source](#building-from-source)
 - [Repository layout](#repository-layout)
 - [License](#license)
+
+## What is off-CPU profiling?
+
+A thread's time splits into two states: **on-CPU**, when it is executing
+instructions, and **off-CPU**, when the kernel scheduler has taken it off the
+processor because it blocked (I/O, a lock, a sleep, a condition variable) or
+was preempted and is waiting in the run queue. CPU profilers only see the
+first state. Off-CPU profiling measures the second: for every interval a
+thread spent descheduled, how long it lasted and which code path was waiting.
+Brendan Gregg's [Thread State Analysis](https://www.brendangregg.com/tsamethod.html)
+method frames this as accounting for *all* of a thread's time by state, so
+that latency is explained by the states that actually dominate it rather than
+by the one state a CPU profiler happens to see.
+
+This matters because in most services request latency is not CPU time. A
+request that takes 200 ms may burn 5 ms of CPU and spend the rest waiting for
+a database, a downstream call, a lock, or a page fault. A CPU flame graph
+shows those 5 ms in detail and nothing about the other 195 ms. An off-CPU
+profile inverts that: it attributes the waiting time to the stack that waited,
+so the 195 ms show up under the code that issued the query, took the lock, or
+called the remote service. Rendered as an
+[off-CPU flame graph](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html),
+frame widths are total off-CPU duration instead of sample counts, and the
+widest towers are the waits worth investigating. CPU and off-CPU profiles
+together cover a thread's whole lifetime, which is the complete picture that
+neither gives alone.
+
+Off-CPU time is measured, not sampled: the scheduler knows the exact moment a
+thread left the CPU and the exact moment it returned, so the interval is a
+real duration. That measurement is only useful when paired with a stack that
+explains why the thread waited, and getting an accurate *Java* stack for a
+kernel-observed interval is the problem `jonoffcpu` solves.
+
+Further reading:
+
+- [Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html): the
+  method, its overheads, and how it complements CPU profiling.
+- [Off-CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html):
+  reading and generating flame graphs whose widths are blocked-time durations.
+- [The TSA Method](https://www.brendangregg.com/tsamethod.html): thread state
+  analysis as a systematic way to account for all of a thread's time.
 
 ## The problem
 
