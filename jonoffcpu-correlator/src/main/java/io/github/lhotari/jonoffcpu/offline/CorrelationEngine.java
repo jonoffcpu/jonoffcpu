@@ -176,7 +176,13 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         sourceIndex.observe(cookie, kept ? sources.size() : DROPPED);
         if (!kept) return;
         sources.add(cookie, start, end, threshold, (int) targetTid, observation.getSignalResult() != 0, reason);
-        if (sources.size() % WATERMARK_ROWS == 0) budget.structures(retainedBytes());
+        if (sources.size() % WATERMARK_ROWS == 0) {
+            try {
+                budget.structures(retainedBytes());
+            } catch (RetentionLimitExceeded limit) {
+                throw limit.withLastObservationEnd(end);
+            }
+        }
     }
 
     private void requireStack(long stackId, String error) throws IOException {

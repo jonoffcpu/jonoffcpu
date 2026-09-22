@@ -3,6 +3,9 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import java.io.IOException;
 import java.math.BigInteger;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 
 /** Fixtures for the primitive structures the columnar correlation engine is built from. */
 public final class PrimitiveStructuresTest {
@@ -230,6 +233,22 @@ public final class PrimitiveStructuresTest {
         check(tenth.scaleQuantum(1_000_000) < 1_000_000, "A thinned run must spend fewer observed nanos per event");
     }
 
+    private static void estimate(Path dir) throws IOException {
+        Path source = dir.resolve("estimate-source.bin");
+        Path jfr = dir.resolve("estimate.jfr");
+        Files.write(source, new byte[110_900_000]);
+        Files.write(jfr, new byte[38_200_000]);
+        RetentionEstimate estimate = RetentionEstimate.of(source, jfr);
+        check(
+                estimate.observations() > 1_000_000 && estimate.observations() < 1_300_000,
+                "Observation estimate is not near the measured 99 bytes a record: " + estimate.observations());
+        check(
+                estimate.retainedBytes() > 100L << 20 && estimate.retainedBytes() < 400L << 20,
+                "Retention estimate is outside the documented per-row constants: " + estimate.retainedBytes());
+        // The guard should track the heap it protects, with a floor for a tiny one.
+        check(RetentionEstimate.budget(0) >= 256L << 20, "Derived budget must not fall below the floor");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
@@ -238,6 +257,14 @@ public final class PrimitiveStructuresTest {
         budget();
         quantum();
         thinning();
+        Path dir = Files.createTempDirectory("jonoffcpu-primitive-structures-test-");
+        try {
+            estimate(dir);
+        } finally {
+            try (var files = Files.walk(dir)) {
+                for (Path path : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
+            }
+        }
         System.out.println("Primitive structure fixtures passed");
     }
 }

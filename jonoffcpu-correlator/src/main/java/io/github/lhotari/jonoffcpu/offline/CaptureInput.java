@@ -722,7 +722,9 @@ final class CaptureInput {
         private void enforce() throws IOException {
             long retained = Math.addExact(documents, structures);
             peak = Math.max(peak, retained);
-            require(retained <= limits.maxRetainedBytes(), "Decoded input budget exceeded");
+            if (retained > limits.maxRetainedBytes()) {
+                throw new RetentionLimitExceeded(retained, limits.maxRetainedBytes(), null);
+            }
         }
 
         private static long estimate(JsonElement value) {
