@@ -243,6 +243,15 @@ interval, plus the interned stacks, is the figure to plan a capture against: the
 scale fixture (`StreamingCorrelatorTest.scale`, 2,000,000 observations and a
 matching 2,000,000 JFR samples) measures about 281 MiB of peak retained bytes.
 
+A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
+distinct Java stacks) measured 203 MiB (212,831,820 bytes) of peak retained
+bytes at `--audit full`, `--audit matches` and no `--audit` alike — about 190
+bytes per recorded interval, roughly 2.4x the 80-byte column-only figure above.
+Real JVM stacks are far deeper than the synthetic scale fixture's, so interned
+stacks account for the difference; treat 80 bytes/interval as a lower bound for
+the column storage alone, not the full per-interval budget, when planning
+against real captures.
+
 Integrity failures still reject the analysis: a JFR whose size or digest differs from
 the footer, an observation referencing an unannounced stack, an async-profiler counter
 inconsistency, a duplicate cookie, a JFR/source target mismatch. These mean the two
