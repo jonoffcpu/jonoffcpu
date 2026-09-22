@@ -125,10 +125,45 @@ public final class PrimitiveStructuresTest {
         check(dictionaries.retainedBytes() > 0, "Dictionary retention accounting is missing");
     }
 
+    private static void columns() {
+        SourceColumns sources = new SourceColumns(2);
+        for (int slot = 0; slot < 1000; slot++) {
+            sources.add(0x8000000100000000L | slot, 1000 + slot, 4000 + slot, 42949673L, 456, false, Reason.NONE);
+        }
+        check(sources.size() == 1000, "Source columns lost rows across growth");
+        check(sources.cookie(999) == (0x8000000100000000L | 999), "Source columns lost a cookie across growth");
+        check(sources.end(999) == 4999, "Source columns lost an end timestamp across growth");
+        check(sources.reason(999) == Reason.NONE, "Default reason is not NONE");
+        sources.reason(999, Reason.DUPLICATE_COOKIE);
+        check(sources.reason(999) == Reason.DUPLICATE_COOKIE, "Reason column did not round-trip");
+        check(sources.outcome(999) == Outcome.UNRESOLVED, "Default outcome is not UNRESOLVED");
+        sources.outcome(999, Outcome.MATCHED);
+        sources.verified(999, true);
+        check(sources.outcome(999) == Outcome.MATCHED && sources.verified(999), "Outcome or verified bit lost");
+        check(!sources.verified(998), "Verified bits leaked between rows");
+        check(!sources.signalFailed(999), "A zero signal result must not read as a failed request");
+        sources.add(0x8000000100000999L, 1, 2, 42949673L, 456, true, Reason.NONE);
+        check(sources.signalFailed(1000) && !sources.signalFailed(999), "Failed-signal bits leaked between rows");
+        check(sources.retainedBytes() >= 1000L * 38, "Source retention accounting is below the stored bytes");
+
+        SampleColumns samples = new SampleColumns(2);
+        for (int slot = 0; slot < 1000; slot++) samples.add(0x8000000100000000L | slot, 5000 + slot, 7L, 456, 1, 2);
+        check(samples.size() == 1000 && samples.monotonicNanos(999) == 5999, "Sample columns lost rows");
+        check(samples.stackId(999) == 1 && samples.threadId(999) == 2, "Sample dictionary ids lost");
+
+        check(Reason.DUPLICATE_COOKIE.text().equals("duplicate-cookie"), "Reason text changed");
+        check(Reason.NONE.text() == null, "A valid row must carry no reason text");
+        check(
+                Outcome.NOT_IN_SELECTED_JFR.text().equals("sample-not-present-in-selected-jfr"),
+                "Unmatched reason text changed");
+        check(Reason.of((byte) Reason.INVALID_PAIR.ordinal()) == Reason.INVALID_PAIR, "Reason byte decoding is wrong");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
         dictionaries();
+        columns();
         System.out.println("Primitive structure fixtures passed");
     }
 }
