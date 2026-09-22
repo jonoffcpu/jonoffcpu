@@ -159,6 +159,10 @@ and exact-cookie matches rather than only checking process exit status.
   correlator's names are the `OutputFiles` constants, and the agent derives
   its manifest and default JFR from the stem of `correlationOutput` via
   `ManifestStore.sibling`. Never spell an output name inline.
+- Declare every plugin version once, in the root build script, with
+  `apply false` for the ones the subprojects apply. Gradle gives a subproject
+  whose plugin set differs from its siblings' its own class loader, and the
+  publish plugin's shared build service then cannot cross that boundary.
 - Keep public configuration, manifest, capture stream, report, and CLI changes backward
   compatible unless a format/version migration is designed and documented.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on

@@ -11,7 +11,7 @@ import org.gradle.jvm.toolchain.JvmVendorSpec
 plugins {
     `java-library`
     // The base plugin: the build script registers the publication itself, as in the other modules.
-    id("com.vanniktech.maven.publish.base") version "0.37.0"
+    id("com.vanniktech.maven.publish.base")
 }
 
 group = "io.github.lhotari"

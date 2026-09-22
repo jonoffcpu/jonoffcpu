@@ -12,9 +12,9 @@ import org.gradle.jvm.toolchain.JvmVendorSpec
 plugins {
     `java-library`
     // The base plugin: the full plugin would publish components["java"], but only the shaded JAR is published.
-    id("com.vanniktech.maven.publish.base") version "0.37.0"
-    id("com.gradleup.shadow") version "9.6.1"
-    id("com.google.protobuf") version "0.10.0"
+    id("com.vanniktech.maven.publish.base")
+    id("com.gradleup.shadow")
+    id("com.google.protobuf")
 }
 
 group = "io.github.lhotari"
