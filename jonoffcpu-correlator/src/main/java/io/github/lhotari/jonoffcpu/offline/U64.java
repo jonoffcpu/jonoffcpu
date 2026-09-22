@@ -6,47 +6,21 @@ import java.math.BigInteger;
 
 /**
  * Unsigned 64-bit helpers for the columnar engine. Capture timestamps, cookies and durations are
- * u64 by construction, so the columns hold their raw bits and every ordering question goes through
- * here rather than through the JVM's signed comparison.
+ * u64 by construction, so the columns hold their raw bits.
  *
- * <p>Arithmetic on those bits is plain signed {@code long}, which is exact as long as the operands
- * stay below {@code 2^63}. The engine enforces that up front with {@link #requireSigned}: {@code
- * 2^63} nanoseconds is 292 years, so the only stream that can violate it is a corrupt one, and it
- * is rejected by name instead of wrapping silently.
+ * <p>Arithmetic and ordering on those bits are plain signed {@code long}, which is exact as long as
+ * the operands stay below {@code 2^63}. The engine enforces that up front with {@link
+ * #requireSigned}: {@code 2^63} nanoseconds is 292 years, so the only stream that can violate it is
+ * a corrupt one, and it is rejected by name instead of wrapping silently. That check is what lets
+ * the rest of the engine compare and subtract these values directly, which is why no unsigned
+ * comparison helper survives here — only the widening, checking and checked-addition ones the
+ * engine actually calls.
  */
 final class U64 {
     static final String MONOTONIC_RANGE = "Monotonic timestamp exceeds signed 64-bit nanoseconds";
     private static final BigInteger SIGNED_LIMIT = BigInteger.ONE.shiftLeft(63);
 
     private U64() {}
-
-    static int compare(long left, long right) {
-        return Long.compareUnsigned(left, right);
-    }
-
-    static boolean gt(long left, long right) {
-        return Long.compareUnsigned(left, right) > 0;
-    }
-
-    static boolean lt(long left, long right) {
-        return Long.compareUnsigned(left, right) < 0;
-    }
-
-    static boolean ge(long left, long right) {
-        return Long.compareUnsigned(left, right) >= 0;
-    }
-
-    static boolean le(long left, long right) {
-        return Long.compareUnsigned(left, right) <= 0;
-    }
-
-    static long max(long left, long right) {
-        return gt(left, right) ? left : right;
-    }
-
-    static long min(long left, long right) {
-        return lt(left, right) ? left : right;
-    }
 
     /** The unsigned value of raw column bits, for report fields that must stay exact decimal text. */
     static BigInteger big(long bits) {
@@ -69,13 +43,6 @@ final class U64 {
     static long requireSignedOffset(BigInteger value, String label) throws IOException {
         CaptureInput.require(value.abs().compareTo(SIGNED_LIMIT) < 0, MONOTONIC_RANGE + ": " + label);
         return value.longValueExact();
-    }
-
-    /** {@code left - right} for operands already in signed range, rejected when the result is negative. */
-    static long difference(long left, long right, String label) throws IOException {
-        long value = left - right;
-        CaptureInput.require(left >= 0 && right >= 0 && value >= 0, label + " exceeds signed 64-bit nanoseconds");
-        return value;
     }
 
     /** Checked addition; the caller names the accumulator so a corrupt stream fails closed by name. */

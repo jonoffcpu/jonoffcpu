@@ -38,7 +38,40 @@ record CorrelationResult(
         OfflineCorrelator.PopulationEstimate populationEstimate,
         CorrelationEngine.SourceAggregate sourceAggregate,
         long peakRetainedBytes,
-        Thinning thinning) {
+        Thinning thinning,
+        Long narrowedToNanos) {
+
+    /**
+     * The source-side kept-row predicate the streaming pass applied, recomputed from the same inputs.
+     *
+     * <p>The columns hold only the rows the engine kept, so a second read of the capture file has to
+     * skip exactly the rows the first read dropped or its file-row to column-slot mapping is wrong.
+     * Both terms are pure functions of the observation itself, so they are recomputable rather than
+     * retained.
+     */
+    boolean keepsSource(long cookie, long startNanos) {
+        return keepsSource(thinning, narrowedToNanos, cookie, startNanos);
+    }
+
+    /** The one definition of that predicate, so the streaming pass and the re-read cannot drift. */
+    static boolean keepsSource(Thinning thinning, Long narrowedToNanos, long cookie, long startNanos) {
+        boolean withinWindow = narrowedToNanos == null || startNanos < narrowedToNanos;
+        return withinWindow && thinning.keeps(cookie);
+    }
+
+    /**
+     * The sample-side kept-row predicate: the cookie survived thinning and its observation was kept.
+     * A cookie with no source row at all is merely absent from the index, not dropped, and its sample
+     * is an orphan the join still carries.
+     */
+    boolean keepsSample(long cookie) {
+        return keepsSample(thinning, sourceIndex, cookie);
+    }
+
+    /** The one definition of that predicate, so the streaming pass and the re-read cannot drift. */
+    static boolean keepsSample(Thinning thinning, LongIntMap sourceIndex, long cookie) {
+        return thinning.keeps(cookie) && sourceIndex.get(cookie) != CorrelationEngine.DROPPED;
+    }
 
     int sourceRows() {
         return sources.size();

@@ -143,6 +143,136 @@ public final class StreamingCorrelatorTest {
         }
     }
 
+    /**
+     * The audit re-read walks the rows correlation kept, not every row in the files.
+     *
+     * <p>Thinning and window narrowing make the columns hold only the kept rows, so an audit pass that
+     * still assumed one column slot per file row indexed past the end of the columns and died with a
+     * raw {@code ArrayIndexOutOfBoundsException} — on exactly the headline case this work exists for,
+     * a full audit of a large capture under a tight budget. Both degradation mechanisms are covered:
+     * an explicit {@code --thinning}, and the watermark-driven narrowing a {@code truncate} run takes.
+     */
+    private static void auditUnderDegradation(Path dir) throws Exception {
+        int rows = 200_000;
+        Path jfr = ScaleFixture.recording(dir, rows, 8);
+        Path source = ScaleFixture.capture(dir, jfr, rows);
+
+        Path thinned = dir.resolve("audit-thinned");
+        int status = OffCpuCorrelator.run(new String[] {
+            "--source",
+            source.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            thinned.toString(),
+            "--format",
+            "collapsed",
+            "--audit",
+            "full",
+            "--thinning",
+            "0.5"
+        });
+        check(status == 0, "A full audit of a thinned run must succeed, but exited " + status);
+        checkAuditMatchesColumns(thinned, OutputFiles.REPORT, OutputFiles.CLASSIFIED_RECORDS, OutputFiles.MATCHES);
+
+        // The same budget and policy ladder() proves narrows: under truncate the ladder skips the
+        // audit-drop and thin-source rungs, so --audit full survives all the way into a narrowed run.
+        Path narrowed = dir.resolve("audit-narrowed");
+        status = OffCpuCorrelator.run(new String[] {
+            "--source",
+            source.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            narrowed.toString(),
+            "--format",
+            "collapsed",
+            "--audit",
+            "full",
+            "--on-limit",
+            "truncate",
+            "--max-retained-bytes",
+            "23000000"
+        });
+        check(status == 2, "A narrowed full audit must still report an incomplete window, got " + status);
+        JsonObject narrowedReport = com.google.gson.JsonParser.parseString(
+                        Files.readString(narrowed.resolve(OutputFiles.INCOMPLETE_REPORT)))
+                .getAsJsonObject();
+        check(
+                !narrowedReport
+                        .getAsJsonObject("degradation")
+                        .get("narrowedToNanos")
+                        .isJsonNull(),
+                "The truncate sub-case must actually narrow, or it proves nothing about the audit pass");
+        check(
+                narrowedReport.get("audit").getAsString().equals("full"),
+                "Truncate must not quietly drop the requested audit level: " + narrowedReport.get("audit"));
+        check(
+                narrowedReport.get("sourceRows").getAsInt() < rows,
+                "A narrowed run must have dropped source rows, or the audit mapping is untested");
+        checkAuditMatchesColumns(
+                narrowed,
+                OutputFiles.INCOMPLETE_REPORT,
+                OutputFiles.INCOMPLETE_CLASSIFIED_RECORDS,
+                OutputFiles.INCOMPLETE_MATCHES);
+    }
+
+    /**
+     * The audit file describes exactly the rows the columns hold: one line per kept source row and per
+     * kept JFR sample, classified the way the counters say, and naming the same cookies the matches
+     * file does. A pass that re-read the files row for row would fail every one of these.
+     */
+    private static void checkAuditMatchesColumns(Path output, String reportName, String recordsName, String matchesName)
+            throws Exception {
+        JsonObject report = com.google.gson.JsonParser.parseString(Files.readString(output.resolve(reportName)))
+                .getAsJsonObject();
+        int sourceRows = report.get("sourceRows").getAsInt();
+        int jfrSamples = report.get("jfrSamples").getAsInt();
+        int matched = report.get("matched").getAsInt();
+        int unmatchedSource = report.get("unmatchedSource").getAsInt();
+        int invalidSource = report.get("invalidSource").getAsInt();
+        check(sourceRows > 0 && jfrSamples > 0 && matched > 0, "Nothing was kept, so nothing is being checked");
+
+        int sourceLines = 0;
+        int jfrLines = 0;
+        int matchedSourceLines = 0;
+        java.util.Set<String> auditMatchedCookies = new java.util.HashSet<>();
+        java.util.Set<String> auditSourceCookies = new java.util.HashSet<>();
+        for (String line : Files.readAllLines(output.resolve(recordsName))) {
+            JsonObject entry = com.google.gson.JsonParser.parseString(line).getAsJsonObject();
+            String cookie = entry.getAsJsonObject("record").get("correlationId").getAsString();
+            if (entry.get("stream").getAsString().equals("source")) {
+                sourceLines++;
+                check(auditSourceCookies.add(cookie), "The audit pass emitted the same source row twice: " + cookie);
+                if (entry.get("classification").getAsString().equals("matched")) {
+                    matchedSourceLines++;
+                    auditMatchedCookies.add(cookie);
+                }
+            } else {
+                jfrLines++;
+            }
+        }
+        check(sourceLines == sourceRows, "Audit source lines " + sourceLines + " != kept source rows " + sourceRows);
+        check(jfrLines == jfrSamples, "Audit JFR lines " + jfrLines + " != kept JFR samples " + jfrSamples);
+        check(
+                sourceLines == matched + unmatchedSource + invalidSource,
+                "Audit source lines do not add up to the report's own source classification counts");
+        check(
+                matchedSourceLines == matched,
+                "Audit matched source lines " + matchedSourceLines + " != report matched " + matched);
+
+        java.util.Set<String> matchesCookies = new java.util.HashSet<>();
+        for (String line : Files.readAllLines(output.resolve(matchesName))) {
+            matchesCookies.add(com.google.gson.JsonParser.parseString(line)
+                    .getAsJsonObject()
+                    .get("correlationId")
+                    .getAsString());
+        }
+        check(
+                auditMatchedCookies.equals(matchesCookies),
+                "The audit pass classified a different set of cookies as matched than the matches file names");
+    }
+
     /** The synthetic view is built from interned stacks, not from retained sample documents. */
     private static void syntheticFromColumns(Path dir) throws Exception {
         Path jfr = OfflineCorrelatorTest.recording(dir, 1);
@@ -860,6 +990,13 @@ public final class StreamingCorrelatorTest {
             thinningAccuracy(dir);
             thinningDeterminism(dir);
             ladder(dir);
+            // Runs after scale(), not next to auditLevels() where it belongs by subject. scale()'s
+            // distinct-stack floor depends on how far the JVM has inlined ScaleFixture's recursive
+            // commitAtDepth by the time it runs: another 200,000-event fixture ahead of it warms that
+            // recursion enough to collapse the captured stacks below the floor (66 observed against a
+            // floor of 100). Every other large fixture is already downstream of scale() for the same
+            // reason; this one joins them.
+            auditUnderDegradation(dir);
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

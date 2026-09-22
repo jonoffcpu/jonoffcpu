@@ -41,7 +41,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private static final int ESTIMATE_FRACTION_BITS = 64;
 
     /** Marks a cookie that was observed but thinned away, so duplicate detection still sees it. */
-    private static final int DROPPED = Integer.MAX_VALUE;
+    static final int DROPPED = Integer.MAX_VALUE;
 
     record SourceAggregate(BigInteger duration, BigInteger estimatedDuration, int rows) {}
 
@@ -195,8 +195,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
         // A narrowed window contributes nothing past its cut; dropping here (not just clipping later)
         // is what actually shrinks retention on the restart that follows a narrow-window ladder step.
-        boolean withinWindow = narrowedToNanos == null || start < narrowedToNanos;
-        boolean kept = withinWindow && thinning.keeps(cookie);
+        boolean kept = CorrelationResult.keepsSource(thinning, narrowedToNanos, cookie, start);
         // Duplicate detection stays global and exact: a dropped row still claims its cookie.
         sourceIndex.observe(cookie, kept ? sources.size() : DROPPED);
         if (!kept) return;
@@ -285,7 +284,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         samplesSeen++;
         // The source pass (already complete by the time samples stream) marks a cookie DROPPED when its
         // observation was thinned or fell outside a narrowed window; the matching sample follows it down.
-        boolean kept = thinning.keeps(cookie) && sourceIndex.get(cookie) != DROPPED;
+        boolean kept = CorrelationResult.keepsSample(thinning, sourceIndex, cookie);
         // Duplicate detection stays global and exact: a dropped sample still claims its cookie.
         sampleIndex.observe(cookie, kept ? samples.size() : DROPPED);
         if (!kept) return;
@@ -509,7 +508,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 estimate,
                 aggregate,
                 capture.budget.peak(),
-                thinning);
+                thinning,
+                narrowedToNanos);
     }
 
     /** Marks every row on both sides whose cookie this index saw more than once. */

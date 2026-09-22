@@ -83,6 +83,12 @@ file. The *library* API (`OffCpuCorrelator.correlate`, and `OfflineCorrelator`'s
 `OutputOptions.defaults()`) keeps the old `full` default, so embedding the
 correlator as a dependency is unaffected.
 
+The audit outputs are produced by a second read of the same two files, so they
+describe the rows the correlation actually kept, not every row in the inputs. Under
+thinning or a narrowed window the re-read applies the same kept-row predicate the
+streaming pass did: `--audit full` then documents the kept subsample, row for row
+against the counters in the report, which is what an audit of a degraded run means.
+
 Reading, selecting, and cutting existing events uses the public JDK
 `RecordingFile` API. The synthetic compatibility view has a different requirement:
 it creates new historical `jdk.ExecutionSample` events with explicit thread and
@@ -184,7 +190,12 @@ Under thinning the collapsed weights are estimates rather than observed duration
 `--estimate-population`, which is an inverse-probability estimator over the kernel's own
 admission thresholds, is rejected together with an explicit `--thinning`, and is marked
 `unavailable` with `correlation-time-thinned-source` when the ladder applies thinning by
-itself.
+itself. That asymmetry is deliberate. Asking for both on the command line is asking for
+two things that cannot both be honoured, and the CLI says so up front rather than
+handing back an estimate that is not the one requested. A ladder-chosen thinning is not
+a request: the run was asked to fit a budget, it thinned to fit, and the population
+estimate that is no longer computable is reported as `unavailable` with that reason
+instead of failing an analysis that otherwise succeeded.
 
 The report's top-level `degradation` object is always present, even when nothing needed
 to degrade, so a consumer can see that degradation was considered and declined. It
@@ -239,9 +250,12 @@ objects. Retention is proportional to the number of *distinct stacks*, not to th
 number of recorded intervals — a capture of 1.12 million samples carrying 10,631
 distinct stacks holds one copy of each — so the guard is a usable steering signal
 rather than a proxy for input size. Roughly 80 bytes of retention per recorded
-interval, plus the interned stacks, is the figure to plan a capture against: the
-scale fixture (`StreamingCorrelatorTest.scale`, 2,000,000 observations and a
-matching 2,000,000 JFR samples) measures about 281 MiB of peak retained bytes.
+interval, plus the interned stacks, is the figure to plan a capture against — it is
+the load-bearing number here. The scale fixture
+(`StreamingCorrelatorTest.scale`, 2,000,000 observations and a matching 2,000,000
+JFR samples) asserts a bound of 400 MiB on peak retained bytes and has measured
+comfortably inside it; the exact figure moves with the engine's structures and is
+not a number to plan against.
 
 A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
 distinct Java stacks) measured 203 MiB (212,831,820 bytes) of peak retained

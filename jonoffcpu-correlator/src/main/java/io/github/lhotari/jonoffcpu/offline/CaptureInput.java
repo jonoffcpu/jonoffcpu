@@ -38,10 +38,6 @@ final class CaptureInput {
     final JsonObject start;
     final JsonObject end;
     final JsonObject inputs;
-    /** The number of observations the stream carried; the counters in {@code captureEnd} must agree. */
-    final int observationCount;
-    /** Every announced stack id, mapped to its frame count. The frames themselves are not retained. */
-    final LongIntMap announcedStacks;
 
     final String sourceDigest;
     final String jfrDigest;
@@ -54,8 +50,6 @@ final class CaptureInput {
             JsonObject start,
             JsonObject end,
             JsonObject inputs,
-            int observationCount,
-            LongIntMap announcedStacks,
             String sourceDigest,
             String jfrDigest,
             String apStoppedAtNanos,
@@ -65,8 +59,6 @@ final class CaptureInput {
         this.start = start;
         this.end = end;
         this.inputs = inputs;
-        this.observationCount = observationCount;
-        this.announcedStacks = announcedStacks;
         this.sourceDigest = sourceDigest;
         this.jfrDigest = jfrDigest;
         this.apStoppedAtNanos = apStoppedAtNanos;
@@ -366,18 +358,7 @@ final class CaptureInput {
         diagnostics.addProperty("clockVerification", footer != null ? "verified-footer" : "unavailable");
         diagnostics.addProperty("apStopVerification", footer != null ? "verified-footer" : "unavailable");
         if (footer != null) diagnostics.add("observedFinalization", footer);
-        return new CaptureInput(
-                start,
-                end,
-                inputs,
-                observations,
-                announcedStacks,
-                sourceHash,
-                jfrHash,
-                apStoppedAt,
-                budget,
-                partial,
-                diagnostics);
+        return new CaptureInput(start, end, inputs, sourceHash, jfrHash, apStoppedAt, budget, partial, diagnostics);
     }
 
     private record CaptureReceipt(
@@ -513,18 +494,6 @@ final class CaptureInput {
         number(start, "targetPid");
         decimal(start, "processGenerationNs");
         decimal(start, "startedMonotonicNanos");
-    }
-
-    /** The frames of a stack record or a JFR sample row, held to the configured per-stack limit. */
-    static JsonArray frames(JsonObject row, OfflineCorrelator.Limits limits) throws IOException {
-        JsonElement frames = row.get("frames");
-        require(frames != null && frames.isJsonArray(), "Missing stack frames");
-        JsonArray array = frames.getAsJsonArray();
-        require(array.size() <= limits.maxFrames(), "Stack frame count limit exceeded");
-        for (JsonElement frame : array) {
-            require(frame.isJsonObject(), "Invalid stack frame");
-        }
-        return array;
     }
 
     static JsonObject object(JsonObject row, String key) throws IOException {
@@ -681,7 +650,7 @@ final class CaptureInput {
      * <p>Before the columnar engine this charged every decoded record, which made it a proxy for input size
      * rather than for retention and made {@code --max-retained-bytes} unusable as a guard: a 110 MB capture
      * charged about 8 GB. It now charges what is actually retained — control documents, columns, cookie index,
-     * interned stacks, merge window — which is what the degradation ladder needs to steer on.
+     * interned stacks — which is what the degradation ladder needs to steer on.
      */
     static final class Budget {
         private final OfflineCorrelator.Limits limits;

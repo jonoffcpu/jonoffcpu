@@ -197,10 +197,20 @@ final class Degradation {
                                     + " narrow the window"
                             : "; --on-limit degrade would thin the source and report the estimator");
         } else if (policy == Policy.TRUNCATE) {
-            // A truncate run that reaches refusal has already narrowed as far as the watermarks allow;
-            // --from-ns/--to-ns would only narrow further by hand, which is what this ladder already did.
+            // A truncate run that reaches refusal having narrowed at least once has gone as far as the
+            // watermarks allow; --from-ns/--to-ns would only narrow further by hand, which is what this
+            // ladder already did. Having narrowed none is a different story and must not claim otherwise:
+            // no watermark ever handed back a cut point, which is what happens when the budget is first
+            // exceeded by the unconditional end-of-pass check — on a capture with too few kept rows on
+            // either side to reach a row watermark, whose fixed preallocation floor is already over the
+            // budget. There was nothing to truncate, so saying the window is fully narrowed would be a
+            // false diagnosis.
             message.append(
-                    "; the window is already narrowed as far as the watermarks allow: raise" + " --max-retained-bytes");
+                    narrowedToNanos == null
+                            ? "; no watermark was reached, so truncation never had a window cut point to"
+                                    + " narrow at: raise --max-retained-bytes"
+                            : "; the window is already narrowed as far as the watermarks allow: raise"
+                                    + " --max-retained-bytes");
         } else {
             message.append("; raise --max-retained-bytes or narrow --from-ns/--to-ns");
         }

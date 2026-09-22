@@ -29,13 +29,7 @@ public final class PrimitiveStructuresTest {
     }
 
     private static void unsigned() throws IOException {
-        check(U64.gt(-1L, 1L), "u64 comparison used signed order");
-        check(U64.lt(1L, -1L), "u64 comparison used signed order");
-        check(U64.max(-1L, 1L) == -1L, "u64 max used signed order");
-        check(U64.min(-1L, 1L) == 1L, "u64 min used signed order");
         check(U64.big(-1L).equals(CaptureInput.U64_MAX), "u64 widening lost the top bit");
-        check(U64.difference(3000L, 1000L, "interval") == 2000L, "u64 difference is wrong");
-        rejects(() -> U64.difference(-1L, 0L, "interval"), "signed 64-bit nanoseconds");
         check(U64.requireSigned(BigInteger.valueOf(5), "boundary") == 5L, "in-range value rejected");
         rejects(
                 () -> U64.requireSigned(BigInteger.ONE.shiftLeft(63), "boundary"),

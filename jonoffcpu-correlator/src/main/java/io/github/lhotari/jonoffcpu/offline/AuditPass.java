@@ -5,6 +5,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.BufferedInputStream;
 import java.io.IOException;
@@ -22,8 +23,12 @@ import java.util.Map;
  * computed. Both files have already been digest-verified and are in page cache, so the second read
  * costs one sequential scan.
  *
- * <p>Order is the contract: every source row in capture file order, then every JFR sample in
- * recording order, which is exactly what the retained {@code classify} produced.
+ * <p>Order is the contract: every <em>kept</em> source row in capture file order, then every kept
+ * JFR sample in recording order, which is exactly what the retained {@code classify} produced. A
+ * degraded run's columns hold only the rows thinning and window narrowing let through, so this pass
+ * re-applies the same predicates ({@link CorrelationResult#keepsSource} and
+ * {@link CorrelationResult#keepsSample}) and skips the rest: without that the file-row to
+ * column-slot mapping slips at the first dropped row and then runs off the end of the columns.
  */
 final class AuditPass {
     interface Sink {
@@ -65,17 +70,21 @@ final class AuditPass {
                         stacks.put(stack.get("stackId").getAsLong(), stack.getAsJsonArray("frames"));
                     }
                     case OBSERVATION -> {
-                        JsonObject row =
-                                CaptureStream.observationRow(framed.record().getObservation());
-                        Reason reason = result.sources().reason(slot);
-                        Outcome outcome = result.sources().outcome(slot);
-                        sink.source(
-                                slot + 2,
-                                slot,
-                                classification(reason, outcome, true, partial),
-                                reasonText(reason, outcome),
-                                expandStacks(row, stacks));
-                        slot++;
+                        CaptureProto.Observation observation = framed.record().getObservation();
+                        // Pass one already accepted these bits as a non-negative signed nanosecond
+                        // value, so the raw long is the same number the engine compared against the cut.
+                        if (result.keepsSource(observation.getCorrelationId(), observation.getStartMonotonicNs())) {
+                            JsonObject row = CaptureStream.observationRow(observation);
+                            Reason reason = result.sources().reason(slot);
+                            Outcome outcome = result.sources().outcome(slot);
+                            sink.source(
+                                    slot + 2,
+                                    slot,
+                                    classification(reason, outcome, true, partial),
+                                    reasonText(reason, outcome),
+                                    expandStacks(row, stacks));
+                            slot++;
+                        }
                     }
                     default -> {
                         // Control records carry no per-row audit output.
@@ -83,6 +92,8 @@ final class AuditPass {
                 }
             }
         }
+        // A true invariant of the kept-row mapping: the same predicate over the same records in the
+        // same order yields the same count, so a mismatch really does mean the file changed.
         CaptureInput.require(slot == result.sources().size(), "Capture changed between correlation passes");
     }
 
@@ -93,6 +104,7 @@ final class AuditPass {
         int[] slot = new int[1];
         SignalJfrExporter.RowConsumer consumer = raw -> {
             if (!"sample".equals(raw.get("recordType"))) return;
+            if (!result.keepsSample(Long.parseUnsignedLong((String) raw.get("correlationId"), 16))) return;
             int index = slot[0]++;
             Reason reason = result.samples().reason(index);
             Outcome outcome = result.samples().outcome(index);
