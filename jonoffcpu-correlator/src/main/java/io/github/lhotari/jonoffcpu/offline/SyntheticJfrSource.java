@@ -127,9 +127,9 @@ interface SyntheticJfrSource {
         List<Interval> intervals = new ArrayList<>(analysis.matches().size());
         long[] stackNanos = new long[analysis.matches().size()];
         for (OfflineCorrelator.Match match : analysis.matches()) {
+            validateMatch(match);
             JsonObject sample = match.sample();
-            JsonArray frames = sample.getAsJsonArray("frames");
-            if (frames == null) throw new IOException("Missing array: frames");
+            JsonArray frames = requiredArray(sample, "frames");
             List<Map<String, Object>> raw = new ArrayList<>(frames.size());
             for (JsonElement element : frames) {
                 if (!element.isJsonObject()) throw new IOException("Invalid frame in matched sample");
@@ -154,17 +154,16 @@ interface SyntheticJfrSource {
                     sample.has("threadName") && !sample.get("threadName").isJsonNull()
                             ? sample.get("threadName").getAsString()
                             : null);
+            long durationNanos = checkedLong(match.durationNanos(), "durationNanos");
             if (stackId >= stackNanos.length) stackNanos = java.util.Arrays.copyOf(stackNanos, stackId * 2 + 1);
-            stackNanos[stackId] =
-                    Math.addExact(stackNanos[stackId], match.durationNanos().longValueExact());
-            BigInteger epochOffset = epochNanos(sample)
-                    .subtract(new BigInteger(sample.get("monotonicTimeNanos").getAsString()));
+            stackNanos[stackId] = Math.addExact(stackNanos[stackId], durationNanos);
+            BigInteger epochOffset = epochNanos(sample).subtract(decimal(sample, "monotonicTimeNanos"));
             intervals.add(new Interval(
-                    match.observation().get("correlationId").getAsString(),
-                    match.fromNanos().longValueExact(),
-                    match.toNanos().longValueExact(),
-                    match.durationNanos().longValueExact(),
-                    epochOffset.longValueExact(),
+                    requiredString(match.observation(), "correlationId"),
+                    checkedLong(match.fromNanos(), "fromNanos"),
+                    checkedLong(match.toNanos(), "toNanos"),
+                    durationNanos,
+                    checkedLong(epochOffset, "epochOffsetNanos"),
                     stackId,
                     threadId));
         }
@@ -221,6 +220,25 @@ interface SyntheticJfrSource {
         };
     }
 
+    /**
+     * The old retained {@code CompatibilityJfrWriter.validateMatch}, unchanged: rejects a null match,
+     * a null observation/sample, a null or negative {@code fromNanos}, a {@code toNanos} below it, or
+     * a {@code durationNanos} that does not equal their difference.
+     */
+    private static void validateMatch(OfflineCorrelator.Match match) throws IOException {
+        if (match == null
+                || match.observation() == null
+                || match.sample() == null
+                || match.fromNanos() == null
+                || match.toNanos() == null
+                || match.durationNanos() == null
+                || match.fromNanos().signum() < 0
+                || match.toNanos().compareTo(match.fromNanos()) < 0
+                || !match.durationNanos().equals(match.toNanos().subtract(match.fromNanos()))) {
+            throw new IOException("Invalid matched interval");
+        }
+    }
+
     private static Long optionalPositiveLong(JsonObject object, String field) throws IOException {
         JsonElement value = object.get(field);
         if (value == null || value.isJsonNull()) return null;
@@ -235,13 +253,43 @@ interface SyntheticJfrSource {
 
     private static BigInteger epochNanos(JsonObject sample) throws IOException {
         try {
-            java.time.Instant instant =
-                    java.time.Instant.parse(sample.get("startTime").getAsString());
+            java.time.Instant instant = java.time.Instant.parse(requiredString(sample, "startTime"));
             return BigInteger.valueOf(instant.getEpochSecond())
                     .multiply(BigInteger.valueOf(1_000_000_000L))
                     .add(BigInteger.valueOf(instant.getNano()));
-        } catch (RuntimeException error) {
+        } catch (java.time.format.DateTimeParseException | ArithmeticException error) {
             throw new IOException("Invalid sample start time", error);
+        }
+    }
+
+    private static JsonArray requiredArray(JsonObject object, String field) throws IOException {
+        JsonElement value = object.get(field);
+        if (value == null || !value.isJsonArray()) throw new IOException("Missing array: " + field);
+        return value.getAsJsonArray();
+    }
+
+    private static String requiredString(JsonObject object, String field) throws IOException {
+        JsonElement value = object.get(field);
+        if (value == null || value.isJsonNull() || !value.isJsonPrimitive()) {
+            throw new IOException("Missing string: " + field);
+        }
+        return value.getAsString();
+    }
+
+    private static BigInteger decimal(JsonObject object, String field) throws IOException {
+        return parseUnsigned(requiredString(object, field), field);
+    }
+
+    private static BigInteger parseUnsigned(String text, String label) throws IOException {
+        if (text == null || !text.matches("0|[1-9][0-9]*")) throw new IOException("Invalid " + label);
+        return new BigInteger(text);
+    }
+
+    private static long checkedLong(BigInteger value, String label) throws IOException {
+        try {
+            return value.longValueExact();
+        } catch (ArithmeticException e) {
+            throw new IOException(label + " does not fit signed 64-bit JFR time", e);
         }
     }
 

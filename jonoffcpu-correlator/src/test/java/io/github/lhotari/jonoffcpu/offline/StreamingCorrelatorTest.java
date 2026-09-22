@@ -8,6 +8,8 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import jdk.jfr.consumer.RecordedEvent;
+import jdk.jfr.consumer.RecordingFile;
 
 /** Fixtures for the streaming, primitive-keyed correlation engine and its degradation ladder. */
 public final class StreamingCorrelatorTest {
@@ -149,6 +151,99 @@ public final class StreamingCorrelatorTest {
                         && viaColumns.representedNanos().equals(viaAnalysis.representedNanos())
                         && viaColumns.omittedRemainderNanos().equals(viaAnalysis.omittedRemainderNanos()),
                 "Column-backed synthetic plan differs from the retained one");
+
+        // The count/total equality above says nothing about *when* the events land: a dropped or
+        // sign-flipped epoch offset would shift every synthetic timestamp by a constant and still pass
+        // it. The matched sample's real JFR startTime (wall clock) and monotonicTimeNanos (JVM-relative
+        // nanoTime) are naturally an astronomically large, non-zero distance apart, so a broken offset
+        // formula lands far outside any plausible epoch and this check catches it.
+        List<Long> analysisTimestamps = executionSampleEpochNanos(fromAnalysis);
+        List<Long> columnsTimestamps = executionSampleEpochNanos(fromColumns);
+        check(!analysisTimestamps.isEmpty(), "Fixture must produce at least one synthetic event");
+        check(
+                analysisTimestamps.equals(columnsTimestamps),
+                "Synthetic event timestamps differ between the column-backed and retained plans: " + columnsTimestamps
+                        + " vs " + analysisTimestamps);
+        // Sanity-check that the offset is genuinely distinctive (a real wall-clock epoch, not a
+        // near-1970 artifact of a dropped/zeroed offset).
+        check(
+                analysisTimestamps.get(0) / 1_000_000L > 1_600_000_000_000L,
+                "Synthetic event timestamp does not look like a real wall-clock epoch: " + analysisTimestamps);
+    }
+
+    private static List<Long> executionSampleEpochNanos(Path file) throws IOException {
+        List<Long> timestamps = new ArrayList<>();
+        try (RecordingFile recording = new RecordingFile(file)) {
+            while (recording.hasMoreEvents()) {
+                RecordedEvent event = recording.readEvent();
+                if (event.getEventType().getName().equals("jdk.ExecutionSample")) {
+                    timestamps.add(event.getStartTime().getEpochSecond() * 1_000_000_000L
+                            + event.getStartTime().getNano());
+                }
+            }
+        }
+        return timestamps;
+    }
+
+    /**
+     * Two matched intervals with identical {@code fromNanos}/{@code toNanos} but different cookies,
+     * inserted in descending-cookie source order. The column-backed and retained plans must both sort
+     * them ascending by cookie, exercising the tie-break the sequential test fixtures never force.
+     */
+    private static void syntheticOrderTiesBreakOnCookie(Path dir) throws Exception {
+        Path jfr = recordingWithSequentialCorrelationIds(dir, 2);
+        long[] tid = new long[1];
+        io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter.visit(jfr, row -> {
+            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
+        });
+        JsonObject second = OfflineCorrelatorTest.observation(tid[0]);
+        second.addProperty("correlationId", "8000000100000002");
+        second.addProperty("startMonotonicNanos", "1000");
+        second.addProperty("endMonotonicNanos", "4000");
+        JsonObject first = OfflineCorrelatorTest.observation(tid[0]);
+        first.addProperty("correlationId", "8000000100000001");
+        first.addProperty("startMonotonicNanos", "1000");
+        first.addProperty("endMonotonicNanos", "4000");
+        // Source-file order deliberately puts the higher cookie first: preserving capture order instead
+        // of sorting by cookie would still pass without this check.
+        Path source = OfflineCorrelatorTest.source(dir, jfr, List.of(second, first));
+        var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
+        check(analysis.matched() == 2, "Tie-break fixture must match both intervals");
+        var result = CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
+
+        List<String> viaAnalysisOrder = new ArrayList<>();
+        SyntheticJfrSource.of(analysis).forEachInterval(interval -> viaAnalysisOrder.add(interval.correlationId()));
+        List<String> viaColumnsOrder = new ArrayList<>();
+        SyntheticJfrSource.of(result).forEachInterval(interval -> viaColumnsOrder.add(interval.correlationId()));
+        check(
+                viaAnalysisOrder.equals(List.of("8000000100000001", "8000000100000002")),
+                "Tie-break must sort ascending by cookie: " + viaAnalysisOrder);
+        check(
+                viaColumnsOrder.equals(viaAnalysisOrder),
+                "Column-backed tie-break order diverged from the retained one: " + viaColumnsOrder + " vs "
+                        + viaAnalysisOrder);
+    }
+
+    private static Path recordingWithSequentialCorrelationIds(Path dir, int count) throws IOException {
+        Path file = dir.resolve("sequential-" + count + ".jfr");
+        try (jdk.jfr.Recording recording = new jdk.jfr.Recording()) {
+            recording.enable(OfflineCorrelatorTest.Capture.class);
+            recording.enable(OfflineCorrelatorTest.Sample.class).withStackTrace();
+            recording.enable(OfflineCorrelatorTest.Stats.class);
+            recording.start();
+            new OfflineCorrelatorTest.Capture().commit();
+            for (int i = 0; i < count; i++) {
+                OfflineCorrelatorTest.Sample sample = new OfflineCorrelatorTest.Sample();
+                sample.correlationId = (sample.correlationId & 0xffffffff00000000L) | (i + 1);
+                sample.commit();
+            }
+            OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
+            stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = count;
+            stats.commit();
+            recording.stop();
+            recording.dump(file);
+        }
+        return file;
     }
 
     public static void main(String[] args) throws Exception {
@@ -156,6 +251,7 @@ public final class StreamingCorrelatorTest {
         try {
             goldenEquivalence(dir);
             syntheticFromColumns(dir);
+            syntheticOrderTiesBreakOnCookie(dir);
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {
