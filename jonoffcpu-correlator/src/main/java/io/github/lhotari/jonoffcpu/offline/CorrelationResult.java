@@ -39,6 +39,14 @@ record CorrelationResult(
         CorrelationEngine.SourceAggregate sourceAggregate,
         long peakRetainedBytes) {
 
+    int sourceRows() {
+        return sources.size();
+    }
+
+    int jfrSamples() {
+        return samples.size();
+    }
+
     /** The sample slot this source slot matched, or {@code -1}. */
     int matchedSample(int sourceSlot) {
         if (sources.outcome(sourceSlot) != Outcome.MATCHED) return -1;

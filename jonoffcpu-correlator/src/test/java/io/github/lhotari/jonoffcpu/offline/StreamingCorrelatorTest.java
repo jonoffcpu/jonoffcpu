@@ -89,14 +89,7 @@ public final class StreamingCorrelatorTest {
         check(streamedReport.equals(retainedReport), "Reports differ beyond the synthetic quantum fields");
     }
 
-    /**
-     * Spec §1: the audit outputs are the only consumers of the per-row documents.
-     *
-     * <p>Not yet called from {@link #main}: {@code --audit} still only toggles today's whole-file
-     * writers (Task A5's stopgap), which already satisfies this assertion, but the report has no
-     * {@code "audit"} field until Task A8 wires the real {@link AuditLevel} plumbing and the
-     * streaming writers into the CLI. A8 must re-enable this call.
-     */
+    /** Spec §1: the audit outputs are the only consumers of the per-row documents. */
     private static void auditLevels(Path dir) throws Exception {
         Path jfr = OfflineCorrelatorTest.recording(dir, 1);
         long[] tid = new long[1];
@@ -250,6 +243,7 @@ public final class StreamingCorrelatorTest {
         Path dir = Files.createTempDirectory("jonoffcpu-streaming-test-");
         try {
             goldenEquivalence(dir);
+            auditLevels(dir);
             syntheticFromColumns(dir);
             syntheticOrderTiesBreakOnCookie(dir);
             System.out.println("Streaming correlator fixtures passed");
