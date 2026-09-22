@@ -135,3 +135,38 @@ jobs:
             release-downloads/jonoffcpu-agent.jar \
             release-downloads/jonoffcpu-correlator.jar \
             release-downloads/jfr-converter.jar
+
+  update-readme:
+    name: Update README version numbers
+    needs:
+      - version
+      - github-release
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Point the README at the released version
+        env:
+          RELEASE_VERSION: ${{ needs.version.outputs.version }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          sed -E -i \
+            -e "s#(io\.github\.lhotari:jonoffcpu-(agent|correlator):)[0-9A-Za-z.-]+#\1${RELEASE_VERSION}#g" \
+            -e "s#(Pass a tag such as \`)v[0-9A-Za-z.-]+(\`)#\1${RELEASE_TAG}\2#" \
+            README.md
+          grep -q "jonoffcpu-agent:${RELEASE_VERSION}" README.md
+          grep -q "jonoffcpu-correlator:${RELEASE_VERSION}" README.md
+          grep -q "such as \`${RELEASE_TAG}\`" README.md
+      - name: Commit and push
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if git diff --quiet -- README.md; then
+            echo "README already references ${RELEASE_TAG}"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update version numbers for latest release ${RELEASE_TAG} in README" -- README.md
+          git push origin "HEAD:${{ github.event.repository.default_branch }}"

@@ -102,7 +102,10 @@ The [release workflow](.github/workflows/release.yml) then:
    that the reusable workflow built from the pinned async-profiler fork and
    checked against a collapsed off-CPU profile; and
 5. creates the GitHub Release with generated notes and all three JAR downloads
-   only after publication succeeds.
+   only after publication succeeds; and
+6. rewrites the Maven coordinates and the example download tag in `README.md`
+   on the default branch to the released version and commits that as
+   "Update version numbers for latest release vX.Y.Z in README".
 
 Generated release-note categories are configured in
 [`.github/release.yml`](.github/release.yml).
