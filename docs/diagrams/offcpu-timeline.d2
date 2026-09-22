@@ -1,0 +1,105 @@
+# One thread as the Linux scheduler sees it: the states between two runs on a CPU.
+# Render from the repository root with
+#   docs/diagrams/render.sh offcpu-timeline   (d2 --layout=tala, output docs/images/)
+#
+# Layout notes (see architecture.d2 for the full list of TALA rules):
+# - A hidden single-row grid pins the three spans in time order; TALA alone would
+#   stack them. Edges between grid cells are routed straight by d2 (rule 5), which
+#   is what a timeline wants.
+# - The off-CPU interval is a one-row grid around the two off-CPU states; that is what
+#   draws the bracket and keeps Sleeping left of Runnable. The on-CPU states are plain
+#   boxes so the whole row stays narrow enough to read at README width.
+# - Preemption (Running -> Runnable without sleeping) is a note under the timeline
+#   rather than an edge: a straight edge across the Sleeping cell would cross it.
+
+direction: right
+
+vars: {
+  d2-config: {
+    layout-engine: tala
+    theme-id: 0
+  }
+}
+
+classes: {
+  span-blue: {
+    style.fill: "#eff6ff"
+    style.stroke: "#2563eb"
+    style.stroke-width: 2
+    style.border-radius: 16
+    style.font-color: "#0f172a"
+    style.font-size: 32
+    style.bold: true
+  }
+  span-violet: {
+    style.fill: "#faf5ff"
+    style.stroke: "#7c3aed"
+    style.stroke-width: 2
+    style.border-radius: 16
+    style.font-color: "#0f172a"
+    style.font-size: 32
+    style.bold: true
+  }
+  state: {
+    label.near: top-center
+    style.border-radius: 10
+    style.font-color: "#0f172a"
+    style.font-size: 30
+    style.bold: true
+  }
+  state-blue: {style.fill: "#dbeafe"; style.stroke: "#93c5fd"}
+  state-violet: {style.fill: "#ede9fe"; style.stroke: "#c4b5fd"}
+  state-teal: {style.fill: "#ccfbf1"; style.stroke: "#5eead4"}
+  detail: {
+    shape: text
+    style.font-size: 26
+    style.bold: false
+    style.font-color: "#334155"
+  }
+  flow: {style.stroke: "#334155"; style.stroke-width: 2; style.font-color: "#334155"; style.font-size: 24}
+  flow-dashed: {style.stroke-dash: 5}
+}
+
+page: "" {
+  style.opacity: 0
+  grid-columns: 1
+  grid-gap: 24
+
+timeline: "" {
+  style.opacity: 0
+  grid-rows: 1
+  horizontal-gap: 180
+  vertical-gap: 40
+
+  before: Running {
+    class: [state; state-blue]
+    detail: "on-CPU:\nCPU profilers\nsample here" {class: detail}
+  }
+
+  offcpu: "off-CPU interval" {
+    class: span-violet
+    grid-rows: 1
+    horizontal-gap: 180
+    vertical-gap: 40
+    sleeping: Sleeping {
+      class: [state; state-violet]
+      detail: "Blocked until an event:\nfutex, socket data,\ndisk I/O, timer" {class: detail}
+    }
+    runnable: Runnable {
+      class: [state; state-teal]
+      detail: "Woken; in the run queue\nwaiting for a free CPU" {class: detail}
+    }
+    sleeping -> runnable: sched_wakeup {class: flow}
+  }
+
+  after: Running {
+    class: [state; state-blue]
+    detail: "on-CPU:\nCPU profilers\nsample here" {class: detail}
+  }
+}
+
+note: "jonoffcpu measures the whole off-CPU interval, from switch-out to switch-in.\nA preempted thread skips Sleeping and only waits for a CPU." {class: detail}
+}
+
+page.timeline.before -> page.timeline.offcpu.sleeping: sched_switch {class: flow}
+page.timeline.offcpu.runnable -> page.timeline.after: sched_switch {class: flow}

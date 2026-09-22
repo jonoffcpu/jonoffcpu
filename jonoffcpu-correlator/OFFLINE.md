@@ -107,7 +107,7 @@ rare stacks are noisy even when the total is unbiased.
 The cookie provides exact event association, **not simultaneous stack capture**.
 eBPF captures native stacks at scheduler exit and requests a signal. Async-profiler
 captures its stack when that signal is delivered. It is therefore a
-**signal-delivery stack**, not a proven stack at the beginning of the blocked
+**signal-delivery stack**, not a proven stack at the beginning of the off-CPU
 interval. Signal delay can change the observed stack. Both original native stacks
 are retained in the classified source rows.
 

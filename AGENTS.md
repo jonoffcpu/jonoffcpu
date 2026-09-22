@@ -147,6 +147,10 @@ initialization or packaging.
 
 - Keep changes focused and update the relevant documentation when a contract,
   option, artifact, or workflow changes.
+- Diagram sources are d2 files in `docs/diagrams/`; the README embeds the
+  rendered SVGs from `docs/images/`. After editing a source, run
+  `docs/diagrams/render.sh` (renders changed sources; `--watch NAME` for live
+  editing) and commit the source and the SVG together.
 - New source must have provenance compatible with the repository license. Do
   not copy code from sources with unknown or incompatible licensing.
 - Avoid unbounded buffers and waits in signal, shutdown, and correlation paths.
