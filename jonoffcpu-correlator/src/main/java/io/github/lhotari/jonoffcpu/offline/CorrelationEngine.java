@@ -52,6 +52,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private final LongIntMap sourceIndex;
     private final LongIntMap sampleIndex;
     private final Thinning thinning;
+    private final Long narrowedToNanos;
     private CaptureInput.Budget budget;
     private LongIntMap announcedStacks;
     // Total JFR samples the exporter delivered, kept or thinned away: the JFR-side parse-completeness
@@ -68,13 +69,18 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private SamplingPolicy sampling;
 
     private CorrelationEngine(
-            OfflineCorrelator.Limits limits, int expectedSources, int expectedSamples, Thinning thinning) {
+            OfflineCorrelator.Limits limits,
+            int expectedSources,
+            int expectedSamples,
+            Thinning thinning,
+            Long narrowedToNanos) {
         this.limits = limits;
         this.sources = new SourceColumns(expectedSources);
         this.samples = new SampleColumns(expectedSamples);
         this.sourceIndex = new LongIntMap(expectedSources);
         this.sampleIndex = new LongIntMap(expectedSamples);
         this.thinning = thinning;
+        this.narrowedToNanos = narrowedToNanos;
     }
 
     static CorrelationResult correlate(
@@ -95,9 +101,25 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             boolean partial,
             Thinning thinning)
             throws IOException {
-        // One observation is 99 bytes of capture stream; the estimate only sizes the first allocation.
-        int expected = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(source) / 96));
-        CorrelationEngine engine = new CorrelationEngine(limits, expected, expected, thinning);
+        return correlate(
+                source, jfr, limits, selection, partial, new Degradation.Settings(AuditLevel.FULL, thinning, null));
+    }
+
+    static CorrelationResult correlate(
+            Path source,
+            Path jfr,
+            OfflineCorrelator.Limits limits,
+            OfflineCorrelator.JfrSelection selection,
+            boolean partial,
+            Degradation.Settings settings)
+            throws IOException {
+        // One observation is 99 bytes of capture stream and one sample 35 bytes of JFR; the estimate
+        // only sizes the first allocation, off each side's own file so a much smaller JFR does not
+        // preallocate as though it were as dense as the capture.
+        int expectedSources = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(source) / 96));
+        int expectedSamples = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(jfr) / 35));
+        CorrelationEngine engine = new CorrelationEngine(
+                limits, expectedSources, expectedSamples, settings.thinning(), settings.narrowedToNanos());
         boolean partialJfr = selection != null && selection.partialInput();
         CaptureInput capture = partial
                 ? CaptureInput.readPartial(source, jfr, limits, engine)
@@ -171,7 +193,10 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         } else {
             reason = Reason.NONE;
         }
-        boolean kept = thinning.keeps(cookie);
+        // A narrowed window contributes nothing past its cut; dropping here (not just clipping later)
+        // is what actually shrinks retention on the restart that follows a narrow-window ladder step.
+        boolean withinWindow = narrowedToNanos == null || start < narrowedToNanos;
+        boolean kept = withinWindow && thinning.keeps(cookie);
         // Duplicate detection stays global and exact: a dropped row still claims its cookie.
         sourceIndex.observe(cookie, kept ? sources.size() : DROPPED);
         if (!kept) return;
@@ -180,7 +205,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             try {
                 budget.structures(retainedBytes());
             } catch (RetentionLimitExceeded limit) {
-                throw limit.withLastObservationEnd(end);
+                // The cut excludes this observation itself (its own start, not its end): a retry that
+                // re-admitted it would retrace the identical column growth up to this exact watermark and
+                // reproduce the identical failure, making no progress. Cutting at its start guarantees the
+                // retry's kept-row count for this window strictly decreases.
+                throw limit.withLastObservationEnd(start);
             }
         }
     }
@@ -254,7 +283,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         String cookieText = (String) raw.get("correlationId");
         long cookie = Long.parseUnsignedLong(cookieText, 16);
         samplesSeen++;
-        boolean kept = thinning.keeps(cookie);
+        // The source pass (already complete by the time samples stream) marks a cookie DROPPED when its
+        // observation was thinned or fell outside a narrowed window; the matching sample follows it down.
+        boolean kept = thinning.keeps(cookie) && sourceIndex.get(cookie) != DROPPED;
         // Duplicate detection stays global and exact: a dropped sample still claims its cookie.
         sampleIndex.observe(cookie, kept ? samples.size() : DROPPED);
         if (!kept) return;
@@ -275,7 +306,17 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         if ((cookie >>> 32) != captureEpoch || (cookie & 0xffffffffL) == 0) {
             samples.reason(samples.size() - 1, Reason.INVALID_COOKIE);
         }
-        if (samples.size() % WATERMARK_ROWS == 0) budget.structures(retainedBytes());
+        if (samples.size() % WATERMARK_ROWS == 0) {
+            try {
+                budget.structures(retainedBytes());
+            } catch (RetentionLimitExceeded limit) {
+                // A sample's cookie resolves to its source slot in the same clock the narrow cut is
+                // expressed in: reusing it here means a budget exceeded while reading JFR samples can
+                // still narrow, instead of only ever refusing with no cut point.
+                int slot = sourceIndex.get(cookie);
+                throw slot >= 0 ? limit.withLastObservationEnd(sources.start(slot)) : limit;
+            }
+        }
     }
 
     private static BigInteger unsignedDecimal(Map<String, Object> raw, String key) throws IOException {
@@ -338,7 +379,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 ? U64.requireSignedOffset(signedDecimal(capture.inputs, "monotonicOffsetNanos"), "monotonicOffsetNanos")
                 : null;
         Long clipFrom = limits.fromNanos() == null ? null : limits.fromNanos().longValueExact();
-        Long clipTo = limits.toNanos() == null ? null : limits.toNanos().longValueExact();
+        Long clipTo = effectiveToNanos();
         Long delayLimit = limits.maxHandlerDelayNanos() == null
                 ? null
                 : limits.maxHandlerDelayNanos().longValueExact();
@@ -492,7 +533,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         BigInteger weighted = BigInteger.ZERO;
         int rows = 0;
         Long clipFrom = limits.fromNanos() == null ? null : limits.fromNanos().longValueExact();
-        Long clipTo = limits.toNanos() == null ? null : limits.toNanos().longValueExact();
+        Long clipTo = effectiveToNanos();
         for (int slot = 0; slot < sources.size(); slot++) {
             if (sources.reason(slot) != Reason.NONE) continue;
             long start = sources.start(slot);
@@ -506,6 +547,13 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             rows++;
         }
         return new SourceAggregate(duration, weighted.shiftRight(ESTIMATE_FRACTION_BITS), rows);
+    }
+
+    /** The configured {@code --to-ns} bound narrowed further by a ladder-chosen window cut, whichever is tighter. */
+    private Long effectiveToNanos() {
+        Long configured = limits.toNanos() == null ? null : limits.toNanos().longValueExact();
+        if (narrowedToNanos == null) return configured;
+        return configured == null ? narrowedToNanos : Math.min(configured, narrowedToNanos);
     }
 
     private long retainedBytes() {

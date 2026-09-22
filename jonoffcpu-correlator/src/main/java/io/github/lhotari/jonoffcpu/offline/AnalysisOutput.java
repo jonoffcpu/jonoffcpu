@@ -63,6 +63,9 @@ interface AnalysisOutput {
     /** Every matched pair's delivery delay, ascending, for the report's percentiles. */
     long[] sortedHandlerDelays();
 
+    /** The high-water mark of retained bytes this pass measured, for the degradation report; {@code 0} if unmeasured. */
+    long peakRetainedBytes();
+
     void writeClassifiedRecords(BufferedWriter writer) throws IOException;
 
     void writeMatches(BufferedWriter writer) throws IOException;
@@ -179,6 +182,13 @@ interface AnalysisOutput {
             }
 
             @Override
+            public long peakRetainedBytes() {
+                // The retained/materialised path keeps everything in memory; it does not stream under a
+                // budget watermark, so no peak was measured.
+                return 0L;
+            }
+
+            @Override
             public void writeClassifiedRecords(BufferedWriter writer) throws IOException {
                 Gson gson = new GsonBuilder().serializeNulls().create();
                 for (var row : analysis.records()) {
@@ -216,9 +226,24 @@ interface AnalysisOutput {
     /** The streamed view: counters come off the columns, and the per-row output re-reads the two files. */
     static AnalysisOutput of(
             CorrelationResult result, Path source, Path jfr, OfflineCorrelator.JfrSelection selection) {
-        String label = result.thinning().active()
-                ? "[thinned q=" + result.thinning().probability() + "; inverse-probability estimate];"
-                : "";
+        return of(result, source, jfr, selection, null);
+    }
+
+    /**
+     * The streamed view, labelling every collapsed line with what was done to produce it: thinning
+     * (a stated estimator over the whole window) and/or window narrowing ({@code narrowedToNanos}, a
+     * complete answer over less of it).
+     */
+    static AnalysisOutput of(
+            CorrelationResult result,
+            Path source,
+            Path jfr,
+            OfflineCorrelator.JfrSelection selection,
+            Long narrowedToNanos) {
+        String label = (result.thinning().active()
+                        ? "[thinned q=" + result.thinning().probability() + "; inverse-probability estimate];"
+                        : "")
+                + (narrowedToNanos == null ? "" : "[INCOMPLETE capture: window narrowed to " + narrowedToNanos + "];");
         return new AnalysisOutput() {
             @Override
             public JsonObject analysisInputs() {
@@ -341,6 +366,11 @@ interface AnalysisOutput {
                 }
                 Arrays.sort(delays);
                 return delays;
+            }
+
+            @Override
+            public long peakRetainedBytes() {
+                return result.peakRetainedBytes();
             }
 
             @Override

@@ -26,16 +26,32 @@ public final class OffCpuCorrelator {
             boolean compatibilityJfr,
             boolean populationEstimate,
             AuditLevel audit,
-            CompatibilityJfrWriter.Options jfrOptions) {
+            CompatibilityJfrWriter.Options jfrOptions,
+            String prefix,
+            Degradation ladder) {
         public OutputOptions {
             if (!collapsed && !compatibilityJfr)
                 throw new IllegalArgumentException("Select at least one output format");
             if (audit == null) throw new IllegalArgumentException("Missing audit level");
             if (jfrOptions == null) throw new IllegalArgumentException("Missing compatibility JFR options");
+            if (prefix == null) throw new IllegalArgumentException("Missing output name prefix");
+            if (ladder == null) throw new IllegalArgumentException("Missing degradation ladder");
+        }
+
+        /** True when {@code --format jfr} was asked for explicitly: an unfittable synthetic JFR must abort. */
+        boolean jfrOnly() {
+            return compatibilityJfr && !collapsed;
         }
 
         public static OutputOptions defaults() {
-            return new OutputOptions(true, true, false, AuditLevel.FULL, CompatibilityJfrWriter.Options.defaults());
+            return new OutputOptions(
+                    true,
+                    true,
+                    false,
+                    AuditLevel.FULL,
+                    CompatibilityJfrWriter.Options.defaults(),
+                    OutputFiles.PREFIX,
+                    Degradation.none());
         }
     }
 
@@ -143,6 +159,7 @@ public final class OffCpuCorrelator {
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
                     + " [--audit none|matches|full] [--thinning Q (0 < Q <= 1, keep probability)]"
+                    + " [--thinning-seed N] [--on-limit degrade|fail|truncate]"
                     + " [--partial true|false (partial format: diagnostics|collapsed)]");
             System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
                     + "   (prints the capture stream as NDJSON, stacks expanded)");
@@ -176,7 +193,9 @@ public final class OffCpuCorrelator {
                 "--to",
                 "--partial-jfr",
                 "--audit",
-                "--thinning");
+                "--thinning",
+                "--thinning-seed",
+                "--on-limit");
         for (int i = 0; i < args.length; i += 2) {
             if (i + 1 == args.length
                     || !allowed.contains(args[i])
@@ -200,9 +219,9 @@ public final class OffCpuCorrelator {
         boolean partial = booleanOption(options, "--partial", false);
         boolean partialJfr = booleanOption(options, "--partial-jfr", false);
         boolean estimatePopulation = booleanOption(options, "--estimate-population", false);
-        // Phase A keeps "full" the CLI default (today's behaviour); flipping it to "matches" is spec
-        // §4's job once the degradation ladder lands.
-        AuditLevel audit = AuditLevel.parse(options.getOrDefault("--audit", "full"));
+        // Spec §4's defaults table: the CLI defaults to "matches", unlike the library's OutputOptions.defaults(),
+        // which keeps "full" so OfflineCorrelatorTest's exact-file-set assertion still holds.
+        AuditLevel audit = AuditLevel.parse(options.getOrDefault("--audit", "matches"));
         boolean hasJfrRange = options.containsKey("--from") || options.containsKey("--to");
         if (partial && (partialJfr || hasJfrRange)) {
             throw new IllegalArgumentException("Incomplete-capture mode cannot be combined with JFR selection");
@@ -213,8 +232,6 @@ public final class OffCpuCorrelator {
         if (estimatePopulation && options.containsKey("--thinning")) {
             throw new IllegalArgumentException("Population estimates require the unthinned source");
         }
-        Thinning thinning =
-                options.containsKey("--thinning") ? Thinning.of(options.get("--thinning"), 0L) : Thinning.NONE;
         String format = options.getOrDefault("--format", partial ? "diagnostics" : "both");
         if (partial) {
             if (!Set.of("diagnostics", "collapsed").contains(format)
@@ -251,22 +268,50 @@ public final class OffCpuCorrelator {
             selection = new OfflineCorrelator.JfrSelection(
                     range == null ? null : range.from(), range == null ? null : range.to(), partialJfr);
         }
-        CorrelationResult result =
-                CorrelationEngine.correlate(Path.of(options.get("--source")), jfr, limits, selection, false, thinning);
+        Path sourcePath = Path.of(options.get("--source"));
+        Thinning requestedThinning = options.containsKey("--thinning")
+                ? Thinning.of(options.get("--thinning"), Long.parseLong(options.getOrDefault("--thinning-seed", "0")))
+                : Thinning.NONE;
+        Degradation ladder = new Degradation(
+                Degradation.Policy.parse(options.getOrDefault("--on-limit", "degrade")),
+                audit,
+                requestedThinning,
+                limits.maxRetainedBytes(),
+                RetentionEstimate.of(sourcePath, jfr));
+        // A restart is one sequential re-read of files that are already digest-verified.
+        Degradation.Settings settings = null;
+        CorrelationResult result = null;
+        while (result == null) {
+            settings = ladder.settings();
+            try {
+                result = CorrelationEngine.correlate(sourcePath, jfr, limits, selection, false, settings);
+            } catch (RetentionLimitExceeded limit) {
+                if (!ladder.advance(limit)) throw new IOException(ladder.refusal(limit), limit);
+            }
+        }
+        boolean narrowed = ladder.narrowed();
+        String prefix = narrowed ? OutputFiles.INCOMPLETE_PREFIX : OutputFiles.PREFIX;
+        CorrelationResult publishedResult = result;
         write(
-                AnalysisOutput.of(result, Path.of(options.get("--source")), jfr, selection),
+                AnalysisOutput.of(result, sourcePath, jfr, selection, settings.narrowedToNanos()),
                 Path.of(options.get("--output")),
                 new OutputOptions(
-                        !format.equals("jfr"), !format.equals("collapsed"), estimatePopulation, audit, jfrOptions),
-                () -> result.capture().verifyUnchanged(Path.of(options.get("--source")), jfr));
-        System.out.println("Wrote validated analysis to "
+                        !format.equals("jfr"),
+                        !format.equals("collapsed"),
+                        estimatePopulation,
+                        ladder.audit(),
+                        jfrOptions,
+                        prefix,
+                        ladder),
+                () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
+        System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + options.get("--output")
                 + ": "
                 + result.matched()
                 + " matches; "
                 + result.selectedObservedDurationNanos()
                 + " selected observed ns");
-        return 0;
+        return narrowed ? 2 : 0;
     }
 
     /**
@@ -305,8 +350,11 @@ public final class OffCpuCorrelator {
             throws IOException {
         Files.createDirectory(directory);
         Gson gson = new GsonBuilder().serializeNulls().create();
+        String prefix = options.prefix();
+        boolean narrowed = options.ladder().narrowed();
         if (options.collapsed()) {
-            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COLLAPSED))) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)))) {
                 for (var entry : new TreeMap<>(output.collapsedNanos()).entrySet()) {
                     writer.write(entry.getKey());
                     writer.write(' ');
@@ -325,17 +373,33 @@ public final class OffCpuCorrelator {
                         requestedJfrOptions.maxSyntheticEvents(),
                         requestedJfrOptions.onEventLimit())
                 : requestedJfrOptions;
-        CompatibilityJfrWriter.Result compatibility = options.compatibilityJfr()
-                ? CompatibilityJfrWriter.write(
-                        output.synthetic(), directory.resolve(OutputFiles.SYNTHETIC_JFR), effectiveJfrOptions)
-                : null;
+        CompatibilityJfrWriter.Result compatibility = null;
+        if (options.compatibilityJfr()) {
+            try {
+                compatibility = CompatibilityJfrWriter.write(
+                        output.synthetic(),
+                        directory.resolve(OutputFiles.name(prefix, OutputFiles.SYNTHETIC_SUFFIX)),
+                        effectiveJfrOptions);
+            } catch (IOException unfittable) {
+                // Spec §3: a quantum that cannot be coarsened to fit degrades to collapsed-only output
+                // instead of discarding an otherwise-complete analysis; only an explicit --format jfr
+                // still aborts, since then there is nothing else to publish.
+                if (options.jfrOnly()) throw unfittable;
+                options.ladder().syntheticOmitted(unfittable.getMessage());
+            }
+            if (compatibility != null && compatibility.quantumRaised()) {
+                options.ladder().quantumRaised(compatibility.requestedQuantumNanos(), compatibility.quantumNanos());
+            }
+        }
         if (options.audit() == AuditLevel.FULL) {
-            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.CLASSIFIED_RECORDS_SUFFIX)))) {
                 output.writeClassifiedRecords(writer);
             }
         }
         if (options.audit() != AuditLevel.NONE) {
-            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.MATCHES))) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.MATCHES_SUFFIX)))) {
                 output.writeMatches(writer);
             }
         }
@@ -406,14 +470,36 @@ public final class OffCpuCorrelator {
             view.addProperty("omittedRemainderNanos", compatibility.omittedRemainderNanos());
             report.add("syntheticJfr", view);
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.REPORT))) {
+        // Always present, with an empty stepsApplied when nothing was needed, so a consumer can see that
+        // degradation was considered and declined.
+        report.add("degradation", options.ladder().report(output.peakRetainedBytes()));
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.REPORT_SUFFIX)))) {
             // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
             new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
             writer.newLine();
         }
         verify.verify();
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
-            writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
+        if (narrowed) {
+            // A narrowed window is not the question that was asked: it never promotes the directory to
+            // complete, and the same no-replace hard-link publication writePartial uses keeps a
+            // half-written marker from ever being observed.
+            JsonObject marker = new JsonObject();
+            marker.addProperty("schemaVersion", 1);
+            marker.addProperty("state", "narrowed");
+            marker.addProperty("coverageComplete", false);
+            marker.addProperty(
+                    "effectiveToNanos", Long.toString(options.ladder().narrowedToNanos()));
+            Path temporary = Files.createTempFile(directory, ".narrowed-marker-", ".tmp");
+            try {
+                Files.writeString(temporary, gson.toJson(marker) + "\n", StandardCharsets.UTF_8);
+                Files.createLink(directory.resolve(OutputFiles.NARROWED), temporary);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        } else {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
+                writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
+            }
         }
     }
 

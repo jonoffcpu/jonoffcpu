@@ -94,8 +94,20 @@ public final class StreamingCorrelatorTest {
             report.getAsJsonObject("syntheticJfr").remove("requestedQuantumNanos");
             report.getAsJsonObject("syntheticJfr").remove("observedQuantumNanos");
             report.getAsJsonObject("syntheticJfr").remove("quantumRaisedForEventLimit");
+            // The streamed path builds a real ladder from the CLI's own limits and pre-decode estimate
+            // (one settings() call even when nothing was needed); the retained/library path's
+            // OutputOptions.defaults() ladder is inert (Degradation.none()), with no limit or estimate
+            // of its own and no measured peak. Both report an empty stepsApplied either way, which is
+            // what this equivalence check cares about.
+            JsonObject degradation = report.getAsJsonObject("degradation");
+            degradation.remove("attempts");
+            degradation.remove("peakRetainedBytes");
+            degradation.remove("retainedBytesLimit");
+            degradation.remove("estimatedRetainedBytes");
         }
-        check(streamedReport.equals(retainedReport), "Reports differ beyond the synthetic quantum fields");
+        check(
+                streamedReport.equals(retainedReport),
+                "Reports differ beyond the synthetic quantum and degradation-measurement fields");
     }
 
     /** Spec §1: the audit outputs are the only consumers of the per-row documents. */
@@ -351,6 +363,95 @@ public final class StreamingCorrelatorTest {
                 Files.readString(first.resolve(OutputFiles.COLLAPSED))
                         .equals(Files.readString(third.resolve(OutputFiles.COLLAPSED))),
                 "Shuffling the capture changed the thinned result");
+    }
+
+    /** Spec acceptance 6: a small budget still produces a flame graph, and says what it cost. */
+    private static void ladder(Path dir) throws Exception {
+        int rows = 200_000;
+        Path jfr = ScaleFixture.recording(dir, rows, 8);
+        Path source = ScaleFixture.capture(dir, jfr, rows);
+
+        // Measured against this fixture: the cookie indices and the source/sample columns are all sized
+        // off the input files up front, so they dominate retention and barely shrink under thinning.
+        // At the heaviest thinning rung (q=0.01, which this budget's headroom always selects) peak
+        // retention floors around 21.5 MB. An unthinned, unnarrowed run exceeds 23,000,000 bytes only
+        // partway through the JFR pass; narrowing to the cut the watermark hands back there (the
+        // triggering sample's own source row) converges, through a few further watermark-driven cuts, to
+        // a window whose full source-and-sample retention fits the same budget.
+        long budgetBytes = 23_000_000L;
+        Path thinnedOnly = dir.resolve("ladder-thinned");
+        int status = OffCpuCorrelator.run(new String[] {
+            "--source",
+            source.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            thinnedOnly.toString(),
+            "--format",
+            "collapsed",
+            "--max-retained-bytes",
+            Long.toString(budgetBytes)
+        });
+        check(status == 0, "Thinning alone must still be a complete analysis, but exited " + status);
+        check(
+                Files.isRegularFile(thinnedOnly.resolve(OutputFiles.COMPLETE)),
+                "Thinning keeps the ordinary names and the completion marker");
+        check(
+                Files.size(thinnedOnly.resolve(OutputFiles.COLLAPSED)) > 0,
+                "A degraded run must still produce a flame graph");
+        JsonObject report = com.google.gson.JsonParser.parseString(
+                        Files.readString(thinnedOnly.resolve(OutputFiles.REPORT)))
+                .getAsJsonObject();
+        List<String> steps = new ArrayList<>();
+        report.getAsJsonObject("degradation")
+                .getAsJsonArray("stepsApplied")
+                .forEach(step -> steps.add(step.getAsJsonObject().get("step").getAsString()));
+        check(steps.contains("thin-source"), "The report must name every ladder step applied: " + steps);
+        check(report.has("sourceThinning"), "A thinned analysis must state its estimator");
+
+        Path narrowed = dir.resolve("ladder-narrowed");
+        status = OffCpuCorrelator.run(new String[] {
+            "--source",
+            source.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            narrowed.toString(),
+            "--format",
+            "collapsed",
+            "--on-limit",
+            "truncate",
+            "--max-retained-bytes",
+            Long.toString(budgetBytes)
+        });
+        check(status == 2, "A narrowed window is not the question that was asked; expected 2, got " + status);
+        check(!Files.exists(narrowed.resolve(OutputFiles.COMPLETE)), "A narrowed window must not look complete");
+        check(
+                Files.isRegularFile(narrowed.resolve(OutputFiles.INCOMPLETE_COLLAPSED))
+                        && Files.isRegularFile(narrowed.resolve(OutputFiles.INCOMPLETE_REPORT))
+                        && Files.isRegularFile(narrowed.resolve(OutputFiles.NARROWED)),
+                "A narrowed window takes the INCOMPLETE names and its own marker");
+
+        Path refused = dir.resolve("ladder-fail");
+        try {
+            OffCpuCorrelator.run(new String[] {
+                "--source",
+                source.toString(),
+                "--jfr",
+                jfr.toString(),
+                "--output",
+                refused.toString(),
+                "--format",
+                "collapsed",
+                "--on-limit",
+                "fail",
+                "--max-retained-bytes",
+                Long.toString(budgetBytes)
+            });
+            throw new AssertionError("--on-limit fail must still refuse");
+        } catch (IOException expected) {
+            check(expected.getMessage().contains("budget"), "Unexpected refusal: " + expected);
+        }
     }
 
     /** The top {@code limit} collapsed stacks by thinning-reweighted duration, descending, ties broken on key. */
@@ -712,6 +813,7 @@ public final class StreamingCorrelatorTest {
             scale(dir);
             thinningAccuracy(dir);
             thinningDeterminism(dir);
+            ladder(dir);
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

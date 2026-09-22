@@ -58,7 +58,9 @@ final class OfflineCorrelator {
         }
 
         public static Limits defaults() {
-            return new Limits(1_000_000, 1024 * 1024, 256L * 1024 * 1024, 4096, null, null, null);
+            // With streaming, row count is no longer the binding constraint, and the retention guard
+            // should track the heap it protects rather than a fixed 256 MiB.
+            return new Limits(100_000_000, 1024 * 1024, RetentionEstimate.budget(0), 4096, null, null, null);
         }
     }
 
