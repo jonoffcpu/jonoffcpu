@@ -1,7 +1,8 @@
 # Releasing jonoffcpu
 
 Releases are built from immutable `v<version>` tags. For example, tag `v1.2.3`
-publishes the agent and correlator Maven artifacts at version `1.2.3`. The
+publishes the agent, correlator and jfr-converter Maven artifacts at version
+`1.2.3`. The
 release workflow rejects tags whose value after the leading `v` is not a
 Maven-style version beginning with three numeric components.
 
@@ -98,9 +99,10 @@ The [release workflow](.github/workflows/release.yml) then:
 3. signs and publishes the artifacts with
    `publishAndReleaseToMavenCentral`, waiting for Central Portal validation; and
 4. copies the executable artifacts to stable `jonoffcpu-agent.jar` and
-   `jonoffcpu-correlator.jar` names and adds `jfr-converter.jar`, the converter
-   that the reusable workflow built from the pinned async-profiler fork and
-   checked against a collapsed off-CPU profile; and
+   `jonoffcpu-correlator.jar` names and adds `jfr-converter.jar`, the
+   `jonoffcpu-jfr-converter` JAR that the reusable workflow built from the
+   pinned async-profiler fork's sources and checked against a collapsed
+   off-CPU profile; and
 5. creates the GitHub Release with generated notes and all three JAR downloads
    only after publication succeeds; and
 6. rewrites the Maven coordinates and the example download tag in `README.md`

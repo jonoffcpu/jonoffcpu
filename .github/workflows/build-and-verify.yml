@@ -143,18 +143,11 @@ jobs:
           ./gradlew
           :jonoffcpu-agent:verifyRuntimeJar
           :jonoffcpu-correlator:verifyRuntimeJar
+          :jonoffcpu-jfr-converter:check
           -PprebuiltNative=true
           -PnativeArchitectures=all
           -PnativeLibcs=all
           --no-daemon
-      - name: Build the forked jfr-converter.jar
-        run: make -C async-profiler build/jar/jfr-converter.jar
-      - name: Verify the converter renders a collapsed off-CPU profile
-        run: |
-          printf 'a;b;c 1500\na;b;d 500\n' > converter-check.collapsed
-          java -jar async-profiler/build/jar/jfr-converter.jar \
-            --title "Off-CPU time" --units µs converter-check.collapsed converter-check.html
-          grep -q 'Off-CPU time' converter-check.html
       - name: Prepare downloadable executable JARs
         run: |
           mkdir workflow-downloads
@@ -164,15 +157,19 @@ jobs:
           mapfile -t correlator_jars < <(find jonoffcpu-correlator/build/libs -maxdepth 1 -type f \
             -name 'jonoffcpu-correlator-*.jar' ! -name '*-plain.jar' \
             ! -name '*-sources.jar' ! -name '*-javadoc.jar')
-          if [[ ${#agent_jars[@]} -ne 1 || ${#correlator_jars[@]} -ne 1 ]]; then
+          mapfile -t converter_jars < <(find jonoffcpu-jfr-converter/build/libs -maxdepth 1 -type f \
+            -name 'jonoffcpu-jfr-converter-*.jar' \
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+          if [[ ${#agent_jars[@]} -ne 1 || ${#correlator_jars[@]} -ne 1 || ${#converter_jars[@]} -ne 1 ]]; then
             echo "Expected exactly one executable JAR from each module" >&2
             printf 'Agent JARs: %s\n' "${agent_jars[*]}" >&2
             printf 'Correlator JARs: %s\n' "${correlator_jars[*]}" >&2
+            printf 'Converter JARs: %s\n' "${converter_jars[*]}" >&2
             exit 1
           fi
           cp "${agent_jars[0]}" workflow-downloads/jonoffcpu-agent.jar
           cp "${correlator_jars[0]}" workflow-downloads/jonoffcpu-correlator.jar
-          cp async-profiler/build/jar/jfr-converter.jar workflow-downloads/jfr-converter.jar
+          cp "${converter_jars[0]}" workflow-downloads/jfr-converter.jar
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.runnable_artifact_name }}

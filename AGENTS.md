@@ -47,6 +47,10 @@ smallest relevant layer before running privileged end-to-end tests.
   post-processing out of this module.
 - `jonoffcpu-correlator`: Java 21 bytecode, offline correlation library and CLI,
   including synthetic compatibility JFR output.
+- `jonoffcpu-jfr-converter`: Java 21 build of async-profiler's converter
+  straight from the submodule's `src/converter` sources, mirroring
+  `async-profiler/pom-converter.xml`. It holds no sources of its own; converter
+  changes go to the fork.
 - `jonoffcpu-native`: maintained libbpf-rs CO-RE collector and privileged proof
   tools.
 - `async-profiler`: pinned submodule containing the generic signal-cookie JFR
@@ -109,7 +113,9 @@ and exact-cookie matches rather than only checking process exit status.
 ## Packaging and compatibility
 
 - Keep the agent and correlator as shaded executable JARs. Relocate bundled
-  dependencies to avoid conflicts for users of their Java APIs.
+  dependencies to avoid conflicts for users of their Java APIs. The
+  jfr-converter has no dependencies and keeps its upstream `one.*` packages and
+  Apache-2.0 license.
 - The agent JAR embeds Linux x86-64 and arm64 copies of the JNI bridge, native
   collector, and patched async-profiler, each in a glibc and a musl flavour,
   plus their checksum manifest. The agent selects the flavour from the C

@@ -268,6 +268,7 @@ contracts are in [jonoffcpu-correlator/OFFLINE.md](jonoffcpu-correlator/OFFLINE.
 dependencies {
     implementation("io.github.lhotari:jonoffcpu-agent:0.1.0")
     implementation("io.github.lhotari:jonoffcpu-correlator:0.1.0")
+    implementation("io.github.lhotari:jonoffcpu-jfr-converter:0.1.0")
 }
 ```
 
@@ -275,6 +276,9 @@ The correlator exposes
 `OffCpuCorrelator.correlate(sourcePath, jfrPath, outputDirectory)` using JDK
 types only. The published Gradle module metadata and POM point at the shaded,
 self-contained JARs, so no further dependencies are needed.
+`jonoffcpu-jfr-converter` is the converter from the pinned async-profiler fork
+under the upstream `one.convert` and `one.jfr` packages, built for Java 21 and
+licensed under Apache-2.0 like async-profiler itself.
 
 ## Building from source
 
@@ -296,10 +300,11 @@ flavour; `-PnativeLibcs` selects `musl` (the default), `glibc`, or `all`.
 Releases embed all four bundles. The executable JARs land in
 `jonoffcpu-agent/build/libs/` and `jonoffcpu-correlator/build/libs/`.
 
-Build the converter from the same fork:
+The converter is built from the same fork's `src/converter` sources by the
+`jonoffcpu-jfr-converter` module:
 
 ```sh
-make -C async-profiler build/jar/jfr-converter.jar
+./gradlew :jonoffcpu-jfr-converter:check
 ```
 
 Every [CI run](https://github.com/lhotari/jonoffcpu/actions) also publishes
