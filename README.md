@@ -204,9 +204,29 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate |
 | `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs |
 | `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
-| `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing |
-| `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay |
-| `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate |
+| `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
+| `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
+| `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
+
+`--audit` defaults to `matches`, so `jonoffcpu-classified-records.jsonl` is no
+longer written unless `--audit full` is passed — this is a backward-incompatible
+change from earlier releases, which always wrote both audit files. Anything that
+reads `jonoffcpu-classified-records.jsonl` needs `--audit full` added to its
+correlator invocation. The library API (`OffCpuCorrelator.correlate`) is
+unaffected and keeps writing both.
+
+When the retained-bytes budget is reached, `--on-limit degrade` (the default)
+trades away thinner outputs before it trades away coverage: it coarsens the
+synthetic JFR quantum, drops the audit outputs, then thins the source with an
+exact inverse-probability reweighting, and only as a last resort narrows the
+analysis window. Thinning still analyses the whole requested window — with
+ordinary output names, `jonoffcpu-complete.json`, and exit status 0 — because it
+is a stated estimator over what was asked for. Narrowing the window instead
+analyses a shorter window *completely*, and is labelled as visibly incomplete:
+`INCOMPLETE-jonoffcpu-*` names, a `jonoffcpu-narrowed.json` marker instead of
+`jonoffcpu-complete.json`, and exit status 2. See
+[jonoffcpu-correlator/OFFLINE.md's **Degradation**](jonoffcpu-correlator/OFFLINE.md#degradation)
+for the full ladder and the report's `degradation` object.
 
 `--partial true` inspects an interrupted capture and writes a visibly different
 set instead: `INCOMPLETE-jonoffcpu-report.json`,
@@ -670,6 +690,17 @@ The agent can also be started programmatically with
 | `--format collapsed\|jfr` | Produce only one of the two derived outputs. |
 | `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
 | `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json` or the synthetic JFR. |
+| `--audit full\|matches\|none` | How much per-row audit output to write. Default `matches`: `jonoffcpu-matches.jsonl` but not `jonoffcpu-classified-records.jsonl`. |
+| `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: coarsen the synthetic quantum, drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses immediately, like earlier releases. `truncate` skips thinning and narrows the window directly. |
+| `--thinning <q>` | Keep each recorded interval with probability `q` and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
+| `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
+
+`--max-rows` and `--max-retained-bytes` bound admission; the default
+`--max-retained-bytes` is sixty percent of the JVM's `-Xmx`, never below 256 MiB.
+Plan a capture's memory against roughly 80 bytes of correlator retention per
+recorded interval, plus one retained copy of each distinct Java stack — retention
+tracks distinct stacks, not capture length, so a long capture with few distinct
+call paths costs little more than a short one.
 
 By default the correlator refuses a JFR whose size or SHA-256 differs from the
 one recorded in the stream's footer. The full output, integrity, and weighting

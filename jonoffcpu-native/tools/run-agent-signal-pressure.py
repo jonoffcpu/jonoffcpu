@@ -155,7 +155,7 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
         run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
              "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
              "--output", case / name, "--max-retained-bytes", str(1024 * 1024 * 1024),
-             *extra], case / f"{name}.log")
+             "--audit", "full", *extra], case / f"{name}.log")
 
     exact = json.loads((case / "analysis-exact/jonoffcpu-report.json").read_text())
     delayed = json.loads((case / "analysis-delay-filtered/jonoffcpu-report.json").read_text())
