@@ -256,7 +256,8 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
 val fixtureMains = mapOf(
     "SignalJfrExporter" to "io.github.lhotari.jonoffcpu.jfr.SignalJfrExporterTest",
     "OfflineCorrelator" to "io.github.lhotari.jonoffcpu.offline.OfflineCorrelatorTest",
-    "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest"
+    "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest",
+    "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {
