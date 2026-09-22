@@ -133,7 +133,7 @@ def verify_ap_first(module, jdk, case, expected_reason):
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
          "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
-         "--output", case / "analysis"], case / "analysis.log")
+         "--output", case / "analysis", "--audit", "full"], case / "analysis.log")
 
     report = json.loads((case / "analysis/jonoffcpu-report.json").read_text())
     source_total = report["matched"] + report["unmatchedSource"] + report["invalidSource"]

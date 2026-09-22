@@ -25,15 +25,33 @@ public final class OffCpuCorrelator {
             boolean collapsed,
             boolean compatibilityJfr,
             boolean populationEstimate,
-            CompatibilityJfrWriter.Options jfrOptions) {
+            AuditLevel audit,
+            CompatibilityJfrWriter.Options jfrOptions,
+            String prefix,
+            Degradation ladder) {
         public OutputOptions {
             if (!collapsed && !compatibilityJfr)
                 throw new IllegalArgumentException("Select at least one output format");
+            if (audit == null) throw new IllegalArgumentException("Missing audit level");
             if (jfrOptions == null) throw new IllegalArgumentException("Missing compatibility JFR options");
+            if (prefix == null) throw new IllegalArgumentException("Missing output name prefix");
+            if (ladder == null) throw new IllegalArgumentException("Missing degradation ladder");
+        }
+
+        /** True when {@code --format jfr} was asked for explicitly: an unfittable synthetic JFR must abort. */
+        boolean jfrOnly() {
+            return compatibilityJfr && !collapsed;
         }
 
         public static OutputOptions defaults() {
-            return new OutputOptions(true, true, false, CompatibilityJfrWriter.Options.defaults());
+            return new OutputOptions(
+                    true,
+                    true,
+                    false,
+                    AuditLevel.FULL,
+                    CompatibilityJfrWriter.Options.defaults(),
+                    OutputFiles.PREFIX,
+                    Degradation.none());
         }
     }
 
@@ -57,9 +75,13 @@ public final class OffCpuCorrelator {
      * directory must not exist.
      */
     public static Summary correlate(Path source, Path jfr, Path outputDirectory) throws IOException {
-        OfflineCorrelator.Analysis result =
-                OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
-        write(result, outputDirectory);
+        CorrelationResult result =
+                CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
+        write(
+                AnalysisOutput.of(result, source, jfr, null),
+                outputDirectory,
+                OutputOptions.defaults(),
+                () -> result.capture().verifyUnchanged(source, jfr));
         return new Summary(
                 outputDirectory,
                 result.sourceRows(),
@@ -70,7 +92,7 @@ public final class OffCpuCorrelator {
                 result.invalidSource(),
                 result.invalidJfr(),
                 result.identityUnverified(),
-                new BigInteger(result.selectedObservedDurationNanos()));
+                result.selectedObservedDuration());
     }
 
     public static void main(String[] args) throws Exception {
@@ -136,14 +158,16 @@ public final class OffCpuCorrelator {
                     + " [--from-ns N] [--to-ns N] [--max-handler-delay-ns N]"
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
+                    + " [--audit none|matches|full] [--thinning Q (0 < Q <= 1, keep probability)]"
+                    + " [--thinning-seed N] [--on-limit degrade|fail|truncate]"
                     + " [--partial true|false (partial format: diagnostics|collapsed)]");
             System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
                     + "   (prints the capture stream as NDJSON, stacks expanded)");
             System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
-                    + OutputFiles.COLLAPSED + ", " + OutputFiles.SYNTHETIC_JFR + ", "
-                    + OutputFiles.CLASSIFIED_RECORDS + ", " + OutputFiles.MATCHES + " and, last, "
-                    + OutputFiles.COMPLETE + "; --partial true writes " + OutputFiles.INCOMPLETE_PREFIX
-                    + "* files and " + OutputFiles.PARTIAL + " instead.");
+                    + OutputFiles.COLLAPSED + ", " + OutputFiles.SYNTHETIC_JFR + " and, last, " + OutputFiles.COMPLETE
+                    + "; " + OutputFiles.CLASSIFIED_RECORDS + " is written only for --audit full and "
+                    + OutputFiles.MATCHES + " for --audit full or matches; --partial true writes "
+                    + OutputFiles.INCOMPLETE_PREFIX + "* files and " + OutputFiles.PARTIAL + " instead.");
             return 0;
         }
         if (args.length == 3 && args[0].equals("--dump") && args[1].equals("--source")) {
@@ -167,7 +191,11 @@ public final class OffCpuCorrelator {
                 "--partial",
                 "--from",
                 "--to",
-                "--partial-jfr");
+                "--partial-jfr",
+                "--audit",
+                "--thinning",
+                "--thinning-seed",
+                "--on-limit");
         for (int i = 0; i < args.length; i += 2) {
             if (i + 1 == args.length
                     || !allowed.contains(args[i])
@@ -191,6 +219,9 @@ public final class OffCpuCorrelator {
         boolean partial = booleanOption(options, "--partial", false);
         boolean partialJfr = booleanOption(options, "--partial-jfr", false);
         boolean estimatePopulation = booleanOption(options, "--estimate-population", false);
+        // Spec §4's defaults table: the CLI defaults to "matches", unlike the library's OutputOptions.defaults(),
+        // which keeps "full" so OfflineCorrelatorTest's exact-file-set assertion still holds.
+        AuditLevel audit = AuditLevel.parse(options.getOrDefault("--audit", "matches"));
         boolean hasJfrRange = options.containsKey("--from") || options.containsKey("--to");
         if (partial && (partialJfr || hasJfrRange)) {
             throw new IllegalArgumentException("Incomplete-capture mode cannot be combined with JFR selection");
@@ -198,12 +229,17 @@ public final class OffCpuCorrelator {
         if (estimatePopulation && (partialJfr || hasJfrRange)) {
             throw new IllegalArgumentException("Population estimates require the complete unselected JFR");
         }
+        if (estimatePopulation && options.containsKey("--thinning")) {
+            throw new IllegalArgumentException("Population estimates require the unthinned source");
+        }
         String format = options.getOrDefault("--format", partial ? "diagnostics" : "both");
         if (partial) {
             if (!Set.of("diagnostics", "collapsed").contains(format)
                     || estimatePopulation
                     || options.containsKey("--quantum-ns")
-                    || options.containsKey("--max-synthetic-events")) {
+                    || options.containsKey("--max-synthetic-events")
+                    || options.containsKey("--audit")
+                    || options.containsKey("--thinning")) {
                 throw new IllegalArgumentException("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -232,21 +268,50 @@ public final class OffCpuCorrelator {
             selection = new OfflineCorrelator.JfrSelection(
                     range == null ? null : range.from(), range == null ? null : range.to(), partialJfr);
         }
-        var result = selection == null
-                ? OfflineCorrelator.correlate(Path.of(options.get("--source")), jfr, limits)
-                : OfflineCorrelator.correlate(Path.of(options.get("--source")), jfr, limits, selection);
+        Path sourcePath = Path.of(options.get("--source"));
+        Thinning requestedThinning = options.containsKey("--thinning")
+                ? Thinning.of(options.get("--thinning"), Long.parseLong(options.getOrDefault("--thinning-seed", "0")))
+                : Thinning.NONE;
+        Degradation ladder = new Degradation(
+                Degradation.Policy.parse(options.getOrDefault("--on-limit", "degrade")),
+                audit,
+                requestedThinning,
+                limits.maxRetainedBytes(),
+                RetentionEstimate.of(sourcePath, jfr));
+        // A restart is one sequential re-read of files that are already digest-verified.
+        Degradation.Settings settings = null;
+        CorrelationResult result = null;
+        while (result == null) {
+            settings = ladder.settings();
+            try {
+                result = CorrelationEngine.correlate(sourcePath, jfr, limits, selection, false, settings);
+            } catch (RetentionLimitExceeded limit) {
+                if (!ladder.advance(limit)) throw new IOException(ladder.refusal(limit), limit);
+            }
+        }
+        boolean narrowed = ladder.narrowed();
+        String prefix = narrowed ? OutputFiles.INCOMPLETE_PREFIX : OutputFiles.PREFIX;
+        CorrelationResult publishedResult = result;
         write(
-                result,
+                AnalysisOutput.of(result, sourcePath, jfr, selection, settings.narrowedToNanos()),
                 Path.of(options.get("--output")),
-                new OutputOptions(!format.equals("jfr"), !format.equals("collapsed"), estimatePopulation, jfrOptions));
-        System.out.println("Wrote validated analysis to "
+                new OutputOptions(
+                        !format.equals("jfr"),
+                        !format.equals("collapsed"),
+                        estimatePopulation,
+                        ladder.audit(),
+                        jfrOptions,
+                        prefix,
+                        ladder),
+                () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
+        System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + options.get("--output")
                 + ": "
                 + result.matched()
                 + " matches; "
                 + result.selectedObservedDurationNanos()
                 + " selected observed ns");
-        return 0;
+        return narrowed ? 2 : 0;
     }
 
     /**
@@ -263,11 +328,34 @@ public final class OffCpuCorrelator {
      * metadata.
      */
     static void write(OfflineCorrelator.Analysis result, Path directory, OutputOptions options) throws IOException {
+        write(AnalysisOutput.of(result), directory, options);
+    }
+
+    /**
+     * Writes the output directory from a streamed or retained {@link AnalysisOutput}. The digest
+     * recheck a caller performs after this returns (see the two overloads with a {@code Runnable})
+     * happens with no completion marker published yet, so a file changed while writing is still
+     * caught before the directory is promoted to complete.
+     */
+    static void write(AnalysisOutput output, Path directory, OutputOptions options) throws IOException {
+        write(output, directory, options, () -> {});
+    }
+
+    /**
+     * The full writer, taking a callback invoked after every other artifact — including the audit
+     * re-read, for the streamed path — but before the completion marker, so a digest recheck can
+     * still fail the run closed.
+     */
+    private static void write(AnalysisOutput output, Path directory, OutputOptions options, Verification verify)
+            throws IOException {
         Files.createDirectory(directory);
         Gson gson = new GsonBuilder().serializeNulls().create();
+        String prefix = options.prefix();
+        boolean narrowed = options.ladder().narrowed();
         if (options.collapsed()) {
-            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COLLAPSED))) {
-                for (var entry : new TreeMap<>(result.collapsedNanos()).entrySet()) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)))) {
+                for (var entry : new TreeMap<>(output.collapsedNanos()).entrySet()) {
                     writer.write(entry.getKey());
                     writer.write(' ');
                     writer.write(collapsedMicros(entry.getValue()));
@@ -275,98 +363,150 @@ public final class OffCpuCorrelator {
                 }
             }
         }
-        CompatibilityJfrWriter.Result compatibility = options.compatibilityJfr()
-                ? CompatibilityJfrWriter.write(
-                        result, directory.resolve(OutputFiles.SYNTHETIC_JFR), options.jfrOptions())
-                : null;
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
-            for (var row : result.records()) {
-                gson.toJson(row, writer);
-                writer.newLine();
+        // The synthetic JFR keeps its observed scale: thinning shrinks the quantum an event consumes so
+        // that, once reweighted by the caller, one event still represents one requested quantum of
+        // estimated time.
+        CompatibilityJfrWriter.Options requestedJfrOptions = options.jfrOptions();
+        CompatibilityJfrWriter.Options effectiveJfrOptions = output.thinning().active()
+                ? new CompatibilityJfrWriter.Options(
+                        output.thinning().scaleQuantum(requestedJfrOptions.quantumNanos()),
+                        requestedJfrOptions.maxSyntheticEvents(),
+                        requestedJfrOptions.onEventLimit())
+                : requestedJfrOptions;
+        CompatibilityJfrWriter.Result compatibility = null;
+        if (options.compatibilityJfr()) {
+            try {
+                compatibility = CompatibilityJfrWriter.write(
+                        output.synthetic(),
+                        directory.resolve(OutputFiles.name(prefix, OutputFiles.SYNTHETIC_SUFFIX)),
+                        effectiveJfrOptions);
+            } catch (IOException unfittable) {
+                // Spec §3: a quantum that cannot be coarsened to fit degrades to collapsed-only output
+                // instead of discarding an otherwise-complete analysis; only an explicit --format jfr
+                // still aborts, since then there is nothing else to publish.
+                if (options.jfrOnly()) throw unfittable;
+                options.ladder().syntheticOmitted(unfittable.getMessage());
+            }
+            if (compatibility != null && compatibility.quantumRaised()) {
+                options.ladder().quantumRaised(compatibility.requestedQuantumNanos(), compatibility.quantumNanos());
             }
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.MATCHES))) {
-            for (var match : result.matches()) {
-                JsonObject row = new JsonObject();
-                row.addProperty(
-                        "correlationId",
-                        match.observation().get("correlationId").getAsString());
-                row.addProperty("fromNanos", match.fromNanos().toString());
-                row.addProperty("toNanos", match.toNanos().toString());
-                row.addProperty("durationNanos", match.durationNanos().toString());
-                row.addProperty("handlerDelayNanos", match.handlerDelayNanos().toString());
-                row.addProperty("threadIdentityVerified", match.threadIdentityVerified());
-                gson.toJson(row, writer);
-                writer.newLine();
+        if (options.audit() == AuditLevel.FULL) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.CLASSIFIED_RECORDS_SUFFIX)))) {
+                output.writeClassifiedRecords(writer);
+            }
+        }
+        if (options.audit() != AuditLevel.NONE) {
+            try (BufferedWriter writer =
+                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.MATCHES_SUFFIX)))) {
+                output.writeMatches(writer);
             }
         }
         JsonObject report = new JsonObject();
         report.addProperty("schemaVersion", 1);
         report.addProperty(
                 "stackSemantics", "signal-delivery stack; not guaranteed to match the eBPF scheduler-exit stack");
+        report.addProperty("audit", options.audit().text());
         report.addProperty(
                 "weightSemantics",
                 "collapsed stacks use rounded integer microseconds; exact selected duration remains in nanoseconds");
-        report.add("analysisInputs", result.analysisInputs());
-        report.add("sourceCounters", result.sourceCounters());
-        report.addProperty("apStoppedAtNanos", result.apStoppedAtNanos());
-        report.addProperty("sourceRows", result.sourceRows());
-        report.addProperty("jfrSamples", result.jfrSamples());
-        report.addProperty("matched", result.matched());
-        report.addProperty("unmatchedSource", result.unmatchedSource());
-        report.addProperty(
-                "sourceRowsWithoutSelectedJfrSample",
-                result.records().stream()
-                        .filter(row -> "source".equals(row.stream())
-                                && "sample-not-present-in-selected-jfr".equals(row.reason()))
-                        .count());
-        report.addProperty("orphanJfr", result.orphanJfr());
-        report.addProperty("invalidSource", result.invalidSource());
-        report.addProperty("invalidJfr", result.invalidJfr());
-        report.addProperty("identityUnverified", result.identityUnverified());
-        report.addProperty("selectedObservedDurationNanos", result.selectedObservedDurationNanos());
-        report.addProperty("submittedButNotParsed", result.submittedButNotParsed());
-        if (result.jfrSelection() != null) {
-            report.add("jfrSelection", result.jfrSelection());
+        if (output.thinning().active()) {
+            report.add("sourceThinning", output.thinning().report());
+            report.addProperty("keptSourceRows", Integer.toString(output.sourceRows()));
+            report.addProperty("observedKeptDurationNanos", Long.toString(output.observedKeptDurationNanos()));
+            report.addProperty(
+                    "weightSemantics",
+                    "collapsed stacks are inverse-probability estimates from a thinned subsample;"
+                            + " observed kept nanoseconds are reported separately");
+        }
+        report.add("analysisInputs", output.analysisInputs());
+        report.add("sourceCounters", output.sourceCounters());
+        report.addProperty("apStoppedAtNanos", output.apStoppedAtNanos());
+        report.addProperty("sourceRows", output.sourceRows());
+        report.addProperty("jfrSamples", output.jfrSamples());
+        report.addProperty("matched", output.matched());
+        report.addProperty("unmatchedSource", output.unmatchedSource());
+        report.addProperty("sourceRowsWithoutSelectedJfrSample", output.sourceRowsWithoutSelectedJfrSample());
+        report.addProperty("orphanJfr", output.orphanJfr());
+        report.addProperty("invalidSource", output.invalidSource());
+        report.addProperty("invalidJfr", output.invalidJfr());
+        report.addProperty("identityUnverified", output.identityUnverified());
+        report.addProperty("selectedObservedDurationNanos", output.selectedObservedDurationNanos());
+        report.addProperty("submittedButNotParsed", output.submittedButNotParsed());
+        if (output.jfrSelection() != null) {
+            report.add("jfrSelection", output.jfrSelection());
         }
         if (options.populationEstimate()) {
-            report.add("populationEstimate", gson.toJsonTree(result.populationEstimate()));
+            report.add("populationEstimate", gson.toJsonTree(output.populationEstimate()));
         }
         JsonObject delays = new JsonObject();
-        List<BigInteger> sortedDelays = result.matches().stream()
-                .map(OfflineCorrelator.Match::handlerDelayNanos)
-                .sorted()
-                .toList();
-        delays.addProperty("count", sortedDelays.size());
+        long[] sortedDelays = output.sortedHandlerDelays();
+        delays.addProperty("count", sortedDelays.length);
         delays.addProperty("scope", "source interval end to AP handler timestamp, after clock translation");
         for (int percentile : new int[] {50, 90, 99, 100}) {
             String name = percentile == 100 ? "max" : "p" + percentile;
-            if (sortedDelays.isEmpty()) {
+            if (sortedDelays.length == 0) {
                 delays.add(name, JsonNull.INSTANCE);
             } else {
-                int rank = (int) ((sortedDelays.size() * (long) percentile + 99) / 100);
-                delays.addProperty(name, sortedDelays.get(rank - 1).toString());
+                int rank = (int) ((sortedDelays.length * (long) percentile + 99) / 100);
+                delays.addProperty(name, Long.toString(sortedDelays[rank - 1]));
             }
         }
         report.add("handlerDelayNanos", delays);
         if (compatibility != null) {
             JsonObject view = new JsonObject();
             view.addProperty("path", compatibility.output().getFileName().toString());
-            view.addProperty("quantumNanos", Long.toString(compatibility.quantumNanos()));
+            // quantumNanos is the requested quantum at estimated scale (what one reweighted event
+            // represents); observedQuantumNanos is the actual, possibly thinning-shrunk and
+            // event-limit-raised, quantum of observed time an event was built from.
+            view.addProperty("quantumNanos", Long.toString(requestedJfrOptions.quantumNanos()));
+            view.addProperty("requestedQuantumNanos", Long.toString(compatibility.requestedQuantumNanos()));
+            view.addProperty("observedQuantumNanos", Long.toString(compatibility.quantumNanos()));
+            view.addProperty("quantumRaisedForEventLimit", compatibility.quantumRaised());
             view.addProperty("syntheticEvents", Long.toString(compatibility.syntheticEvents()));
             view.addProperty("representedNanos", compatibility.representedNanos());
             view.addProperty("quantizationErrorNanos", compatibility.quantizationErrorNanos());
             view.addProperty("omittedRemainderNanos", compatibility.omittedRemainderNanos());
             report.add("syntheticJfr", view);
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.REPORT))) {
+        // Always present, with an empty stepsApplied when nothing was needed, so a consumer can see that
+        // degradation was considered and declined.
+        report.add("degradation", options.ladder().report(output.peakRetainedBytes()));
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.REPORT_SUFFIX)))) {
             // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
             new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
             writer.newLine();
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
-            writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
+        verify.verify();
+        if (narrowed) {
+            // A narrowed window is not the question that was asked: it never promotes the directory to
+            // complete, and the same no-replace hard-link publication writePartial uses keeps a
+            // half-written marker from ever being observed.
+            JsonObject marker = new JsonObject();
+            marker.addProperty("schemaVersion", 1);
+            marker.addProperty("state", "narrowed");
+            marker.addProperty("coverageComplete", false);
+            marker.addProperty(
+                    "effectiveToNanos", Long.toString(options.ladder().narrowedToNanos()));
+            Path temporary = Files.createTempFile(directory, ".narrowed-marker-", ".tmp");
+            try {
+                Files.writeString(temporary, gson.toJson(marker) + "\n", StandardCharsets.UTF_8);
+                Files.createLink(directory.resolve(OutputFiles.NARROWED), temporary);
+            } finally {
+                Files.deleteIfExists(temporary);
+            }
+        } else {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
+                writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
+            }
         }
+    }
+
+    /** A digest recheck run after every other artifact is written but before the completion marker. */
+    @FunctionalInterface
+    private interface Verification {
+        void verify() throws IOException;
     }
 
     /**

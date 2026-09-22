@@ -256,7 +256,9 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
 val fixtureMains = mapOf(
     "SignalJfrExporter" to "io.github.lhotari.jonoffcpu.jfr.SignalJfrExporterTest",
     "OfflineCorrelator" to "io.github.lhotari.jonoffcpu.offline.OfflineCorrelatorTest",
-    "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest"
+    "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest",
+    "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest",
+    "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {
@@ -267,6 +269,12 @@ val fixtureTasks = fixtureMains.map { (taskName, className) ->
         mainClass = className
         jvmArgs("-ea")
     }
+}
+
+// Spec acceptance 4: the scale fixture's assertion is the heap cap itself, so it must run under
+// exactly the bound it proves, not whatever heap the other fixtures happen to get.
+tasks.named<JavaExec>("testStreamingCorrelator") {
+    jvmArgs("-ea", "-Xmx1g")
 }
 
 val testCorrelatorPublicApi = tasks.register<JavaExec>("testCorrelatorPublicApi") {

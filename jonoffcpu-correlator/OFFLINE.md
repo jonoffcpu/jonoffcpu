@@ -59,16 +59,35 @@ recognisable wherever the directory ends up. A successful run writes:
 
 | File | Contents | Written when |
 | --- | --- | --- |
-| `jonoffcpu-report.json` | Capture counters, classifications, handler-delay percentiles, interpretation notes and the opt-in population estimate | always |
-| `jonoffcpu-classified-records.jsonl` | Source and resolved JFR rows, including rejected and unmatched observations, with their classification | always |
-| `jonoffcpu-matches.jsonl` | Cookies, clipped intervals, delivery delays and whether the target-to-JFR thread mapping could be verified | always |
-| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling | `--format both` (default) or `collapsed` |
+| `jonoffcpu-report.json` | Capture counters, classifications, handler-delay percentiles, interpretation notes, the degradation ladder and the opt-in population estimate | always |
+| `jonoffcpu-classified-records.jsonl` | Source and resolved JFR rows, including rejected and unmatched observations, with their classification | `--audit full` |
+| `jonoffcpu-matches.jsonl` | Cookies, clipped intervals, delivery delays and whether the target-to-JFR thread mapping could be verified | `--audit matches` (default) or `full` |
+| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling unless thinning applied (see **Degradation**) | `--format both` (default) or `collapsed` |
 | `jonoffcpu-offcpu-synthetic.jfr` | An explicitly synthetic CPU-compatible view, using duration-quantized `jdk.ExecutionSample` events | `--format both` (default) or `jfr` |
-| `jonoffcpu-complete.json` | Completion marker | last; a directory without it is not a complete analysis |
+| `jonoffcpu-complete.json` | Completion marker | last; a directory without it is not a complete analysis, and it is never written for a narrowed run (see **Degradation**) |
 
 The original combined JFR is never rewritten. CPU, allocation, lock, wall and JVM
 events in it remain available to other tools. Both derived formats are produced by default. Use `--format collapsed` or
-`--format jfr` to select one. Reports and classified records are always retained.
+`--format jfr` to select one.
+
+`--audit full|matches|none` controls how much per-row audit output is written.
+The CLI defaults to `matches`: `jonoffcpu-matches.jsonl` is written but
+`jonoffcpu-classified-records.jsonl` is **not**, which is a backward-incompatible
+change from earlier releases that always wrote both. Anything that reads
+`jonoffcpu-classified-records.jsonl` — including
+[`jonoffcpu-agent/tools/run-native-agent-interruptions.py`](../jonoffcpu-agent/tools/run-native-agent-interruptions.py)
+and
+[`jonoffcpu-native/tools/run-agent-signal-pressure.py`](../jonoffcpu-native/tools/run-agent-signal-pressure.py)
+— must now pass `--audit full` explicitly. `--audit none` writes neither audit
+file. The *library* API (`OffCpuCorrelator.correlate`, and `OfflineCorrelator`'s
+`OutputOptions.defaults()`) keeps the old `full` default, so embedding the
+correlator as a dependency is unaffected.
+
+The audit outputs are produced by a second read of the same two files, so they
+describe the rows the correlation actually kept, not every row in the inputs. Under
+thinning or a narrowed window the re-read applies the same kept-row predicate the
+streaming pass did: `--audit full` then documents the kept subsample, row for row
+against the counters in the report, which is what an audit of a degraded run means.
 
 Reading, selecting, and cutting existing events uses the public JDK
 `RecordingFile` API. The synthetic compatibility view has a different requirement:
@@ -122,6 +141,72 @@ missing Java stacks. Under `proportional`, a rare short interval that was admitt
 carries a weight of up to the full reference duration, so per-stack estimates for
 rare stacks are noisy even when the total is unbiased.
 
+## Degradation
+
+A profile is not an audit log. When a capture does not fit the retained-bytes budget,
+`--on-limit degrade` (the default) walks a ladder rather than refusing, and records
+every step in the report's `degradation` object:
+
+1. **Coarsen the synthetic quantum.** The event count for a quantum is the sum of
+   per-stack floors and is known before the first event is written, so the quantum is
+   raised until it fits. A synthetic JFR renders totals the report states exactly, so
+   this costs granularity, not time. `requestedQuantumNanos` and
+   `quantumRaisedForEventLimit` appear in the report's `syntheticJfr` block.
+2. **Drop the audit outputs.** `--audit matches`, then `--audit none`. They cost the
+   most and contribute nothing to the flame graph.
+3. **Thin the source and reweight.** Each recorded interval is kept with probability
+   `q`, decided by hashing its cookie, and the duration it contributes is scaled by the
+   exact reciprocal of the realised probability. The result is an unbiased estimate of
+   the same per-stack totals over the whole requested window. Because the cookie is the
+   join key, an observation and its JFR sample are dropped together, so every count in
+   the report describes one coherent subsample. `--thinning <q>` pins it and
+   `--thinning-seed` changes the draw; `q = 1` is the default whenever the input fits.
+4. **Narrow the window.** Analyse `[from, effectiveTo)` completely rather than the whole
+   window approximately. Because both inputs are ordered on the delivery clock, a prefix
+   is a complete analysis of a shorter window.
+5. **Fail**, naming the limit, the steps already tried and the flag that would allow the
+   next one.
+
+`--on-limit fail` restores the old behaviour. `--on-limit truncate` skips thinning and
+goes straight to narrowing.
+
+The two degradations are labelled differently because they differ:
+
+- **Thinning keeps the ordinary output names**, writes `jonoffcpu-complete.json`, and
+  exits 0. The capture is already a sample of the intervals by design; a second sampling
+  stage with a stated estimator covers the window that was asked for. The report carries
+  `sourceThinning` with `q`, the seed, the exact realised probability and the estimator,
+  and every collapsed line carries a `[thinned q=…; inverse-probability estimate]` root
+  label so a rendered flame graph cannot be quoted without its caveat.
+- **Narrowing takes the `INCOMPLETE-jonoffcpu-*` names**, exits 2, writes
+  `jonoffcpu-narrowed.json` instead of `jonoffcpu-complete.json`, and labels its
+  collapsed lines with the effective window, because the result no longer answers the
+  question that was asked. A reader that only checks the exit status and the presence of
+  `jonoffcpu-complete.json` can already tell a statistically valid whole-window estimate
+  (thinning, exit 0) apart from a result describing less than the window it asked for
+  (narrowing, exit 2, `jonoffcpu-narrowed.json`).
+
+Under thinning the collapsed weights are estimates rather than observed durations, so
+`--estimate-population`, which is an inverse-probability estimator over the kernel's own
+admission thresholds, is rejected together with an explicit `--thinning`, and is marked
+`unavailable` with `correlation-time-thinned-source` when the ladder applies thinning by
+itself. That asymmetry is deliberate. Asking for both on the command line is asking for
+two things that cannot both be honoured, and the CLI says so up front rather than
+handing back an estimate that is not the one requested. A ladder-chosen thinning is not
+a request: the run was asked to fit a budget, it thinned to fit, and the population
+estimate that is no longer computable is reported as `unavailable` with that reason
+instead of failing an analysis that otherwise succeeded.
+
+The report's top-level `degradation` object is always present, even when nothing needed
+to degrade, so a consumer can see that degradation was considered and declined. It
+carries `policy`, `requestedAudit`, `audit`, `retainedBytesLimit`,
+`estimatedRetainedBytes` (from `RetentionEstimate`, computed from the input file sizes
+before decoding), `peakRetainedBytes` (what the run actually held at its high-water
+mark), `attempts`, the top-level `narrowedToNanos` (`null` unless the window was
+narrowed, mirroring `peakRetainedBytes` so a consumer that reads only the top-level
+object need not scan `stepsApplied` for the `narrow-window` entries), and `stepsApplied`:
+one object per ladder step actually taken, each with a `step` name and the reason.
+
 ## Interpretation
 
 The cookie provides exact event association, **not simultaneous stack capture**.
@@ -148,13 +233,44 @@ not silently converted into matches.
 **source monotonic clock**, after joining the complete capture. These are not
 relative seconds or epoch timestamps. Either bound can be omitted. A matching
 handler event outside the interval still identifies an overlapping source interval.
+`--from-ns`, `--to-ns` and `--max-handler-delay-ns` are held as signed `long`
+nanoseconds in the engine's columns, so each is rejected with `Time boundary
+outside signed 64-bit nanoseconds` when it is negative or at or above `2^63`;
+values in `[2^63, 2^64)` that an earlier release accepted now fail fast instead of
+wrapping.
 
-Default admission limits are one million total source/JFR records, 1 MiB per
-source record, 4,096 frames per stack record and per JFR sample, and 256 MiB of
-conservative decoded-object accounting.
-Use `--max-rows` or `--max-retained-bytes` to change the corresponding limits.
-These are admission budgets, not a hard JVM heap limit. Failures reject the
-analysis rather than return a truncated successful result.
+Default admission limits are a hundred million total source/JFR records, 1 MiB per
+source record, 4,096 frames per stack record and per JFR sample, and a retained-bytes
+budget of sixty percent of `Runtime.maxMemory()`, never below 256 MiB. Use `--max-rows`
+or `--max-retained-bytes` to change them.
+
+`--max-retained-bytes` charges what the correlator actually holds: the primitive
+columns, the cookie index, the interned JFR stacks and the few retained control
+objects. Retention is proportional to the number of *distinct stacks*, not to the
+number of recorded intervals — a capture of 1.12 million samples carrying 10,631
+distinct stacks holds one copy of each — so the guard is a usable steering signal
+rather than a proxy for input size. Roughly 80 bytes of retention per recorded
+interval, plus the interned stacks, is the figure to plan a capture against — it is
+the load-bearing number here. The scale fixture
+(`StreamingCorrelatorTest.scale`, 2,000,000 observations and a matching 2,000,000
+JFR samples) asserts a bound of 400 MiB on peak retained bytes and has measured
+comfortably inside it; the exact figure moves with the engine's structures and is
+not a number to plan against.
+
+A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
+distinct Java stacks) measured 203 MiB (212,831,820 bytes) of peak retained
+bytes at `--audit full`, `--audit matches` and no `--audit` alike — about 190
+bytes per recorded interval, roughly 2.4x the 80-byte column-only figure above.
+Real JVM stacks are far deeper than the synthetic scale fixture's, so interned
+stacks account for the difference; treat 80 bytes/interval as a lower bound for
+the column storage alone, not the full per-interval budget, when planning
+against real captures.
+
+Integrity failures still reject the analysis: a JFR whose size or digest differs from
+the footer, an observation referencing an unannounced stack, an async-profiler counter
+inconsistency, a duplicate cookie, a JFR/source target mismatch. These mean the two
+files do not describe the same capture, so no weight computed from them means
+anything. Volume limits behave differently; see **Degradation**.
 
 ## Library API
 
