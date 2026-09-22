@@ -38,6 +38,9 @@ import java.util.TreeMap;
  * Resource-limit failures abort analysis.
  */
 final class OfflineCorrelator {
+    /** The engine's columns hold clock values as signed longs, so a time boundary must fit that range. */
+    private static final BigInteger SIGNED_MAX = BigInteger.valueOf(Long.MAX_VALUE);
+
     public record Limits(
             int maxRows,
             int maxLineBytes,
@@ -50,9 +53,10 @@ final class OfflineCorrelator {
             if (maxRows <= 0 || maxLineBytes <= 0 || maxRetainedBytes <= 0 || maxFrames <= 0) {
                 throw new IllegalArgumentException("Resource limits must be positive");
             }
+            // Clock values are held as signed longs in the columns, so the engine's arithmetic is exact.
             for (BigInteger time : new BigInteger[] {maxHandlerDelayNanos, fromNanos, toNanos}) {
-                if (time != null && (time.signum() < 0 || time.compareTo(U64_MAX) > 0)) {
-                    throw new IllegalArgumentException("Time boundary outside u64 range");
+                if (time != null && (time.signum() < 0 || time.compareTo(SIGNED_MAX) > 0)) {
+                    throw new IllegalArgumentException("Time boundary outside signed 64-bit nanoseconds");
                 }
             }
             if (fromNanos != null && toNanos != null && fromNanos.compareTo(toNanos) >= 0) {
@@ -325,6 +329,23 @@ final class OfflineCorrelator {
                 default -> throw new IOException("Unknown JFR row");
             }
         };
+        JsonObject selectionMetadata = readJfr(capture, jfr, selection, consumer);
+        JsonObject stats = capture.inputs.has("apStats") ? object(capture.inputs, "apStats") : observedStats[0];
+        BigInteger notParsed = stats == null || selection != null
+                ? null
+                : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samples.size()));
+        require(notParsed == null || notParsed.signum() >= 0, "JFR samples exceed submitted samples");
+        return join(capture, sources, samples, limits, notParsed, selectionMetadata, stacks);
+    }
+
+    /**
+     * Reads the JFR through the right entry point for this run and returns the selection metadata
+     * the report echoes, or null for an unselected read. The dispatch is unchanged; only its home
+     * moved, so the engine can drive it.
+     */
+    static JsonObject readJfr(
+            CaptureInput capture, Path jfr, JfrSelection selection, SignalJfrExporter.RowConsumer consumer)
+            throws IOException {
         JsonObject selectionMetadata = null;
         if (capture.partial) {
             SignalJfrExporter.PrefixOutcome outcome = SignalJfrExporter.visitPrefix(jfr, consumer);
@@ -369,15 +390,10 @@ final class OfflineCorrelator {
         } else {
             SignalJfrExporter.visit(jfr, consumer);
         }
-        JsonObject stats = capture.inputs.has("apStats") ? object(capture.inputs, "apStats") : observedStats[0];
-        BigInteger notParsed = stats == null || selection != null
-                ? null
-                : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samples.size()));
-        require(notParsed == null || notParsed.signum() >= 0, "JFR samples exceed submitted samples");
-        return join(capture, sources, samples, limits, notParsed, selectionMetadata, stacks);
+        return selectionMetadata;
     }
 
-    private static void validateStats(JsonObject row, JsonObject inputs) throws IOException {
+    static void validateStats(JsonObject row, JsonObject inputs) throws IOException {
         identity(row, inputs);
         if (inputs.has("apStats")) {
             JsonObject expected = object(inputs, "apStats");

@@ -24,6 +24,11 @@ public final class OffCpuCorrelator {
     record OutputOptions(
             boolean collapsed,
             boolean compatibilityJfr,
+            // A stopgap for the "--audit" CLI flag ahead of the streaming writers and full ladder
+            // (spec §4): the analysis stays fully materialised, only these two per-row files are
+            // optionally skipped.
+            boolean classifiedRecords,
+            boolean matches,
             boolean populationEstimate,
             CompatibilityJfrWriter.Options jfrOptions) {
         public OutputOptions {
@@ -33,7 +38,7 @@ public final class OffCpuCorrelator {
         }
 
         public static OutputOptions defaults() {
-            return new OutputOptions(true, true, false, CompatibilityJfrWriter.Options.defaults());
+            return new OutputOptions(true, true, true, true, false, CompatibilityJfrWriter.Options.defaults());
         }
     }
 
@@ -136,7 +141,7 @@ public final class OffCpuCorrelator {
                     + " [--from-ns N] [--to-ns N] [--max-handler-delay-ns N]"
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
-                    + " [--partial true|false (partial format: diagnostics|collapsed)]");
+                    + " [--audit none|matches|full] [--partial true|false (partial format: diagnostics|collapsed)]");
             System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
                     + "   (prints the capture stream as NDJSON, stacks expanded)");
             System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
@@ -167,7 +172,8 @@ public final class OffCpuCorrelator {
                 "--partial",
                 "--from",
                 "--to",
-                "--partial-jfr");
+                "--partial-jfr",
+                "--audit");
         for (int i = 0; i < args.length; i += 2) {
             if (i + 1 == args.length
                     || !allowed.contains(args[i])
@@ -191,6 +197,12 @@ public final class OffCpuCorrelator {
         boolean partial = booleanOption(options, "--partial", false);
         boolean partialJfr = booleanOption(options, "--partial-jfr", false);
         boolean estimatePopulation = booleanOption(options, "--estimate-population", false);
+        // Phase A keeps "full" the CLI default (today's behaviour); flipping it to "matches" is spec
+        // §4's job once the streaming writers and degradation ladder land.
+        String audit = options.getOrDefault("--audit", "full");
+        if (!Set.of("none", "matches", "full").contains(audit)) {
+            throw new IllegalArgumentException("Invalid audit level");
+        }
         boolean hasJfrRange = options.containsKey("--from") || options.containsKey("--to");
         if (partial && (partialJfr || hasJfrRange)) {
             throw new IllegalArgumentException("Incomplete-capture mode cannot be combined with JFR selection");
@@ -203,7 +215,8 @@ public final class OffCpuCorrelator {
             if (!Set.of("diagnostics", "collapsed").contains(format)
                     || estimatePopulation
                     || options.containsKey("--quantum-ns")
-                    || options.containsKey("--max-synthetic-events")) {
+                    || options.containsKey("--max-synthetic-events")
+                    || options.containsKey("--audit")) {
                 throw new IllegalArgumentException("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -238,7 +251,13 @@ public final class OffCpuCorrelator {
         write(
                 result,
                 Path.of(options.get("--output")),
-                new OutputOptions(!format.equals("jfr"), !format.equals("collapsed"), estimatePopulation, jfrOptions));
+                new OutputOptions(
+                        !format.equals("jfr"),
+                        !format.equals("collapsed"),
+                        audit.equals("full"),
+                        !audit.equals("none"),
+                        estimatePopulation,
+                        jfrOptions));
         System.out.println("Wrote validated analysis to "
                 + options.get("--output")
                 + ": "
@@ -279,25 +298,30 @@ public final class OffCpuCorrelator {
                 ? CompatibilityJfrWriter.write(
                         result, directory.resolve(OutputFiles.SYNTHETIC_JFR), options.jfrOptions())
                 : null;
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
-            for (var row : result.records()) {
-                gson.toJson(row, writer);
-                writer.newLine();
+        if (options.classifiedRecords()) {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
+                for (var row : result.records()) {
+                    gson.toJson(row, writer);
+                    writer.newLine();
+                }
             }
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.MATCHES))) {
-            for (var match : result.matches()) {
-                JsonObject row = new JsonObject();
-                row.addProperty(
-                        "correlationId",
-                        match.observation().get("correlationId").getAsString());
-                row.addProperty("fromNanos", match.fromNanos().toString());
-                row.addProperty("toNanos", match.toNanos().toString());
-                row.addProperty("durationNanos", match.durationNanos().toString());
-                row.addProperty("handlerDelayNanos", match.handlerDelayNanos().toString());
-                row.addProperty("threadIdentityVerified", match.threadIdentityVerified());
-                gson.toJson(row, writer);
-                writer.newLine();
+        if (options.matches()) {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.MATCHES))) {
+                for (var match : result.matches()) {
+                    JsonObject row = new JsonObject();
+                    row.addProperty(
+                            "correlationId",
+                            match.observation().get("correlationId").getAsString());
+                    row.addProperty("fromNanos", match.fromNanos().toString());
+                    row.addProperty("toNanos", match.toNanos().toString());
+                    row.addProperty("durationNanos", match.durationNanos().toString());
+                    row.addProperty(
+                            "handlerDelayNanos", match.handlerDelayNanos().toString());
+                    row.addProperty("threadIdentityVerified", match.threadIdentityVerified());
+                    gson.toJson(row, writer);
+                    writer.newLine();
+                }
             }
         }
         JsonObject report = new JsonObject();
