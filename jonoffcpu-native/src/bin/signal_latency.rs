@@ -108,6 +108,7 @@ fn main() -> Result<()> {
             "targetPid":child.pid,
             "outputPath":output,
             "sampling": {
+                "reasons": ["blocked", "runnable", "preempted"],
                 "minOffCpuMicros": null,
                 "maxOffCpuMicros": null,
                 "admission": {
@@ -217,7 +218,7 @@ fn main() -> Result<()> {
         "signal":signal,
         "signalName":signal_name(signal),
         "hook":"tp_btf/sched_exit_tp",
-        "switchOutHook":"sched/sched_switch",
+        "switchOutHook":"tp_btf/sched_switch",
         "loader":"libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
         "targetSleepNanos":SLEEP_NS,
         "blockedSleeps":blocked_sleeps,

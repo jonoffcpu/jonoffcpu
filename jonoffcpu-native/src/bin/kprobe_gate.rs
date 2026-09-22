@@ -27,6 +27,8 @@ fn main() -> Result<()> {
     bss.max_off_cpu_ns = 0;
     bss.has_max_off_cpu = 0;
     bss.sample_threshold = 1u64 << 32;
+    // Every switch-out reason stays eligible, as before the reason filter existed.
+    bss.reason_mask = 0b1110;
     bss.next_sequence = 1;
 
     let _skel = open

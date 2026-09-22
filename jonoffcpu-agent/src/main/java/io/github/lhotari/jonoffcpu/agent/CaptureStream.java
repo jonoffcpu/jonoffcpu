@@ -143,6 +143,30 @@ final class CaptureStream {
         if (!observation.getUserStackError().isEmpty()) {
             row.addProperty("userStackError", observation.getUserStackError());
         }
+        // A schemaVersion 2 observation carries none of the classification, and its row keeps the old shape.
+        if (observation.getReasonValue() != 0 || observation.hasPrevTaskState() || observation.hasPreempted()) {
+            row.addProperty("offCpuReason", offCpuReason(observation.getReasonValue()));
+            if (observation.hasPrevTaskState()) {
+                row.addProperty("prevTaskState", Integer.toUnsignedLong(observation.getPrevTaskState()));
+            }
+            if (observation.hasPreempted()) row.addProperty("preempted", observation.getPreempted());
+        }
         return row;
+    }
+
+    /** The lowercase reason name, or null for a value this reader does not know. */
+    static String offCpuReason(int value) {
+        return switch (value) {
+            case 1 -> "blocked";
+            case 2 -> "runnable";
+            case 3 -> "preempted";
+            default -> null;
+        };
+    }
+
+    /** The kernel's classification: preemption wins, then a zero task state is TASK_RUNNING. */
+    static String classifyOffCpu(boolean preempted, long prevTaskState) {
+        if (preempted) return "preempted";
+        return prevTaskState == 0 ? "runnable" : "blocked";
     }
 }

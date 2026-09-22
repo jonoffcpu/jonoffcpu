@@ -23,7 +23,12 @@ record CorrelationResult(
         JfrDictionaries dictionaries,
         LongIntMap sampleIndex,
         long[] collapsedNanos,
+        // Per switch-out reason ordinal; null for a reason no matched interval had.
+        long[][] collapsedNanosByReason,
         long[] stackNanos,
+        NativeStacks nativeStacks,
+        ProfileAccumulator profile,
+        SamplingPolicy sampling,
         long selectedObservedDurationNanos,
         Long monotonicOffsetNanos,
         Long clipFromNanos,

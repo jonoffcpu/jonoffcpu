@@ -15,12 +15,14 @@ final class OutputFiles {
     static final String SYNTHETIC_SUFFIX = "offcpu-synthetic.jfr";
     static final String CLASSIFIED_RECORDS_SUFFIX = "classified-records.jsonl";
     static final String MATCHES_SUFFIX = "matches.jsonl";
+    static final String PROFILE_SUFFIX = "offcpu-profile.pb";
 
     static final String REPORT = PREFIX + REPORT_SUFFIX;
     static final String COLLAPSED = PREFIX + COLLAPSED_SUFFIX;
     static final String SYNTHETIC_JFR = PREFIX + SYNTHETIC_SUFFIX;
     static final String CLASSIFIED_RECORDS = PREFIX + CLASSIFIED_RECORDS_SUFFIX;
     static final String MATCHES = PREFIX + MATCHES_SUFFIX;
+    static final String PROFILE = PREFIX + PROFILE_SUFFIX;
     /** Written last; a directory without it is not a complete analysis. */
     static final String COMPLETE = PREFIX + "complete.json";
 
@@ -36,6 +38,11 @@ final class OutputFiles {
     static final String NARROWED = PREFIX + "narrowed.json";
 
     /** One output's name under the prefix this run publishes with. */
+    /** The collapsed stacks of one switch-out reason, written beside the combined file when a capture mixes reasons. */
+    static String collapsedForReason(String prefix, OffCpuReason reason) {
+        return prefix + "offcpu-stacks-" + reason.label() + ".collapsed";
+    }
+
     static String name(String prefix, String suffix) {
         return prefix + suffix;
     }

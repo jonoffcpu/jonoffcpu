@@ -119,6 +119,7 @@ record AgentConfig(
                 case "jonoffcpudelivery" -> value.addProperty("signalDelivery", option);
                 case "jonoffcpuoutput" -> value.addProperty("correlationOutput", option);
                 case "sampling-policy" -> admission.addProperty("policy", option);
+                case "sampling-reasons" -> sampling.add("reasons", SamplingConfig.reasonsOption(key, option));
                 case "sampling-probability" -> {
                     SamplingConfig.parseProbability(key, option);
                     admission.addProperty("probability", option);

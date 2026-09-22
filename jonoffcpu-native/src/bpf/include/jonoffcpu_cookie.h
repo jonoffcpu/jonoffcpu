@@ -11,6 +11,14 @@
 #define JONOFFCPU_ADMISSION_PROPORTIONAL 1
 #define JONOFFCPU_ADMISSION_CERTAIN (1ULL << 32)
 
+/* Why the scheduler took the thread off the CPU, derived at switch-out from the
+ * raw sched_switch arguments. Zero is never written by the kernel: a capture
+ * without classification reads back as unspecified. */
+#define JONOFFCPU_REASON_UNSPECIFIED 0
+#define JONOFFCPU_REASON_BLOCKED 1
+#define JONOFFCPU_REASON_RUNNABLE 2
+#define JONOFFCPU_REASON_PREEMPTED 3
+
 struct jonoffcpu_target_binding {
     __u64 registration_token;
     __u64 process_generation_ns;
@@ -20,6 +28,10 @@ struct jonoffcpu_target_binding {
 struct jonoffcpu_thread_state {
     __u64 start_monotonic_ns;
     __u64 thread_generation_ns;
+    /* The raw task state sched_switch reported; 0 is TASK_RUNNING. */
+    __u32 prev_task_state;
+    __u8 reason;
+    __u8 preempted;
 };
 
 struct jonoffcpu_observation {
@@ -40,6 +52,10 @@ struct jonoffcpu_observation {
     __u32 capture_epoch;
     __u32 sequence;
     char comm[JONOFFCPU_TASK_COMM_LEN];
+    __u32 prev_task_state;
+    __u8 reason;
+    __u8 preempted;
+    __u8 reserved[2];
 };
 
 struct jonoffcpu_stats {
@@ -59,6 +75,14 @@ struct jonoffcpu_stats {
     __u64 signal_failures;
     __u64 ring_reserve_failures;
     __u64 target_namespace_failures;
+    /* Every switch-out of the target's threads by reason, counted before the
+     * reason filter, so a blocked-only capture still reports how often its
+     * threads were preempted. */
+    __u64 switch_outs_blocked;
+    __u64 switch_outs_runnable;
+    __u64 switch_outs_preempted;
+    __u64 reason_rejections;
+    __u64 reason_rejected_duration_us;
 };
 
 #endif

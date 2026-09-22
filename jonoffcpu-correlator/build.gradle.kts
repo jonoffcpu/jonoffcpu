@@ -258,7 +258,8 @@ val fixtureMains = mapOf(
     "OfflineCorrelator" to "io.github.lhotari.jonoffcpu.offline.OfflineCorrelatorTest",
     "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest",
     "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest",
-    "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest"
+    "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest",
+    "StackProfile" to "io.github.lhotari.jonoffcpu.offline.StackProfileTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {

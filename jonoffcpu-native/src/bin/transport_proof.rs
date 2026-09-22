@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use jonoffcpu_native::bpf_control::JonoffcpuCookieSkelBuilder;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
+use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
 use serde::Serialize;
 use std::fs;
 use std::mem::{MaybeUninit, size_of};
@@ -40,6 +40,10 @@ struct Observation {
     capture_epoch: u32,
     sequence: u32,
     comm: [u8; 16],
+    prev_task_state: u32,
+    reason: u8,
+    preempted: u8,
+    reserved: [u8; 2],
 }
 
 #[derive(Serialize)]
@@ -104,6 +108,8 @@ fn main() -> Result<()> {
         bss.max_off_cpu_ns = 0;
         bss.has_max_off_cpu = 0;
         bss.sample_threshold = 1u64 << 32;
+        // Every switch-out reason stays eligible, as before the reason filter existed.
+        bss.reason_mask = 0b1110;
         bss.next_sequence = 1;
     }
     let mut skel = open
@@ -121,7 +127,7 @@ fn main() -> Result<()> {
     let _switch_out = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, "sched_switch")
+        .attach()
         .context("attach sched_switch tracepoint")?;
     let _switch_in = skel
         .progs

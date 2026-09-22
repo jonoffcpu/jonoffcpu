@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, bail};
 use jonoffcpu_native::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
+use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::fs;
@@ -46,6 +46,10 @@ struct Observation {
     capture_epoch: u32,
     sequence: u32,
     comm: [u8; 16],
+    prev_task_state: u32,
+    reason: u8,
+    preempted: u8,
+    reserved: [u8; 2],
 }
 
 #[repr(C)]
@@ -68,6 +72,11 @@ struct KernelStats {
     signal_failures: u64,
     ring_reserve_failures: u64,
     target_namespace_failures: u64,
+    switch_outs_blocked: u64,
+    switch_outs_runnable: u64,
+    switch_outs_preempted: u64,
+    reason_rejections: u64,
+    reason_rejected_duration_us: u64,
 }
 
 impl KernelStats {
@@ -159,6 +168,8 @@ fn main() -> Result<()> {
         bss.max_off_cpu_ns = 0;
         bss.has_max_off_cpu = 0;
         bss.sample_threshold = 1u64 << 32;
+        // Every switch-out reason stays eligible, as before the reason filter existed.
+        bss.reason_mask = 0b1110;
         bss.next_sequence = INITIAL_SEQUENCE;
     }
     let mut skel = open
@@ -177,7 +188,7 @@ fn main() -> Result<()> {
     let _switch_out = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, "sched_switch")
+        .attach()
         .context("attach production sched_switch start hook")?;
     let _switch_in = skel
         .progs
@@ -347,7 +358,7 @@ fn main() -> Result<()> {
             .to_string(),
         loader: "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
         production_object: "src/bpf/jonoffcpu_cookie.bpf.c compiled with JONOFFCPU_SCHED_EXIT_TP_BTF",
-        hook: "tp/sched/sched_switch + tp_btf/sched_exit_tp (is_switch gate exercised)",
+        hook: "tp_btf/sched_switch + tp_btf/sched_exit_tp (is_switch gate exercised)",
         worker_threads,
         worker_iterations: WORKER_ITERATIONS,
         scheduler_exit_no_switch_callbacks: stats.scheduler_exit_no_switches,

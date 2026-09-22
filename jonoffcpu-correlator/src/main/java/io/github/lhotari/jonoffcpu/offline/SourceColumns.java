@@ -6,14 +6,18 @@ import java.util.BitSet;
 
 /**
  * One slot per observation, in capture file order, holding only what the join and the aggregates
- * read. Thirty-eight bytes a row replaces a retained Gson object graph.
+ * read. Fifty-one bytes a row replaces a retained Gson object graph.
  *
  * <p>Timestamps, the cookie and the admission threshold are raw u64 bits; compare them through
- * {@link U64}. The interned kernel and user stack ids and the host TID are deliberately absent:
- * they are validated where they are decoded and nothing downstream reads them, and the audit pass
+ * {@link U64}. The interned kernel and user stack ids are kept for the stack profile, which groups
+ * by them; a stack the kernel could not take is {@link #NO_STACK}. The host TID is deliberately
+ * absent: it is validated where it is decoded and nothing downstream reads it, and the audit pass
  * re-reads the observation when it needs its content.
  */
 final class SourceColumns {
+    /** The stack id of an observation whose kernel or user stack is missing. */
+    static final int NO_STACK = -1;
+
     private long[] cookie;
     private long[] start;
     private long[] end;
@@ -21,6 +25,10 @@ final class SourceColumns {
     private int[] targetTid;
     private byte[] reason;
     private byte[] outcome;
+    private byte[] offCpuReason;
+    private int[] taskState;
+    private int[] kernelStack;
+    private int[] userStack;
     private final BitSet verified = new BitSet();
     private final BitSet signalFailed = new BitSet();
     private int size;
@@ -34,6 +42,10 @@ final class SourceColumns {
         targetTid = new int[capacity];
         reason = new byte[capacity];
         outcome = new byte[capacity];
+        offCpuReason = new byte[capacity];
+        taskState = new int[capacity];
+        kernelStack = new int[capacity];
+        userStack = new int[capacity];
     }
 
     void add(
@@ -44,7 +56,37 @@ final class SourceColumns {
             int tid,
             boolean failedSignalRequest,
             Reason decoded) {
+        add(
+                cookieBits,
+                startNanos,
+                endNanos,
+                admissionThreshold,
+                tid,
+                failedSignalRequest,
+                decoded,
+                OffCpuReason.UNSPECIFIED,
+                0,
+                NO_STACK,
+                NO_STACK);
+    }
+
+    void add(
+            long cookieBits,
+            long startNanos,
+            long endNanos,
+            long admissionThreshold,
+            int tid,
+            boolean failedSignalRequest,
+            Reason decoded,
+            OffCpuReason switchOut,
+            int prevTaskState,
+            int kernelStackId,
+            int userStackId) {
         if (size == cookie.length) grow();
+        offCpuReason[size] = (byte) switchOut.ordinal();
+        taskState[size] = prevTaskState;
+        kernelStack[size] = kernelStackId;
+        userStack[size] = userStackId;
         cookie[size] = cookieBits;
         start[size] = startNanos;
         end[size] = endNanos;
@@ -92,6 +134,24 @@ final class SourceColumns {
         reason[slot] = (byte) value.ordinal();
     }
 
+    /** Why the kernel recorded the thread leaving the CPU; unspecified for a schemaVersion 2 capture. */
+    OffCpuReason offCpuReason(int slot) {
+        return OffCpuReason.ofOrdinal(offCpuReason[slot]);
+    }
+
+    /** The raw task state {@code sched_switch} reported; 0 for runnable, preempted and unclassified rows. */
+    int taskState(int slot) {
+        return taskState[slot];
+    }
+
+    int kernelStack(int slot) {
+        return kernelStack[slot];
+    }
+
+    int userStack(int slot) {
+        return userStack[slot];
+    }
+
     Outcome outcome(int slot) {
         return Outcome.of(outcome[slot]);
     }
@@ -109,7 +169,7 @@ final class SourceColumns {
     }
 
     long retainedBytes() {
-        return (long) cookie.length * (Long.BYTES * 4 + Integer.BYTES + 2)
+        return (long) cookie.length * (Long.BYTES * 4 + Integer.BYTES * 4 + 3)
                 + (verified.size() + signalFailed.size()) / 8L;
     }
 
@@ -122,5 +182,9 @@ final class SourceColumns {
         targetTid = Arrays.copyOf(targetTid, capacity);
         reason = Arrays.copyOf(reason, capacity);
         outcome = Arrays.copyOf(outcome, capacity);
+        offCpuReason = Arrays.copyOf(offCpuReason, capacity);
+        taskState = Arrays.copyOf(taskState, capacity);
+        kernelStack = Arrays.copyOf(kernelStack, capacity);
+        userStack = Arrays.copyOf(userStack, capacity);
     }
 }

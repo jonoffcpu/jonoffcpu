@@ -11,6 +11,7 @@ fn main() -> Result<()> {
         "targetPid":unsafe { libc::getpid() },
         "outputPath":path,
         "sampling": {
+            "reasons": ["blocked", "runnable", "preempted"],
             "minOffCpuMicros": null,
             "maxOffCpuMicros": null,
             "admission": {

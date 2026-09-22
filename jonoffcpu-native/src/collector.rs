@@ -2,8 +2,10 @@
 use crate::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
 use crate::capture;
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use libbpf_rs::TracepointCategory;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
+use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,7 +26,8 @@ use std::time::{Duration, Instant};
 
 const SOURCE_ID: &str = "jonoffcpu.offcpu.v1";
 /// Version 2 interns stacks: each distinct stack is one `stack` record and observations reference it.
-const SCHEMA_VERSION: u32 = 2;
+/// Version 3 classifies every observation by its switch-out reason and adds `sampling.reasons`.
+const SCHEMA_VERSION: u32 = 3;
 const MAX_CONTROL_JSON: usize = 64 * 1024;
 const DRAIN_QUIET_POLLS: usize = 2;
 const MAX_RING_BATCH: usize = 1024;
@@ -69,11 +72,58 @@ pub(crate) struct EnableConfig {
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct SamplingConfig {
+    /// The switch-out reasons whose intervals are eligible, in canonical order.
+    reasons: Vec<OffCpuReason>,
     #[serde(deserialize_with = "deserialize_optional_u64")]
     min_off_cpu_micros: Option<u64>,
     #[serde(deserialize_with = "deserialize_optional_u64")]
     max_off_cpu_micros: Option<u64>,
     admission: Admission,
+}
+
+/// Why the scheduler took a thread off the CPU. The kernel derives it at switch-out from the raw
+/// `sched_switch` arguments: `preempt` gives `Preempted`; otherwise a `prev_state` of zero
+/// (`TASK_RUNNING`) gives `Runnable` and any other state `Blocked`. A user-space thread preempted by
+/// the tick is switched out at an ordinary `schedule()` on its return to user mode, so it is
+/// `Runnable`; `Preempted` is preemption at a point inside the kernel.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum OffCpuReason {
+    Blocked,
+    Runnable,
+    Preempted,
+}
+
+impl OffCpuReason {
+    /// The kernel's `JONOFFCPU_REASON_*` value, which is also the capture schema's enum number.
+    pub(crate) fn kernel_value(self) -> u8 {
+        match self {
+            Self::Blocked => 1,
+            Self::Runnable => 2,
+            Self::Preempted => 3,
+        }
+    }
+
+    pub(crate) fn from_kernel(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Blocked),
+            2 => Some(Self::Runnable),
+            3 => Some(Self::Preempted),
+            _ => None,
+        }
+    }
+
+    /// The classification the BPF program applies, which the tests model.
+    #[cfg(test)]
+    pub(crate) fn classify(preempted: bool, prev_task_state: u32) -> Self {
+        if preempted {
+            Self::Preempted
+        } else if prev_task_state == 0 {
+            Self::Runnable
+        } else {
+            Self::Blocked
+        }
+    }
 }
 
 /// Admission decides which duration-eligible intervals are recorded. The `none` policy never
@@ -108,6 +158,13 @@ pub(crate) fn proportional_scale(record_all_above_ns: u64) -> (u64, u32) {
 
 impl SamplingConfig {
     fn validate(&self) -> Result<()> {
+        if self.reasons.is_empty() {
+            bail!("reasons must name at least one switch-out reason");
+        }
+        // Canonical order keeps the echoed object byte-identical to the one the agent sent.
+        if self.reasons.windows(2).any(|pair| pair[0] >= pair[1]) {
+            bail!("reasons must be distinct and in the order blocked, runnable, preempted");
+        }
         let min_ns = self
             .min_off_cpu_micros
             .map(|value| {
@@ -148,6 +205,13 @@ impl SamplingConfig {
             }
         }
         Ok(())
+    }
+
+    /// Bit `1 << reason` for each selected reason, as the BPF program tests it.
+    fn reason_mask(&self) -> u32 {
+        self.reasons
+            .iter()
+            .fold(0, |mask, reason| mask | (1_u32 << reason.kernel_value()))
     }
 
     fn min_off_cpu_ns(&self) -> u64 {
@@ -204,6 +268,10 @@ struct Observation {
     capture_epoch: u32,
     sequence: u32,
     comm: [u8; 16],
+    prev_task_state: u32,
+    reason: u8,
+    preempted: u8,
+    reserved: [u8; 2],
 }
 
 #[repr(C)]
@@ -225,6 +293,11 @@ struct KernelStats {
     signal_failures: u64,
     ring_reserve_failures: u64,
     target_namespace_failures: u64,
+    switch_outs_blocked: u64,
+    switch_outs_runnable: u64,
+    switch_outs_preempted: u64,
+    reason_rejections: u64,
+    reason_rejected_duration_us: u64,
 }
 
 impl KernelStats {
@@ -264,6 +337,11 @@ impl KernelStats {
             "signalFailures": self.signal_failures.to_string(),
             "ringReserveFailures": self.ring_reserve_failures.to_string(),
             "targetNamespaceFailures": self.target_namespace_failures.to_string(),
+            "switchOutsBlocked": self.switch_outs_blocked.to_string(),
+            "switchOutsRunnable": self.switch_outs_runnable.to_string(),
+            "switchOutsPreempted": self.switch_outs_preempted.to_string(),
+            "reasonRejections": self.reason_rejections.to_string(),
+            "reasonRejectedDurationMicros": self.reason_rejected_duration_us.to_string(),
         })
     }
 }
@@ -1203,7 +1281,10 @@ fn worker(
     let open = JonoffcpuCookieSkelBuilder::default()
         .open(&mut object)
         .context("open scheduler-exit BPF skeleton")?;
-    let mut skel = open.load().context("load scheduler-exit BPF object")?;
+    let mut skel = open.load().context(
+        "load scheduler-exit BPF object (requires tp_btf/sched_exit_tp and the four-argument \
+         tp_btf/sched_switch of Linux 5.18 or newer)",
+    )?;
     {
         let bss = skel
             .maps
@@ -1239,21 +1320,26 @@ fn worker(
         )
         .context("seed exact target task storage")?;
 
+    // The injected failure attaches the BTF program as a classic tracepoint of a name that does not
+    // exist, so the kernel itself refuses it and the unwind path is the real one.
     #[cfg(test)]
-    let first_attach_name = if test_control
+    let switch_out = if test_control
         .as_ref()
         .is_some_and(|control| control.fault == PrepareFault::FirstAttach)
     {
-        "jonoffcpu_intentionally_missing_sched_switch"
+        skel.progs.record_switch_out.attach_tracepoint(
+            TracepointCategory::Sched,
+            "jonoffcpu_intentionally_missing_sched_switch",
+        )
     } else {
-        "sched_switch"
-    };
+        skel.progs.record_switch_out.attach()
+    }
+    .context("attach sched_switch recorder")?;
     #[cfg(not(test))]
-    let first_attach_name = "sched_switch";
     let switch_out = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, first_attach_name)
+        .attach()
         .context("attach sched_switch recorder")?;
 
     #[cfg(test)]
@@ -1854,6 +1940,7 @@ fn enable_capture(
         bss.max_off_cpu_ns = prepare.sampling.max_off_cpu_ns();
         bss.has_min_off_cpu = u32::from(prepare.sampling.min_off_cpu_micros.is_some());
         bss.has_max_off_cpu = u32::from(prepare.sampling.max_off_cpu_micros.is_some());
+        bss.reason_mask = prepare.sampling.reason_mask();
         match prepare.sampling.admission {
             Admission::Uniform {
                 probability_threshold,
@@ -1899,7 +1986,7 @@ fn enable_capture(
         "sampling": prepare.sampling.json(),
         "loader": "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
         "hook": "tp_btf/sched_exit_tp",
-        "switchOutHook": "sched/sched_switch",
+        "switchOutHook": "tp_btf/sched_switch",
         "timeNamespaceInode": identity.time_namespace_inode.to_string(),
         "wallClockCalibration": wall_clock_calibration.json(),
         "signalEnvironment": signal_environment.clone(),
@@ -2220,6 +2307,12 @@ fn observation_record(
             user_stack_id: event.user_stack_id,
             kernel_stack_error: kernel_stack_error.unwrap_or_default(),
             user_stack_error: user_stack_error.unwrap_or_default(),
+            // The kernel writes one of the three reasons; anything else reads back as unspecified
+            // and the correlator rejects it against the recomputed classification.
+            reason: OffCpuReason::from_kernel(event.reason)
+                .map_or(0, |reason| i32::from(reason.kernel_value())),
+            prev_task_state: Some(event.prev_task_state),
+            preempted: Some(event.preempted != 0),
         })),
     }
 }
@@ -2559,7 +2652,8 @@ mod tests {
     }
 
     fn sampling_json(bounds: Value, admission: Value) -> Value {
-        let mut sampling = json!({"minOffCpuMicros": null, "maxOffCpuMicros": null});
+        let mut sampling =
+            json!({"reasons": ["blocked"], "minOffCpuMicros": null, "maxOffCpuMicros": null});
         sampling
             .as_object_mut()
             .unwrap()
@@ -2620,6 +2714,103 @@ mod tests {
             u32::MAX,
             &proportional(10)
         ));
+    }
+
+    /// The BPF program's classification: the `preempt` argument wins, then a zero task state
+    /// (`TASK_RUNNING`) is a voluntary switch-out while still runnable, and any other state blocks.
+    #[test]
+    fn switch_out_reason_follows_the_raw_sched_switch_arguments() {
+        const TASK_INTERRUPTIBLE: u32 = 0x1;
+        const TASK_UNINTERRUPTIBLE: u32 = 0x2;
+        const TASK_KILLABLE: u32 = TASK_UNINTERRUPTIBLE | 0x100;
+        assert_eq!(OffCpuReason::classify(true, 0), OffCpuReason::Preempted);
+        // A preempted task keeps whatever state it was entering; preemption still wins.
+        assert_eq!(
+            OffCpuReason::classify(true, TASK_INTERRUPTIBLE),
+            OffCpuReason::Preempted
+        );
+        assert_eq!(OffCpuReason::classify(false, 0), OffCpuReason::Runnable);
+        for state in [TASK_INTERRUPTIBLE, TASK_UNINTERRUPTIBLE, TASK_KILLABLE] {
+            assert_eq!(OffCpuReason::classify(false, state), OffCpuReason::Blocked);
+        }
+        for reason in [
+            OffCpuReason::Blocked,
+            OffCpuReason::Runnable,
+            OffCpuReason::Preempted,
+        ] {
+            assert_eq!(
+                OffCpuReason::from_kernel(reason.kernel_value()),
+                Some(reason)
+            );
+        }
+        assert_eq!(OffCpuReason::from_kernel(0), None);
+        assert_eq!(OffCpuReason::from_kernel(4), None);
+        // The capture schema's enum numbers are the kernel's values.
+        assert_eq!(
+            i32::from(OffCpuReason::Blocked.kernel_value()),
+            capture::OffCpuReason::Blocked as i32
+        );
+        assert_eq!(
+            i32::from(OffCpuReason::Runnable.kernel_value()),
+            capture::OffCpuReason::Runnable as i32
+        );
+        assert_eq!(
+            i32::from(OffCpuReason::Preempted.kernel_value()),
+            capture::OffCpuReason::Preempted as i32
+        );
+    }
+
+    /// The reason filter runs before the bounds: an unselected reason is never eligible, whatever
+    /// its duration and whatever the admission draw.
+    #[test]
+    fn reason_filter_precedes_bounds_and_admission() {
+        let parse = |reasons: Value| {
+            let mut value = sampling_json(
+                json!({"minOffCpuMicros":10}),
+                json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64}),
+            );
+            value["sampling"]["reasons"] = reasons;
+            parse_prepare(&value.to_string())
+        };
+        let blocked = parse(json!(["blocked"])).unwrap().sampling;
+        let everything = parse(json!(["blocked", "runnable", "preempted"]))
+            .unwrap()
+            .sampling;
+        let selected = |sampling: &SamplingConfig, reason: OffCpuReason, duration_ns: u64| {
+            sampling.reason_mask() & (1 << reason.kernel_value()) != 0
+                && admitted(
+                    duration_ns,
+                    sampling.min_off_cpu_micros,
+                    sampling.max_off_cpu_micros,
+                    0,
+                    &sampling.admission,
+                )
+        };
+        assert!(selected(&blocked, OffCpuReason::Blocked, 20_000));
+        assert!(!selected(&blocked, OffCpuReason::Runnable, 20_000));
+        assert!(!selected(&blocked, OffCpuReason::Preempted, u64::MAX / 2));
+        assert!(!selected(&blocked, OffCpuReason::Blocked, 10_000));
+        assert!(selected(&everything, OffCpuReason::Preempted, 20_000));
+        assert_eq!(everything.reason_mask(), 0b1110);
+        for rejected in [
+            json!([]),
+            json!(["preempted", "blocked"]),
+            json!(["blocked", "blocked"]),
+            json!(["sleeping"]),
+            json!("blocked"),
+            Value::Null,
+        ] {
+            assert!(parse(rejected.clone()).is_err(), "{rejected}");
+        }
+        let mut missing = sampling_json(
+            json!({}),
+            json!({"policy":"proportional","recordAllAboveMicros":5}),
+        );
+        missing["sampling"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasons");
+        assert!(parse_prepare(&missing.to_string()).is_err());
     }
 
     #[test]
@@ -2708,9 +2899,10 @@ mod tests {
         // The echoed object round-trips unchanged.
         assert_eq!(
             config.sampling.json(),
-            json!({"minOffCpuMicros":10,"maxOffCpuMicros":null,
+            json!({"reasons":["blocked"],"minOffCpuMicros":10,"maxOffCpuMicros":null,
                    "admission":{"policy":"proportional","recordAllAboveMicros":5}})
         );
+        assert_eq!(config.sampling.reason_mask(), 0b0010);
         for rejected in [
             sampling_json(
                 json!({"minOffCpuMicros":"10","maxOffCpuMicros":"10"}),
@@ -3248,6 +3440,11 @@ mod tests {
 
     fn privileged_sampling() -> SamplingConfig {
         SamplingConfig {
+            reasons: vec![
+                OffCpuReason::Blocked,
+                OffCpuReason::Runnable,
+                OffCpuReason::Preempted,
+            ],
             min_off_cpu_micros: None,
             max_off_cpu_micros: None,
             admission: uniform(1_u64 << 32),

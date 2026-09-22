@@ -118,6 +118,9 @@ def main():
     for path in (output / "jonoffcpu-capture.pb", output / "jonoffcpu-capture.jfr"):
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError(f"Capture artifact is missing or empty: {path}")
+    # The configuration names no reasons, so the resolved policy records blocked intervals only.
+    if manifest.get("sampling", {}).get("reasons") != ["blocked"]:
+        raise RuntimeError(f"Capture did not resolve the default switch-out reasons: {manifest_path}")
 
     run(
         [
@@ -145,6 +148,29 @@ def main():
         raise RuntimeError(f"Correlator produced no matched off-CPU samples: {report_path}")
     if any(report.get(field, 0) != 0 for field in ("invalidSource", "invalidJfr", "identityUnverified")):
         raise RuntimeError(f"Correlator reported invalid or unverified samples: {report_path}")
+    # Every matched interval is classified by its switch-out reason, and only selected reasons appear.
+    reasons = report.get("offCpuReasons") or {}
+    matched_by_reason = reasons.get("matched", {})
+    if list(matched_by_reason) != ["blocked"] or int(matched_by_reason["blocked"]["intervals"]) != report["matched"]:
+        raise RuntimeError(f"Switch-out reasons do not account for every matched interval: {report_path}")
+    switch_outs = reasons.get("kernelSwitchOuts", {})
+    if int(switch_outs.get("blocked") or 0) <= 0:
+        raise RuntimeError(f"The kernel counted no blocked switch-outs: {report_path}")
+    profile_path = output / "analysis/jonoffcpu-offcpu-profile.pb"
+    if not profile_path.is_file() or profile_path.stat().st_size == 0:
+        raise RuntimeError(f"Stack profile is missing or empty: {profile_path}")
+    # The profile renders back to the collapsed stacks the correlator wrote.
+    run(
+        [
+            *common,
+            java, "-jar", "/artifacts/jonoffcpu-correlator.jar", "stacks",
+            "--profile", "/out/analysis/jonoffcpu-offcpu-profile.pb",
+            "--output", "/out/rendered.collapsed",
+        ],
+        output / "stacks.log",
+    )
+    if (output / "rendered.collapsed").read_bytes() != (output / "analysis/jonoffcpu-offcpu-stacks.collapsed").read_bytes():
+        raise RuntimeError("The stack profile does not reproduce the collapsed stacks")
 
     print(
         f"Packaged agent and correlator smoke passed on {platform.machine()} ({args.libc}): "

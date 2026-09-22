@@ -80,7 +80,9 @@ def main():
     build = module / "build"
     options = (
         "jonoffcpuoutput=/out/jonoffcpu-capture.pb,jonoffcpudelivery=queued,"
-        "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
+        # Every switch-out reason is recorded, so the check can show the known waits are classified blocked.
+        "sampling-policy=uniform,sampling-probability=1,sampling-reasons=blocked+runnable+preempted,"
+        "min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
         "event=cpu,jfrsync=profile,file=/out/jonoffcpu-capture.jfr"

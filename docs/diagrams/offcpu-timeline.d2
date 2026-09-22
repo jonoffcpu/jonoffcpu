@@ -7,10 +7,10 @@
 #   stack them. Edges between grid cells are routed straight by d2 (rule 5), which
 #   is what a timeline wants.
 # - The off-CPU interval is a one-row grid around the two off-CPU states; that is what
-#   draws the bracket and keeps Sleeping left of Runnable. The on-CPU states are plain
+#   draws the bracket and keeps Blocked left of Runnable. The on-CPU states are plain
 #   boxes so the whole row stays narrow enough to read at README width.
 # - Preemption (Running -> Runnable without sleeping) is a note under the timeline
-#   rather than an edge: a straight edge across the Sleeping cell would cross it.
+#   rather than an edge: a straight edge across the Blocked cell would cross it.
 
 direction: right
 
@@ -81,7 +81,7 @@ timeline: "" {
     grid-rows: 1
     horizontal-gap: 180
     vertical-gap: 40
-    sleeping: Sleeping {
+    sleeping: "Blocked (sleeping)" {
       class: [state; state-violet]
       detail: "Blocked until an event:\nfutex, socket data,\ndisk I/O, timer" {class: detail}
     }
@@ -98,7 +98,7 @@ timeline: "" {
   }
 }
 
-note: "jonoffcpu measures the whole off-CPU interval, from switch-out to switch-in.\nA preempted thread skips Sleeping and only waits for a CPU." {class: detail}
+note: "jonoffcpu measures the whole off-CPU interval, from switch-out to switch-in.\nIt records why it began: blocked, or runnable/preempted,\nwhen the thread skips Blocked and only waits for a CPU." {class: detail}
 }
 
 page.timeline.before -> page.timeline.offcpu.sleeping: sched_switch {class: flow}

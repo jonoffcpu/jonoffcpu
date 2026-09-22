@@ -56,6 +56,10 @@ path = "src/bin/signal_latency.rs"
 name = "jonoffcpu-target-exit-proof"
 path = "src/bin/target_exit_proof.rs"
 
+[[bin]]
+name = "jonoffcpu-offcpu-reason-proof"
+path = "src/bin/offcpu_reason_proof.rs"
+
 [dependencies]
 anyhow = "1.0.104"
 libbpf-rs = { version = "=0.27.1", features = ["vendored"] }

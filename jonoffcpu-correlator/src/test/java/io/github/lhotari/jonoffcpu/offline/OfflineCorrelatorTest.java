@@ -162,6 +162,21 @@ public final class OfflineCorrelatorTest {
     }
 
     static Path source(Path dir, Path jfr, List<JsonObject> observations, JsonObject sampling) throws IOException {
+        return source(dir, jfr, observations, sampling, 2, new JsonObject());
+    }
+
+    /**
+     * A finalized capture of the given control schema version. {@code extraKernelCounters} are added to the
+     * {@code captureEnd} kernel counters, as a version 3 collector reports per-reason switch-outs.
+     */
+    static Path source(
+            Path dir,
+            Path jfr,
+            List<JsonObject> observations,
+            JsonObject sampling,
+            int schemaVersion,
+            JsonObject extraKernelCounters)
+            throws IOException {
         List<JsonObject> samples = new ArrayList<>();
         List<JsonObject> statsRows = new ArrayList<>();
         SignalJfrExporter.visit(jfr, raw -> {
@@ -170,6 +185,7 @@ public final class OfflineCorrelatorTest {
             if (raw.get("recordType").equals("stats")) statsRows.add(row);
         });
         JsonObject start = row("captureStart");
+        start.addProperty("schemaVersion", schemaVersion);
         start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
         start.addProperty("signal", 35);
         start.addProperty("signalDelivery", "queued");
@@ -183,6 +199,7 @@ public final class OfflineCorrelatorTest {
         start.addProperty("registrationToken", "0000000000000001");
         start.addProperty("startedMonotonicNanos", "500");
         JsonObject end = row("captureEnd");
+        end.addProperty("schemaVersion", schemaVersion);
         end.addProperty("state", "complete");
         end.addProperty("drainTimedOut", false);
         end.addProperty("startedMonotonicNanos", "500");
@@ -209,6 +226,7 @@ public final class OfflineCorrelatorTest {
                 "threadStateFailures")) {
             kernel.addProperty(key, "0");
         }
+        for (var extra : extraKernelCounters.entrySet()) kernel.add(extra.getKey(), extra.getValue());
         counters.add("kernel", kernel);
         end.add("counters", counters);
         List<JsonObject> rows = new ArrayList<>();
@@ -220,6 +238,7 @@ public final class OfflineCorrelatorTest {
         rows.add(end);
         byte[] bytes = CaptureStreamFixture.encode(rows);
         JsonObject footer = row("captureFinalized");
+        footer.addProperty("schemaVersion", schemaVersion);
         footer.addProperty("state", "complete");
         JsonObject inputs = start.deepCopy();
         inputs.remove("recordType");

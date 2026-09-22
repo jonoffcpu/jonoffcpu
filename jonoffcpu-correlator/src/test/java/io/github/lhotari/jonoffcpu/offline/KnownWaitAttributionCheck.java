@@ -66,6 +66,10 @@ public final class KnownWaitAttributionCheck {
                 summary.sourceRows++;
                 summary.sourceIntervalNanos = summary.sourceIntervalNanos.add(end.subtract(start));
                 summary.sourceFixtureOverlapNanos = summary.sourceFixtureOverlapNanos.add(overlap);
+                // A known wait is a sleep, a park or a blocking JNI call: the kernel must classify it blocked.
+                String reason =
+                        row.has("offCpuReason") ? row.get("offCpuReason").getAsString() : "unspecified";
+                summary.overlapByReason.merge(reason, overlap, BigInteger::add);
             }
         }
         for (OfflineCorrelator.Match match : analysis.matches()) {
@@ -94,6 +98,12 @@ public final class KnownWaitAttributionCheck {
             check(
                     summary.handlerDelays.stream().allMatch(delay -> delay.signum() >= 0),
                     "Negative handler delay for " + summary.name);
+            BigInteger blocked = summary.overlapByReason.getOrDefault("blocked", BigInteger.ZERO);
+            check(
+                    blocked.multiply(BigInteger.valueOf(100))
+                                    .compareTo(summary.sourceFixtureOverlapNanos.multiply(BigInteger.valueOf(95)))
+                            >= 0,
+                    "Known waits must be classified blocked for " + summary.name + ": " + summary.overlapByReason);
             JsonObject row = new JsonObject();
             row.addProperty("targetTid", summary.tid);
             row.addProperty("fixtureOperations", summary.fixtureOperations);
@@ -102,6 +112,10 @@ public final class KnownWaitAttributionCheck {
             row.addProperty("sourceRowsOverlappingFixture", summary.sourceRows);
             row.addProperty("sourceObservedIntervalNanos", summary.sourceIntervalNanos.toString());
             row.addProperty("sourceOverlapWithFixtureNanos", summary.sourceFixtureOverlapNanos.toString());
+            JsonObject byReason = new JsonObject();
+            new TreeMap<>(summary.overlapByReason)
+                    .forEach((reason, nanos) -> byReason.addProperty(reason, nanos.toString()));
+            row.add("sourceOverlapWithFixtureNanosByOffCpuReason", byReason);
             row.addProperty("matchedDeliveryRows", summary.matchedRows);
             row.addProperty("matchedDeliveryWeightedNanos", summary.matchedIntervalNanos.toString());
             row.add("handlerDelayNanos", delaySummary(summary.handlerDelays));
@@ -283,6 +297,7 @@ public final class KnownWaitAttributionCheck {
         BigInteger matchedIntervalNanos = BigInteger.ZERO;
         final List<BigInteger> handlerDelays = new ArrayList<>();
         final Map<String, Integer> deliveryStacks = new HashMap<>();
+        final Map<String, BigInteger> overlapByReason = new HashMap<>();
 
         ThreadSummary(String name, long tid) {
             this.name = name;

@@ -116,6 +116,9 @@ Options before `asprofpath` belong to JONOFFCPU:
 - `jonoffcpudelivery=queued|coalescing`: signal delivery policy; defaults to `queued`.
 - `sampling-policy=none|uniform|proportional` (required): the admission policy,
   `sampling.admission.policy` in YAML.
+- `sampling-reasons`: the switch-out reasons to record, joined with `+` because
+  `,` separates options, for example `sampling-reasons=blocked+runnable`;
+  `sampling.reasons` in YAML. Defaults to `blocked`.
 - `sampling-probability`: the `uniform` policy's decimal probability in the
   inclusive range `0.0..1.0`, written without exponent notation. The controller
   multiplies the exact decimal by `2^32` and rounds down, so the effective
@@ -133,6 +136,18 @@ Options before `asprofpath` belong to JONOFFCPU:
 Policy `none` selects profiler-only mode: the eBPF source is never prepared or
 enabled, async-profiler runs without `signalcookie`, and the correlation output
 holds a single `captureFinalized` row with `state: "profilerOnly"`.
+
+The source applies the reason filter first: only intervals whose switch-out
+reason is in `sampling.reasons` (`blocked` unless configured) are eligible, and
+the others are counted by reason in `captureEnd` (`switchOutsBlocked`,
+`switchOutsRunnable`, `switchOutsPreempted`, `reasonRejections`,
+`reasonRejectedDurationMicros`). The resolved list is serialized in the order
+`blocked`, `runnable`, `preempted` whatever order it was given in. Each
+observation row carries its `reason` next to the raw `sched_switch` arguments
+it was derived from, `prevTaskState` and `preempted`; the agent recomputes the
+reason and checks it was selected for every row at stop, as it does the
+admission threshold. A capture that classifies its intervals is written at
+control `schemaVersion` 3.
 
 The source applies the duration bounds before the admission policy. A duration
 is eligible only when it is strictly greater than the configured minimum and

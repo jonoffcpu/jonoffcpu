@@ -61,6 +61,8 @@ dependencies {
 sourceSets {
     main {
         proto.setSrcDirs(listOf(rootProject.layout.projectDirectory.dir("docs/schema")))
+        // The stack profile is the correlator's derived artifact; the agent never reads or writes one.
+        proto.exclude("jonoffcpu-profile.proto")
     }
 }
 

@@ -26,7 +26,7 @@ import java.util.Map;
  * Streams a finalized capture and its combined JFR into primitive columns, joins them on the exact
  * 64-bit cookie, and accumulates duration-weighted stacks per interned stack id.
  *
- * <p>Nothing per-row survives the pass: an observation becomes 38 bytes of columns, a sample 38
+ * <p>Nothing per-row survives the pass: an observation becomes 51 bytes of columns, a sample 38
  * plus a dictionary id, and the two audit files are written by re-reading the files afterwards.
  * Validation is unchanged, only relocated: every constant an observation is checked against comes
  * from {@code captureStart}, which the reader delivers before the first observation, and the one
@@ -49,6 +49,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private final SourceColumns sources;
     private final SampleColumns samples;
     private final JfrDictionaries dictionaries = new JfrDictionaries();
+    private final NativeStacks nativeStacks = new NativeStacks();
+    private final ProfileAccumulator.Options profileOptions;
     private final LongIntMap sourceIndex;
     private final LongIntMap sampleIndex;
     private final Thinning thinning;
@@ -73,8 +75,10 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             int expectedSources,
             int expectedSamples,
             Thinning thinning,
-            Long narrowedToNanos) {
+            Long narrowedToNanos,
+            ProfileAccumulator.Options profileOptions) {
         this.limits = limits;
+        this.profileOptions = profileOptions;
         this.sources = new SourceColumns(expectedSources);
         this.samples = new SampleColumns(expectedSamples);
         this.sourceIndex = new LongIntMap(expectedSources);
@@ -113,13 +117,30 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             boolean partial,
             Degradation.Settings settings)
             throws IOException {
+        return correlate(source, jfr, limits, selection, partial, settings, ProfileAccumulator.Options.defaults());
+    }
+
+    static CorrelationResult correlate(
+            Path source,
+            Path jfr,
+            OfflineCorrelator.Limits limits,
+            OfflineCorrelator.JfrSelection selection,
+            boolean partial,
+            Degradation.Settings settings,
+            ProfileAccumulator.Options profileOptions)
+            throws IOException {
         // One observation is 99 bytes of capture stream and one sample 35 bytes of JFR; the estimate
         // only sizes the first allocation, off each side's own file so a much smaller JFR does not
         // preallocate as though it were as dense as the capture.
         int expectedSources = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(source) / 96));
         int expectedSamples = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(jfr) / 35));
         CorrelationEngine engine = new CorrelationEngine(
-                limits, expectedSources, expectedSamples, settings.thinning(), settings.narrowedToNanos());
+                limits,
+                expectedSources,
+                expectedSamples,
+                settings.thinning(),
+                settings.narrowedToNanos(),
+                profileOptions);
         boolean partialJfr = selection != null && selection.partialInput();
         CaptureInput capture = partial
                 ? CaptureInput.readPartial(source, jfr, limits, engine)
@@ -148,7 +169,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
 
     @Override
     public void stack(long stackId, CaptureProto.Stack stack) {
-        // The announced-stack set lives in CaptureInput; the frames are not retained in this pass.
+        // The announced-stack set lives in CaptureInput. The frames are retained once per distinct stack
+        // for the stack profile, which groups by them.
+        nativeStacks.add(stackId, stack);
     }
 
     @Override
@@ -170,7 +193,24 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         long end = U64.requireSigned(observation.getEndMonotonicNs(), "endMonotonicNanos");
         long cookie = observation.getCorrelationId();
         boolean cookieValid = (cookie >>> 32) == captureEpoch && (cookie & 0xffffffffL) != 0;
-        boolean policyMismatch = targetTgid != targetPid
+        // The kernel derived the reason from the two raw sched_switch arguments it recorded beside it, and its
+        // filter only passes selected reasons: both are recomputed, like the admission threshold. An unclassified
+        // capture carries none of the three fields.
+        OffCpuReason switchOut = OffCpuReason.fromWire(observation.getReasonValue());
+        boolean classificationMismatch;
+        if (sampling.classified()) {
+            classificationMismatch = switchOut == null
+                    || !observation.hasPrevTaskState()
+                    || !observation.hasPreempted()
+                    || switchOut != OffCpuReason.classify(observation.getPreempted(), observation.getPrevTaskState())
+                    || !sampling.selects(switchOut);
+        } else {
+            classificationMismatch =
+                    observation.getReasonValue() != 0 || observation.hasPrevTaskState() || observation.hasPreempted();
+        }
+        if (switchOut == null) switchOut = OffCpuReason.UNSPECIFIED;
+        boolean policyMismatch = classificationMismatch
+                || targetTgid != targetPid
                 || Integer.toUnsignedLong(observation.getHostTgid()) != hostTgid
                 // The kernel recorded the threshold it drew against; it must be the policy's for this length.
                 || start > end
@@ -199,7 +239,18 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         // Duplicate detection stays global and exact: a dropped row still claims its cookie.
         sourceIndex.observe(cookie, kept ? sources.size() : DROPPED);
         if (!kept) return;
-        sources.add(cookie, start, end, threshold, (int) targetTid, observation.getSignalResult() != 0, reason);
+        sources.add(
+                cookie,
+                start,
+                end,
+                threshold,
+                (int) targetTid,
+                observation.getSignalResult() != 0,
+                reason,
+                switchOut,
+                observation.getPrevTaskState(),
+                stackColumn(observation.getKernelStackId(), observation.getKernelStackError()),
+                stackColumn(observation.getUserStackId(), observation.getUserStackError()));
         if (sources.size() % WATERMARK_ROWS == 0) {
             try {
                 budget.structures(retainedBytes());
@@ -218,6 +269,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             require(stackId >= 0, "Unexplained negative stack id");
             require(announcedStacks.contains(stackId), "Observation references an unannounced stack");
         }
+    }
+
+    /** An announced stack id, or {@link SourceColumns#NO_STACK} when the kernel produced none. */
+    private static int stackColumn(long stackId, String error) {
+        return error.isEmpty() ? Math.toIntExact(stackId) : SourceColumns.NO_STACK;
     }
 
     private static BigInteger unsigned(long bits) {
@@ -399,7 +455,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
 
         long[] collapsedNanos = new long[dictionaries.collapsedCount()];
+        long[][] collapsedNanosByReason = new long[OffCpuReason.values().length][];
         long[] stackNanos = new long[dictionaries.stackCount()];
+        ProfileAccumulator profile = new ProfileAccumulator(profileOptions);
         long total = 0;
         int matched = 0;
         int unverified = 0;
@@ -467,11 +525,27 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             total = U64.add(total, duration, "Selected duration");
             int stackId = samples.stackId(sample);
             stackNanos[stackId] = U64.add(stackNanos[stackId], duration, "Selected duration");
+            int collapsed = dictionaries.collapsedOf(stackId);
+            OffCpuReason switchOut = sources.offCpuReason(slot);
             if (duration > 0) {
-                int collapsed = dictionaries.collapsedOf(stackId);
                 collapsedNanos[collapsed] = U64.add(collapsedNanos[collapsed], duration, "Selected duration");
+                long[] byReason = collapsedNanosByReason[switchOut.ordinal()];
+                if (byReason == null) {
+                    byReason = collapsedNanosByReason[switchOut.ordinal()] = new long[collapsedNanos.length];
+                }
+                byReason[collapsed] = U64.add(byReason[collapsed], duration, "Selected duration");
             }
+            profile.add(
+                    collapsed,
+                    sources.kernelStack(slot),
+                    sources.userStack(slot),
+                    switchOut,
+                    sources.taskState(slot),
+                    dictionaries.thread(samples.threadId(sample)).name(),
+                    duration,
+                    sources.threshold(slot));
         }
+        capture.budget.structures(retainedBytes() + profile.retainedBytes());
 
         int invalidSource = 0;
         for (int slot = 0; slot < sources.size(); slot++) {
@@ -493,7 +567,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 dictionaries,
                 sampleIndex,
                 collapsedNanos,
+                collapsedNanosByReason,
                 stackNanos,
+                nativeStacks,
+                profile,
+                sampling,
                 total,
                 offset,
                 clipFrom,
@@ -566,7 +644,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 + samples.retainedBytes()
                 + sourceIndex.retainedBytes()
                 + sampleIndex.retainedBytes()
-                + dictionaries.retainedBytes();
+                + dictionaries.retainedBytes()
+                + nativeStacks.retainedBytes();
     }
 
     /**

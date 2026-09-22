@@ -7,7 +7,9 @@ import com.google.gson.JsonObject;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -71,6 +73,32 @@ interface AnalysisOutput {
     void writeMatches(BufferedWriter writer) throws IOException;
 
     SyntheticJfrSource synthetic() throws IOException;
+
+    /**
+     * The switch-out reasons with a positive selected duration, in canonical order. Empty for the retained view,
+     * which predates the classification.
+     */
+    default List<OffCpuReason> reasonsPresent() {
+        return List.of();
+    }
+
+    /**
+     * Collapsed weights of one reason ({@code only}), or of every reason when {@code only} is null, in which case
+     * each line starts with its {@code [offcpu: reason]} frame so that the reasons stay apart.
+     */
+    default Map<String, String> collapsedNanos(OffCpuReason only) {
+        throw new UnsupportedOperationException("Per-reason collapsed stacks need the streamed view");
+    }
+
+    /** The report's switch-out reason accounting, or null for a capture without classification. */
+    default JsonObject offCpuReasons() {
+        return null;
+    }
+
+    /** The stack profile of this analysis, or null when the view cannot produce one. */
+    default StackProfile stackProfile(String reportJson) throws IOException {
+        return null;
+    }
 
     /** The retained view: every counter and row comes straight off the materialised {@link OfflineCorrelator.Analysis}. */
     static AnalysisOutput of(OfflineCorrelator.Analysis analysis) {
@@ -411,6 +439,92 @@ interface AnalysisOutput {
             @Override
             public SyntheticJfrSource synthetic() {
                 return SyntheticJfrSource.of(result);
+            }
+
+            @Override
+            public List<OffCpuReason> reasonsPresent() {
+                List<OffCpuReason> present = new ArrayList<>();
+                for (OffCpuReason reason : OffCpuReason.values()) {
+                    // A reason's array exists only once an interval of it had a positive duration.
+                    if (result.collapsedNanosByReason()[reason.ordinal()] != null) present.add(reason);
+                }
+                return present;
+            }
+
+            @Override
+            public Map<String, String> collapsedNanos(OffCpuReason only) {
+                Map<String, String> weights = new java.util.TreeMap<>();
+                for (OffCpuReason reason : OffCpuReason.values()) {
+                    long[] nanos = result.collapsedNanosByReason()[reason.ordinal()];
+                    if (nanos == null || only != null && reason != only) continue;
+                    String prefix = only == null ? label + StackProfileRenderer.reasonFrame(reason) + ";" : label;
+                    for (int id = 0; id < nanos.length; id++) {
+                        if (nanos[id] > 0) {
+                            weights.put(
+                                    prefix + result.dictionaries().collapsedKey(id),
+                                    result.thinning().scale(nanos[id]).toString());
+                        }
+                    }
+                }
+                return weights;
+            }
+
+            @Override
+            public JsonObject offCpuReasons() {
+                if (!result.sampling().classified()) return null;
+                JsonObject value = new JsonObject();
+                value.addProperty(
+                        "semantics",
+                        "switch-out reason: why the scheduler took the thread off the CPU. A blocked interval's"
+                                + " duration includes its run-queue delay after wakeup; the two are not split.");
+                com.google.gson.JsonArray selected = new com.google.gson.JsonArray();
+                for (OffCpuReason reason : result.sampling().reasons()) selected.add(reason.label());
+                value.add("selected", selected);
+                long[] intervals = new long[OffCpuReason.values().length];
+                long[] nanos = new long[OffCpuReason.values().length];
+                for (int slot = 0; slot < result.sources().size(); slot++) {
+                    if (result.sources().outcome(slot) != Outcome.MATCHED) continue;
+                    int reason = result.sources().offCpuReason(slot).ordinal();
+                    intervals[reason]++;
+                    nanos[reason] = Math.addExact(nanos[reason], result.durationNanos(slot));
+                }
+                JsonObject matched = new JsonObject();
+                for (OffCpuReason reason : result.sampling().reasons()) {
+                    JsonObject counts = new JsonObject();
+                    counts.addProperty("intervals", Long.toString(intervals[reason.ordinal()]));
+                    counts.addProperty("observedNanos", Long.toString(nanos[reason.ordinal()]));
+                    matched.add(reason.label(), counts);
+                }
+                value.add("matched", matched);
+                // The kernel counts every switch-out by reason before its filter, so a blocked-only capture
+                // still shows how often its threads were preempted.
+                JsonObject kernel = result.capture().end == null
+                        ? null
+                        : result.capture().end.getAsJsonObject("counters").getAsJsonObject("kernel");
+                JsonObject switchOuts = new JsonObject();
+                for (String reason : List.of("blocked", "runnable", "preempted")) {
+                    String key = "switchOuts" + Character.toUpperCase(reason.charAt(0)) + reason.substring(1);
+                    switchOuts.add(reason, kernel == null ? com.google.gson.JsonNull.INSTANCE : kernel.get(key));
+                }
+                value.add("kernelSwitchOuts", switchOuts);
+                for (String key : List.of("reasonRejections", "reasonRejectedDurationMicros")) {
+                    value.add(key, kernel == null ? com.google.gson.JsonNull.INSTANCE : kernel.get(key));
+                }
+                return value;
+            }
+
+            @Override
+            public StackProfile stackProfile(String reportJson) throws IOException {
+                OfflineCorrelator.PopulationEstimate estimate = result.populationEstimate();
+                return StackProfile.of(
+                        result,
+                        reportJson,
+                        label,
+                        result.capture().sourceDigest,
+                        result.capture().jfrDigest,
+                        estimate != null
+                                && estimate.sourceCoverageComplete()
+                                && !result.thinning().active());
             }
         };
     }

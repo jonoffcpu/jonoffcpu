@@ -59,6 +59,7 @@ fn main() -> Result<()> {
             "targetPid": libc::getpid(),
             "outputPath": output,
             "sampling": {
+                "reasons": ["blocked", "runnable", "preempted"],
                 "minOffCpuMicros": null,
                 "maxOffCpuMicros": null,
                 "admission": {

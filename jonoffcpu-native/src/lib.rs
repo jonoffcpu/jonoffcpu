@@ -113,6 +113,14 @@ pub mod capture {
                 "userStackId": observation.user_stack_id,
                 "kernelStackError": observation.kernel_stack_error,
                 "userStackError": observation.user_stack_error,
+                "reason": match observation.reason() {
+                    OffCpuReason::Unspecified => serde_json::Value::Null,
+                    OffCpuReason::Blocked => "blocked".into(),
+                    OffCpuReason::Runnable => "runnable".into(),
+                    OffCpuReason::Preempted => "preempted".into(),
+                },
+                "prevTaskState": observation.prev_task_state,
+                "preempted": observation.preempted,
             }),
             None => serde_json::Value::Null,
         }
