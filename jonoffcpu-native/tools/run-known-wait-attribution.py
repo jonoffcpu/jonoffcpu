@@ -80,7 +80,7 @@ def main():
     build = module / "build"
     options = (
         "jonoffcpuoutput=/out/correlation.ndjson,jonoffcpudelivery=queued,"
-        "samplethreshold=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
+        "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
         "event=cpu,jfrsync=profile,file=/out/original.jfr"

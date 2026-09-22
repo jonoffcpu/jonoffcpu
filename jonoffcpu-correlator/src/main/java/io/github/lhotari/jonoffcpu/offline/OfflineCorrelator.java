@@ -94,19 +94,19 @@ final class OfflineCorrelator {
             boolean threadIdentityVerified) {}
 
     /**
-     * Exact inverse-probability source-duration estimate, kept separate from matched stack weights.
+     * Inverse-probability source-duration estimate, kept separate from matched stack weights. Each valid source
+     * row is weighted by {@code duration * 2^32 / admissionThreshold} using the exact per-row threshold the kernel
+     * drew against; the sum is accumulated in exact fixed-point arithmetic and truncated to whole nanoseconds.
      */
     public record PopulationEstimate(
             String method,
             String status,
             String scope,
-            String effectiveProbabilityNumerator,
-            String effectiveProbabilityDenominator,
+            String admissionPolicy,
             String sourceSelectedObservedDurationNanos,
             String matchedSelectedObservedDurationNanos,
             String sourceRowsUsed,
-            String durationNanosNumerator,
-            String durationNanosDenominator,
+            String estimatedDurationNanos,
             boolean sourceCoverageComplete,
             boolean stackDeliveryCorrectionApplied,
             List<String> unavailableReasons) {}
@@ -235,9 +235,10 @@ final class OfflineCorrelator {
     private static Joined correlate(CaptureInput capture, Path jfr, Limits limits, JfrSelection selection)
             throws IOException {
         List<Row> sources = new ArrayList<>();
+        SamplingPolicy sampling = capture.sampling();
         for (JsonObject observation : capture.observations) {
             Row row = new Row(sources.size() + 2, observation, capture.inputs);
-            validateSource(row, capture, limits);
+            validateSource(row, capture, sampling, limits);
             sources.add(row);
         }
         List<Row> samples = new ArrayList<>();
@@ -351,7 +352,8 @@ final class OfflineCorrelator {
                 "AP submission counter inconsistency");
     }
 
-    private static void validateSource(Row row, CaptureInput capture, Limits limits) throws IOException {
+    private static void validateSource(Row row, CaptureInput capture, SamplingPolicy sampling, Limits limits)
+            throws IOException {
         JsonObject value = row.value;
         require(optionalTid(value, "targetTid") != null, "Missing target namespace TID");
         require(number(value, "targetTgid") > 0 && number(value, "targetTgid") <= 0xffffffffL, "Invalid target TGID");
@@ -367,28 +369,25 @@ final class OfflineCorrelator {
             require(status.equals("ok") || status.equals("error"), "Invalid native stack status");
             frames(stack, limits);
         }
+        long threshold = number(value, "admissionThreshold");
+        require(
+                threshold >= 1 && threshold <= SamplingPolicy.CERTAIN_ADMISSION.longValueExact(),
+                "Invalid admission threshold");
+        BigInteger duration = end.subtract(start);
         if (start.compareTo(end) > 0) row.invalid = "negative-source-duration";
         else if (start.compareTo(decimal(capture.start, "startedMonotonicNanos")) < 0
                 || capture.end != null && end.compareTo(decimal(capture.end, "detachedMonotonicNanos")) > 0) {
             row.invalid = "source-interval-outside-capture";
         } else if (number(value, "targetTgid") != number(capture.inputs, "targetPid")
                 || number(value, "hostTgid") != number(capture.inputs, "hostTgid")
-                || number(value, "sampleThreshold") != number(capture.inputs, "sampleThreshold")
+                // The kernel recorded the threshold it drew against; it must be the policy's value for this duration.
+                || !BigInteger.valueOf(threshold).equals(sampling.admissionThreshold(duration))
                 || !text(value, "sourceId").equals("jonoffcpu.offcpu.v1")
                 || !generation.equals(decimal(capture.start, "processGenerationNs"))
                 || !text(value, "registrationToken").equals(text(capture.start, "registrationToken"))) {
             row.invalid = "source-policy-or-target-mismatch";
         }
-        BigInteger duration = end.subtract(start);
-        for (String bound : List.of("minOffCpuMicros", "maxOffCpuMicros")) {
-            require(capture.start.has(bound), "Missing duration policy: " + bound);
-            if (!capture.start.get(bound).isJsonNull()) {
-                int comparison =
-                        duration.compareTo(decimal(capture.start, bound).multiply(BigInteger.valueOf(1000)));
-                if (bound.startsWith("min") ? comparison <= 0 : comparison >= 0)
-                    row.invalid = "duration-policy-mismatch";
-            }
-        }
+        if (row.invalid == null && !sampling.withinBounds(duration)) row.invalid = "duration-policy-mismatch";
     }
 
     private static void frames(JsonObject row, Limits limits) throws IOException {
@@ -528,8 +527,15 @@ final class OfflineCorrelator {
         }
     }
 
+    // Fixed-point scale for the inverse-probability sum: each row's truncation error is below 2^-64 ns, so the
+    // truncated total is the exact floor of the true sum unless that sum lies within rows * 2^-64 ns above an
+    // integer, in which case it is one nanosecond low. Exact rationals would instead need the lcm of every
+    // distinct per-row threshold as a denominator.
+    private static final int ESTIMATE_FRACTION_BITS = 64;
+
     private static SourceAggregate sourceAggregate(List<Row> sources, Limits limits) {
         BigInteger duration = BigInteger.ZERO;
+        BigInteger weighted = BigInteger.ZERO;
         int rows = 0;
         for (Row source : sources) {
             if (source.invalid != null) {
@@ -539,10 +545,15 @@ final class OfflineCorrelator {
             BigInteger end = decimalUnchecked(source.value, "endMonotonicNanos");
             BigInteger from = limits.fromNanos() == null ? start : start.max(limits.fromNanos());
             BigInteger to = limits.toNanos() == null ? end : end.min(limits.toNanos());
-            duration = duration.add(to.subtract(from).max(BigInteger.ZERO));
+            BigInteger selected = to.subtract(from).max(BigInteger.ZERO);
+            duration = duration.add(selected);
+            BigInteger threshold =
+                    BigInteger.valueOf(source.value.get("admissionThreshold").getAsLong());
+            weighted =
+                    weighted.add(selected.shiftLeft(32 + ESTIMATE_FRACTION_BITS).divide(threshold));
             rows++;
         }
-        return new SourceAggregate(duration, rows);
+        return new SourceAggregate(duration, weighted.shiftRight(ESTIMATE_FRACTION_BITS), rows);
     }
 
     private static PopulationEstimate populationEstimate(
@@ -558,7 +569,7 @@ final class OfflineCorrelator {
         BigInteger sourceRows = BigInteger.valueOf(sources.size());
         BigInteger selected = optionalCounter(kernel, "selectedIntervals", reasons);
         BigInteger eligible = optionalCounter(kernel, "eligibleIntervals", reasons);
-        BigInteger rejected = optionalCounter(kernel, "probabilityRejections", reasons);
+        BigInteger rejected = optionalCounter(kernel, "admissionRejections", reasons);
         BigInteger received = optionalCounter(userspace, "receivedObservations", reasons);
         BigInteger written = optionalCounter(userspace, "writtenObservations", reasons);
         if (selected != null
@@ -589,21 +600,16 @@ final class OfflineCorrelator {
             }
         }
         reasons = reasons.stream().distinct().sorted().toList();
-        BigInteger threshold = BigInteger.valueOf(number(capture.inputs, "sampleThreshold"));
-        BigInteger denominator = BigInteger.ONE.shiftLeft(32);
-        if (threshold.signum() == 0) reasons.add("zero-sampling-probability");
         boolean available = reasons.isEmpty();
         return new PopulationEstimate(
                 "inverse-probability-source-duration",
                 available ? "available" : "unavailable",
                 "completed duration-eligible source intervals",
-                threshold.toString(),
-                denominator.toString(),
+                capture.sampling().policy(),
                 aggregate.duration().toString(),
                 matchedDuration.toString(),
                 Integer.toString(aggregate.rows()),
-                available ? aggregate.duration().multiply(denominator).toString() : null,
-                available ? threshold.toString() : null,
+                available ? aggregate.estimatedDuration().toString() : null,
                 available,
                 false,
                 reasons);
@@ -642,7 +648,7 @@ final class OfflineCorrelator {
         return new BigInteger(value.get(key).getAsString());
     }
 
-    private record SourceAggregate(BigInteger duration, int rows) {}
+    private record SourceAggregate(BigInteger duration, BigInteger estimatedDuration, int rows) {}
 
     private static Map<String, List<Row>> index(List<Row> rows) {
         Map<String, List<Row>> index = new HashMap<>();

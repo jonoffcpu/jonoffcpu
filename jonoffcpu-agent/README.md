@@ -65,13 +65,18 @@ output path and the async-profiler options:
 ```yaml
 correlationOutput: /data/run.correlation.ndjson
 asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/data/run.jfr
-sampleProbability: "0.010"
-minOffCpuMicros: 1000
+sampling:
+  minOffCpuMicros: 100
+  admission:
+    policy: proportional
+    recordAllAboveMicros: 10000
 ```
 
 The agent uses SnakeYAML's safe constructor, rejects duplicate and unknown keys,
-and does not allow aliases. Quote `sampleProbability` when its exact decimal
-spelling should be retained in capture metadata.
+and does not allow aliases. The `sampling` block is required; the top-level
+README's [Choosing what to sample](../README.md#choosing-what-to-sample)
+explains its policies. Quote a `uniform` policy's `probability` when its exact
+decimal spelling should be retained in capture metadata.
 
 Then start the application with the Java agent:
 
@@ -102,24 +107,41 @@ Options before `asprofpath` belong to JONOFFCPU:
 
 - `jonoffcpuoutput` (required): exact correlation NDJSON path.
 - `jonoffcpudelivery=queued|coalescing`: signal delivery policy; defaults to `queued`.
-- `samplethreshold`: requested decimal probability in the inclusive range
-  `0.0..1.0`, written without exponent notation. The controller multiplies the
-  exact decimal by `2^32` and rounds down, so the effective probability never
-  exceeds the request. It persists both `requestedSampleProbability` and the effective
-  integer `sampleThreshold`; only the integer is sent to the native source.
-  `1` admits every eligible interval. `0` selects profiler-only mode: the
-  eBPF source is never prepared or enabled, async-profiler runs without
-  `signalcookie`, and the correlation output holds a single `captureFinalized`
-  row with `state: "profilerOnly"`.
+- `sampling-policy=none|uniform|proportional` (required): the admission policy,
+  `sampling.admission.policy` in YAML.
+- `sampling-probability`: the `uniform` policy's decimal probability in the
+  inclusive range `0.0..1.0`, written without exponent notation. The controller
+  multiplies the exact decimal by `2^32` and rounds down, so the effective
+  probability never exceeds the request; it persists both the spelling as
+  `probability` and the integer `probabilityThreshold`. `1` admits every
+  eligible interval. Exactly `0` resolves to policy `none`; a positive value
+  that rounds down to no draws is rejected.
+- `record-all-above-micros`: the `proportional` policy's reference duration in
+  microseconds.
 - `min-off-cpu-micros`: optional strict lower duration bound in microseconds.
 - `max-off-cpu-micros`: optional strict upper duration bound in microseconds.
 - `nativestoptimeoutmillis`, `deliverygracemillis`, and
   `shutdowntimeoutmillis`: bounded lifecycle timeouts.
 
-The source applies duration filters and probability together. A duration is
-eligible only when it is strictly greater than the configured minimum and
-strictly less than the configured maximum. Omitting either bound leaves that
-side unbounded.
+Policy `none` selects profiler-only mode: the eBPF source is never prepared or
+enabled, async-profiler runs without `signalcookie`, and the correlation output
+holds a single `captureFinalized` row with `state: "profilerOnly"`.
+
+The source applies the duration bounds before the admission policy. A duration
+is eligible only when it is strictly greater than the configured minimum and
+strictly less than the configured maximum; omitting either bound leaves that
+side unbounded. The resolved `sampling` object is sent to the native source,
+echoed back by it, and written unchanged into the manifest, the `captureStart`
+row, and the `captureFinalized` footer's `analysisInputs`, so every consumer
+compares the same value. Each observation row carries `admissionThreshold`,
+the exact 32-bit-scaled threshold the kernel drew against for that interval
+(`4294967296` means certain admission). Under `uniform` it is the policy's
+`probabilityThreshold`; under `proportional` it is `2^32` for a duration at
+or above `recordAllAboveMicros` and otherwise `duration * 2^32 / reference`
+computed in 64-bit arithmetic with the nanosecond reference shifted right until
+it fits in 32 bits (and the duration shifted by the same amount). The agent
+recomputes it for every row at stop and rejects a stream where any row
+disagrees.
 
 `queued` requests a dedicated real-time signal from async-profiler. `coalescing`
 explicitly requests a spare standard signal, trading missing observations for

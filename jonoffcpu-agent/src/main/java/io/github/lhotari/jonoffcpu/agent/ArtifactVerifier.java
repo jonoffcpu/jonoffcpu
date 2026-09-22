@@ -56,9 +56,7 @@ final class ArtifactVerifier {
             long epoch,
             int signal,
             String delivery,
-            long threshold,
-            Long minOffCpuMicros,
-            Long maxOffCpuMicros,
+            SamplingConfig sampling,
             long hostTgid,
             long targetPid,
             JsonObject verifiedIdentity)
@@ -90,11 +88,7 @@ final class ArtifactVerifier {
                         JsonSupport.requireEqual(
                                 "signalDelivery", delivery, JsonSupport.requireString(row, "signalDelivery"));
                         JsonSupport.requireEqual(
-                                "sampleThreshold",
-                                threshold,
-                                JsonSupport.requireNumber(row, "sampleThreshold", 0, 1L << 32));
-                        requireOptionalDuration(row, "minOffCpuMicros", minOffCpuMicros);
-                        requireOptionalDuration(row, "maxOffCpuMicros", maxOffCpuMicros);
+                                "sampling", sampling.json(), JsonSupport.requireObject(row, "sampling"));
                         JsonSupport.requireEqual(
                                 "hostTgid", hostTgid, JsonSupport.requireNumber(row, "hostTgid", 1, 0xffffffffL));
                         JsonSupport.requireEqual(
@@ -120,7 +114,7 @@ final class ArtifactVerifier {
                     }
                     case "observation" -> {
                         if (start == null) throw new IOException("Observation before captureStart");
-                        validateObservation(row, sessionId, epoch, threshold, hostTgid, targetPid, verifiedIdentity);
+                        validateObservation(row, sessionId, epoch, sampling, hostTgid, targetPid, verifiedIdentity);
                         observations++;
                     }
                     case "captureEnd" -> {
@@ -145,7 +139,7 @@ final class ArtifactVerifier {
             "lifetimeRejections",
             "eligibleIntervals",
             "eligibleDurationMicros",
-            "probabilityRejections",
+            "admissionRejections",
             "selectedIntervals",
             "sequenceExhaustions",
             "sequenceContentions",
@@ -281,20 +275,11 @@ final class ArtifactVerifier {
         return number;
     }
 
-    private static void requireOptionalDuration(JsonObject object, String key, Long expected) throws IOException {
-        JsonElement value = object.get(key);
-        if (expected == null) {
-            if (value == null || !value.isJsonNull()) throw new IOException(key + " must be explicit null");
-        } else if (!Long.toString(expected).equals(JsonSupport.requireDecimal(object, key))) {
-            throw new IOException(key + " does not match source policy");
-        }
-    }
-
     private static void validateObservation(
             JsonObject row,
             String sessionId,
             long epoch,
-            long threshold,
+            SamplingConfig sampling,
             long hostTgid,
             long targetPid,
             JsonObject verifiedIdentity)
@@ -308,10 +293,6 @@ final class ArtifactVerifier {
         JsonSupport.requireEqual(
                 "observation targetTgid", targetPid, JsonSupport.requireNumber(row, "targetTgid", 1, 0xffffffffL));
         JsonSupport.requireNumber(row, "targetTid", 1, 0xffffffffL);
-        JsonSupport.requireEqual(
-                "observation sampleThreshold",
-                threshold,
-                JsonSupport.requireNumber(row, "sampleThreshold", 0, 1L << 32));
         String cookieText = JsonSupport.requireString(row, "correlationId");
         if (!cookieText.matches("[0-9a-f]{16}")) throw new IOException("Invalid observation cookie");
         long cookie = Long.parseUnsignedLong(cookieText, 16);
@@ -330,6 +311,11 @@ final class ArtifactVerifier {
         BigInteger start = requireU64(row, "startMonotonicNanos");
         BigInteger end = requireU64(row, "endMonotonicNanos");
         if (start.compareTo(end) > 0) throw new IOException("Observation has negative duration");
+        // The kernel records the exact threshold it drew against; recompute it from the policy and duration.
+        JsonSupport.requireEqual(
+                "observation admissionThreshold",
+                sampling.admissionThreshold(end.subtract(start).longValueExact()),
+                JsonSupport.requireNumber(row, "admissionThreshold", 1, SamplingConfig.CERTAIN_ADMISSION));
         for (String stackName : new String[] {"kernelStack", "userStack"}) {
             JsonObject stack = JsonSupport.requireObject(row, stackName);
             String status = JsonSupport.requireString(stack, "status");

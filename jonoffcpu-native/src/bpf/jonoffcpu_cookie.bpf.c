@@ -47,6 +47,10 @@ volatile __u32 capture_epoch;
 volatile __u64 min_off_cpu_ns;
 volatile __u64 max_off_cpu_ns;
 volatile __u64 sample_threshold;
+volatile __u32 admission_policy;
+volatile __u64 record_all_above_ns;
+volatile __u64 record_all_above_scaled;
+volatile __u32 record_all_above_shift;
 volatile __u32 has_min_off_cpu;
 volatile __u32 has_max_off_cpu;
 volatile __u32 enabled;
@@ -171,6 +175,7 @@ int BPF_KPROBE(capture_switch_in)
     __u64 end_ns;
     __u64 duration_ns;
     __u64 duration_us;
+    __u64 admission_threshold;
     __u64 cookie;
     __u64 registration_token;
     __u32 sequence;
@@ -214,9 +219,23 @@ int BPF_KPROBE(capture_switch_in)
         __sync_fetch_and_add(&s->eligible_intervals, 1);
     if (s)
         __sync_fetch_and_add(&s->eligible_duration_us, duration_us);
-    if ((__u64)bpf_get_prandom_u32() >= sample_threshold) {
+    /* The proportional policy admits with probability duration / D, so the
+     * 32-bit threshold is duration * 2^32 / D. Userspace pre-shifts D below
+     * 2^32; duration < D keeps the shifted numerator below 2^64. */
+    if (admission_policy == JONOFFCPU_ADMISSION_PROPORTIONAL) {
+        if (duration_ns >= record_all_above_ns)
+            admission_threshold = JONOFFCPU_ADMISSION_CERTAIN;
+        else if (record_all_above_scaled)
+            admission_threshold = ((duration_ns >> record_all_above_shift) << 32) /
+                                  record_all_above_scaled;
+        else
+            admission_threshold = 0;
+    } else {
+        admission_threshold = sample_threshold;
+    }
+    if ((__u64)bpf_get_prandom_u32() >= admission_threshold) {
         if (s)
-            __sync_fetch_and_add(&s->probability_rejections, 1);
+            __sync_fetch_and_add(&s->admission_rejections, 1);
         goto cleanup;
     }
     if (s)
@@ -243,6 +262,7 @@ int BPF_KPROBE(capture_switch_in)
     event->process_generation_ns = BPF_CORE_READ(leader, start_boottime);
     event->thread_generation_ns = state->thread_generation_ns;
     event->registration_token = registration_token;
+    event->admission_threshold = admission_threshold;
     event->host_tgid = (__u32)(pid_tgid >> 32);
     event->host_tid = (__u32)pid_tgid;
     event->target_tgid = target_ids.tgid;

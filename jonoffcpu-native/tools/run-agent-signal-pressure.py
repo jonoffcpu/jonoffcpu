@@ -54,7 +54,7 @@ def java_command(module, ap, jdk, case, delivery, signo, blocked_ms, recovery_ms
     build = module / "build"
     options = (
         f"jonoffcpuoutput=/out/correlation.ndjson,jonoffcpudelivery={delivery},"
-        "samplethreshold=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
+        "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
         f"cookiesignal={signo},event=cpu,alloc=1m,wall=10ms,lock=1ms,"

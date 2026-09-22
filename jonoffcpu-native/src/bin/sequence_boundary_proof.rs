@@ -35,6 +35,7 @@ struct Observation {
     process_generation_ns: u64,
     thread_generation_ns: u64,
     registration_token: u64,
+    admission_threshold: u64,
     signal_result: i64,
     kernel_stack_id: i64,
     user_stack_id: i64,
@@ -58,7 +59,7 @@ struct KernelStats {
     thread_state_failures: u64,
     eligible_intervals: u64,
     eligible_duration_us: u64,
-    probability_rejections: u64,
+    admission_rejections: u64,
     selected_intervals: u64,
     sequence_exhaustions: u64,
     sequence_contentions: u64,
@@ -301,7 +302,7 @@ fn main() -> Result<()> {
             stats.sequence_exhaustions
         );
     }
-    if stats.probability_rejections != 0
+    if stats.admission_rejections != 0
         || stats.ring_reserve_failures != 0
         || stats.target_namespace_failures != 0
     {

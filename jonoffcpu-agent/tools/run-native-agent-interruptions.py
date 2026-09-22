@@ -29,7 +29,7 @@ def make_readable(case):
 def java_command(module, ap, jdk, case, mode, seconds):
     build = module / "build"
     ap_first = mode in ("timeout", "master-stop")
-    controller = "samplethreshold=1,min-off-cpu-micros=5000," if ap_first else ""
+    controller = "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=5000," if ap_first else ""
     profiler = "timeout=2s," if mode == "timeout" else ""
     workload_mode = "wait" if mode == "sigkill" else mode
     return [

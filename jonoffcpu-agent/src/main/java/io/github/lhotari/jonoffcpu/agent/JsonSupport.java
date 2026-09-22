@@ -12,8 +12,11 @@ import java.util.regex.Pattern;
 
 final class JsonSupport {
     static final int MAX_CONTROL_BYTES = 64 * 1024;
-    static final Gson GSON =
-            new GsonBuilder().disableHtmlEscaping().setPrettyPrinting().create();
+    static final Gson GSON = new GsonBuilder()
+            .disableHtmlEscaping()
+            .serializeNulls()
+            .setPrettyPrinting()
+            .create();
     private static final Pattern DECIMAL = Pattern.compile("0|[1-9][0-9]*");
     private static final Pattern HANDLE = Pattern.compile("[0-9a-f]{16}");
 

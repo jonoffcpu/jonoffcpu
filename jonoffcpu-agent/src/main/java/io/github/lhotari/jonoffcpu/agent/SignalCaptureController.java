@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -326,9 +325,7 @@ final class SignalCaptureController {
                         capture.epoch(),
                         capture.signal(),
                         capture.delivery(),
-                        config.sampleThreshold(),
-                        config.minOffCpuMicros(),
-                        config.maxOffCpuMicros(),
+                        config.sampling(),
                         JsonSupport.requireNumber(prepared, "hostTgid", 1, 0xffffffffL),
                         config.targetPid(),
                         JsonSupport.requireObject(prepared, "verifiedIdentity"));
@@ -430,7 +427,7 @@ final class SignalCaptureController {
 
     // ---------------------------------------------------------------- profiler-only mode
     //
-    // sampleProbability 0 turns the agent into a plain async-profiler launcher: no eBPF program is loaded, no
+    // Admission policy none turns the agent into a plain async-profiler launcher: no eBPF program is loaded, no
     // signal is negotiated, and no BPF privileges are needed. The JFR is the only measurement. The correlation
     // path still receives a single captureFinalized row so tooling can tell "deliberately disabled" from "lost".
 
@@ -492,8 +489,7 @@ final class SignalCaptureController {
             analysisInputs.addProperty("mode", "profilerOnly");
             analysisInputs.addProperty("sessionId", sessionId);
             analysisInputs.addProperty("targetPid", config.targetPid());
-            analysisInputs.addProperty("sampleThreshold", config.sampleThreshold());
-            analysisInputs.add("sourcePolicy", config.sourcePolicy());
+            analysisInputs.add("sampling", config.sampling().json());
             analysisInputs.add("jfrArtifact", jfrArtifact.json());
             JsonObject footer = new JsonObject();
             footer.addProperty("schemaVersion", 1);
@@ -501,7 +497,7 @@ final class SignalCaptureController {
             footer.addProperty("sessionId", sessionId);
             footer.addProperty("state", "profilerOnly");
             footer.addProperty("sourceDisabled", true);
-            footer.addProperty("reason", "sampleProbability=0");
+            footer.addProperty("reason", "sampling.admission.policy=none");
             footer.add("analysisInputs", analysisInputs.deepCopy());
             footer.addProperty("apStopResponse", apStopReceipt);
             footer.addProperty("finalizedAt", Instant.now().toString());
@@ -539,9 +535,7 @@ final class SignalCaptureController {
         value.addProperty("schemaVersion", 1);
         value.addProperty("targetPid", config.targetPid());
         value.addProperty("outputPath", manifest.sourcePath().toString());
-        value.addProperty("sampleThreshold", config.sampleThreshold());
-        if (config.minOffCpuMicros() != null) value.addProperty("minOffCpuMicros", config.minOffCpuMicros());
-        if (config.maxOffCpuMicros() != null) value.addProperty("maxOffCpuMicros", config.maxOffCpuMicros());
+        value.add("sampling", config.sampling().json());
         return value;
     }
 
@@ -552,9 +546,7 @@ final class SignalCaptureController {
         value.addProperty("captureEpoch", capture.epoch());
         value.addProperty("signal", capture.signal());
         value.addProperty("signalDelivery", capture.delivery());
-        value.addProperty("sampleThreshold", config.sampleThreshold());
-        if (config.minOffCpuMicros() != null) value.addProperty("minOffCpuMicros", config.minOffCpuMicros());
-        if (config.maxOffCpuMicros() != null) value.addProperty("maxOffCpuMicros", config.maxOffCpuMicros());
+        value.add("sampling", config.sampling().json());
         return value;
     }
 
@@ -635,23 +627,9 @@ final class SignalCaptureController {
         }
     }
 
+    // The native collector echoes the sampling object it was prepared with; any drift is a protocol error.
     private void validateEffectivePolicy(JsonObject result) {
-        JsonSupport.requireEqual(
-                "sampleThreshold",
-                config.sampleThreshold(),
-                JsonSupport.requireNumber(result, "sampleThreshold", 0, 1L << 32));
-        validateOptionalPolicy(result, "minOffCpuMicros", config.minOffCpuMicros());
-        validateOptionalPolicy(result, "maxOffCpuMicros", config.maxOffCpuMicros());
-    }
-
-    private static void validateOptionalPolicy(JsonObject result, String name, Long expected) {
-        JsonElement actual = result.get(name);
-        if (expected == null) {
-            if (actual == null || !actual.isJsonNull())
-                throw new IllegalStateException(name + " was enabled unexpectedly");
-        } else {
-            JsonSupport.requireEqual(name, Long.toString(expected), JsonSupport.requireDecimal(result, name));
-        }
+        JsonSupport.requireEqual("sampling", config.sampling().json(), JsonSupport.requireObject(result, "sampling"));
     }
 
     private void requireCapture(CaptureProtocol.Active found) {
@@ -678,10 +656,9 @@ final class SignalCaptureController {
         value.addProperty("signalDelivery", capture.delivery());
         value.addProperty("hostTgid", JsonSupport.requireNumber(prepared, "hostTgid", 1, 0xffffffffL));
         value.addProperty("targetPid", config.targetPid());
-        value.addProperty("sampleThreshold", config.sampleThreshold());
+        value.add("sampling", config.sampling().json());
         value.addProperty("monotonicOffsetNanos", JsonSupport.requireDecimal(identity, "monotonicOffsetNanos"));
         value.addProperty("clockVerified", JsonSupport.requireBoolean(identity, "clockVerified"));
-        value.add("sourcePolicy", config.sourcePolicy());
         value.add("verifiedIdentity", identity.deepCopy());
         value.add("apStats", stringMap(counters));
         value.add("sourceArtifact", sourceArtifact.json());

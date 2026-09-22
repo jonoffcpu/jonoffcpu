@@ -111,7 +111,7 @@ public final class OfflineCorrelatorTest {
         row.addProperty("hostTid", 456);
         row.addProperty("targetTid", tid);
         row.addProperty("targetTgid", ProcessHandle.current().pid());
-        row.addProperty("sampleThreshold", 42949673);
+        row.addProperty("admissionThreshold", 42949673);
         row.addProperty("processGenerationNs", "100");
         row.addProperty("registrationToken", "0000000000000001");
         row.addProperty("threadGenerationNs", "200");
@@ -127,7 +127,27 @@ public final class OfflineCorrelatorTest {
         return row;
     }
 
+    static JsonObject uniformSampling() {
+        JsonObject admission = new JsonObject();
+        admission.addProperty("policy", "uniform");
+        admission.addProperty("probability", "0.01");
+        admission.addProperty("probabilityThreshold", 42949673);
+        return sampling(admission);
+    }
+
+    static JsonObject sampling(JsonObject admission) {
+        JsonObject sampling = new JsonObject();
+        sampling.add("minOffCpuMicros", JsonNull.INSTANCE);
+        sampling.add("maxOffCpuMicros", JsonNull.INSTANCE);
+        sampling.add("admission", admission);
+        return sampling;
+    }
+
     static Path source(Path dir, Path jfr, List<JsonObject> observations) throws IOException {
+        return source(dir, jfr, observations, uniformSampling());
+    }
+
+    static Path source(Path dir, Path jfr, List<JsonObject> observations, JsonObject sampling) throws IOException {
         List<JsonObject> samples = new ArrayList<>();
         List<JsonObject> statsRows = new ArrayList<>();
         SignalJfrExporter.visit(jfr, raw -> {
@@ -141,16 +161,13 @@ public final class OfflineCorrelatorTest {
         start.addProperty("signalDelivery", "queued");
         start.addProperty("hostTgid", 123);
         start.addProperty("targetPid", ProcessHandle.current().pid());
-        start.addProperty("sampleThreshold", 42949673);
-        start.addProperty("sampleDenominator", 4294967296L);
+        start.add("sampling", sampling);
         start.addProperty("processGenerationNs", "100");
         start.addProperty("timeNamespaceInode", "42");
         start.addProperty("pidNamespaceDevice", "4");
         start.addProperty("pidNamespaceInode", "43");
         start.addProperty("registrationToken", "0000000000000001");
         start.addProperty("startedMonotonicNanos", "500");
-        start.add("minOffCpuMicros", JsonNull.INSTANCE);
-        start.add("maxOffCpuMicros", JsonNull.INSTANCE);
         JsonObject end = row("captureEnd");
         end.addProperty("state", "complete");
         end.addProperty("drainTimedOut", false);
@@ -168,7 +185,7 @@ public final class OfflineCorrelatorTest {
         JsonObject kernel = new JsonObject();
         kernel.addProperty("targetNamespaceFailures", "0");
         kernel.addProperty("eligibleIntervals", Integer.toString(observations.size()));
-        kernel.addProperty("probabilityRejections", "0");
+        kernel.addProperty("admissionRejections", "0");
         kernel.addProperty("selectedIntervals", Integer.toString(observations.size()));
         for (String key : List.of(
                 "ringReserveFailures",
@@ -225,6 +242,58 @@ public final class OfflineCorrelatorTest {
         Path result = dir.resolve("source.jsonl");
         Files.writeString(result, raw + footer.toString() + "\n");
         return result;
+    }
+
+    /**
+     * Under the proportional policy each row carries the threshold the kernel drew against: 2^32 at and above the
+     * reference duration, duration * 2^32 / reference below it. The estimate weights each row by its own threshold.
+     */
+    private static void proportionalEstimate(Path dir, Path jfr, JsonObject matched, long tid) throws Exception {
+        JsonObject admission = new JsonObject();
+        admission.addProperty("policy", "proportional");
+        admission.addProperty("recordAllAboveMicros", 2);
+        JsonObject certain = matched.deepCopy();
+        certain.addProperty("admissionThreshold", 1L << 32);
+        JsonObject half = observation(tid);
+        half.addProperty("correlationId", "8000000100000002");
+        half.addProperty("startMonotonicNanos", "4000");
+        half.addProperty("endMonotonicNanos", "5000");
+        half.addProperty("admissionThreshold", 1L << 31);
+        Path source = source(dir, jfr, List.of(certain, half), sampling(admission));
+        var result = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
+        check(result.invalidSource() == 0 && result.matched() == 1, "Proportional rows were not accepted");
+        check(
+                result.populationEstimate().status().equals("available")
+                        && result.populationEstimate().admissionPolicy().equals("proportional")
+                        && result.populationEstimate()
+                                .sourceSelectedObservedDurationNanos()
+                                .equals("4000")
+                        && result.populationEstimate().estimatedDurationNanos().equals("5000"),
+                "Proportional estimate must weight the half-probability row twice: " + result.populationEstimate());
+        JsonObject wrong = half.deepCopy();
+        wrong.addProperty("admissionThreshold", 1L << 32);
+        source = source(dir, jfr, List.of(certain, wrong), sampling(admission));
+        result = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
+        check(result.invalidSource() == 1, "Row threshold that disagrees with the policy was accepted");
+        check(
+                result.populationEstimate().status().equals("unavailable")
+                        && result.populationEstimate()
+                                .unavailableReasons()
+                                .contains("intrinsically-invalid-or-duplicate-source-rows"),
+                "Invalid row must disable the estimate");
+        source = source(dir, jfr, List.of(certain, half), sampling(admission));
+        mutateSource(
+                source,
+                0,
+                row -> row.getAsJsonObject("sampling")
+                        .getAsJsonObject("admission")
+                        .addProperty("recordAllAboveMicros", 3));
+        rejects(source, jfr, OfflineCorrelator.Limits.defaults(), "Source/footer mismatch: sampling");
+        JsonObject bounded = sampling(admission);
+        bounded.addProperty("minOffCpuMicros", 1);
+        source = source(dir, jfr, List.of(certain, half), bounded);
+        result = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
+        check(result.invalidSource() == 1, "Strict lower bound did not reject the 1000 ns row");
     }
 
     /**
@@ -418,14 +487,17 @@ public final class OfflineCorrelatorTest {
                             .getAsString()
                             .equals("3000"),
                     "Matched duration estimate basis mismatch");
+            check(estimate.get("admissionPolicy").getAsString().equals("uniform"), "Population estimate lost policy");
             check(
-                    estimate.get("durationNanosNumerator")
+                    estimate.get("estimatedDurationNanos")
                             .getAsString()
-                            .equals(BigInteger.valueOf(3000).shiftLeft(32).toString()),
-                    "Population estimate lost exact numerator");
-            check(
-                    estimate.get("durationNanosDenominator").getAsString().equals("42949673"),
-                    "Population estimate lost effective threshold");
+                            .equals(BigInteger.valueOf(3000)
+                                    .shiftLeft(32)
+                                    .divide(BigInteger.valueOf(42949673))
+                                    .toString()),
+                    "Population estimate is not the truncated exact inverse-probability sum");
+            // Writes its own source.jsonl variants, so it runs before the two-row source below is created.
+            proportionalEstimate(dir, jfr, observation, tid[0]);
             JsonObject unmatched = observation(tid[0]);
             unmatched.addProperty("correlationId", "8000000100000002");
             Path twoSource = source(dir, jfr, List.of(observation, unmatched));

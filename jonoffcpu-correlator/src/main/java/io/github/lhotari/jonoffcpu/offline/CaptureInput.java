@@ -70,6 +70,11 @@ final class CaptureInput {
         return read(source, jfr, limits, false, false);
     }
 
+    /** The validated sampling policy from {@code captureStart}. */
+    SamplingPolicy sampling() throws IOException {
+        return SamplingPolicy.parse(object(start, "sampling"));
+    }
+
     static CaptureInput read(Path source, Path jfr, OfflineCorrelator.Limits limits, boolean partialJfr)
             throws IOException {
         return read(source, jfr, limits, false, partialJfr);
@@ -116,9 +121,9 @@ final class CaptureInput {
                 if (type.equals("captureFinalized")
                         && start == null
                         && "profilerOnly".equals(optionalText(row, "state"))) {
-                    throw new IOException("This capture was recorded with sampleProbability 0 (profiler-only mode):"
-                            + " the eBPF source was disabled, the JFR holds only async-profiler events,"
-                            + " and there is nothing to correlate");
+                    throw new IOException("This capture was recorded with sampling.admission.policy none"
+                            + " (profiler-only mode): the eBPF source was disabled, the JFR holds only"
+                            + " async-profiler events, and there is nothing to correlate");
                 }
                 switch (type) {
                     case "captureStart" -> {
@@ -170,47 +175,20 @@ final class CaptureInput {
         }
         require(text(start, "sourceId").equals("jonoffcpu.offcpu.v1"), "Unsupported source");
         require(text(start, "registrationToken").matches("[0-9a-f]{16}"), "Invalid process registration token");
-        for (String key : List.of("signal", "hostTgid", "targetPid", "sampleThreshold")) {
+        for (String key : List.of("signal", "hostTgid", "targetPid")) {
             require(number(start, key) == number(inputs, key), "Source/footer mismatch: " + key);
         }
         require(number(inputs, "signal") > 0 && number(inputs, "signal") <= Integer.MAX_VALUE, "Invalid signal");
         require(number(inputs, "hostTgid") > 0 && number(inputs, "targetPid") > 0, "Invalid target PID");
-        long threshold = number(inputs, "sampleThreshold");
-        require(threshold >= 0 && threshold <= 1L << 32, "Invalid probability threshold");
-        require(number(start, "sampleDenominator") == 1L << 32, "Unsupported probability denominator");
-        BigInteger minimum = null;
-        BigInteger maximum = null;
-        for (String key : List.of("minOffCpuMicros", "maxOffCpuMicros")) {
-            require(start.has(key), "Missing source bound: " + key);
-            if (!start.get(key).isJsonNull()) {
-                BigInteger bound = decimal(start, key);
-                require(
-                        bound.multiply(BigInteger.valueOf(1000)).compareTo(U64_MAX) <= 0,
-                        "Duration policy overflows nanoseconds");
-                if (key.startsWith("min")) minimum = bound;
-                else maximum = bound;
-            }
-        }
-        require(minimum == null || maximum == null || minimum.compareTo(maximum) < 0, "Invalid duration policy bounds");
+        // The agent writes one resolved sampling object everywhere; the copies must agree exactly.
+        SamplingPolicy.parse(object(start, "sampling"));
+        require(object(start, "sampling").equals(object(inputs, "sampling")), "Source/footer mismatch: sampling");
         for (String key : List.of("pidNamespaceDevice", "pidNamespaceInode")) {
             require(decimal(start, key).signum() > 0, "Invalid source namespace: " + key);
         }
         decimal(start, "processGenerationNs");
         decimal(start, "timeNamespaceInode");
         decimal(start, "startedMonotonicNanos");
-        if (inputs.has("sourcePolicy")) {
-            JsonObject policy = object(inputs, "sourcePolicy");
-            require(number(policy, "sampleThreshold") == threshold, "Source policy threshold mismatch");
-            for (String key : List.of("minOffCpuMicros", "maxOffCpuMicros")) {
-                if (start.get(key).isJsonNull()) {
-                    require(!policy.has(key) || policy.get(key).isJsonNull(), "Unexpected source policy bound: " + key);
-                } else {
-                    require(
-                            decimal(start, key).equals(BigInteger.valueOf(number(policy, key))),
-                            "Source policy bound mismatch: " + key);
-                }
-            }
-        }
         if (footer != null) {
             require(bool(inputs, "clockVerified"), "Clock translation not verified");
             signedDecimal(inputs, "monotonicOffsetNanos");

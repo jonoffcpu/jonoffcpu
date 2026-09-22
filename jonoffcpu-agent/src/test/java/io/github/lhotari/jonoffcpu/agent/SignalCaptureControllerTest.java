@@ -67,6 +67,8 @@ public final class SignalCaptureControllerTest {
             nativeOptionParsing(root.resolve("options"));
             yamlConfigParsing(root.resolve("yaml"));
             samplingProbabilityParsing(root.resolve("sampling-probability"));
+            samplingConfigParsing(root.resolve("sampling-config"));
+            proportionalAdmissionThreshold();
             unsignedStopCountersParse();
             System.out.println("SignalCaptureController fixtures passed");
         } finally {
@@ -110,7 +112,7 @@ public final class SignalCaptureControllerTest {
         Files.createDirectory(root);
         FakeProfiler profiler = new FakeProfiler();
         FakeSource source = new FakeSource();
-        SignalCaptureController controller = controller(root, profiler, source, BigDecimal.ZERO);
+        SignalCaptureController controller = controller(root, profiler, source, NONE);
         controller.start();
         check(controller.state() == SignalCaptureController.State.PROFILER_ONLY, "profiler-only state expected");
         check(profiler.plainStarts == 1 && profiler.cookieStarts == 0, "AP must start without signalcookie");
@@ -143,7 +145,9 @@ public final class SignalCaptureControllerTest {
         Files.createDirectory(root);
         FakeProfiler profiler = new FakeProfiler();
         FakeSource source = new FakeSource();
-        SignalCaptureController controller = controller(root, profiler, source, BigDecimal.ZERO);
+        // A zero uniform probability resolves to the explicit none policy.
+        SignalCaptureController controller = controller(
+                root, profiler, source, new SamplingConfig(null, null, SamplingConfig.uniform(BigDecimal.ZERO)));
         controller.start();
         profiler.stopExternally();
         controller.pollProfiler();
@@ -163,7 +167,7 @@ public final class SignalCaptureControllerTest {
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
                         + root.resolve("source.ndjson")
-                        + ",jonoffcpudelivery=coalescing,asprofpath="
+                        + ",jonoffcpudelivery=coalescing,sampling-policy=uniform,sampling-probability=1,asprofpath="
                         + ap
                         + ",event=cpu,file="
                         + root.resolve("original.jfr"),
@@ -465,21 +469,44 @@ public final class SignalCaptureControllerTest {
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
                         + root.resolve("correlation.ndjson")
-                        + ",samplethreshold=0.1,min-off-cpu-micros=7,asprofpath="
+                        + ",sampling-policy=uniform,sampling-probability=0.1,min-off-cpu-micros=7,asprofpath="
                         + ap
                         + ",event=cpu,alloc=1m,jfrsync=profile,file="
                         + jfr,
                 nativeLibrary);
-        check(config.requestedSampleProbability().toPlainString().equals("0.1"), "requested probability not retained");
-        check(config.sampleThreshold() == 429_496_729L, "probability threshold was not rounded down");
+        SamplingConfig.Uniform uniform =
+                (SamplingConfig.Uniform) config.sampling().admission();
+        check(uniform.probability().toPlainString().equals("0.1"), "requested probability not retained");
+        check(uniform.probabilityThreshold() == 429_496_729L, "probability threshold was not rounded down");
+        JsonObject persisted = config.sampling().json();
         check(
-                config.sourcePolicy()
-                                .get("requestedSampleProbability")
+                persisted
+                                .getAsJsonObject("admission")
+                                .get("probability")
                                 .getAsString()
                                 .equals("0.1")
-                        && config.sourcePolicy().get("sampleThreshold").getAsLong() == 429_496_729L,
-                "requested/effective sampling policy not persisted");
-        check(config.minOffCpuMicros() == 7 && config.maxOffCpuMicros() == null, "optional duration policy lost");
+                        && persisted
+                                        .getAsJsonObject("admission")
+                                        .get("probabilityThreshold")
+                                        .getAsLong()
+                                == 429_496_729L
+                        && persisted.get("minOffCpuMicros").getAsLong() == 7
+                        && persisted.get("maxOffCpuMicros").isJsonNull(),
+                "requested/effective sampling policy not persisted: " + persisted);
+        check(
+                config.sampling().minOffCpuMicros() == 7 && config.sampling().maxOffCpuMicros() == null,
+                "optional duration policy lost");
+        AgentConfig proportional = AgentConfig.parseNativeOptions(
+                "jonoffcpuoutput="
+                        + root.resolve("proportional.ndjson")
+                        + ",sampling-policy=proportional,record-all-above-micros=250,asprofpath="
+                        + ap
+                        + ",event=cpu,file="
+                        + root.resolve("proportional.jfr"),
+                nativeLibrary);
+        check(
+                proportional.sampling().admission().equals(new SamplingConfig.Proportional(250)),
+                "proportional native options not parsed");
         check(config.asyncProfilerOptions().contains("event=cpu,alloc=1m,jfrsync=profile"), "AP tail changed");
         check(config.jfrOutput().equals(jfr), "AP output path not retained");
 
@@ -487,7 +514,7 @@ public final class SignalCaptureControllerTest {
             AgentConfig.parseNativeOptions(
                     "jonoffcpuoutput="
                             + root.resolve("pattern.ndjson")
-                            + ",asprofpath="
+                            + ",sampling-policy=uniform,sampling-probability=1,asprofpath="
                             + ap
                             + ",event=cpu,file="
                             + root.resolve("profile-%p.jfr"),
@@ -502,7 +529,7 @@ public final class SignalCaptureControllerTest {
                 AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
                                 + root.resolve("rejected-" + action + ".ndjson")
-                                + ",asprofpath="
+                                + ",sampling-policy=uniform,sampling-probability=1,asprofpath="
                                 + ap
                                 + ","
                                 + action
@@ -519,7 +546,9 @@ public final class SignalCaptureControllerTest {
 
         Path racedJfr = root.resolve("raced.jfr");
         AgentConfig raced = AgentConfig.parseNativeOptions(
-                "jonoffcpuoutput=" + root.resolve("raced.ndjson") + ",asprofpath=" + ap + ",event=cpu,file=" + racedJfr,
+                "jonoffcpuoutput=" + root.resolve("raced.ndjson")
+                        + ",sampling-policy=uniform,sampling-probability=1,asprofpath=" + ap + ",event=cpu,file="
+                        + racedJfr,
                 nativeLibrary);
         Files.writeString(racedJfr, "foreign");
         FakeProfiler profiler = new FakeProfiler();
@@ -544,15 +573,21 @@ public final class SignalCaptureControllerTest {
                 nativeCollectorLibrary: %s
                 asyncProfilerOptions: event=cpu,file=%s
                 signalDelivery: coalescing
-                sampleProbability: "0.125"
-                minOffCpuMicros: 10
-                maxOffCpuMicros: 1000
+                sampling:
+                  minOffCpuMicros: 10
+                  maxOffCpuMicros: 1000
+                  admission:
+                    policy: uniform
+                    probability: "0.125"
                 """.formatted(
                         root.resolve("correlation.ndjson"), ap, nativeLibrary, root.resolve("combined.jfr")));
         AgentConfig config = AgentConfig.parse(configFile.toString());
         check(config.signalDelivery().equals("coalescing"), "YAML delivery policy not parsed");
-        check(config.sampleThreshold() == 536_870_912L, "YAML sampling probability not parsed exactly");
-        check(config.minOffCpuMicros() == 10 && config.maxOffCpuMicros() == 1000, "YAML duration bounds not parsed");
+        check(
+                config.sampling()
+                        .equals(new SamplingConfig(
+                                10L, 1000L, new SamplingConfig.Uniform(new BigDecimal("0.125"), 536_870_912L))),
+                "YAML sampling policy not parsed exactly: " + config.sampling());
         try {
             AgentConfig.parse("correlationOutput: /tmp/a\nunknownOption: true\n");
             throw new AssertionError("Expected unknown YAML key rejection");
@@ -572,9 +607,6 @@ public final class SignalCaptureControllerTest {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         String[][] valid = {
-            {"0", "0"},
-            {"0.0000000001", "0"},
-            {"0.0000000002", "0"},
             {"0.0000000003", "1"},
             {"0.5", "2147483648"},
             {"1.000", "4294967296"}
@@ -583,26 +615,42 @@ public final class SignalCaptureControllerTest {
             AgentConfig config = AgentConfig.parseNativeOptions(
                     "jonoffcpuoutput="
                             + root.resolve("valid-" + i + ".ndjson")
-                            + ",samplethreshold="
+                            + ",sampling-policy=uniform,sampling-probability="
                             + valid[i][0]
                             + ",asprofpath="
                             + ap
                             + ",event=cpu,file="
                             + root.resolve("valid-" + i + ".jfr"),
                     nativeLibrary);
+            SamplingConfig.Uniform uniform =
+                    (SamplingConfig.Uniform) config.sampling().admission();
             check(
-                    config.requestedSampleProbability().toPlainString().equals(valid[i][0]),
+                    uniform.probability().toPlainString().equals(valid[i][0]),
                     "requested probability spelling was not retained: " + valid[i][0]);
             check(
-                    Long.toString(config.sampleThreshold()).equals(valid[i][1]),
+                    Long.toString(uniform.probabilityThreshold()).equals(valid[i][1]),
                     "wrong effective threshold for " + valid[i][0]);
         }
-        for (String invalid : new String[] {"-0.1", ".5", "1.0001", "1e-1", "NaN"}) {
+        // Exactly zero is the explicit off switch; a positive value that rounds to no draws is a mistake.
+        for (String zero : new String[] {"0", "0.000"}) {
+            AgentConfig config = AgentConfig.parseNativeOptions(
+                    "jonoffcpuoutput="
+                            + root.resolve("zero-" + zero.length() + ".ndjson")
+                            + ",sampling-policy=uniform,sampling-probability="
+                            + zero
+                            + ",asprofpath="
+                            + ap
+                            + ",event=cpu,file="
+                            + root.resolve("zero-" + zero.length() + ".jfr"),
+                    nativeLibrary);
+            check(config.profilerOnly() && config.sampling().admission().equals(NONE.admission()), "zero != none");
+        }
+        for (String invalid : new String[] {"-0.1", ".5", "1.0001", "1e-1", "NaN", "0.0000000001", "0.0000000002"}) {
             try {
                 AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
                                 + root.resolve("invalid-" + invalid.hashCode() + ".ndjson")
-                                + ",samplethreshold="
+                                + ",sampling-policy=uniform,sampling-probability="
                                 + invalid
                                 + ",asprofpath="
                                 + ap
@@ -616,6 +664,103 @@ public final class SignalCaptureControllerTest {
                         "wrong invalid probability failure for " + invalid + ": " + expected.getMessage());
             }
         }
+    }
+
+    private static void samplingConfigParsing(Path root) throws Exception {
+        Files.createDirectory(root);
+        Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
+        Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
+        String prefix = """
+                correlationOutput: %s
+                asyncProfilerLibrary: %s
+                nativeCollectorLibrary: %s
+                asyncProfilerOptions: event=cpu,file=%s
+                """;
+        int counter = 0;
+        for (String[] valid : new String[][] {
+            {"sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 10000\n", "proportional"},
+            {
+                "sampling:\n  minOffCpuMicros: 100\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 1\n",
+                "proportional"
+            },
+            {"sampling:\n  admission:\n    policy: none\n", "none"},
+            {"sampling:\n  admission:\n    policy: uniform\n    probability: 1\n", "uniform"},
+        }) {
+            counter++;
+            String yaml = prefix.formatted(
+                            root.resolve("valid-" + counter + ".ndjson"),
+                            ap,
+                            nativeLibrary,
+                            root.resolve("valid-" + counter + ".jfr"))
+                    + valid[0];
+            AgentConfig config = AgentConfig.parse(yaml);
+            check(config.sampling().admission().policy().equals(valid[1]), "policy not parsed: " + yaml);
+            check(config.profilerOnly() == valid[1].equals("none"), "profiler-only mismatch: " + yaml);
+        }
+        AgentConfig proportional = AgentConfig.parse(
+                prefix.formatted(root.resolve("p.ndjson"), ap, nativeLibrary, root.resolve("p.jfr"))
+                        + "sampling:\n  minOffCpuMicros: 100\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 10000\n");
+        check(
+                proportional
+                        .sampling()
+                        .json()
+                        .toString()
+                        .equals("{\"minOffCpuMicros\":100,\"maxOffCpuMicros\":null,"
+                                + "\"admission\":{\"policy\":\"proportional\",\"recordAllAboveMicros\":10000}}"),
+                "unexpected sampling JSON: " + proportional.sampling().json());
+        for (String invalid : new String[] {
+            "",
+            "sampling: {}\n",
+            "sampling:\n  admission: {}\n",
+            "sampling:\n  admission:\n    policy: linear\n",
+            "sampling:\n  admission:\n    policy: proportional\n",
+            "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 0\n",
+            "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 5\n    probability: 1\n",
+            "sampling:\n  admission:\n    policy: uniform\n",
+            "sampling:\n  admission:\n    policy: uniform\n    probability: 1\n    recordAllAboveMicros: 5\n",
+            "sampling:\n  minOffCpuMicros: 1\n  admission:\n    policy: none\n",
+            "sampling:\n  maxOffCpuMicros: 1\n  admission:\n    policy: none\n",
+            "sampling:\n  minOffCpuMicros: 5\n  maxOffCpuMicros: 5\n  admission:\n    policy: none\n",
+            "sampling:\n  sampleProbability: 1\n  admission:\n    policy: none\n",
+            "sampleProbability: 1\n",
+        }) {
+            counter++;
+            String yaml = prefix.formatted(
+                            root.resolve("invalid-" + counter + ".ndjson"),
+                            ap,
+                            nativeLibrary,
+                            root.resolve("invalid-" + counter + ".jfr"))
+                    + invalid;
+            try {
+                AgentConfig.parse(yaml);
+                throw new AssertionError("Expected sampling config rejection: " + invalid);
+            } catch (IllegalArgumentException expected) {
+                // rejected as intended
+            }
+        }
+    }
+
+    private static void proportionalAdmissionThreshold() {
+        long certain = SamplingConfig.CERTAIN_ADMISSION;
+        long reference = 10_000_000L;
+        check(SamplingConfig.admissionThreshold(reference, reference) == certain, "reference must be certain");
+        check(SamplingConfig.admissionThreshold(Long.MAX_VALUE, reference) == certain, "long wait must be certain");
+        check(SamplingConfig.admissionThreshold(-1L, reference) == certain, "u64 max must be certain");
+        check(SamplingConfig.admissionThreshold(reference / 10, reference) == certain / 10, "tenth must be 2^32/10");
+        check(SamplingConfig.admissionThreshold(0, reference) == 0, "zero duration never admits");
+        check(SamplingConfig.admissionThreshold(1, reference) == 429, "one nanosecond threshold");
+        long shifted = 10_000_000_000L;
+        check(SamplingConfig.admissionThreshold(shifted / 2, shifted) == certain / 2, "shifted half");
+        long justBelow = SamplingConfig.admissionThreshold(shifted - 1, shifted);
+        check(justBelow >= certain - 2 && justBelow < certain, "shifted just below: " + justBelow);
+        check(SamplingConfig.admissionThreshold(-2L, -1L) == certain, "u64 max reference");
+        SamplingConfig proportional = new SamplingConfig(null, null, new SamplingConfig.Proportional(10_000));
+        check(proportional.admissionThreshold(1_000_000) == certain / 10, "policy delegation");
+        check(
+                new SamplingConfig(null, null, new SamplingConfig.Uniform(BigDecimal.ONE, certain))
+                                .admissionThreshold(1)
+                        == certain,
+                "uniform ignores duration");
     }
 
     private static void unsignedStopCountersParse() {
@@ -644,13 +789,17 @@ public final class SignalCaptureControllerTest {
         check(stopped.manifestCounters().get("submittedSamples").equals(max), "u64 AP counter rejected");
     }
 
+    private static final SamplingConfig NONE = new SamplingConfig(null, null, new SamplingConfig.None());
+    private static final SamplingConfig SPARSE =
+            new SamplingConfig(null, null, SamplingConfig.uniform(new BigDecimal("0.0000000233")));
+
     private static SignalCaptureController controller(Path root, FakeProfiler profiler, FakeSource source)
             throws IOException {
-        return controller(root, profiler, source, new BigDecimal("0.0000000233"));
+        return controller(root, profiler, source, SPARSE);
     }
 
     private static SignalCaptureController controller(
-            Path root, FakeProfiler profiler, FakeSource source, BigDecimal probability) throws IOException {
+            Path root, FakeProfiler profiler, FakeSource source, SamplingConfig sampling) throws IOException {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         AgentConfig config = new AgentConfig(
@@ -661,10 +810,7 @@ public final class SignalCaptureControllerTest {
                 ProcessHandle.current().pid(),
                 "event=cpu",
                 "queued",
-                probability,
-                probability.multiply(new BigDecimal(1L << 32)).toBigInteger().longValueExact(),
-                null,
-                null,
+                sampling,
                 50,
                 0,
                 1000);
@@ -786,7 +932,7 @@ public final class SignalCaptureControllerTest {
         private boolean stopError;
         private boolean nativeStackFailure;
         private Path source;
-        private long threshold;
+        private JsonObject sampling;
         private long targetPid;
         private int signal;
         private String session;
@@ -797,16 +943,14 @@ public final class SignalCaptureControllerTest {
             prepareCalls++;
             JsonObject config = JsonParser.parseString(configJson).getAsJsonObject();
             source = Path.of(config.get("outputPath").getAsString());
-            threshold = config.get("sampleThreshold").getAsLong();
+            sampling = config.getAsJsonObject("sampling");
             targetPid = config.get("targetPid").getAsLong();
             JsonObject result = success("prepared");
             result.addProperty("handle", HANDLE);
             result.addProperty("sourcePath", source.toString());
             result.addProperty("targetPid", config.get("targetPid").getAsLong());
             result.addProperty("hostTgid", config.get("targetPid").getAsLong());
-            result.addProperty("sampleThreshold", threshold);
-            result.add("minOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
-            result.add("maxOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
+            result.add("sampling", sampling.deepCopy());
             JsonObject identity = new JsonObject();
             identity.addProperty("registrationToken", "0123456789abcdef");
             identity.addProperty("processGenerationNs", "9");
@@ -834,9 +978,7 @@ public final class SignalCaptureControllerTest {
             result.addProperty("sourcePath", source.toString());
             result.addProperty("targetPid", targetPid);
             result.addProperty("hostTgid", targetPid);
-            result.addProperty("sampleThreshold", threshold);
-            result.add("minOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
-            result.add("maxOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
+            result.add("sampling", sampling.deepCopy());
             JsonObject identity = new JsonObject();
             identity.addProperty("registrationToken", "0123456789abcdef");
             identity.addProperty("processGenerationNs", "9");
@@ -854,8 +996,7 @@ public final class SignalCaptureControllerTest {
             start.addProperty("captureEpoch", 7);
             start.addProperty("signal", signal);
             start.addProperty("signalDelivery", signal >= 34 ? "queued" : "coalescing");
-            start.addProperty("sampleThreshold", threshold);
-            start.addProperty("sampleDenominator", 4294967296L);
+            start.add("sampling", sampling.deepCopy());
             start.addProperty("startedMonotonicNanos", "9");
             start.addProperty("hostTgid", targetPid);
             start.addProperty("targetPid", targetPid);
@@ -864,8 +1005,6 @@ public final class SignalCaptureControllerTest {
             start.addProperty("timeNamespaceInode", "42");
             start.addProperty("pidNamespaceDevice", "4");
             start.addProperty("pidNamespaceInode", "43");
-            start.add("minOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
-            start.add("maxOffCpuMicros", com.google.gson.JsonNull.INSTANCE);
             try {
                 Files.writeString(source, start + "\n");
             } catch (IOException error) {
@@ -899,7 +1038,11 @@ public final class SignalCaptureControllerTest {
                     observation.addProperty("hostTid", targetPid);
                     observation.addProperty("targetTgid", targetPid);
                     observation.addProperty("targetTid", targetPid);
-                    observation.addProperty("sampleThreshold", threshold);
+                    observation.addProperty(
+                            "admissionThreshold",
+                            sampling.getAsJsonObject("admission")
+                                    .get("probabilityThreshold")
+                                    .getAsLong());
                     observation.addProperty("processGenerationNs", "9");
                     observation.addProperty("threadGenerationNs", "9");
                     observation.addProperty("registrationToken", "0123456789abcdef");
@@ -974,7 +1117,7 @@ public final class SignalCaptureControllerTest {
                 "lifetimeRejections",
                 "eligibleIntervals",
                 "eligibleDurationMicros",
-                "probabilityRejections",
+                "admissionRejections",
                 "selectedIntervals",
                 "sequenceExhaustions",
                 "sequenceContentions",

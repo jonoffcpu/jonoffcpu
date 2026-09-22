@@ -68,8 +68,11 @@ def main():
         "asyncProfilerOptions: "
         "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/original.jfr\n"
         "signalDelivery: queued\n"
-        "sampleProbability: 0.01\n"
-        "minOffCpuMicros: 100\n"
+        "sampling:\n"
+        "  minOffCpuMicros: 100\n"
+        "  admission:\n"
+        "    policy: proportional\n"
+        "    recordAllAboveMicros: 10000\n"
     )
 
     module = Path(__file__).resolve().parents[1]

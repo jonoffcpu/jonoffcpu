@@ -3,7 +3,7 @@ use crate::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
 use anyhow::{Context, Result, anyhow, bail};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -37,12 +37,7 @@ const TARGET_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub(crate) struct PrepareConfig {
     target_pid: u32,
     output_path: PathBuf,
-    #[serde(deserialize_with = "deserialize_u64")]
-    sample_threshold: u64,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
-    min_off_cpu_micros: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
-    max_off_cpu_micros: Option<u64>,
+    sampling: SamplingConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -53,12 +48,111 @@ pub(crate) struct EnableConfig {
     signal: i32,
     #[serde(default)]
     signal_delivery: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
-    sample_threshold: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    #[serde(default)]
+    sampling: Option<SamplingConfig>,
+}
+
+/// The resolved sampling policy. The same object is echoed verbatim in every control reply and
+/// in the `captureStart` row, so the agent and the correlator can compare copies structurally.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct SamplingConfig {
+    #[serde(deserialize_with = "deserialize_optional_u64")]
     min_off_cpu_micros: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_optional_u64")]
+    #[serde(deserialize_with = "deserialize_optional_u64")]
     max_off_cpu_micros: Option<u64>,
+    admission: Admission,
+}
+
+/// Admission decides which duration-eligible intervals are recorded. The `none` policy never
+/// reaches the collector: the agent runs async-profiler alone in that case.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(
+    tag = "policy",
+    rename_all = "lowercase",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub(crate) enum Admission {
+    /// Every eligible interval is admitted with the same probability `probabilityThreshold / 2^32`.
+    Uniform {
+        probability: String,
+        probability_threshold: u64,
+    },
+    /// An interval of at least `recordAllAboveMicros` is always admitted; a shorter one with
+    /// probability `duration / recordAllAboveMicros`.
+    Proportional { record_all_above_micros: u64 },
+}
+
+/// Shifts the proportional policy's reference duration below 2^32 for the kernel. The BPF program
+/// has no 128-bit arithmetic; with `duration < reference` the shifted numerator
+/// `(duration >> shift) << 32` then stays below 2^64. The threshold the kernel applies is
+/// `((duration >> shift) << 32) / scaled`, or 2^32 at and above the reference; the agent's
+/// verifier and the correlator recompute that exact value from each row.
+pub(crate) fn proportional_scale(record_all_above_ns: u64) -> (u64, u32) {
+    let shift = (64 - record_all_above_ns.leading_zeros()).saturating_sub(32);
+    (record_all_above_ns >> shift, shift)
+}
+
+impl SamplingConfig {
+    fn validate(&self) -> Result<()> {
+        let min_ns = self
+            .min_off_cpu_micros
+            .map(|value| {
+                value
+                    .checked_mul(1_000)
+                    .context("minOffCpuMicros overflows nanos")
+            })
+            .transpose()?;
+        let max_ns = self
+            .max_off_cpu_micros
+            .map(|value| {
+                value
+                    .checked_mul(1_000)
+                    .context("maxOffCpuMicros overflows nanos")
+            })
+            .transpose()?;
+        if min_ns.zip(max_ns).is_some_and(|(min, max)| min >= max) {
+            bail!("minOffCpuMicros must be strictly below maxOffCpuMicros");
+        }
+        match self.admission {
+            Admission::Uniform {
+                probability_threshold,
+                ..
+            } => {
+                if probability_threshold == 0 || probability_threshold > (1_u64 << 32) {
+                    bail!("probabilityThreshold must be in 1..=4294967296");
+                }
+            }
+            Admission::Proportional {
+                record_all_above_micros,
+            } => {
+                if record_all_above_micros == 0 {
+                    bail!("recordAllAboveMicros must be at least 1");
+                }
+                record_all_above_micros
+                    .checked_mul(1_000)
+                    .context("recordAllAboveMicros overflows nanos")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn min_off_cpu_ns(&self) -> u64 {
+        self.min_off_cpu_micros
+            .and_then(|value| value.checked_mul(1_000))
+            .unwrap_or(0)
+    }
+
+    fn max_off_cpu_ns(&self) -> u64 {
+        self.max_off_cpu_micros
+            .and_then(|value| value.checked_mul(1_000))
+            .unwrap_or(0)
+    }
+
+    fn json(&self) -> Value {
+        serde_json::to_value(self).expect("sampling config serializes")
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,16 +160,6 @@ pub(crate) struct EnableConfig {
 enum U64Value {
     Number(u64),
     String(String),
-}
-
-fn deserialize_u64<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    match U64Value::deserialize(deserializer)? {
-        U64Value::Number(value) => Ok(value),
-        U64Value::String(value) => value.parse().map_err(serde::de::Error::custom),
-    }
 }
 
 fn deserialize_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
@@ -97,6 +181,7 @@ struct Observation {
     process_generation_ns: u64,
     thread_generation_ns: u64,
     registration_token: u64,
+    admission_threshold: u64,
     signal_result: i64,
     kernel_stack_id: i64,
     user_stack_id: i64,
@@ -119,7 +204,7 @@ struct KernelStats {
     thread_state_failures: u64,
     eligible_intervals: u64,
     eligible_duration_us: u64,
-    probability_rejections: u64,
+    admission_rejections: u64,
     selected_intervals: u64,
     sequence_exhaustions: u64,
     sequence_contentions: u64,
@@ -158,7 +243,7 @@ impl KernelStats {
             "threadStateFailures": self.thread_state_failures.to_string(),
             "eligibleIntervals": self.eligible_intervals.to_string(),
             "eligibleDurationMicros": self.eligible_duration_us.to_string(),
-            "probabilityRejections": self.probability_rejections.to_string(),
+            "admissionRejections": self.admission_rejections.to_string(),
             "selectedIntervals": self.selected_intervals.to_string(),
             "sequenceExhaustions": self.sequence_exhaustions.to_string(),
             "sequenceContentions": self.sequence_contentions.to_string(),
@@ -243,28 +328,7 @@ pub(crate) fn parse_prepare(json: &str) -> Result<PrepareConfig> {
     if config.output_path.as_os_str().is_empty() {
         bail!("outputPath must be nonempty");
     }
-    if config.sample_threshold > (1_u64 << 32) {
-        bail!("sampleThreshold must be in 0..=4294967296");
-    }
-    let min_ns = config
-        .min_off_cpu_micros
-        .map(|value| {
-            value
-                .checked_mul(1_000)
-                .context("minOffCpuMicros overflows nanos")
-        })
-        .transpose()?;
-    let max_ns = config
-        .max_off_cpu_micros
-        .map(|value| {
-            value
-                .checked_mul(1_000)
-                .context("maxOffCpuMicros overflows nanos")
-        })
-        .transpose()?;
-    if min_ns.zip(max_ns).is_some_and(|(min, max)| min >= max) {
-        bail!("minOffCpuMicros must be strictly below maxOffCpuMicros");
-    }
+    config.sampling.validate()?;
     Ok(config)
 }
 
@@ -873,9 +937,7 @@ fn prepare_internal(
         "sourcePath": output_path,
         "targetPid": prepared.target_pid,
         "hostTgid": prepared.host_tgid,
-        "sampleThreshold": prepared.sample_threshold,
-        "minOffCpuMicros": prepared.min_off_cpu_micros.map(|value| value.to_string()),
-        "maxOffCpuMicros": prepared.max_off_cpu_micros.map(|value| value.to_string()),
+        "sampling": prepared.sampling.json(),
         "verifiedIdentity": {
             "registrationToken": format!("{:016x}", prepared.registration_token),
             "processGenerationNs": prepared.process_generation_ns.to_string(),
@@ -893,9 +955,7 @@ fn prepare_internal(
 struct PreparedReply {
     target_pid: u32,
     host_tgid: u32,
-    sample_threshold: u64,
-    min_off_cpu_micros: Option<u64>,
-    max_off_cpu_micros: Option<u64>,
+    sampling: SamplingConfig,
     registration_token: u64,
     pid_namespace_device: u64,
     pid_namespace_inode: u64,
@@ -1232,9 +1292,7 @@ fn worker(
     let reply = PreparedReply {
         target_pid: identity.target_pid,
         host_tgid: identity.host_tgid,
-        sample_threshold: config.sample_threshold,
-        min_off_cpu_micros: config.min_off_cpu_micros,
-        max_off_cpu_micros: config.max_off_cpu_micros,
+        sampling: config.sampling.clone(),
         registration_token: identity.registration_token,
         pid_namespace_device: identity.pid_namespace_device,
         pid_namespace_inode: identity.pid_namespace_inode,
@@ -1742,30 +1800,13 @@ fn enable_capture(
         bail!("collector is already enabled");
     }
     if enable
-        .sample_threshold
-        .is_some_and(|value| value != prepare.sample_threshold)
+        .sampling
+        .as_ref()
+        .is_some_and(|value| *value != prepare.sampling)
     {
-        bail!("sampleThreshold differs from prepared policy");
+        bail!("sampling differs from prepared policy");
     }
-    for (name, supplied, expected) in [
-        (
-            "minOffCpuMicros",
-            enable.min_off_cpu_micros,
-            prepare.min_off_cpu_micros,
-        ),
-        (
-            "maxOffCpuMicros",
-            enable.max_off_cpu_micros,
-            prepare.max_off_cpu_micros,
-        ),
-    ] {
-        if supplied.is_some() && supplied != expected {
-            bail!("{name} differs from prepared policy");
-        }
-    }
-    enable.sample_threshold = Some(prepare.sample_threshold);
-    enable.min_off_cpu_micros = prepare.min_off_cpu_micros;
-    enable.max_off_cpu_micros = prepare.max_off_cpu_micros;
+    enable.sampling = Some(prepare.sampling.clone());
     reset_stats(&skel.maps.stats)?;
     let wall_clock_calibration = capture_wall_clock_calibration()?;
     let started_ns = monotonic_ns()?;
@@ -1779,17 +1820,35 @@ fn enable_capture(
             .context("missing BPF bss")?;
         bss.signal_number = enable.signal as u32;
         bss.capture_epoch = enable.capture_epoch;
-        bss.min_off_cpu_ns = prepare
-            .min_off_cpu_micros
-            .and_then(|value| value.checked_mul(1_000))
-            .unwrap_or(0);
-        bss.max_off_cpu_ns = prepare
-            .max_off_cpu_micros
-            .and_then(|value| value.checked_mul(1_000))
-            .unwrap_or(0);
-        bss.has_min_off_cpu = u32::from(prepare.min_off_cpu_micros.is_some());
-        bss.has_max_off_cpu = u32::from(prepare.max_off_cpu_micros.is_some());
-        bss.sample_threshold = prepare.sample_threshold;
+        bss.min_off_cpu_ns = prepare.sampling.min_off_cpu_ns();
+        bss.max_off_cpu_ns = prepare.sampling.max_off_cpu_ns();
+        bss.has_min_off_cpu = u32::from(prepare.sampling.min_off_cpu_micros.is_some());
+        bss.has_max_off_cpu = u32::from(prepare.sampling.max_off_cpu_micros.is_some());
+        match prepare.sampling.admission {
+            Admission::Uniform {
+                probability_threshold,
+                ..
+            } => {
+                bss.admission_policy = 0;
+                bss.sample_threshold = probability_threshold;
+                bss.record_all_above_ns = 0;
+                bss.record_all_above_scaled = 0;
+                bss.record_all_above_shift = 0;
+            }
+            Admission::Proportional {
+                record_all_above_micros,
+            } => {
+                let record_all_above_ns = record_all_above_micros
+                    .checked_mul(1_000)
+                    .context("recordAllAboveMicros overflows nanos")?;
+                let (scaled, shift) = proportional_scale(record_all_above_ns);
+                bss.admission_policy = 1;
+                bss.sample_threshold = 0;
+                bss.record_all_above_ns = record_all_above_ns;
+                bss.record_all_above_scaled = scaled;
+                bss.record_all_above_shift = shift;
+            }
+        }
         bss.next_sequence = 1;
     }
     let start = json!({
@@ -1807,10 +1866,7 @@ fn enable_capture(
         "pidNamespaceDevice": identity.pid_namespace_device.to_string(),
         "pidNamespaceInode": identity.pid_namespace_inode.to_string(),
         "startedMonotonicNanos": started_ns.to_string(),
-        "sampleThreshold": prepare.sample_threshold,
-        "sampleDenominator": 4_294_967_296_u64,
-        "minOffCpuMicros": prepare.min_off_cpu_micros.map(|value| value.to_string()),
-        "maxOffCpuMicros": prepare.max_off_cpu_micros.map(|value| value.to_string()),
+        "sampling": prepare.sampling.json(),
         "loader": "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
         "hook": "tp_btf/sched_exit_tp",
         "switchOutHook": "sched/sched_switch",
@@ -1839,9 +1895,7 @@ fn enable_capture(
         "sourcePath": prepare.output_path,
         "targetPid": reply.target_pid,
         "hostTgid": reply.host_tgid,
-        "sampleThreshold": reply.sample_threshold,
-        "minOffCpuMicros": reply.min_off_cpu_micros.map(|value| value.to_string()),
-        "maxOffCpuMicros": reply.max_off_cpu_micros.map(|value| value.to_string()),
+        "sampling": reply.sampling.json(),
         "signalEnvironment": signal_environment,
         "verifiedIdentity": {
             "registrationToken": format!("{:016x}", reply.registration_token),
@@ -2071,7 +2125,7 @@ fn observation_row(
         "registrationToken": format!("{:016x}", event.registration_token),
         "startMonotonicNanos": event.start_monotonic_ns.to_string(),
         "endMonotonicNanos": event.end_monotonic_ns.to_string(),
-        "sampleThreshold": capture.config.sample_threshold.unwrap_or(0),
+        "admissionThreshold": event.admission_threshold,
         "signalResult": event.signal_result,
         "comm": String::from_utf8_lossy(&event.comm[..comm_end]),
         "kernelStack": kernel_stack.unwrap_or_else(|error| stack_error(event.kernel_stack_id, &error)),
@@ -2359,12 +2413,14 @@ mod tests {
         }))
     }
 
+    /// Models the kernel predicate: strict bounds first, then the random draw against the
+    /// per-interval threshold of the admission policy.
     fn admitted(
         duration_ns: u64,
         min_micros: Option<u64>,
         max_micros: Option<u64>,
         random: u32,
-        threshold: u64,
+        admission: &Admission,
     ) -> bool {
         let duration_matches = min_micros
             .map(|value| duration_ns > value * 1_000)
@@ -2372,7 +2428,48 @@ mod tests {
             && max_micros
                 .map(|value| duration_ns < value * 1_000)
                 .unwrap_or(true);
+        let threshold = match *admission {
+            Admission::Uniform {
+                probability_threshold,
+                ..
+            } => probability_threshold,
+            Admission::Proportional {
+                record_all_above_micros,
+            } => admission_threshold(duration_ns, record_all_above_micros * 1_000),
+        };
         duration_matches && u64::from(random) < threshold
+    }
+
+    /// The kernel's per-interval threshold under the proportional policy.
+    fn admission_threshold(duration_ns: u64, record_all_above_ns: u64) -> u64 {
+        if duration_ns >= record_all_above_ns {
+            return 1_u64 << 32;
+        }
+        let (scaled, shift) = proportional_scale(record_all_above_ns);
+        ((duration_ns >> shift) << 32) / scaled
+    }
+
+    fn uniform(probability_threshold: u64) -> Admission {
+        Admission::Uniform {
+            probability: "test".to_string(),
+            probability_threshold,
+        }
+    }
+
+    fn proportional(record_all_above_micros: u64) -> Admission {
+        Admission::Proportional {
+            record_all_above_micros,
+        }
+    }
+
+    fn sampling_json(bounds: Value, admission: Value) -> Value {
+        let mut sampling = json!({"minOffCpuMicros": null, "maxOffCpuMicros": null});
+        sampling
+            .as_object_mut()
+            .unwrap()
+            .extend(bounds.as_object().unwrap().clone());
+        sampling["admission"] = admission;
+        json!({"targetPid":1,"outputPath":"/tmp/source.ndjson","sampling":sampling})
     }
 
     #[test]
@@ -2401,48 +2498,145 @@ mod tests {
     }
 
     #[test]
-    fn optional_duration_bounds_are_strict_and_compose_with_probability() {
-        assert!(admitted(10_000, None, None, 4, 5));
-        assert!(!admitted(10_000, Some(10), None, 0, 1));
-        assert!(admitted(10_001, Some(10), None, 0, 1));
-        assert!(!admitted(20_000, None, Some(20), 0, 1));
-        assert!(admitted(19_999, None, Some(20), 0, 1));
-        assert!(admitted(15_000, Some(10), Some(20), 0, 1));
-        assert!(!admitted(15_000, Some(10), Some(20), 1, 1));
-        assert!(!admitted(10_000, Some(10), Some(20), 0, u64::MAX));
+    fn optional_duration_bounds_are_strict_and_compose_with_admission() {
+        assert!(admitted(10_000, None, None, 4, &uniform(5)));
+        assert!(!admitted(10_000, Some(10), None, 0, &uniform(1)));
+        assert!(admitted(10_001, Some(10), None, 0, &uniform(1)));
+        assert!(!admitted(20_000, None, Some(20), 0, &uniform(1)));
+        assert!(admitted(19_999, None, Some(20), 0, &uniform(1)));
+        assert!(admitted(15_000, Some(10), Some(20), 0, &uniform(1)));
+        assert!(!admitted(15_000, Some(10), Some(20), 1, &uniform(1)));
+        assert!(!admitted(10_000, Some(10), Some(20), 0, &uniform(u64::MAX)));
+        // Proportional: a 5 µs interval against a 10 µs reference admits half the draws.
+        assert!(admitted(
+            5_000,
+            None,
+            None,
+            (1 << 31) - 1,
+            &proportional(10)
+        ));
+        assert!(!admitted(5_000, None, None, 1 << 31, &proportional(10)));
+        assert!(admitted(10_000, None, None, u32::MAX, &proportional(10)));
+        assert!(!admitted(
+            10_000,
+            Some(10),
+            None,
+            u32::MAX,
+            &proportional(10)
+        ));
     }
 
     #[test]
-    fn prepare_policy_accepts_each_optional_shape_and_rejects_bad_bounds() {
-        parse_prepare(r#"{"targetPid":1,"outputPath":"/tmp/source.ndjson","sampleThreshold":0}"#)
-            .expect("zero probability must disable selection without disabling capture setup");
+    fn proportional_threshold_is_exact_and_overflow_free() {
+        let certain = 1_u64 << 32;
+        assert_eq!(admission_threshold(10_000_000, 10_000_000), certain);
+        assert_eq!(admission_threshold(u64::MAX, 10_000_000), certain);
+        assert_eq!(admission_threshold(1_000_000, 10_000_000), certain / 10);
+        assert_eq!(admission_threshold(0, 10_000_000), 0);
+        assert_eq!(admission_threshold(1, 10_000_000), 429);
+        assert_eq!(proportional_scale(10_000_000), (10_000_000, 0));
+        // Above 2^32 ns the reference is shifted so the numerator stays within u64.
+        let long = 10_000_000_000_u64;
+        let (scaled, shift) = proportional_scale(long);
+        assert_eq!(shift, 2);
+        assert_eq!(scaled, long >> 2);
+        // Shifting drops the low bits of both operands, so the result can be one or two below.
+        let just_below = admission_threshold(long - 1, long);
+        assert!(
+            just_below >= certain - 2 && just_below < certain,
+            "{just_below}"
+        );
+        assert_eq!(admission_threshold(long / 2, long), certain / 2);
+        let (scaled, shift) = proportional_scale(u64::MAX);
+        assert_eq!(shift, 32);
+        assert_eq!(scaled, u32::MAX as u64);
+        assert_eq!(admission_threshold(u64::MAX - 1, u64::MAX), certain);
+        let mut previous = 0;
+        for duration in (0..long).step_by(123_456_789) {
+            let threshold = admission_threshold(duration, long);
+            assert!(threshold >= previous);
+            previous = threshold;
+        }
+    }
+
+    #[test]
+    fn prepare_policy_accepts_each_shape_and_rejects_bad_values() {
+        let uniform_one =
+            json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64});
         for bounds in [
             json!({}),
             json!({"minOffCpuMicros":"10"}),
             json!({"maxOffCpuMicros":"20"}),
             json!({"minOffCpuMicros":"10","maxOffCpuMicros":"20"}),
         ] {
-            let mut value = json!({
-                "targetPid":1,
-                "outputPath":"/tmp/source.ndjson",
-                "sampleThreshold":1,
-            });
-            value
-                .as_object_mut()
-                .unwrap()
-                .extend(bounds.as_object().unwrap().clone());
-            parse_prepare(&value.to_string()).unwrap();
+            parse_prepare(&sampling_json(bounds.clone(), uniform_one.clone()).to_string()).unwrap();
+            parse_prepare(
+                &sampling_json(
+                    bounds,
+                    json!({"policy":"proportional","recordAllAboveMicros":5}),
+                )
+                .to_string(),
+            )
+            .unwrap();
         }
-        let equal = json!({
-            "targetPid":1,"outputPath":"/tmp/source.ndjson","sampleThreshold":1,
-            "minOffCpuMicros":"10","maxOffCpuMicros":"10"
-        });
-        assert!(parse_prepare(&equal.to_string()).is_err());
-        let overflow = json!({
-            "targetPid":1,"outputPath":"/tmp/source.ndjson","sampleThreshold":1,
-            "maxOffCpuMicros":u64::MAX.to_string()
-        });
-        assert!(parse_prepare(&overflow.to_string()).is_err());
+        let config = parse_prepare(
+            &sampling_json(
+                json!({"minOffCpuMicros":10}),
+                json!({"policy":"proportional","recordAllAboveMicros":5}),
+            )
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(config.sampling.min_off_cpu_micros, Some(10));
+        assert_eq!(config.sampling.admission, proportional(5));
+        // The echoed object round-trips unchanged.
+        assert_eq!(
+            config.sampling.json(),
+            json!({"minOffCpuMicros":10,"maxOffCpuMicros":null,
+                   "admission":{"policy":"proportional","recordAllAboveMicros":5}})
+        );
+        for rejected in [
+            sampling_json(
+                json!({"minOffCpuMicros":"10","maxOffCpuMicros":"10"}),
+                uniform_one.clone(),
+            ),
+            sampling_json(
+                json!({"maxOffCpuMicros":u64::MAX.to_string()}),
+                uniform_one.clone(),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"uniform","probability":"0","probabilityThreshold":0}),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"uniform","probability":"2","probabilityThreshold":4294967297_u64}),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"uniform","probabilityThreshold":1}),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"proportional","recordAllAboveMicros":0}),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"proportional","recordAllAboveMicros":u64::MAX}),
+            ),
+            sampling_json(
+                json!({}),
+                json!({"policy":"proportional","recordAllAboveMicros":5,"probability":"1"}),
+            ),
+            sampling_json(json!({}), json!({"policy":"none"})),
+            sampling_json(json!({"sampleThreshold":1}), uniform_one.clone()),
+            json!({"targetPid":1,"outputPath":"/tmp/source.ndjson"}),
+        ] {
+            assert!(
+                parse_prepare(&rejected.to_string()).is_err(),
+                "accepted {rejected}"
+            );
+        }
     }
 
     #[test]
@@ -2701,9 +2895,7 @@ mod tests {
         let dead_error = prepare(PrepareConfig {
             target_pid: dead_pid as u32,
             output_path: dead_path.clone(),
-            sample_threshold: 1_u64 << 32,
-            min_off_cpu_micros: None,
-            max_off_cpu_micros: None,
+            sampling: privileged_sampling(),
         })
         .err()
         .expect("dead target prepare unexpectedly succeeded");
@@ -2930,9 +3122,15 @@ mod tests {
         PrepareConfig {
             target_pid: unsafe { libc::getpid() as u32 },
             output_path: path,
-            sample_threshold: 1_u64 << 32,
+            sampling: privileged_sampling(),
+        }
+    }
+
+    fn privileged_sampling() -> SamplingConfig {
+        SamplingConfig {
             min_off_cpu_micros: None,
             max_off_cpu_micros: None,
+            admission: uniform(1_u64 << 32),
         }
     }
 
@@ -2942,9 +3140,7 @@ mod tests {
             capture_epoch: epoch,
             signal: libc::SIGRTMIN() + 5,
             signal_delivery: Some("queued".to_string()),
-            sample_threshold: None,
-            min_off_cpu_micros: None,
-            max_off_cpu_micros: None,
+            sampling: None,
         }
     }
 

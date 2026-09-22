@@ -78,7 +78,15 @@ fn parent_proof() -> Result<()> {
         let input = json!({
             "targetPid": child_pid,
             "outputPath": output,
-            "sampleThreshold": 4_294_967_296_u64,
+            "sampling": {
+                "minOffCpuMicros": null,
+                "maxOffCpuMicros": null,
+                "admission": {
+                    "policy": "uniform",
+                    "probability": "1",
+                    "probabilityThreshold": 4_294_967_296_u64,
+                },
+            },
         })
         .to_string();
         jonoffcpu_collector_prepare(input.as_ptr().cast(), input.len(), out)

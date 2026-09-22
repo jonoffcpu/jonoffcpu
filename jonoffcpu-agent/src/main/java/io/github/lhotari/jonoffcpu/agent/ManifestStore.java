@@ -70,7 +70,7 @@ final class ManifestStore {
         profiler.addProperty("requestedOptions", config.asyncProfilerOptions());
         profiler.addProperty("protocol", "signal-capture-v1");
         root.add("asyncProfiler", profiler);
-        root.add("sourcePolicy", config.sourcePolicy());
+        root.add("sampling", config.sampling().json());
 
         JsonObject threads = new JsonObject();
         threads.addProperty("schemaVersion", 1);

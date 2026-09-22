@@ -21,6 +21,7 @@ ordinary async-profiler JFR.
   - [4. Render the flame graph](#4-render-the-flame-graph)
 - [Configuration](#configuration)
   - [Agent options](#agent-options)
+  - [Choosing what to sample](#choosing-what-to-sample)
   - [Turning jonoffcpu off without removing it](#turning-jonoffcpu-off-without-removing-it)
   - [Correlator options](#correlator-options)
   - [Using the artifacts as libraries](#using-the-artifacts-as-libraries)
@@ -198,16 +199,21 @@ Create `jonoffcpu.yaml`:
 ```yaml
 correlationOutput: /tmp/example.correlation.ndjson
 asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/tmp/example.jfr
-sampleProbability: "0.010"
-minOffCpuMicros: 1000
+sampling:
+  minOffCpuMicros: 100
+  admission:
+    policy: proportional
+    recordAllAboveMicros: 10000
 ```
 
 `asyncProfilerOptions` is passed to async-profiler unchanged, so any of its
 [usual events](https://github.com/async-profiler/async-profiler/blob/master/docs/ProfilingModes.md)
-can be recorded alongside the off-CPU samples. `minOffCpuMicros: 1000` skips
-intervals shorter than 1 ms, which drops the run-queue and context-switch
-noise that would otherwise dominate the sample count without contributing much
-off-CPU time; drop it to keep every interval. Start the application:
+can be recorded alongside the off-CPU samples. `recordAllAboveMicros: 10000`
+records every wait of 10 ms or longer and samples shorter ones in proportion
+to their length, so long waits are never missed and the run-queue noise does
+not swamp the capture; `minOffCpuMicros: 100` drops the sub-100 µs context
+switches entirely. See [Choosing what to sample](#choosing-what-to-sample).
+Start the application:
 
 ```sh
 java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
@@ -266,21 +272,80 @@ The synthetic JFR opens directly in
 | --- | --- |
 | `correlationOutput` | Required. Path of the correlation NDJSON stream. Must not exist yet. |
 | `asyncProfilerOptions` | Required. async-profiler options, including one absolute `file=` path for the JFR. |
-| `sampleProbability` | `0.000` through `1.000`; default `0.01`. `1` records every eligible interval. `0` switches off-CPU capture off entirely (see below). Quote the value to keep its exact spelling in the capture metadata. |
-| `minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
-| `maxOffCpuMicros` | Optional strict upper bound on the off-CPU duration, in microseconds. |
+| `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
+| `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
+| `sampling.maxOffCpuMicros` | Optional strict upper bound on the off-CPU duration, in microseconds. |
+| `sampling.admission.policy` | Required. `proportional`, `uniform`, or `none`. |
+| `sampling.admission.recordAllAboveMicros` | `proportional` only. Intervals at least this long are always recorded; shorter ones with probability `length / recordAllAboveMicros`. |
+| `sampling.admission.probability` | `uniform` only. `"0.000"` through `"1.000"`; every eligible interval is recorded with this probability. `"0"` is the same as policy `none`. Quote the value to keep its exact spelling in the capture metadata. |
 | `signalDelivery` | `queued` (default) uses a dedicated real-time signal and never merges notifications. `coalescing` uses a standard signal and may merge them, trading lost samples for a bounded pending-signal queue. |
 | `nativeStopTimeoutMillis` | Budget for detaching the eBPF source and draining the ring buffer at stop. Default 30000. |
 | `deliveryGraceMillis` | Time allowed after detach for already-requested signals to arrive. Default 100. |
 | `shutdownTimeoutMillis` | How long the JVM shutdown hook waits for the capture to finalize. Default 10000. |
 
-Duration bounds and probability compose: an interval must satisfy both bounds
-before the probability check is applied.
+### Choosing what to sample
+
+Every off-CPU interval costs the same to *measure* (the kernel does that
+anyway), but *recording* one costs a signal to the thread and a Java stack
+walk. The `sampling` block decides which measured intervals are worth that
+cost. All decisions are made in the kernel after the interval's duration is
+known, in this order:
+
+1. **`minOffCpuMicros` / `maxOffCpuMicros`** — strict bounds. Intervals outside
+   them are never recorded and never counted.
+2. **`admission.policy`** — which of the remaining intervals to record:
+   - `proportional`: an interval of at least `recordAllAboveMicros` is always
+     recorded; a shorter one is recorded with probability
+     `length / recordAllAboveMicros`. With `10000`, a 1 ms wait has a 10 %
+     chance and a 10 µs wait 0.1 %.
+   - `uniform`: every interval is recorded with the same `probability`.
+   - `none`: nothing is recorded and no eBPF program is loaded (see below).
+
+Each policy has exactly one parameter; giving `probability` to `proportional`
+or `recordAllAboveMicros` to `uniform` is a configuration error, as are bounds
+with `none`. There is no default: the block is required so that a capture
+without off-CPU data is always a deliberate choice.
+
+**Which one to use?**
+
+- *"Show me the slow waits."* `proportional` with `recordAllAboveMicros` set
+  to the duration you never want to miss, say `10000` (10 ms). Every wait of
+  10 ms or more is recorded; shorter waits still appear with the right total
+  width but do not flood the capture. Every microsecond of off-CPU time has
+  the same chance of being represented, which is what a duration-weighted
+  flame graph wants, and the recording rate is bounded by the total off-CPU
+  time divided by `recordAllAboveMicros` no matter how many short waits the
+  application makes. The cost does scale with concurrency: when many threads
+  wake from long waits at once, each of them signals.
+- *"I only want the tail and nothing else."* Use `minOffCpuMicros` as the
+  cutoff. Everything below it is invisible rather than under-sampled, and the
+  report's totals describe only the intervals above the bound. A
+  `minOffCpuMicros` at or above `recordAllAboveMicros` degenerates to
+  "record every eligible interval".
+- *"I want everything and can afford it."* `uniform` with `probability: "1"`.
+  Expect the signal rate to track the context-switch rate.
+- *"Uniform, cheap, statistical."* `uniform` with `probability: "0.01"` is a
+  plain 1-in-100 sample of intervals. Long waits are missed 99 times out of
+  100, so pair it with `minOffCpuMicros` to stop short intervals from
+  dominating.
+
+**Reading the results.** The collapsed stacks and flame graph always show the
+durations that were actually observed, so a wait recorded under
+`proportional` appears at its true length. Every observation row records the
+exact admission threshold the kernel drew against, and the correlator's
+`--estimate-population true` reweights the observed intervals by those
+thresholds to estimate the total off-CPU time of all eligible intervals,
+including the ones the sampler skipped: under `proportional`, each recorded
+interval shorter than `recordAllAboveMicros` stands in for
+`recordAllAboveMicros` worth of waiting and each longer one for itself. That
+estimate is exact arithmetic on the recorded thresholds, not a heuristic, but
+a single rare short wait that happened to be caught carries a large weight, so
+treat per-stack estimates for rare stacks as noisy.
 
 ### Turning jonoffcpu off without removing it
 
-Set `sampleProbability: "0"` to run plain async-profiler through the same
-`-javaagent` line. The agent then loads no eBPF program, negotiates no signal,
+Set `sampling.admission.policy: none` to run plain async-profiler through the
+same `-javaagent` line. The agent then loads no eBPF program, negotiates no signal,
 and needs no BPF privileges; async-profiler is started with
 `asyncProfilerOptions` exactly as given, so the JFR contains only its ordinary
 events. The correlation path still receives a one-line stream whose

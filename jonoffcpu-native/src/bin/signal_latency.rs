@@ -107,7 +107,15 @@ fn main() -> Result<()> {
         let request = json!({
             "targetPid":child.pid,
             "outputPath":output,
-            "sampleThreshold":4_294_967_296_u64,
+            "sampling": {
+                "minOffCpuMicros": null,
+                "maxOffCpuMicros": null,
+                "admission": {
+                    "policy": "uniform",
+                    "probability": "1",
+                    "probabilityThreshold": 4_294_967_296_u64,
+                },
+            },
         })
         .to_string();
         jonoffcpu_collector_prepare(request.as_ptr().cast(), request.len(), out)

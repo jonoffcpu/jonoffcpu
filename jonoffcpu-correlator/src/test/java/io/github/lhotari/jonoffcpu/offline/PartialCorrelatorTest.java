@@ -266,8 +266,8 @@ public final class PartialCorrelatorTest {
         Files.writeString(source, header + "\n");
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Unsupported source schema");
         header.addProperty("schemaVersion", 1);
-        header.addProperty("minOffCpuMicros", "10");
-        header.addProperty("maxOffCpuMicros", "10");
+        header.getAsJsonObject("sampling").addProperty("minOffCpuMicros", 10);
+        header.getAsJsonObject("sampling").addProperty("maxOffCpuMicros", 10);
         Files.writeString(source, header + "\n");
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Invalid duration policy");
         Files.writeString(source, prefix(complete, 2));

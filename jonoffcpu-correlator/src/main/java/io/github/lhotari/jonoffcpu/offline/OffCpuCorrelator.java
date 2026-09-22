@@ -298,7 +298,8 @@ public final class OffCpuCorrelator {
             report.add("syntheticJfr", view);
         }
         try (BufferedWriter writer = newFile(directory.resolve("report.json"))) {
-            new GsonBuilder().setPrettyPrinting().create().toJson(report, writer);
+            // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
+            new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
             writer.newLine();
         }
         try (BufferedWriter writer = newFile(directory.resolve("complete.json"))) {

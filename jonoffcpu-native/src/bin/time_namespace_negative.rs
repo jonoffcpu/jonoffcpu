@@ -10,7 +10,15 @@ fn main() -> Result<()> {
     let input = json!({
         "targetPid":unsafe { libc::getpid() },
         "outputPath":path,
-        "sampleThreshold":1,
+        "sampling": {
+            "minOffCpuMicros": null,
+            "maxOffCpuMicros": null,
+            "admission": {
+                "policy": "uniform",
+                "probability": "0.0000000003",
+                "probabilityThreshold": 1,
+            },
+        },
     })
     .to_string();
     let mut result = JonoffcpuResult::default();

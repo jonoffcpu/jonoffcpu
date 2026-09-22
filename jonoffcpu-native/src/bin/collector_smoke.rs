@@ -58,7 +58,15 @@ fn main() -> Result<()> {
         let json = json!({
             "targetPid": libc::getpid(),
             "outputPath": output,
-            "sampleThreshold": 4_294_967_296_u64,
+            "sampling": {
+                "minOffCpuMicros": null,
+                "maxOffCpuMicros": null,
+                "admission": {
+                    "policy": "uniform",
+                    "probability": "1",
+                    "probabilityThreshold": 4_294_967_296_u64,
+                },
+            },
         })
         .to_string();
         jonoffcpu_collector_prepare(json.as_ptr().cast(), json.len(), out)

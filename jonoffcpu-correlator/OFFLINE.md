@@ -13,7 +13,8 @@ java -jar jonoffcpu-correlator.jar \
 ```
 
 A stream whose only row is a `captureFinalized` footer with
-`state: "profilerOnly"` comes from an agent run with `sampleProbability: "0"`.
+`state: "profilerOnly"` comes from an agent run with
+`sampling.admission.policy: none`.
 The correlator rejects it with an explicit message: no eBPF source ran, so the
 JFR is an ordinary async-profiler recording with nothing to correlate.
 
@@ -74,22 +75,32 @@ java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
 ```
 
 Use `--estimate-population true` to add a separate, opt-in
-`populationEstimate` object to `report.json`. It estimates total duration for the
-completed, duration-eligible source interval population from the capture's exact
-integer sampling threshold. The estimate is serialized as an unreduced rational
-`durationNanosNumerator / durationNanosDenominator`; it is never rounded through
-floating point and never scales the collapsed stacks or synthetic JFR. The report
-also keeps the durable source duration and the smaller stack-matched duration
-separate, because missing or delayed Java stack delivery does not erase a valid
-source interval.
+`populationEstimate` object to `report.json`. It estimates the total duration of
+the completed, duration-eligible source interval population by weighting each
+valid source row with `duration * 2^32 / admissionThreshold`, where
+`admissionThreshold` is the exact threshold the kernel drew against for that row
+(the `uniform` policy's fixed `probabilityThreshold`, or under `proportional`
+`2^32` at and above `recordAllAboveMicros` and `duration * 2^32 / reference`
+below it). The correlator recomputes that threshold from the `captureStart`
+`sampling` object and the row's own duration and marks a disagreeing row
+`source-policy-or-target-mismatch`, so the weights are the policy's, never the
+producer's word alone. The sum is accumulated in exact fixed-point arithmetic and
+reported as `estimatedDurationNanos`, truncated to whole nanoseconds (at most one
+nanosecond low); nothing passes through floating point, and the estimate never
+scales the collapsed stacks or synthetic JFR. `admissionPolicy` names the policy
+in effect. The report also keeps the durable source duration and the smaller
+stack-matched duration separate, because missing or delayed Java stack delivery
+does not erase a valid source interval.
 
 The estimate is marked `available` only when source rows and the kernel/userspace
 selection, receipt and write counters prove complete coverage and the capture did
 not report source-loss conditions. Otherwise the observed source duration remains
-visible, the rational estimate is null and `unavailableReasons` says which
-coverage proof failed. This is an inverse-probability estimate under the configured
+visible, `estimatedDurationNanos` is null and `unavailableReasons` says which
+coverage proof failed. This is an inverse-probability estimate under the recorded
 random admission policy; it is not a confidence interval or an adjustment for
-missing Java stacks.
+missing Java stacks. Under `proportional`, a rare short interval that was admitted
+carries a weight of up to the full reference duration, so per-stack estimates for
+rare stacks are noisy even when the total is unbiased.
 
 ## Interpretation
 

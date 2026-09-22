@@ -3,7 +3,6 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import com.google.gson.JsonObject;
 import java.io.IOException;
-import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -21,10 +20,7 @@ record AgentConfig(
         long targetPid,
         String asyncProfilerOptions,
         String signalDelivery,
-        BigDecimal requestedSampleProbability,
-        long sampleThreshold,
-        Long minOffCpuMicros,
-        Long maxOffCpuMicros,
+        SamplingConfig sampling,
         long nativeStopTimeoutMillis,
         long deliveryGraceMillis,
         long shutdownTimeoutMillis) {
@@ -36,9 +32,7 @@ record AgentConfig(
             "targetPid",
             "asyncProfilerOptions",
             "signalDelivery",
-            "sampleProbability",
-            "minOffCpuMicros",
-            "maxOffCpuMicros",
+            "sampling",
             "nativeStopTimeoutMillis",
             "deliveryGraceMillis",
             "shutdownTimeoutMillis");
@@ -103,6 +97,10 @@ record AgentConfig(
         }
         String[] tokens = arguments.split(",", -1);
         JsonObject value = new JsonObject();
+        // Sampling keys build the same nested object as the YAML form; the object only exists when one is given.
+        JsonObject sampling = new JsonObject();
+        JsonObject admission = new JsonObject();
+        sampling.add("admission", admission);
         int asprof = -1;
         for (int i = 0; i < tokens.length; i++) {
             int equals = tokens[i].indexOf('=');
@@ -116,15 +114,19 @@ record AgentConfig(
                 asprof = i;
                 break;
             }
+            if (key.startsWith("sampling-") || key.endsWith("-micros")) value.add("sampling", sampling);
             switch (key) {
                 case "jonoffcpudelivery" -> value.addProperty("signalDelivery", option);
                 case "jonoffcpuoutput" -> value.addProperty("correlationOutput", option);
-                case "samplethreshold" -> {
-                    parseProbability(key, option);
-                    value.addProperty("sampleProbability", option);
+                case "sampling-policy" -> admission.addProperty("policy", option);
+                case "sampling-probability" -> {
+                    SamplingConfig.parseProbability(key, option);
+                    admission.addProperty("probability", option);
                 }
-                case "min-off-cpu-micros" -> value.addProperty("minOffCpuMicros", parseOptionLong(key, option));
-                case "max-off-cpu-micros" -> value.addProperty("maxOffCpuMicros", parseOptionLong(key, option));
+                case "record-all-above-micros" ->
+                    admission.addProperty("recordAllAboveMicros", parseOptionLong(key, option));
+                case "min-off-cpu-micros" -> sampling.addProperty("minOffCpuMicros", parseOptionLong(key, option));
+                case "max-off-cpu-micros" -> sampling.addProperty("maxOffCpuMicros", parseOptionLong(key, option));
                 case "nativestoptimeoutmillis" ->
                     value.addProperty("nativeStopTimeoutMillis", parseOptionLong(key, option));
                 case "deliverygracemillis" -> value.addProperty("deliveryGraceMillis", parseOptionLong(key, option));
@@ -154,19 +156,8 @@ record AgentConfig(
         if (targetPid != currentPid) {
             throw new IllegalArgumentException("Version 1 agent can only target its own JVM process");
         }
-        Long minimum = optionalNullableLong(value, "minOffCpuMicros", 0, Long.MAX_VALUE);
-        Long maximum = optionalNullableLong(value, "maxOffCpuMicros", 0, Long.MAX_VALUE);
-        if (minimum != null && maximum != null && minimum >= maximum) {
-            throw new IllegalArgumentException("minOffCpuMicros must be less than maxOffCpuMicros");
-        }
-        BigDecimal requestedProbability = value.has("sampleProbability")
-                ? parseProbability(
-                        "sampleProbability", value.get("sampleProbability").getAsString())
-                : new BigDecimal("0.01");
-        long effectiveThreshold = requestedProbability
-                .multiply(new BigDecimal(1L << 32))
-                .toBigInteger()
-                .longValueExact();
+        // Sampling is mandatory so that a profiler-only run is always an explicit decision.
+        SamplingConfig sampling = SamplingConfig.parse(JsonSupport.requireObject(value, "sampling"));
         AgentConfig config = new AgentConfig(
                 absolute(value, "correlationOutput"),
                 absolute(value, "asyncProfilerLibrary"),
@@ -175,27 +166,13 @@ record AgentConfig(
                 targetPid,
                 JsonSupport.requireString(value, "asyncProfilerOptions"),
                 value.has("signalDelivery") ? JsonSupport.requireString(value, "signalDelivery") : "queued",
-                requestedProbability,
-                effectiveThreshold,
-                minimum,
-                maximum,
+                sampling,
                 optionalLong(value, "nativeStopTimeoutMillis", 30_000, 1, 3_600_000),
                 optionalLong(value, "deliveryGraceMillis", 100, 0, 60_000),
                 optionalLong(value, "shutdownTimeoutMillis", 10_000, 1, 3_600_000));
         config.validatePaths();
         config.validateProfilerOptions();
         return config;
-    }
-
-    private static BigDecimal parseProbability(String key, String value) {
-        if (value == null || !value.matches("(?:0|1)(?:\\.[0-9]+)?")) {
-            throw new IllegalArgumentException("Invalid decimal probability option: " + key);
-        }
-        BigDecimal probability = new BigDecimal(value);
-        if (probability.compareTo(BigDecimal.ZERO) < 0 || probability.compareTo(BigDecimal.ONE) > 0) {
-            throw new IllegalArgumentException("Probability option must be in 0.0..1.0: " + key);
-        }
-        return probability;
     }
 
     private static long parseOptionLong(String key, String value) {
@@ -222,10 +199,6 @@ record AgentConfig(
 
     private static long optionalLong(JsonObject value, String name, long defaultValue, long minimum, long maximum) {
         return value.has(name) ? JsonSupport.requireNumber(value, name, minimum, maximum) : defaultValue;
-    }
-
-    private static Long optionalNullableLong(JsonObject value, String name, long minimum, long maximum) {
-        return value.has(name) ? JsonSupport.requireNumber(value, name, minimum, maximum) : null;
     }
 
     private void validatePaths() {
@@ -311,19 +284,10 @@ record AgentConfig(
     }
 
     /**
-     * A zero sampling threshold disables the eBPF source entirely: the agent then only starts async-profiler,
+     * Admission policy {@code none} disables the eBPF source entirely: the agent then only starts async-profiler,
      * so the same agent configuration acts as an off switch without unloading jonoffcpu.
      */
     boolean profilerOnly() {
-        return sampleThreshold == 0;
-    }
-
-    JsonObject sourcePolicy() {
-        JsonObject value = new JsonObject();
-        value.addProperty("requestedSampleProbability", requestedSampleProbability.toPlainString());
-        value.addProperty("sampleThreshold", sampleThreshold);
-        if (minOffCpuMicros != null) value.addProperty("minOffCpuMicros", minOffCpuMicros);
-        if (maxOffCpuMicros != null) value.addProperty("maxOffCpuMicros", maxOffCpuMicros);
-        return value;
+        return sampling.profilerOnly();
     }
 }

@@ -34,9 +34,18 @@ smallest relevant layer before running privileged end-to-end tests.
   publish completion last.
 - `queued` and `coalescing` signal delivery have different loss behavior. Never
   fall back silently from one policy to the other.
-- Probability and duration filters compose. `sampleProbability` is a decimal
-  from `0.000` through `1.000`; `minOffCpuMicros` and `maxOffCpuMicros` are
-  independent optional strict bounds.
+- Sampling is one required `sampling` object: optional strict
+  `minOffCpuMicros`/`maxOffCpuMicros` bounds, applied in the kernel before the
+  admission policy, and `admission.policy` of `none`, `uniform`
+  (`probability`) or `proportional` (`recordAllAboveMicros`). Each policy has
+  exactly one parameter; `none` rejects bounds. The same resolved object is
+  sent to the native source, echoed by it, and written into the manifest,
+  `captureStart` and `analysisInputs`; consumers compare it structurally.
+  Every observation row carries the exact `admissionThreshold` the kernel drew
+  against, recomputable from the policy and the row's duration, so population
+  estimates stay exact inverse-probability sums. A future rate cap belongs in a
+  separate `sampling.limit` block, orthogonal to `admission`, because its loss
+  is not random and must be reported, not reweighted.
 - Partial JFR and interrupted-capture modes must remain explicit and visibly
   different from a complete, integrity-verified result.
 

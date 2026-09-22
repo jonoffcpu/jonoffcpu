@@ -20,9 +20,12 @@ public final class ShadedAgentJarTest {
                     asyncProfilerLibrary: %s
                     nativeCollectorLibrary: %s
                     asyncProfilerOptions: event=cpu,file=%s
-                    sampleProbability: "0.125"
+                    sampling:
+                      admission:
+                        policy: uniform
+                        probability: "0.125"
                     """.formatted(root.resolve("capture.ndjson"), profiler, collector, root.resolve("capture.jfr")));
-            if (config.sampleThreshold() != 536_870_912L) {
+            if (((SamplingConfig.Uniform) config.sampling().admission()).probabilityThreshold() != 536_870_912L) {
                 throw new AssertionError("Relocated YAML parser changed the sampling probability");
             }
             System.out.println("Shaded agent YAML fixture passed");

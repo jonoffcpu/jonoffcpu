@@ -29,6 +29,7 @@ struct Observation {
     process_generation_ns: u64,
     thread_generation_ns: u64,
     registration_token: u64,
+    admission_threshold: u64,
     signal_result: i64,
     kernel_stack_id: i64,
     user_stack_id: i64,
