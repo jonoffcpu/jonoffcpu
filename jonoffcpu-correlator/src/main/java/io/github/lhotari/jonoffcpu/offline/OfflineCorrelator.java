@@ -221,8 +221,8 @@ final class OfflineCorrelator {
                 Long.toString(result.selectedObservedDurationNanos()),
                 result.submittedButNotParsed(),
                 collapsedNanos(result),
-                collector.records(),
-                collector.matches());
+                List.copyOf(collector.records()),
+                List.copyOf(collector.matches()));
     }
 
     private static Collector collect(CorrelationResult result, Path source, Path jfr, JfrSelection selection)
@@ -251,8 +251,8 @@ final class OfflineCorrelator {
                 Long.toString(result.selectedObservedDurationNanos()),
                 result.submittedButNotParsed(),
                 collapsedNanos(result),
-                collector.records(),
-                collector.matches(),
+                List.copyOf(collector.records()),
+                List.copyOf(collector.matches()),
                 result.populationEstimate(),
                 result.selectionMetadata());
     }
