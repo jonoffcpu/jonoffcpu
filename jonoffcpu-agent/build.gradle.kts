@@ -289,6 +289,9 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     isPreserveFileTimestamps = false
     isReproducibleFileOrder = true
+    // The bundled libraries' Maven descriptors and ProGuard rules describe their original,
+    // unrelocated coordinates and packages, so they are misleading inside the shaded JAR.
+    exclude("META-INF/maven/**", "META-INF/proguard/**")
     manifest {
         attributes(
             "Premain-Class" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent",

@@ -11,7 +11,8 @@ import org.gradle.jvm.toolchain.JvmVendorSpec
 
 plugins {
     `java-library`
-    id("com.vanniktech.maven.publish") version "0.37.0"
+    // The base plugin: the full plugin would publish components["java"], but only the shaded JAR is published.
+    id("com.vanniktech.maven.publish.base") version "0.37.0"
     id("com.gradleup.shadow") version "9.6.1"
 }
 
@@ -31,6 +32,9 @@ java {
         vendor = JvmVendorSpec.AMAZON
     }
     targetCompatibility = JavaVersion.VERSION_21
+    // Maven Central requires sources and javadoc JARs next to the shaded JAR.
+    withSourcesJar()
+    withJavadocJar()
 }
 
 val embeddedRuntime = configurations.create("embeddedRuntime") {
@@ -142,8 +146,9 @@ val compileJmcWriterPatch = tasks.register<JavaCompile>("compileJmcWriterPatch")
     options.encoding = "UTF-8"
 }
 
+// The plain JAR is never published or consumed; the shaded JAR below is the only artifact.
 tasks.named<Jar>("jar") {
-    archiveClassifier = "plain"
+    enabled = false
 }
 
 val jar = tasks.named<ShadowJar>("shadowJar") {
@@ -155,6 +160,9 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     isPreserveFileTimestamps = false
     isReproducibleFileOrder = true
+    // The bundled libraries' Maven descriptors and ProGuard rules describe their original,
+    // unrelocated coordinates and packages, so they are misleading inside the shaded JAR.
+    exclude("META-INF/maven/**", "META-INF/proguard/**")
     manifest {
         attributes(
             "Main-Class" to "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
@@ -168,18 +176,16 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     }
 }
 
-// Consumers of the Java API resolve apiElements/runtimeElements by default. The plain
-// JAR neither embeds nor declares its relocated dependencies, so only the shaded JAR
-// is a usable variant; publish it as the default and drop the plain-JAR variants.
-listOf(configurations.apiElements, configurations.runtimeElements).forEach { elements ->
-    elements.configure {
-        outgoing.artifacts.clear()
-        outgoing.artifact(jar)
-        attributes.attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.SHADOWED))
+// The plain JAR neither embeds nor declares its relocated dependencies, so the shaded JAR is the only
+// usable artifact. Publishing the Shadow plugin's component makes it the module's sole runtime
+// variant: a consumer that asks for nothing in particular gets it, since Gradle accepts a shadowed
+// variant when no external one exists. The correlator has no separate API, so no apiElements is published.
+publishing {
+    publications.register<MavenPublication>("maven") {
+        from(components["shadow"])
+        artifact(tasks.named("sourcesJar"))
+        artifact(tasks.named("javadocJar"))
     }
-}
-components.named<AdhocComponentWithVariants>("java") {
-    withVariantsFromConfiguration(configurations.named("shadowRuntimeElements").get()) { skip() }
 }
 
 val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
@@ -261,6 +267,10 @@ tasks.named("check") {
 
 mavenPublishing {
     publishToMavenCentral()
+    // The base plugin leaves this property switch, which the release workflow sets, to the build script.
+    if (providers.gradleProperty("signAllPublications").map(String::toBoolean).getOrElse(false)) {
+        signAllPublications()
+    }
     coordinates(project.group.toString(), "jonoffcpu-correlator", project.version.toString())
     pom {
         name.set("jonoffcpu correlator")
