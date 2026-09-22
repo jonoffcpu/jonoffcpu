@@ -409,6 +409,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 notParsed == null ? null : notParsed.toString(),
                 sources,
                 samples,
+                sourceIndex,
                 dictionaries,
                 sampleIndex,
                 collapsedNanos,

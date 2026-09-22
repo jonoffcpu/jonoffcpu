@@ -19,6 +19,7 @@ record CorrelationResult(
         String submittedButNotParsed,
         SourceColumns sources,
         SampleColumns samples,
+        LongIntMap sourceIndex,
         JfrDictionaries dictionaries,
         LongIntMap sampleIndex,
         long[] collapsedNanos,

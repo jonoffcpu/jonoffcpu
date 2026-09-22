@@ -87,6 +87,46 @@ public final class StreamingCorrelatorTest {
         check(streamedReport.equals(retainedReport), "Reports differ beyond the synthetic quantum fields");
     }
 
+    /**
+     * Spec §1: the audit outputs are the only consumers of the per-row documents.
+     *
+     * <p>Not yet called from {@link #main}: {@code --audit} still only toggles today's whole-file
+     * writers (Task A5's stopgap), which already satisfies this assertion, but the report has no
+     * {@code "audit"} field until Task A8 wires the real {@link AuditLevel} plumbing and the
+     * streaming writers into the CLI. A8 must re-enable this call.
+     */
+    private static void auditLevels(Path dir) throws Exception {
+        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        long[] tid = new long[1];
+        io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter.visit(jfr, row -> {
+            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
+        });
+        Path source = capture(dir, jfr, tid[0], 1);
+        for (String level : List.of("full", "matches", "none")) {
+            Path output = dir.resolve("audit-" + level);
+            OffCpuCorrelator.main(new String[] {
+                "--source", source.toString(),
+                "--jfr", jfr.toString(),
+                "--output", output.toString(),
+                "--format", "collapsed",
+                "--audit", level
+            });
+            check(
+                    Files.exists(output.resolve(OutputFiles.CLASSIFIED_RECORDS)) == level.equals("full"),
+                    "--audit " + level + " wrote the wrong classified-records file set");
+            check(
+                    Files.exists(output.resolve(OutputFiles.MATCHES)) == !level.equals("none"),
+                    "--audit " + level + " wrote the wrong matches file set");
+            check(
+                    Files.isRegularFile(output.resolve(OutputFiles.COLLAPSED)),
+                    "--audit must never affect the collapsed stacks");
+            JsonObject report = com.google.gson.JsonParser.parseString(
+                            Files.readString(output.resolve(OutputFiles.REPORT)))
+                    .getAsJsonObject();
+            check(report.get("audit").getAsString().equals(level), "The report must record the audit level");
+        }
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-streaming-test-");
         try {
