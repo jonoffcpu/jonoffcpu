@@ -70,8 +70,9 @@ record SamplingConfig(Long minOffCpuMicros, Long maxOffCpuMicros, Admission admi
 
     /**
      * An interval of at least {@code recordAllAboveMicros} is always admitted; a shorter one with probability
-     * {@code duration / recordAllAboveMicros}, so every microsecond of off-CPU time is equally likely to be
-     * represented and the expected signal rate is bounded by the total off-CPU time divided by the reference.
+     * {@code duration / recordAllAboveMicros}, so below the reference the expected number of samples follows
+     * off-CPU time rather than interval count, and the signal rate is bounded by the total off-CPU time
+     * divided by the reference.
      */
     record Proportional(long recordAllAboveMicros) implements Admission {
         @Override

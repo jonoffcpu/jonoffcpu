@@ -23,6 +23,7 @@ ordinary async-profiler JFR.
 - [Configuration](#configuration)
   - [Agent options](#agent-options)
   - [Choosing what to sample](#choosing-what-to-sample)
+  - [Overhead and the observer effect](#overhead-and-the-observer-effect)
   - [Turning jonoffcpu off without removing it](#turning-jonoffcpu-off-without-removing-it)
   - [Correlator options](#correlator-options)
   - [Using the artifacts as libraries](#using-the-artifacts-as-libraries)
@@ -59,7 +60,7 @@ the reason lives in the stack of the code that called into the wait.
 
 | What the code is doing | Where the Java thread waits | What the kernel sees |
 | --- | --- | --- |
-| Synchronous JDBC query | `SocketInputStream.read` / `NioSocketImpl.read` | `recvfrom` or `poll` sleeping on the socket |
+| Synchronous JDBC query | `SocketInputStream.read` (`NioSocketImpl`) | `read`/`recv` or `poll` on the socket, sleeping until data arrives |
 | Async client, `CompletableFuture.get()`, connection pool | `LockSupport.park` | `futex` wait; another thread performs the I/O |
 | Contended `synchronized` or `ReentrantLock` | monitor enter / `park` | `futex` wait |
 | `Thread.sleep`, timed `wait` | `park` with a timeout | `futex` wait armed with a timer |
@@ -135,7 +136,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
    thread of the target JVM is switched out it records the timestamp; when the
    same thread is switched back in it has a complete off-CPU interval with its
    kernel and user native stacks.
-2. Intervals that pass the configured duration bounds and sampling probability
+2. Intervals that pass the configured duration bounds and admission policy
    are written to a ring buffer together with a fresh 64-bit correlation key.
    The kernel then sends the resumed thread a signal whose payload is only that
    key.
@@ -169,6 +170,12 @@ that turns it into a measurement lives in the correlation stream:
 | Signal request result and kernel-side loss counters | no | yes |
 | Footer binding the JFR's size and digest | no | yes |
 
+Counting `SignalSample` events on their own would give a signal-frequency
+profile, not an off-CPU profile: ten 1 ms parks and one 10 s socket read would
+look identical. The JFR supplies *which Java code* was waiting; the stream
+supplies *for how long* and *in which kernel path*. Observations that never
+received a matching sample are kept and reported as loss, never dropped.
+
 ### Files jonoffcpu writes
 
 Every file the agent or the correlator creates carries the `jonoffcpu` name,
@@ -201,12 +208,6 @@ set instead: `INCOMPLETE-jonoffcpu-report.json`,
 `INCOMPLETE-jonoffcpu-classified-records.jsonl`, `INCOMPLETE-jonoffcpu-pairs.jsonl`,
 optionally `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed`, and the marker
 `jonoffcpu-partial.json`. It never writes `jonoffcpu-complete.json`.
-
-Counting `SignalSample` events on their own would give a signal-frequency
-profile, not an off-CPU profile: ten 1 ms parks and one 10 s socket read would
-look identical. The JFR supplies *which Java code* was waiting; the stream
-supplies *for how long* and *in which kernel path*. Observations that never
-received a matching sample are kept and reported as loss, never dropped.
 
 ### What the Java stack means
 
@@ -348,9 +349,13 @@ The synthetic JFR opens directly in
 
 Every off-CPU interval costs the same to *measure* (the kernel does that
 anyway), but *recording* one costs a signal to the thread and a Java stack
-walk. The `sampling` block decides which measured intervals are worth that
-cost. All decisions are made in the kernel after the interval's duration is
-known, in this order:
+walk, and that cost lands on the thread being measured. Sampling exists to
+keep that disturbance small enough that the profile still describes the
+application rather than the profiler; see
+[Overhead and the observer effect](#overhead-and-the-observer-effect). The
+`sampling` block decides which measured intervals are worth recording. All
+decisions are made in the kernel after the interval's duration is known, in
+this order:
 
 1. **`minOffCpuMicros` / `maxOffCpuMicros`** — strict bounds. Intervals outside
    them are never recorded and never counted.
@@ -372,12 +377,14 @@ without off-CPU data is always a deliberate choice.
 - *"Show me the slow waits."* `proportional` with `recordAllAboveMicros` set
   to the duration you never want to miss, say `10000` (10 ms). Every wait of
   10 ms or more is recorded; shorter waits still appear with the right total
-  width but do not flood the capture. Every microsecond of off-CPU time has
-  the same chance of being represented, which is what a duration-weighted
-  flame graph wants, and the recording rate is bounded by the total off-CPU
-  time divided by `recordAllAboveMicros` no matter how many short waits the
-  application makes. The cost does scale with concurrency: when many threads
-  wake from long waits at once, each of them signals.
+  width but do not flood the capture. Below the reference the chance of
+  recording an interval grows with its length, so a millisecond of off-CPU
+  time yields the same expected number of samples whether it was one 1 ms
+  wait or ten 100 µs waits: samples follow off-CPU *time*, which is what a
+  duration-weighted flame graph wants, and the recording rate is bounded by
+  the total off-CPU time divided by `recordAllAboveMicros` no matter how many
+  short waits the application makes. The cost does scale with concurrency:
+  when many threads wake from long waits at once, each of them signals.
 - *"I only want the tail and nothing else."* Use `minOffCpuMicros` as the
   cutoff. Everything below it is invisible rather than under-sampled, and the
   report's totals describe only the intervals above the bound. A
@@ -402,6 +409,51 @@ interval shorter than `recordAllAboveMicros` stands in for
 estimate is exact arithmetic on the recorded thresholds, not a heuristic, but
 a single rare short wait that happened to be caught carries a large weight, so
 treat per-stack estimates for rare stacks as noisy.
+
+### Overhead and the observer effect
+
+Scheduler events are frequent — a busy service switches threads tens of
+thousands of times per second, in extreme cases millions — so, as Brendan
+Gregg's
+[Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html) warns, a
+tracer that costs even a little per event, or that ships every event to user
+space, quickly becomes the largest thing on the machine. `jonoffcpu` is built
+so that the unavoidable per-switch cost stays in the kernel and everything
+else is paid only for intervals that are actually recorded:
+
+| Stage | Applies to | Cost | Where it lands |
+| --- | --- | --- | --- |
+| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
+| Ring-buffer record + signal | each recorded interval | a 120-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
+| Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
+| Drain, symbolize, write | each recorded interval | native stack symbolization and a JSON row of roughly 3 KB | the collector's own thread; rows are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
+
+The second and third stages are the observer effect: the signal and the stack
+walk are on-CPU time and latency the application would not otherwise have,
+and they can themselves cause context switches. Recording every interval of a
+busy service would therefore change the very thing being measured. The
+admission policy bounds the recording rate, and with `proportional` it bounds
+it in proportion to off-CPU *time* rather than event *count*, so the intervals
+that dominate the profile are always recorded while the short, numerous ones —
+whose recording cost would exceed their information — are sampled. The
+capture's `captureEnd` counters show what the kernel saw against what it
+recorded: `switchOuts` is every switch of the process's threads,
+`eligibleIntervals` the ones inside the bounds, and `selectedIntervals` the
+ones recorded. If `selectedIntervals` is a large fraction of `switchOuts`,
+raise `recordAllAboveMicros` or `minOffCpuMicros`.
+
+Data volume follows the same rule: at 3 KB per row, a thousand recorded
+intervals per second write about 3 MB/s of correlation stream, so the same
+knobs bound disk usage and correlation time.
+
+Feedback loops — the profiler observing its own waits — are closed in the
+kernel: the collector's drain thread and the agent's controller thread report
+their thread IDs at setup and the eBPF program never records their intervals.
+async-profiler's own threads are ordinary threads of the process and do appear
+when they wait; a `wall=` sampler, for example, shows up under
+`libasyncProfiler.so` frames sleeping for its interval. Leave `wall=` out of
+`asyncProfilerOptions` unless wall-clock samples are wanted alongside the
+measured intervals.
 
 ### Turning jonoffcpu off without removing it
 

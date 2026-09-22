@@ -24,6 +24,7 @@ const SOURCE_ID: &str = "jonoffcpu.offcpu.v1";
 const MAX_CONTROL_JSON: usize = 64 * 1024;
 const DRAIN_QUIET_POLLS: usize = 2;
 const MAX_RING_BATCH: usize = 1024;
+const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
 const MAX_AUDITED_THREADS: usize = 4096;
 const MAX_TID_EXAMPLES: usize = 32;
 const MAX_DIAGNOSTIC_REASON: usize = 240;
@@ -38,6 +39,13 @@ pub(crate) struct PrepareConfig {
     target_pid: u32,
     output_path: PathBuf,
     sampling: SamplingConfig,
+    /// The agent's controller thread calls prepare and later only polls the profiler; when set, that
+    /// thread's own waits are left out of the capture like the collector's, so the profiler does not
+    /// observe itself.
+    #[serde(default)]
+    exclude_calling_thread: bool,
+    #[serde(skip)]
+    calling_tid: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -868,6 +876,10 @@ fn prepare_internal(
     config: PrepareConfig,
     #[cfg(test)] test_control: Option<PrepareTestControl>,
 ) -> Result<PreparedCollector> {
+    let mut config = config;
+    if config.exclude_calling_thread {
+        config.calling_tid = current_tid();
+    }
     let identity = verify_identity(config.target_pid)?;
     let output_path = config.output_path.clone();
     let handle = allocate_handle()?;
@@ -1176,7 +1188,9 @@ fn worker(
         .create_new(true)
         .open(&config.output_path)
         .with_context(|| format!("create source artifact {}", config.output_path.display()))?;
-    let mut writer = BufWriter::new(file);
+    // Rows with symbolized stacks run to a few kilobytes; a large buffer keeps a drain batch to a
+    // handful of write syscalls instead of one per row.
+    let mut writer = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file);
 
     let mut object = MaybeUninit::uninit();
     let open = JonoffcpuCookieSkelBuilder::default()
@@ -1820,6 +1834,9 @@ fn enable_capture(
             .context("missing BPF bss")?;
         bss.signal_number = enable.signal as u32;
         bss.capture_epoch = enable.capture_epoch;
+        // enable_capture runs on the worker thread that drains the ring buffer and writes rows.
+        bss.collector_tid = current_tid();
+        bss.agent_tid = prepare.calling_tid;
         bss.min_off_cpu_ns = prepare.sampling.min_off_cpu_ns();
         bss.max_off_cpu_ns = prepare.sampling.max_off_cpu_ns();
         bss.has_min_off_cpu = u32::from(prepare.sampling.min_off_cpu_micros.is_some());
@@ -2280,6 +2297,11 @@ fn write_row(writer: &mut BufWriter<File>, value: &Value) -> Result<()> {
     serde_json::to_writer(&mut *writer, value)?;
     writer.write_all(b"\n")?;
     Ok(())
+}
+
+/// This thread's ID in the process's own PID namespace, which is also the target's namespace.
+fn current_tid() -> u32 {
+    unsafe { libc::syscall(libc::SYS_gettid) as u32 }
 }
 
 fn monotonic_ns() -> Result<u64> {

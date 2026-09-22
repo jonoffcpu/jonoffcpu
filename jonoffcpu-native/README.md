@@ -29,7 +29,10 @@ before the signal request.
 
 The reusable collector exports the C ABI in `include/jonoffcpu_collector.h` from
 `libjonoffcpu_native.so`. Its lifecycle is disabled `prepare`, configured `enable`,
-quiesce/detach/drain `stop`, then `close`. Run the complete lifecycle and durable
+quiesce/detach/drain `stop`, then `close`. The drain thread never observes
+itself, and a `prepare` request carrying `"excludeCallingThread": true` also
+excludes the calling thread (the agent's controller); both TIDs are compared
+inside the target's PID namespace. Run the complete lifecycle and durable
 NDJSON smoke fixture with:
 
 ```sh

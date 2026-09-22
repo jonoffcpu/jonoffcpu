@@ -58,6 +58,10 @@ volatile __u64 next_sequence;
 volatile __u64 target_pid_namespace_device;
 volatile __u64 target_pid_namespace_inode;
 volatile __u32 target_namespace_tgid;
+/* The collector's own drain thread lives in the target process; its poll sleeps
+ * would otherwise be captured, signalled, and written back by itself. */
+volatile __u32 collector_tid;
+volatile __u32 agent_tid;
 
 static __always_inline struct jonoffcpu_stats *current_stats(void)
 {
@@ -117,6 +121,7 @@ int record_switch_out(void *ctx)
     struct jonoffcpu_thread_state initial = {};
     struct jonoffcpu_thread_state *state;
     struct jonoffcpu_stats *s;
+    struct bpf_pidns_info self_ids = {};
     __u64 pid_tgid;
 
     pid_tgid = bpf_get_current_pid_tgid();
@@ -131,6 +136,14 @@ int record_switch_out(void *ctx)
         return 0;
     }
     if (!enabled)
+        return 0;
+    /* The profiler's own threads report their TIDs from inside the target's
+     * PID namespace. Their waits are never captured. */
+    if ((collector_tid || agent_tid) &&
+        !bpf_get_ns_current_pid_tgid(target_pid_namespace_device,
+                                     target_pid_namespace_inode,
+                                     &self_ids, sizeof(self_ids)) &&
+        (self_ids.pid == collector_tid || self_ids.pid == agent_tid))
         return 0;
     initial.start_monotonic_ns = bpf_ktime_get_ns();
     initial.thread_generation_ns = BPF_CORE_READ(task, start_boottime);

@@ -130,6 +130,11 @@ and exact-cookie matches rather than only checking process exit status.
   collector, and patched async-profiler, each in a glibc and a musl flavour,
   plus their checksum manifest. The agent selects the flavour from the C
   library mapped into the running JVM and never falls back to the other one.
+- The profiler never records its own waits: the native collector's drain
+  thread and the agent's controller thread (the thread that calls `prepare`
+  with `excludeCallingThread`) are excluded by TID in the eBPF program,
+  compared inside the target's PID namespace. Do not add profiler-owned
+  threads whose sleeps would be captured without extending that exclusion.
 - Every file the agent or the correlator creates is named `jonoffcpu-…`: the
   correlator's names are the `OutputFiles` constants, and the agent derives
   its manifest and default JFR from the stem of `correlationOutput` via

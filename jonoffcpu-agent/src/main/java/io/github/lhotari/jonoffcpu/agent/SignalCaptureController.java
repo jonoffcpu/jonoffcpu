@@ -536,6 +536,8 @@ final class SignalCaptureController {
         value.addProperty("targetPid", config.targetPid());
         value.addProperty("outputPath", manifest.sourcePath().toString());
         value.add("sampling", config.sampling().json());
+        // prepare runs on the controller thread, whose profiler polls must not appear in its own capture.
+        value.addProperty("excludeCallingThread", true);
         return value;
     }
 
