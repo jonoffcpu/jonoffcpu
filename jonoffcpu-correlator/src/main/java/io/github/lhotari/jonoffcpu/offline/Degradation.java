@@ -105,15 +105,21 @@ final class Degradation {
     boolean advance(RetentionLimitExceeded limit) {
         if (policy == Policy.FAIL) return false;
         if (policy == Policy.DEGRADE && audit != AuditLevel.NONE) {
-            AuditLevel next = audit == AuditLevel.FULL ? AuditLevel.MATCHES : AuditLevel.NONE;
-            AuditLevel from = audit;
-            audit = next;
-            record("drop-audit-outputs", detail -> {
-                detail.addProperty("from", from.text());
-                detail.addProperty("to", next.text());
-                detail.addProperty("reason", "the audit outputs cost the most and are not in the flame graph");
-            });
-            return true;
+            // Dropping the audit outputs costs nothing the engine's own retention accounting sees
+            // today: they come from a second, post-hoc read that never touches this budget. Spending a
+            // whole retry on a step guaranteed to reproduce the identical failure would be a wasted
+            // full pass, so every remaining audit level is dropped in this one call instead — each
+            // still recorded as its own step — before falling through to a step that can actually help.
+            while (audit != AuditLevel.NONE) {
+                AuditLevel next = audit == AuditLevel.FULL ? AuditLevel.MATCHES : AuditLevel.NONE;
+                AuditLevel from = audit;
+                audit = next;
+                record("drop-audit-outputs", detail -> {
+                    detail.addProperty("from", from.text());
+                    detail.addProperty("to", next.text());
+                    detail.addProperty("reason", "the audit outputs cost the most and are not in the flame graph");
+                });
+            }
         }
         if (policy == Policy.DEGRADE && thinningRung + 1 < THINNING_LADDER.length) {
             String next = THINNING_LADDER[++thinningRung];
@@ -183,7 +189,18 @@ final class Degradation {
                 .append(steps.size())
                 .append(" degradation step(s)");
         if (policy == Policy.FAIL) {
-            message.append("; --on-limit degrade would thin the source and report the estimator");
+            message.append(
+                    requestedThinning.active()
+                            // Thinning was already requested explicitly, so the ladder's own thin-source
+                            // rung is not the thing degrade would newly contribute here.
+                            ? "; --on-limit degrade would drop the audit outputs and, if that is not enough,"
+                                    + " narrow the window"
+                            : "; --on-limit degrade would thin the source and report the estimator");
+        } else if (policy == Policy.TRUNCATE) {
+            // A truncate run that reaches refusal has already narrowed as far as the watermarks allow;
+            // --from-ns/--to-ns would only narrow further by hand, which is what this ladder already did.
+            message.append(
+                    "; the window is already narrowed as far as the watermarks allow: raise" + " --max-retained-bytes");
         } else {
             message.append("; raise --max-retained-bytes or narrow --from-ns/--to-ns");
         }
@@ -198,6 +215,9 @@ final class Degradation {
         value.addProperty("retainedBytesLimit", Long.toString(budgetBytes));
         value.addProperty("estimatedRetainedBytes", Long.toString(estimate.retainedBytes()));
         value.addProperty("peakRetainedBytes", Long.toString(peakRetainedBytes));
+        // Symmetric with peakRetainedBytes: a consumer reading only the top-level object, not scanning
+        // stepsApplied for the narrow-window entries and taking their minimum, still learns the window.
+        value.addProperty("narrowedToNanos", narrowedToNanos == null ? null : Long.toString(narrowedToNanos));
         value.addProperty("attempts", attempts);
         JsonArray applied = new JsonArray();
         steps.forEach(applied::add);

@@ -408,6 +408,52 @@ public final class StreamingCorrelatorTest {
                 .forEach(step -> steps.add(step.getAsJsonObject().get("step").getAsString()));
         check(steps.contains("thin-source"), "The report must name every ladder step applied: " + steps);
         check(report.has("sourceThinning"), "A thinned analysis must state its estimator");
+        check(
+                report.getAsJsonObject("degradation").get("narrowedToNanos").isJsonNull(),
+                "A thinned-only run must not report a narrowed window");
+
+        // The case above never leaves Degradation's constructor: the pre-decode estimate already picks
+        // a rung that fits, so the retry loop's own thin-source rung (advance(), triggered by a
+        // watermark exceeded mid-decode) is never exercised. Force that path by requesting a thinning
+        // ratio explicit enough to bypass the constructor's proactive pick (Degradation only picks for
+        // itself when the caller did not) but loose enough to still exceed the same budget once decoded.
+        Path reactiveThinned = dir.resolve("ladder-reactive-thinned");
+        status = OffCpuCorrelator.run(new String[] {
+            "--source",
+            source.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            reactiveThinned.toString(),
+            "--format",
+            "collapsed",
+            "--thinning",
+            "0.9",
+            "--max-retained-bytes",
+            Long.toString(budgetBytes)
+        });
+        check(
+                status == 0,
+                "A watermark-driven thin-source retry must still be a complete analysis, but exited " + status);
+        JsonObject reactiveReport = com.google.gson.JsonParser.parseString(
+                        Files.readString(reactiveThinned.resolve(OutputFiles.REPORT)))
+                .getAsJsonObject();
+        JsonObject reactiveDegradation = reactiveReport.getAsJsonObject("degradation");
+        check(
+                reactiveDegradation.get("attempts").getAsInt() > 1,
+                "A too-loose --thinning must force a watermark-driven retry, not just the constructor's"
+                        + " pre-decode pick: " + reactiveDegradation);
+        List<String> reactiveThinSourceReasons = new ArrayList<>();
+        reactiveDegradation.getAsJsonArray("stepsApplied").forEach(step -> {
+            JsonObject entry = step.getAsJsonObject();
+            if (entry.get("step").getAsString().equals("thin-source")) {
+                reactiveThinSourceReasons.add(entry.get("reason").getAsString());
+            }
+        });
+        check(
+                reactiveThinSourceReasons.contains("retained bytes reached the budget during the pass"),
+                "The watermark-driven rung must record the watermark reason, not the pre-decode one: "
+                        + reactiveDegradation);
 
         Path narrowed = dir.resolve("ladder-narrowed");
         status = OffCpuCorrelator.run(new String[] {

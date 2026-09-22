@@ -312,8 +312,13 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             } catch (RetentionLimitExceeded limit) {
                 // A sample's cookie resolves to its source slot in the same clock the narrow cut is
                 // expressed in: reusing it here means a budget exceeded while reading JFR samples can
-                // still narrow, instead of only ever refusing with no cut point.
+                // still narrow, instead of only ever refusing with no cut point. An orphan sample (no
+                // source row at all, so the cookie is merely absent from the index, not DROPPED) falls
+                // back to the last kept source slot's start: the source pass is already complete by the
+                // time samples stream, so that slot exists and is the latest one this window still
+                // admits, which still costs a rung rather than refusing outright.
                 int slot = sourceIndex.get(cookie);
+                if (slot < 0 && sources.size() > 0) slot = sources.size() - 1;
                 throw slot >= 0 ? limit.withLastObservationEnd(sources.start(slot)) : limit;
             }
         }
