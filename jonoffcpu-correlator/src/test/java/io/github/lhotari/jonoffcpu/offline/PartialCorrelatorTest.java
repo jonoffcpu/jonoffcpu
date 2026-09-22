@@ -96,7 +96,29 @@ public final class PartialCorrelatorTest {
         stats.commit();
     }
 
-    private static String prefix(List<String> lines, int count) {
+    /** The last row of the given type, so fixtures do not depend on line numbers. */
+    private static JsonObject row(List<String> lines, String recordType) {
+        JsonObject found = null;
+        for (String line : lines) {
+            JsonObject candidate = JsonParser.parseString(line).getAsJsonObject();
+            if (candidate.get("recordType").getAsString().equals(recordType)) found = candidate;
+        }
+        check(found != null, "No " + recordType + " row");
+        return found;
+    }
+
+    /** The stream truncated after the last row of the given type, so fixtures do not depend on line numbers. */
+    private static String prefix(List<String> lines, String recordType) {
+        int count = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            if (JsonParser.parseString(lines.get(i))
+                    .getAsJsonObject()
+                    .get("recordType")
+                    .getAsString()
+                    .equals(recordType)) {
+                count = i + 1;
+            }
+        }
         return String.join("\n", lines.subList(0, count)) + "\n";
     }
 
@@ -106,7 +128,7 @@ public final class PartialCorrelatorTest {
 
     private static void sourcePrefixFixtures(
             Path dir, Path source, Path jfr, JsonObject observation, List<String> complete) throws Exception {
-        Files.writeString(source, prefix(complete, 3));
+        Files.writeString(source, prefix(complete, "captureEnd"));
         rejects(() -> OfflineCorrelator.correlate(source, jfr, DEFAULTS), "Missing source finalization");
         var result = OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS);
         check(result.provisionalPairs() == 1 && result.identityUnverified() == 0, "Missing-footer pair not retained");
@@ -128,7 +150,7 @@ public final class PartialCorrelatorTest {
                 null);
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, delayLimit), "without verified clock");
 
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
         var clipped = new OfflineCorrelator.Limits(
                 DEFAULTS.maxRows(),
                 DEFAULTS.maxLineBytes(),
@@ -146,7 +168,7 @@ public final class PartialCorrelatorTest {
         for (byte[] tail : List.of(
                 "{\"recordType\":\"observation\"".getBytes(StandardCharsets.UTF_8),
                 new byte[] {'{', '"', (byte) 0xe2, (byte) 0x82})) {
-            byte[] prefix = prefix(complete, 2).getBytes(StandardCharsets.UTF_8);
+            byte[] prefix = prefix(complete, "observation").getBytes(StandardCharsets.UTF_8);
             byte[] bytes = Arrays.copyOf(prefix, prefix.length + tail.length);
             System.arraycopy(tail, 0, bytes, prefix.length, tail.length);
             Files.write(source, bytes);
@@ -166,10 +188,10 @@ public final class PartialCorrelatorTest {
         check(
                 result.diagnostics().get("apStopVerification").getAsString().equals("unavailable"),
                 "Unterminated footer certified AP completion");
-        JsonObject end = JsonParser.parseString(complete.get(2)).getAsJsonObject();
+        JsonObject end = row(complete, "captureEnd");
         end.addProperty("state", "incomplete");
         end.getAsJsonObject("counters").getAsJsonObject("kernel").addProperty("targetNamespaceFailures", "1");
-        Files.writeString(source, prefix(complete, 2) + end + "\n");
+        Files.writeString(source, prefix(complete, "observation") + end + "\n");
         rejects(() -> OfflineCorrelator.correlate(source, jfr, DEFAULTS), "Missing source finalization");
         result = OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS);
         check(
@@ -187,13 +209,13 @@ public final class PartialCorrelatorTest {
                         .equals("1"),
                 "Source failure counter erased");
 
-        Files.writeString(source, prefix(complete, 2) + observation + "\n");
+        Files.writeString(source, prefix(complete, "observation") + observation + "\n");
         result = OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS);
         check(
                 result.provisionalPairs() == 0 && result.invalidSource() == 2 && result.invalidJfr() == 1,
                 "Late prefix source duplicate joined");
         check(result.sourceSelectedObservedDurationNanos().equals("0"), "Duplicate source duration counted");
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
         Path duplicate = recording(dir.resolve("duplicate.jfr"), 2, true, false, false, false, 1, 2);
         result = OfflineCorrelator.correlatePartial(source, duplicate, DEFAULTS);
         check(
@@ -254,23 +276,23 @@ public final class PartialCorrelatorTest {
     }
 
     private static void hardFailures(Path dir, Path source, Path jfr, List<String> complete) throws Exception {
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
         for (String bad : List.of("{}\n", "{invalid}\n", "{\"schemaVersion\":1,\"schemaVersion\":1}\n")) {
-            Files.writeString(source, prefix(complete, 2) + bad);
+            Files.writeString(source, prefix(complete, "observation") + bad);
             rejects(
                     () -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS),
                     bad.equals("{}\n") ? "schemaVersion" : bad.contains("invalid") ? "line" : "Duplicate JSON field");
         }
-        JsonObject header = JsonParser.parseString(complete.get(0)).getAsJsonObject();
-        header.addProperty("schemaVersion", 2);
+        JsonObject header = row(complete, "captureStart");
+        header.addProperty("schemaVersion", 3);
         Files.writeString(source, header + "\n");
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Unsupported source schema");
-        header.addProperty("schemaVersion", 1);
+        header.addProperty("schemaVersion", 2);
         header.getAsJsonObject("sampling").addProperty("minOffCpuMicros", 10);
         header.getAsJsonObject("sampling").addProperty("maxOffCpuMicros", 10);
         Files.writeString(source, header + "\n");
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Invalid duration policy");
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
         Path conflict = recording(dir.resolve("conflict.jfr"), 1, false, false, false, true, 1, 0);
         rejects(
                 () -> OfflineCorrelator.correlatePartial(source, conflict, DEFAULTS),
@@ -309,11 +331,11 @@ public final class PartialCorrelatorTest {
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Source digest mismatch");
         Files.writeString(source, String.join("\n", complete) + "\n{}");
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Rows follow captureFinalized");
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
         CaptureInput snapshot = CaptureInput.readPartial(source, jfr, DEFAULTS);
-        Files.writeString(source, prefix(complete, 1));
+        Files.writeString(source, prefix(complete, "captureStart"));
         rejects(() -> snapshot.verifyUnchanged(source, jfr), "Inputs changed");
-        Files.writeString(source, prefix(complete, 2));
+        Files.writeString(source, prefix(complete, "observation"));
     }
 
     private static void outputFixtures(Path dir, Path source, Path jfr) throws Exception {

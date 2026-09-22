@@ -139,7 +139,11 @@ strictly less than the configured maximum; omitting either bound leaves that
 side unbounded. The resolved `sampling` object is sent to the native source,
 echoed back by it, and written unchanged into the manifest, the `captureStart`
 row, and the `captureFinalized` footer's `analysisInputs`, so every consumer
-compares the same value. Each observation row carries `admissionThreshold`,
+compares the same value. Each distinct native stack is symbolized once and
+written as its own `stack` row; observations reference it through
+`kernelStackId` and `userStackId`, or carry `kernelStackError`/`userStackError`
+when the kernel could not produce one. A stack row always precedes the first
+observation that references it. Each observation row carries `admissionThreshold`,
 the exact 32-bit-scaled threshold the kernel drew against for that interval
 (`4294967296` means certain admission). Under `uniform` it is the policy's
 `probabilityThreshold`; under `proportional` it is `2^32` for a duration at

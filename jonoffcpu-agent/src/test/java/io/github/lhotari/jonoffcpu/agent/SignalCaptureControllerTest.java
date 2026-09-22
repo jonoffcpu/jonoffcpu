@@ -197,7 +197,9 @@ public final class SignalCaptureControllerTest {
                 "Missing native stack rejected complete source");
         String rows = Files.readString(root.resolve("correlation.ndjson"));
         check(
-                rows.contains("\"symbolizationFailures\":\"1\"") && rows.contains("\"status\":\"error\""),
+                rows.contains("\"symbolizationFailures\":\"1\"")
+                        && rows.contains("\"userStackError\":\"bpf_stack_error_-7\"")
+                        && rows.contains("\"recordType\":\"stack\""),
                 "Native stack failure evidence not retained");
     }
 
@@ -1007,7 +1009,7 @@ public final class SignalCaptureControllerTest {
             identity.addProperty("monotonicOffsetNanos", "0");
             result.add("verifiedIdentity", identity);
             JsonObject start = new JsonObject();
-            start.addProperty("schemaVersion", 1);
+            start.addProperty("schemaVersion", 2);
             start.addProperty("recordType", "captureStart");
             start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             start.addProperty("sessionId", session);
@@ -1046,7 +1048,7 @@ public final class SignalCaptureControllerTest {
             try {
                 if (nativeStackFailure) {
                     JsonObject observation = new JsonObject();
-                    observation.addProperty("schemaVersion", 1);
+                    observation.addProperty("schemaVersion", 2);
                     observation.addProperty("recordType", "observation");
                     observation.addProperty("sourceId", "jonoffcpu.offcpu.v1");
                     observation.addProperty("sessionId", session);
@@ -1066,12 +1068,19 @@ public final class SignalCaptureControllerTest {
                     observation.addProperty("registrationToken", "0123456789abcdef");
                     observation.addProperty("startMonotonicNanos", "9");
                     observation.addProperty("endMonotonicNanos", "10");
-                    for (String key : new String[] {"kernelStack", "userStack"}) {
-                        JsonObject stack = new JsonObject();
-                        stack.addProperty("status", key.equals("userStack") ? "error" : "ok");
-                        stack.add("frames", new com.google.gson.JsonArray());
-                        observation.add(key, stack);
-                    }
+                    // One announced stack for the kernel side; the user side failed, so it has no record.
+                    JsonObject stack = new JsonObject();
+                    stack.addProperty("schemaVersion", 2);
+                    stack.addProperty("recordType", "stack");
+                    stack.addProperty("sourceId", "jonoffcpu.offcpu.v1");
+                    stack.addProperty("sessionId", session);
+                    stack.addProperty("captureEpoch", 7);
+                    stack.addProperty("stackId", 5);
+                    stack.add("frames", new com.google.gson.JsonArray());
+                    Files.writeString(source, stack + "\n", java.nio.file.StandardOpenOption.APPEND);
+                    observation.addProperty("kernelStackId", 5);
+                    observation.addProperty("userStackId", -7);
+                    observation.addProperty("userStackError", "bpf_stack_error_-7");
                     JsonObject userspace =
                             captureEnd.getAsJsonObject("counters").getAsJsonObject("userspace");
                     userspace.addProperty("receivedObservations", "1");
@@ -1114,7 +1123,7 @@ public final class SignalCaptureControllerTest {
 
         private static JsonObject captureEnd(String session, boolean complete) {
             JsonObject end = new JsonObject();
-            end.addProperty("schemaVersion", 1);
+            end.addProperty("schemaVersion", 2);
             end.addProperty("recordType", "captureEnd");
             end.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             end.addProperty("sessionId", session);

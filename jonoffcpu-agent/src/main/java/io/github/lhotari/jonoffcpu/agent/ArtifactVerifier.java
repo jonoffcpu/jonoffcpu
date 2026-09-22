@@ -16,13 +16,19 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Set;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingFile;
 
 final class ArtifactVerifier {
     private static final int MAX_LINE_BYTES = 1024 * 1024;
+    /** Version 2 interns stacks: each distinct stack is one record that observations reference by id. */
+    static final int SCHEMA_VERSION = 2;
+
+    private static final int MAX_STACK_FRAMES = 4096;
     private static final BigInteger MAX_U64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
 
     record Artifact(String path, String bytes, String sha256) {
@@ -65,11 +71,12 @@ final class ArtifactVerifier {
         JsonObject start = null;
         JsonObject end = null;
         long observations = 0;
+        Set<Long> announcedStacks = new HashSet<>();
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
             String line;
             while ((line = readLine(input)) != null) {
                 JsonObject row = JsonSupport.parseObject(line, "source NDJSON row", MAX_LINE_BYTES);
-                JsonSupport.requireNumber(row, "schemaVersion", 1, 1);
+                JsonSupport.requireNumber(row, "schemaVersion", SCHEMA_VERSION, SCHEMA_VERSION);
                 String type = JsonSupport.requireString(row, "recordType");
                 if (end != null) {
                     throw new IOException("Source rows follow captureEnd");
@@ -112,9 +119,32 @@ final class ArtifactVerifier {
                         }
                         start = row;
                     }
+                    case "stack" -> {
+                        if (start == null) throw new IOException("Stack before captureStart");
+                        requireIdentity(row, sessionId, epoch);
+                        JsonSupport.requireEqual(
+                                "stack sourceId", "jonoffcpu.offcpu.v1", JsonSupport.requireString(row, "sourceId"));
+                        long stackId = JsonSupport.requireNumber(row, "stackId", 0, Integer.MAX_VALUE);
+                        if (!announcedStacks.add(stackId)) {
+                            throw new IOException("Duplicate stack record: " + stackId);
+                        }
+                        JsonElement frames = row.get("frames");
+                        if (frames == null || !frames.isJsonArray()) throw new IOException("Missing stack frames");
+                        if (frames.getAsJsonArray().size() > MAX_STACK_FRAMES) {
+                            throw new IOException("Stack record exceeds the frame limit: " + stackId);
+                        }
+                    }
                     case "observation" -> {
                         if (start == null) throw new IOException("Observation before captureStart");
-                        validateObservation(row, sessionId, epoch, sampling, hostTgid, targetPid, verifiedIdentity);
+                        validateObservation(
+                                row,
+                                sessionId,
+                                epoch,
+                                sampling,
+                                hostTgid,
+                                targetPid,
+                                verifiedIdentity,
+                                announcedStacks);
                         observations++;
                     }
                     case "captureEnd" -> {
@@ -282,7 +312,8 @@ final class ArtifactVerifier {
             SamplingConfig sampling,
             long hostTgid,
             long targetPid,
-            JsonObject verifiedIdentity)
+            JsonObject verifiedIdentity,
+            Set<Long> announcedStacks)
             throws IOException {
         requireIdentity(row, sessionId, epoch);
         JsonSupport.requireEqual(
@@ -316,12 +347,19 @@ final class ArtifactVerifier {
                 "observation admissionThreshold",
                 sampling.admissionThreshold(end.subtract(start).longValueExact()),
                 JsonSupport.requireNumber(row, "admissionThreshold", 1, SamplingConfig.CERTAIN_ADMISSION));
-        for (String stackName : new String[] {"kernelStack", "userStack"}) {
-            JsonObject stack = JsonSupport.requireObject(row, stackName);
-            String status = JsonSupport.requireString(stack, "status");
-            if (!status.equals("ok") && !status.equals("error")) throw new IOException("Invalid stack status");
-            JsonElement frames = stack.get("frames");
-            if (frames == null || !frames.isJsonArray()) throw new IOException("Missing stack frames");
+        // A stack is either announced by an earlier record or explained by an error on this row.
+        for (String stack : new String[] {"kernelStack", "userStack"}) {
+            long stackId = JsonSupport.requireSignedNumber(row, stack + "Id", Integer.MIN_VALUE, Integer.MAX_VALUE);
+            JsonElement error = row.get(stack + "Error");
+            boolean failed = error != null && !error.isJsonNull();
+            if (failed) {
+                // A stack the kernel or the map lookup could not produce has no record of its own.
+                JsonSupport.requireString(row, stack + "Error");
+            } else if (stackId < 0) {
+                throw new IOException("Unexplained negative stack id for " + stack + ": " + stackId);
+            } else if (!announcedStacks.contains(stackId)) {
+                throw new IOException("Observation references an unannounced " + stack + ": " + stackId);
+            }
         }
     }
 

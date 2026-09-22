@@ -7,6 +7,16 @@ footer binds the source prefix and JFR hashes, capture identity and stop counter
 No separate manifest or exporter subprocess is required. Stored artifact paths
 are advisory, so recordings can be moved together or supplied from new locations.
 
+The stream is `schemaVersion` 2 NDJSON: a `captureStart` header, a `stack` record
+for each distinct native stack, one `observation` per recorded off-CPU interval,
+a `captureEnd`, and the footer. Stacks are interned: an observation names its two
+stacks through `kernelStackId`/`userStackId`, and a stack record always precedes
+the first observation that references it. When the kernel could not produce a
+stack there is no record and the observation carries `kernelStackError` or
+`userStackError` instead. An unannounced reference, a duplicate `stackId` and an
+unexplained negative id are all hard errors. The classified records re-expand
+both stacks, so an audit row remains self-contained.
+
 ```sh
 java -jar jonoffcpu-correlator.jar \
   --source jonoffcpu-capture.ndjson --jfr jonoffcpu-capture.jfr --output analysis
@@ -105,7 +115,8 @@ eBPF captures native stacks at scheduler exit and requests a signal. Async-profi
 captures its stack when that signal is delivered. It is therefore a
 **signal-delivery stack**, not a proven stack at the beginning of the off-CPU
 interval. Signal delay can change the observed stack. Both original native stacks
-are retained in the classified source rows.
+are retained in the classified source rows, expanded from the interned stack
+records.
 
 `--max-handler-delay-ns N` can reject delayed pairs, but a small delay does not
 prove stack equivalence. Delay is the handler's monotonic timestamp minus the
@@ -125,7 +136,8 @@ relative seconds or epoch timestamps. Either bound can be omitted. A matching
 handler event outside the interval still identifies an overlapping source interval.
 
 Default admission limits are one million total source/JFR rows, 1 MiB per source
-line, 4,096 frames per stack and 256 MiB of conservative decoded-object accounting.
+line, 4,096 frames per stack record and per JFR sample, and 256 MiB of
+conservative decoded-object accounting.
 Use `--max-rows` or `--max-retained-bytes` to change the corresponding limits.
 These are admission budgets, not a hard JVM heap limit. Failures reject the
 analysis rather than return a truncated successful result.

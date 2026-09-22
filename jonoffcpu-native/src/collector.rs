@@ -21,6 +21,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SOURCE_ID: &str = "jonoffcpu.offcpu.v1";
+/// Version 2 interns stacks: each distinct stack is one `stack` record and observations reference it.
+const SCHEMA_VERSION: u32 = 2;
 const MAX_CONTROL_JSON: usize = 64 * 1024;
 const DRAIN_QUIET_POLLS: usize = 2;
 const MAX_RING_BATCH: usize = 1024;
@@ -1580,6 +1582,9 @@ struct CaptureState {
     userspace: UserStats,
     kernel_symbols: KernelSymbols,
     user_maps: Vec<UserMap>,
+    /// Stack ids already written as their own record. The BPF stack map returns one id per distinct
+    /// stack and is never cleared during a capture, so an id identifies the same frames throughout.
+    emitted_stacks: HashSet<i64>,
     post_detach_signal_environment: Option<Value>,
     end_wall_clock_calibration: Option<WallClockCalibration>,
 }
@@ -1869,7 +1874,7 @@ fn enable_capture(
         bss.next_sequence = 1;
     }
     let start = json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "recordType": "captureStart",
         "sourceId": SOURCE_ID,
         "sessionId": enable.session_id,
@@ -1898,6 +1903,7 @@ fn enable_capture(
         started_ns,
         userspace: UserStats::default(),
         kernel_symbols: KernelSymbols::load(),
+        emitted_stacks: HashSet::new(),
         user_maps: UserMap::load(reply.target_pid),
         post_detach_signal_environment: None,
         end_wall_clock_calibration: None,
@@ -2064,7 +2070,7 @@ fn capture_end(
         Some("ring_poll_failure")
     };
     json!({
-        "schemaVersion": 1,
+        "schemaVersion": SCHEMA_VERSION,
         "recordType": "captureEnd",
         "sourceId": SOURCE_ID,
         "sessionId": capture.config.session_id,
@@ -2095,8 +2101,14 @@ fn drain_events(
     let events = std::mem::take(&mut *pending.lock().unwrap());
     for event in events {
         capture.userspace.received_observations += 1;
-        let row = observation_row(skel, capture, &event);
-        match row.and_then(|row| write_row(writer, &row)) {
+        // Each distinct stack is symbolized and written once; observations then reference it by id.
+        let kernel_error = emit_stack(skel, capture, writer, event.kernel_stack_id, true);
+        let user_error = emit_stack(skel, capture, writer, event.user_stack_id, false);
+        if kernel_error.is_some() || user_error.is_some() {
+            capture.userspace.symbolization_failures += 1;
+        }
+        let row = observation_row(capture, &event, kernel_error, user_error);
+        match write_row(writer, &row) {
             Ok(()) => capture.userspace.written_observations += 1,
             Err(_) => capture.userspace.write_failures += 1,
         }
@@ -2106,28 +2118,84 @@ fn drain_events(
     }
 }
 
-fn observation_row(
+/// What an observation's stack id needs before the observation can reference it.
+#[derive(Debug, PartialEq, Eq)]
+enum StackAction {
+    /// The id was announced by an earlier `stack` record.
+    AlreadyEmitted,
+    /// The first sighting: materialize and write the record before the observation.
+    NeedsRecord,
+    /// The kernel could not take the stack, so there is no record and the observation carries this.
+    Error(String),
+}
+
+fn stack_action(stack_id: i64, emitted: &HashSet<i64>) -> StackAction {
+    if stack_id < 0 {
+        StackAction::Error(format!("bpf_stack_error_{stack_id}"))
+    } else if emitted.contains(&stack_id) {
+        StackAction::AlreadyEmitted
+    } else {
+        StackAction::NeedsRecord
+    }
+}
+
+/// Writes the `stack` record for an id the capture has not seen yet. Returns the error code when the
+/// stack could not be materialized, in which case no record exists and the observation carries it.
+fn emit_stack(
     skel: &crate::bpf_sched_exit::JonoffcpuCookieSkel<'_>,
     capture: &mut CaptureState,
-    event: &Observation,
-) -> Result<Value> {
-    let kernel_stack =
-        materialize_stack(&skel.maps.stack_traces, event.kernel_stack_id, |address| {
-            capture.kernel_symbols.resolve(address)
-        });
-    let user_stack = materialize_stack(&skel.maps.stack_traces, event.user_stack_id, |address| {
-        resolve_user(address, &capture.user_maps)
-    });
-    if kernel_stack.is_err() || user_stack.is_err() {
-        capture.userspace.symbolization_failures += 1;
+    writer: &mut BufWriter<File>,
+    stack_id: i64,
+    kernel: bool,
+) -> Option<String> {
+    match stack_action(stack_id, &capture.emitted_stacks) {
+        StackAction::AlreadyEmitted => return None,
+        StackAction::Error(error) => return Some(error),
+        StackAction::NeedsRecord => {}
     }
+    let frames = if kernel {
+        materialize_frames(&skel.maps.stack_traces, stack_id, |address| {
+            capture.kernel_symbols.resolve(address)
+        })
+    } else {
+        materialize_frames(&skel.maps.stack_traces, stack_id, |address| {
+            resolve_user(address, &capture.user_maps)
+        })
+    };
+    let frames = match frames {
+        Ok(frames) => frames,
+        Err(error) => return Some(error.to_string()),
+    };
+    let row = json!({
+        "schemaVersion": SCHEMA_VERSION,
+        "recordType": "stack",
+        "sourceId": SOURCE_ID,
+        "sessionId": capture.config.session_id,
+        "captureEpoch": capture.config.capture_epoch,
+        "stackId": stack_id,
+        "frames": frames,
+    });
+    if write_row(writer, &row).is_err() {
+        capture.userspace.write_failures += 1;
+        return Some("stack_record_write_failure".to_string());
+    }
+    capture.emitted_stacks.insert(stack_id);
+    None
+}
+
+fn observation_row(
+    capture: &CaptureState,
+    event: &Observation,
+    kernel_stack_error: Option<String>,
+    user_stack_error: Option<String>,
+) -> Value {
     let comm_end = event
         .comm
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(event.comm.len());
-    Ok(json!({
-        "schemaVersion": 1,
+    json!({
+        "schemaVersion": SCHEMA_VERSION,
         "recordType": "observation",
         "sourceId": SOURCE_ID,
         "sessionId": capture.config.session_id,
@@ -2145,25 +2213,18 @@ fn observation_row(
         "admissionThreshold": event.admission_threshold,
         "signalResult": event.signal_result,
         "comm": String::from_utf8_lossy(&event.comm[..comm_end]),
-        "kernelStack": kernel_stack.unwrap_or_else(|error| stack_error(event.kernel_stack_id, &error)),
-        "userStack": user_stack.unwrap_or_else(|error| stack_error(event.user_stack_id, &error)),
-    }))
-}
-
-fn stack_error(stack_id: i64, error: &anyhow::Error) -> Value {
-    json!({
-        "status":"error",
-        "stackId":stack_id,
-        "errorCode":error.to_string(),
-        "frames":[],
+        "kernelStackId": event.kernel_stack_id,
+        "userStackId": event.user_stack_id,
+        "kernelStackError": kernel_stack_error,
+        "userStackError": user_stack_error,
     })
 }
 
-fn materialize_stack(
+fn materialize_frames(
     map: &impl MapCore,
     stack_id: i64,
     mut resolve: impl FnMut(u64) -> (Option<String>, Option<String>),
-) -> Result<Value> {
+) -> Result<Vec<Value>> {
     if stack_id < 0 {
         bail!("bpf_stack_error_{stack_id}");
     }
@@ -2183,12 +2244,7 @@ fn materialize_stack(
             "module": module,
         }));
     }
-    Ok(json!({
-        "status":"ok",
-        "stackId":stack_id,
-        "errorCode":Value::Null,
-        "frames":frames,
-    }))
+    Ok(frames)
 }
 
 struct KernelSymbols(Vec<(u64, String)>);
@@ -2426,7 +2482,7 @@ mod tests {
             "state": "incomplete",
             "sourcePath": "/tmp/source.ndjson",
             "captureEnd": {
-                "schemaVersion": 1,
+                "schemaVersion": SCHEMA_VERSION,
                 "recordType": "captureEnd",
                 "state": "incomplete",
                 "targetExited": true,
@@ -2546,6 +2602,26 @@ mod tests {
             u32::MAX,
             &proportional(10)
         ));
+    }
+
+    #[test]
+    fn stacks_are_announced_once_before_they_are_referenced() {
+        let mut emitted = HashSet::new();
+        assert_eq!(stack_action(7, &emitted), StackAction::NeedsRecord);
+        emitted.insert(7);
+        assert_eq!(stack_action(7, &emitted), StackAction::AlreadyEmitted);
+        // A second id is announced on its own, and an id is never confused with another.
+        assert_eq!(stack_action(8, &emitted), StackAction::NeedsRecord);
+        assert_eq!(stack_action(0, &emitted), StackAction::NeedsRecord);
+        // A failed stack has no record at all; the error travels on the observation.
+        assert_eq!(
+            stack_action(-7, &emitted),
+            StackAction::Error("bpf_stack_error_-7".to_string())
+        );
+        assert_eq!(
+            stack_action(-1, &HashSet::new()),
+            StackAction::Error("bpf_stack_error_-1".to_string())
+        );
     }
 
     #[test]
@@ -2918,6 +2994,8 @@ mod tests {
             target_pid: dead_pid as u32,
             output_path: dead_path.clone(),
             sampling: privileged_sampling(),
+            exclude_calling_thread: false,
+            calling_tid: 0,
         })
         .err()
         .expect("dead target prepare unexpectedly succeeded");
@@ -3145,6 +3223,8 @@ mod tests {
             target_pid: unsafe { libc::getpid() as u32 },
             output_path: path,
             sampling: privileged_sampling(),
+            exclude_calling_thread: false,
+            calling_tid: 0,
         }
     }
 

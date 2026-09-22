@@ -25,6 +25,12 @@ smallest relevant layer before running privileged end-to-end tests.
   incomplete data in normal mode.
 - Join records by capture identity and the exact 64-bit cookie. Timestamps are
   for clipping and delivery-delay analysis, never a heuristic join key.
+- Native stacks are interned in the stream: one `stack` record per distinct BPF
+  stack id, always written before the first observation that references it, and
+  observations carry only the ids. Keep that ordering guarantee, keep the
+  failure case on the observation (`kernelStackError`/`userStackError`, no
+  record), and keep the classified records self-contained by re-expanding both
+  stacks.
 - The kernel interval is the actual off-CPU duration. The JVM stack is captured
   asynchronously after the task resumes. Keep source duration, signal delivery
   delay, and the observed JVM stack distinct in APIs and reports.

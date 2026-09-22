@@ -32,10 +32,16 @@ import java.util.UUID;
 /** Validates a finalized source stream and its self-contained receipt before correlation. */
 final class CaptureInput {
     static final BigInteger U64_MAX = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
+    /** Version 2 interns stacks: each distinct stack is one record that observations reference by id. */
+    private static final int SCHEMA_VERSION = 2;
+
     final JsonObject start;
     final JsonObject end;
     final JsonObject inputs;
     final List<JsonObject> observations;
+    /** Interned stacks by id: each is announced once, before the first observation that references it. */
+    final Map<Long, JsonArray> stacks;
+
     final String sourceDigest;
     final String jfrDigest;
     final String apStoppedAtNanos;
@@ -48,6 +54,7 @@ final class CaptureInput {
             JsonObject end,
             JsonObject inputs,
             List<JsonObject> observations,
+            Map<Long, JsonArray> stacks,
             String sourceDigest,
             String jfrDigest,
             String apStoppedAtNanos,
@@ -58,6 +65,7 @@ final class CaptureInput {
         this.end = end;
         this.inputs = inputs;
         this.observations = observations;
+        this.stacks = stacks;
         this.sourceDigest = sourceDigest;
         this.jfrDigest = jfrDigest;
         this.apStoppedAtNanos = apStoppedAtNanos;
@@ -97,6 +105,7 @@ final class CaptureInput {
         JsonObject end = null;
         JsonObject footer = null;
         List<JsonObject> observations = new ArrayList<>();
+        Map<Long, JsonArray> stacks = new LinkedHashMap<>();
         List<String> reasons = new ArrayList<>();
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
             byte[] line;
@@ -112,7 +121,7 @@ final class CaptureInput {
                 }
                 JsonObject row = parse(line);
                 budget.charge(row);
-                require(number(row, "schemaVersion") == 1, "Unsupported source schema");
+                require(number(row, "schemaVersion") == SCHEMA_VERSION, "Unsupported source schema");
                 String type = text(row, "recordType");
                 if (!type.equals("captureFinalized")) {
                     rawHash.update(line);
@@ -129,6 +138,13 @@ final class CaptureInput {
                     case "captureStart" -> {
                         require(start == null && end == null && observations.isEmpty(), "Duplicate/out-of-order start");
                         start = row;
+                    }
+                    case "stack" -> {
+                        require(start != null && end == null, "Stack outside source capture");
+                        long stackId = number(row, "stackId");
+                        require(stackId >= 0, "Invalid stack id");
+                        JsonArray frames = frames(row, limits);
+                        require(stacks.putIfAbsent(stackId, frames) == null, "Duplicate stack record");
                     }
                     case "observation" -> {
                         require(start != null && end == null, "Observation outside source capture");
@@ -320,7 +336,17 @@ final class CaptureInput {
         diagnostics.addProperty("apStopVerification", footer != null ? "verified-footer" : "unavailable");
         if (footer != null) diagnostics.add("observedFinalization", footer);
         return new CaptureInput(
-                start, end, inputs, observations, sourceHash, jfrHash, apStoppedAt, budget, partial, diagnostics);
+                start,
+                end,
+                inputs,
+                observations,
+                stacks,
+                sourceHash,
+                jfrHash,
+                apStoppedAt,
+                budget,
+                partial,
+                diagnostics);
     }
 
     private record CaptureReceipt(
@@ -441,6 +467,18 @@ final class CaptureInput {
                 text(row, "sessionId").equals(text(inputs, "sessionId"))
                         && number(row, "captureEpoch") == number(inputs, "captureEpoch"),
                 "Capture identity mismatch");
+    }
+
+    /** The frames of a stack record or a JFR sample row, held to the configured per-stack limit. */
+    static JsonArray frames(JsonObject row, OfflineCorrelator.Limits limits) throws IOException {
+        JsonElement frames = row.get("frames");
+        require(frames != null && frames.isJsonArray(), "Missing stack frames");
+        JsonArray array = frames.getAsJsonArray();
+        require(array.size() <= limits.maxFrames(), "Stack frame count limit exceeded");
+        for (JsonElement frame : array) {
+            require(frame.isJsonObject(), "Invalid stack frame");
+        }
+        return array;
     }
 
     static JsonObject object(JsonObject row, String key) throws IOException {

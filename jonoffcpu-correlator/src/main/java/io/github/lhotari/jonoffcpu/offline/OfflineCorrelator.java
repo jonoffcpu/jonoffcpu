@@ -7,6 +7,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
@@ -363,11 +364,16 @@ final class OfflineCorrelator {
         BigInteger generation = decimal(value, "processGenerationNs");
         BigInteger start = decimal(value, "startMonotonicNanos");
         BigInteger end = decimal(value, "endMonotonicNanos");
-        for (String key : List.of("kernelStack", "userStack")) {
-            JsonObject stack = object(value, key);
-            String status = text(stack, "status");
-            require(status.equals("ok") || status.equals("error"), "Invalid native stack status");
-            frames(stack, limits);
+        // Stacks are interned: an observation names an announced stack id, or explains why there is none.
+        for (String stack : List.of("kernelStack", "userStack")) {
+            long stackId = number(value, stack + "Id");
+            JsonElement error = value.get(stack + "Error");
+            if (error == null || error.isJsonNull()) {
+                require(stackId >= 0, "Unexplained negative stack id");
+                require(capture.stacks.containsKey(stackId), "Observation references an unannounced stack");
+            } else {
+                require(error.isJsonPrimitive() && error.getAsJsonPrimitive().isString(), "Invalid stack error");
+            }
         }
         long threshold = number(value, "admissionThreshold");
         require(
@@ -388,16 +394,6 @@ final class OfflineCorrelator {
             row.invalid = "source-policy-or-target-mismatch";
         }
         if (row.invalid == null && !sampling.withinBounds(duration)) row.invalid = "duration-policy-mismatch";
-    }
-
-    private static void frames(JsonObject row, Limits limits) throws IOException {
-        JsonElement frames = row.get("frames");
-        require(
-                frames != null
-                        && frames.isJsonArray()
-                        && frames.getAsJsonArray().size() <= limits.maxFrames(),
-                "Invalid/excessive frame count");
-        for (JsonElement frame : frames.getAsJsonArray()) require(frame.isJsonObject(), "Invalid frame");
     }
 
     private static Long optionalTid(JsonObject row, String key) throws IOException {
@@ -488,8 +484,8 @@ final class OfflineCorrelator {
             matches.add(new Match(source.value, sample.value, from, to.max(from), duration, delay, verified));
         }
         List<ClassifiedRecord> records = new ArrayList<>();
-        int invalidSource = classify("source", sources, records, capture.partial);
-        int invalidJfr = classify("jfr", samples, records, capture.partial);
+        int invalidSource = classify("source", sources, records, capture.partial, capture.stacks);
+        int invalidJfr = classify("jfr", samples, records, capture.partial, capture.stacks);
         Map<String, String> weights = new TreeMap<>();
         collapsed.forEach((key, value) -> weights.put(key, value.toString()));
         PopulationEstimate populationEstimate =
@@ -658,7 +654,33 @@ final class OfflineCorrelator {
         return index;
     }
 
-    private static int classify(String stream, List<Row> rows, List<ClassifiedRecord> records, boolean partial) {
+    /**
+     * Puts an interned stack back into the echoed row, so a classified record stays self-contained: a reader of
+     * the audit file never has to resolve a stack id against the capture stream.
+     */
+    private static JsonObject expandStacks(JsonObject observation, Map<Long, JsonArray> stacks) {
+        JsonObject expanded = observation.deepCopy();
+        for (String stack : List.of("kernelStack", "userStack")) {
+            JsonElement id = expanded.remove(stack + "Id");
+            JsonElement error = expanded.remove(stack + "Error");
+            JsonObject value = new JsonObject();
+            value.add("stackId", id);
+            value.add("errorCode", error == null ? JsonNull.INSTANCE : error);
+            boolean failed = error != null && !error.isJsonNull();
+            value.addProperty("status", failed ? "error" : "ok");
+            JsonArray frames = failed ? new JsonArray() : stacks.get(id.getAsLong());
+            value.add("frames", frames == null ? new JsonArray() : frames);
+            expanded.add(stack, value);
+        }
+        return expanded;
+    }
+
+    private static int classify(
+            String stream,
+            List<Row> rows,
+            List<ClassifiedRecord> records,
+            boolean partial,
+            Map<Long, JsonArray> stacks) {
         int invalid = 0;
         for (Row row : rows) {
             String classification;
@@ -672,7 +694,7 @@ final class OfflineCorrelator {
                     row.number,
                     classification,
                     row.invalid != null ? row.invalid : row.matched ? null : row.unmatchedReason,
-                    row.value));
+                    stream.equals("source") ? expandStacks(row.value, stacks) : row.value));
         }
         return invalid;
     }

@@ -115,6 +115,31 @@ final class JsonSupport {
         return number;
     }
 
+    /** Like {@link #requireNumber} but accepts negative values, such as a failed BPF stack id. */
+    static long requireSignedNumber(JsonObject object, String name, long minimum, long maximum) {
+        JsonElement value = object.get(name);
+        if (value == null
+                || !value.isJsonPrimitive()
+                || !value.getAsJsonPrimitive().isNumber()) {
+            throw new IllegalArgumentException("Missing/integer field " + name);
+        }
+        String text = value.getAsString();
+        boolean negative = text.startsWith("-");
+        if (!DECIMAL.matcher(negative ? text.substring(1) : text).matches()) {
+            throw new IllegalArgumentException("Invalid integer field " + name);
+        }
+        long number;
+        try {
+            number = Long.parseLong(text);
+        } catch (NumberFormatException error) {
+            throw new IllegalArgumentException("Out-of-range integer field " + name, error);
+        }
+        if (number < minimum || number > maximum) {
+            throw new IllegalArgumentException("Out-of-range integer field " + name);
+        }
+        return number;
+    }
+
     static String requireDecimal(JsonObject object, String name) {
         String value = requireString(object, name);
         if (!DECIMAL.matcher(value).matches()) {

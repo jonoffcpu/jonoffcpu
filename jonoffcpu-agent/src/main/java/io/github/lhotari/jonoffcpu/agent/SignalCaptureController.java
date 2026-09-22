@@ -356,7 +356,7 @@ final class SignalCaptureController {
                 manifest.root().add("processStartTime", processStart);
                 JsonObject analysisInputs = analysisInputs(apStopped.manifestCounters(), sourceArtifact, jfrArtifact);
                 JsonObject footer = new JsonObject();
-                footer.addProperty("schemaVersion", 1);
+                footer.addProperty("schemaVersion", ArtifactVerifier.SCHEMA_VERSION);
                 footer.addProperty("recordType", "captureFinalized");
                 footer.addProperty("sessionId", sessionId);
                 footer.addProperty("captureEpoch", capture.epoch());
@@ -492,7 +492,7 @@ final class SignalCaptureController {
             analysisInputs.add("sampling", config.sampling().json());
             analysisInputs.add("jfrArtifact", jfrArtifact.json());
             JsonObject footer = new JsonObject();
-            footer.addProperty("schemaVersion", 1);
+            footer.addProperty("schemaVersion", ArtifactVerifier.SCHEMA_VERSION);
             footer.addProperty("recordType", "captureFinalized");
             footer.addProperty("sessionId", sessionId);
             footer.addProperty("state", "profilerOnly");

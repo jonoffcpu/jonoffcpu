@@ -66,7 +66,7 @@ public final class OfflineCorrelatorTest {
 
     static JsonObject row(String type) {
         JsonObject row = new JsonObject();
-        row.addProperty("schemaVersion", 1);
+        row.addProperty("schemaVersion", 2);
         row.addProperty("recordType", type);
         row.addProperty("sessionId", SESSION);
         row.addProperty("captureEpoch", EPOCH);
@@ -118,12 +118,27 @@ public final class OfflineCorrelatorTest {
         row.addProperty("startMonotonicNanos", "1000");
         row.addProperty("endMonotonicNanos", "4000");
         row.addProperty("signalResult", 0);
-        for (String field : List.of("kernelStack", "userStack")) {
-            JsonObject stack = new JsonObject();
-            stack.addProperty("status", "ok");
-            stack.add("frames", new JsonArray());
-            row.add(field, stack);
-        }
+        row.addProperty("kernelStackId", KERNEL_STACK_ID);
+        row.addProperty("userStackId", USER_STACK_ID);
+        return row;
+    }
+
+    /** The two interned stacks every fixture observation references. */
+    static final long KERNEL_STACK_ID = 11;
+
+    static final long USER_STACK_ID = 12;
+
+    static JsonObject stack(long stackId, String symbol) {
+        JsonObject row = row("stack");
+        row.addProperty("sourceId", "jonoffcpu.offcpu.v1");
+        row.addProperty("stackId", stackId);
+        JsonArray frames = new JsonArray();
+        JsonObject frame = new JsonObject();
+        frame.addProperty("address", "00007f0000000001");
+        frame.addProperty("symbol", symbol);
+        frame.addProperty("module", "libtest.so");
+        frames.add(frame);
+        row.add("frames", frames);
         return row;
     }
 
@@ -198,6 +213,9 @@ public final class OfflineCorrelatorTest {
         counters.add("kernel", kernel);
         end.add("counters", counters);
         StringBuilder raw = new StringBuilder(start + "\n");
+        // Stacks are announced once, before the observations that reference them.
+        raw.append(stack(KERNEL_STACK_ID, "kernel_wait")).append('\n');
+        raw.append(stack(USER_STACK_ID, "user_wait")).append('\n');
         for (JsonObject observation : observations) raw.append(observation).append('\n');
         raw.append(end).append('\n');
         byte[] bytes = raw.toString().getBytes(StandardCharsets.UTF_8);
@@ -284,7 +302,7 @@ public final class OfflineCorrelatorTest {
         source = source(dir, jfr, List.of(certain, half), sampling(admission));
         mutateSource(
                 source,
-                0,
+                "captureStart",
                 row -> row.getAsJsonObject("sampling")
                         .getAsJsonObject("admission")
                         .addProperty("recordAllAboveMicros", 3));
@@ -300,9 +318,16 @@ public final class OfflineCorrelatorTest {
      * Rewrite a source prefix and its digest, so validation cannot pass merely by rejecting a stale
      * hash.
      */
-    private static void mutateSource(Path source, int rowIndex, java.util.function.Consumer<JsonObject> mutation)
+    private static void mutateSource(Path source, String recordType, java.util.function.Consumer<JsonObject> mutation)
             throws IOException {
         List<String> lines = Files.readAllLines(source);
+        int rowIndex = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            JsonObject candidate =
+                    com.google.gson.JsonParser.parseString(lines.get(i)).getAsJsonObject();
+            if (candidate.get("recordType").getAsString().equals(recordType)) rowIndex = i;
+        }
+        check(rowIndex >= 0, "No " + recordType + " row to mutate");
         JsonObject row =
                 com.google.gson.JsonParser.parseString(lines.get(rowIndex)).getAsJsonObject();
         mutation.accept(row);
@@ -517,7 +542,7 @@ public final class OfflineCorrelatorTest {
                     "Stack-matched duration was incorrectly scaled");
             mutateSource(
                     twoSource,
-                    3,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .addProperty("selectedIntervals", "3"));
@@ -531,7 +556,7 @@ public final class OfflineCorrelatorTest {
             source = source(dir, jfr, List.of(observation));
             mutateSource(
                     source,
-                    2,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .addProperty("eligibleIntervals", CaptureInput.U64_MAX.toString()));
@@ -545,7 +570,7 @@ public final class OfflineCorrelatorTest {
             source = source(dir, jfr, List.of(observation));
             mutateSource(
                     source,
-                    2,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .addProperty("eligibleIntervals", 1));
@@ -559,7 +584,7 @@ public final class OfflineCorrelatorTest {
             source = source(dir, jfr, List.of(observation));
             mutateSource(
                     source,
-                    2,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .addProperty("targetNamespaceFailures", "+0"));
@@ -692,12 +717,22 @@ public final class OfflineCorrelatorTest {
             check(result.invalidSource() == 1 && result.invalidJfr() == 1, "Wrong namespace TGID joined");
             observation.addProperty("targetTgid", ProcessHandle.current().pid());
             source = source(dir, jfr, List.of(observation));
-            mutateSource(source, 0, row -> row.addProperty("pidNamespaceInode", "1"));
+            mutateSource(source, "captureStart", row -> row.addProperty("pidNamespaceInode", "1"));
             rejects(source, jfr, defaults, "Verified namespace mismatch");
+            // Interned stacks: a reference must be announced first, and an id may be announced only once.
+            source = source(dir, jfr, List.of(observation));
+            mutateSource(source, "observation", row -> row.addProperty("kernelStackId", 99));
+            rejects(source, jfr, defaults, "Observation references an unannounced stack");
+            source = source(dir, jfr, List.of(observation));
+            mutateSource(source, "observation", row -> row.addProperty("kernelStackId", -7));
+            rejects(source, jfr, defaults, "Unexplained negative stack id");
+            source = source(dir, jfr, List.of(observation));
+            mutateSource(source, "stack", row -> row.addProperty("stackId", KERNEL_STACK_ID));
+            rejects(source, jfr, defaults, "Duplicate stack record");
             source = source(dir, jfr, List.of(observation));
             mutateSource(
                     source,
-                    2,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .addProperty("targetNamespaceFailures", "1"));
@@ -705,7 +740,7 @@ public final class OfflineCorrelatorTest {
             source = source(dir, jfr, List.of(observation));
             mutateSource(
                     source,
-                    2,
+                    "captureEnd",
                     row -> row.getAsJsonObject("counters")
                             .getAsJsonObject("kernel")
                             .remove("targetNamespaceFailures"));
@@ -724,7 +759,7 @@ public final class OfflineCorrelatorTest {
             Files.writeString(source, valid + "{}\n");
             rejects(source, jfr, defaults, "Rows follow");
             Files.writeString(
-                    source, valid.replaceFirst("\"schemaVersion\":1", "\"schemaVersion\":1,\"schemaVersion\":1"));
+                    source, valid.replaceFirst("\"schemaVersion\":2", "\"schemaVersion\":2,\"schemaVersion\":2"));
             rejects(source, jfr, defaults, "Duplicate JSON field");
             Files.writeString(source, valid);
             rejects(
