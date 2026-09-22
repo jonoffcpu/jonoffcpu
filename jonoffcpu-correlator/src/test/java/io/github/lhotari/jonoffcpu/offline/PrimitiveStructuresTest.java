@@ -64,9 +64,71 @@ public final class PrimitiveStructuresTest {
         check(grown.retainedBytes() >= 10_000L * 12, "Retention accounting is below the stored bytes");
     }
 
+    private static java.util.Map<String, Object> frame(String className, String methodName, int line) {
+        java.util.Map<String, Object> frame = new java.util.LinkedHashMap<>();
+        frame.put("type", "Interpreted");
+        frame.put("className", className);
+        frame.put("methodName", methodName);
+        frame.put("descriptor", "()V");
+        frame.put("lineNumber", line);
+        frame.put("bytecodeIndex", 0);
+        return frame;
+    }
+
+    private static void dictionaries() throws IOException {
+        JfrDictionaries dictionaries = new JfrDictionaries();
+        java.util.List<java.util.Map<String, Object>> leafFirst =
+                java.util.List.of(frame("a.Leaf", "run", 3), frame("a.Root", "main", 1));
+        int first = dictionaries.internStack(leafFirst, false, 4096);
+        int again = dictionaries.internStack(
+                java.util.List.of(frame("a.Leaf", "run", 3), frame("a.Root", "main", 1)), false, 4096);
+        check(first == again, "Equal stacks were not interned to one id");
+        check(dictionaries.stackCount() == 1, "Interner retained a second copy of an equal stack");
+        int truncated = dictionaries.internStack(leafFirst, true, 4096);
+        check(truncated != first, "The truncation flag must separate canonical stacks");
+        int differentLine = dictionaries.internStack(
+                java.util.List.of(frame("a.Leaf", "run", 4), frame("a.Root", "main", 1)), false, 4096);
+        check(differentLine != first, "A different line number must separate canonical stacks");
+        // Root first, ';'-joined, class and method dotted: the collapsed key the flame graph reads.
+        check(
+                dictionaries.collapsedKey(dictionaries.collapsedOf(first)).equals("a.Root.main;a.Leaf.run"),
+                "Collapsed key is not the root-first dotted form: "
+                        + dictionaries.collapsedKey(dictionaries.collapsedOf(first)));
+        // Line numbers do not belong in a collapsed key, so those two stacks share one collapsed id.
+        check(
+                dictionaries.collapsedOf(differentLine) == dictionaries.collapsedOf(first),
+                "Collapsed ids must merge stacks that differ only below the collapsed key");
+        check(dictionaries.collapsedCount() == 1, "Collapsed id space grew with canonical stacks");
+        int empty = dictionaries.internStack(java.util.List.of(), false, 4096);
+        check(
+                dictionaries.collapsedKey(dictionaries.collapsedOf(empty)).equals("[stack unavailable]"),
+                "An empty frame list must collapse to the unavailable marker");
+        java.util.Map<String, Object> unresolved = frame(null, null, -1);
+        int missing = dictionaries.internStack(java.util.List.of(unresolved), false, 4096);
+        check(
+                dictionaries.collapsedKey(dictionaries.collapsedOf(missing)).equals("[unresolved]"),
+                "A frame with no class or method must collapse to [unresolved]");
+        java.util.Map<String, Object> awkward = frame("a;b\nc", "run", 1);
+        int escaped = dictionaries.internStack(java.util.List.of(awkward), false, 4096);
+        check(
+                dictionaries.collapsedKey(dictionaries.collapsedOf(escaped)).equals("a:b c.run"),
+                "Separator and newline escaping changed");
+        rejects(() -> dictionaries.internStack(leafFirst, false, 1), "Stack frame count limit exceeded");
+        check(dictionaries.frames(first).length == 2, "Interner lost the retained frames");
+        check(dictionaries.frames(first)[0].className().equals("a.Leaf"), "Frames must stay leaf-first");
+
+        int thread = dictionaries.internThread(41L, 401L, "worker");
+        check(dictionaries.internThread(41L, 401L, "worker") == thread, "Equal threads were not interned");
+        check(dictionaries.internThread(42L, 401L, "worker") != thread, "Different OS thread ids were merged");
+        check(dictionaries.thread(thread).name().equals("worker"), "Thread dictionary lost the name");
+        check(dictionaries.internThread(null, null, null) >= 0, "A sample without a thread must still intern");
+        check(dictionaries.retainedBytes() > 0, "Dictionary retention accounting is missing");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
+        dictionaries();
         System.out.println("Primitive structure fixtures passed");
     }
 }
