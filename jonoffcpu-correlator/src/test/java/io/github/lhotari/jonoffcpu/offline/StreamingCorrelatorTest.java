@@ -127,10 +127,35 @@ public final class StreamingCorrelatorTest {
         }
     }
 
+    /** The synthetic view is built from interned stacks, not from retained sample documents. */
+    private static void syntheticFromColumns(Path dir) throws Exception {
+        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        long[] tid = new long[1];
+        io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter.visit(jfr, row -> {
+            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
+        });
+        Path source = capture(dir, jfr, tid[0], 3);
+        var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
+        Path fromAnalysis = dir.resolve("synthetic-analysis.jfr");
+        var viaAnalysis = CompatibilityJfrWriter.write(
+                analysis, fromAnalysis, new CompatibilityJfrWriter.Options(1000L, 1_000_000L));
+        Path fromColumns = dir.resolve("synthetic-columns.jfr");
+        var result = CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
+        var viaColumns = CompatibilityJfrWriter.write(
+                SyntheticJfrSource.of(result), fromColumns, new CompatibilityJfrWriter.Options(1000L, 1_000_000L));
+        check(
+                viaColumns.syntheticEvents() == viaAnalysis.syntheticEvents()
+                        && viaColumns.canonicalStacks() == viaAnalysis.canonicalStacks()
+                        && viaColumns.representedNanos().equals(viaAnalysis.representedNanos())
+                        && viaColumns.omittedRemainderNanos().equals(viaAnalysis.omittedRemainderNanos()),
+                "Column-backed synthetic plan differs from the retained one");
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-streaming-test-");
         try {
             goldenEquivalence(dir);
+            syntheticFromColumns(dir);
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

@@ -1,21 +1,15 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.LinkedHashMap;
+import java.util.BitSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import org.openjdk.jmc.flightrecorder.writer.api.Recording;
 import org.openjdk.jmc.flightrecorder.writer.api.Recordings;
@@ -35,7 +29,6 @@ import org.openjdk.jmc.flightrecorder.writer.api.Types;
  * and in the metadata event; this file is a compatibility view, not historical CPU sampling.
  */
 final class CompatibilityJfrWriter {
-    private static final BigInteger BILLION = BigInteger.valueOf(1_000_000_000L);
     private static final BigInteger LONG_MAX = BigInteger.valueOf(Long.MAX_VALUE);
     private static final String EXECUTION_SAMPLE = "jdk.ExecutionSample";
     private static final String METADATA = "jonoffcpu.SyntheticOffCpuMetadata";
@@ -63,7 +56,7 @@ final class CompatibilityJfrWriter {
             String quantizationErrorNanos,
             String omittedRemainderNanos) {}
 
-    private record Planned(OfflineCorrelator.Match match, String stackKey, long count, BigInteger epochOffsetNanos) {}
+    private record Planned(SyntheticJfrSource.Interval interval, long count) {}
 
     private record Plan(
             List<Planned> intervals,
@@ -90,12 +83,21 @@ final class CompatibilityJfrWriter {
 
     private CompatibilityJfrWriter() {}
 
+    /** A retained analysis, for the existing fixture that builds matches by hand. */
+    public static Result write(OfflineCorrelator.Analysis analysis, Path output, Options options) throws IOException {
+        Objects.requireNonNull(analysis, "analysis");
+        if (analysis.schemaVersion() != 1 || analysis.matches() == null || analysis.analysisInputs() == null) {
+            throw new IOException("Unsupported or incomplete correlation analysis");
+        }
+        return write(SyntheticJfrSource.of(analysis), output, options);
+    }
+
     /**
      * Creates a new compatibility recording. Publication uses a same-directory hard link, so an
      * existing destination is never replaced and unsupported atomic publication fails closed.
      */
-    public static Result write(OfflineCorrelator.Analysis analysis, Path output, Options options) throws IOException {
-        Objects.requireNonNull(analysis, "analysis");
+    public static Result write(SyntheticJfrSource source, Path output, Options options) throws IOException {
+        Objects.requireNonNull(source, "source");
         Objects.requireNonNull(output, "output");
         Objects.requireNonNull(options, "options");
         Path absolute = output.toAbsolutePath().normalize();
@@ -105,10 +107,10 @@ final class CompatibilityJfrWriter {
         }
         if (Files.exists(absolute)) throw new FileAlreadyExistsException(absolute.toString());
 
-        Plan plan = plan(analysis, options);
+        Plan plan = plan(source, options);
         Path temporary = Files.createTempFile(parent, ".jonoffcpu-compatibility-", ".jfr.tmp");
         try {
-            writeTemporary(analysis, temporary, options, plan);
+            writeTemporary(source, temporary, options, plan);
             // Hard-link creation is an atomic, no-replace publication on the required Linux filesystems.
             Files.createLink(absolute, temporary);
         } finally {
@@ -126,68 +128,68 @@ final class CompatibilityJfrWriter {
                 plan.omitted().toString());
     }
 
-    private static Plan plan(OfflineCorrelator.Analysis analysis, Options options) throws IOException {
-        if (analysis.schemaVersion() != 1 || analysis.matches() == null || analysis.analysisInputs() == null) {
-            throw new IOException("Unsupported or incomplete correlation analysis");
-        }
-        List<OfflineCorrelator.Match> matches = new ArrayList<>(analysis.matches());
-        for (OfflineCorrelator.Match match : matches) {
-            validateMatch(match);
-            requiredString(match.observation(), "correlationId");
-        }
-        matches.sort(Comparator.comparing(OfflineCorrelator.Match::fromNanos)
-                .thenComparing(OfflineCorrelator.Match::toNanos)
-                .thenComparing(match -> match.observation().get("correlationId").getAsString()));
+    private static Plan plan(SyntheticJfrSource source, Options options) throws IOException {
         BigInteger quantum = BigInteger.valueOf(options.quantumNanos());
-        Map<String, BigInteger> remainders = new LinkedHashMap<>();
-        List<Planned> intervals = new ArrayList<>(matches.size());
-        BigInteger exact = BigInteger.ZERO;
-        BigInteger eventCount = BigInteger.ZERO;
-        BigInteger firstEpoch = null;
-        BigInteger lastEpoch = null;
-        for (OfflineCorrelator.Match match : matches) {
-            String stack = canonicalStack(match.sample());
-            BigInteger duration = match.durationNanos();
-            exact = exact.add(duration);
-            BigInteger available =
-                    remainders.getOrDefault(stack, BigInteger.ZERO).add(duration);
+        BigInteger monotonicOffset = signedOffset(source.analysisInputs());
+        long[] remainders = new long[source.stackCount()];
+        BitSet seen = new BitSet(source.stackCount());
+        List<Planned> intervals = new ArrayList<>(source.intervalCount());
+
+        class Totals {
+            BigInteger exact = BigInteger.ZERO;
+            BigInteger eventCount = BigInteger.ZERO;
+            BigInteger firstEpoch;
+            BigInteger lastEpoch;
+        }
+        Totals totals = new Totals();
+
+        source.forEachInterval(interval -> {
+            validateInterval(interval);
+            int stackId = interval.stackId();
+            seen.set(stackId);
+            BigInteger duration = BigInteger.valueOf(interval.durationNanos());
+            totals.exact = totals.exact.add(duration);
+            BigInteger available = BigInteger.valueOf(remainders[stackId]).add(duration);
             BigInteger[] divided = available.divideAndRemainder(quantum);
-            remainders.put(stack, divided[1]);
-            eventCount = eventCount.add(divided[0]);
-            if (eventCount.compareTo(BigInteger.valueOf(options.maxSyntheticEvents())) > 0
+            remainders[stackId] = divided[1].longValueExact();
+            totals.eventCount = totals.eventCount.add(divided[0]);
+            if (totals.eventCount.compareTo(BigInteger.valueOf(options.maxSyntheticEvents())) > 0
                     || divided[0].compareTo(LONG_MAX) > 0) {
                 throw new IOException("Synthetic event limit exceeded before output publication");
             }
-            BigInteger epochOffset = epochNanos(match.sample()).subtract(decimal(match.sample(), "monotonicTimeNanos"));
-            BigInteger intervalFirst = match.fromNanos()
-                    .add(signedOffset(analysis.analysisInputs()))
-                    .add(epochOffset);
-            BigInteger intervalLast =
-                    match.toNanos().add(signedOffset(analysis.analysisInputs())).add(epochOffset);
-            firstEpoch = firstEpoch == null ? intervalFirst : firstEpoch.min(intervalFirst);
-            lastEpoch = lastEpoch == null ? intervalLast : lastEpoch.max(intervalLast);
-            intervals.add(new Planned(match, stack, divided[0].longValueExact(), epochOffset));
-        }
-        BigInteger declared = parseUnsigned(analysis.selectedObservedDurationNanos(), "selected duration");
-        if (!declared.equals(exact)) throw new IOException("Analysis selected duration does not match intervals");
-        BigInteger represented = eventCount.multiply(quantum);
-        BigInteger omitted = exact.subtract(represented);
-        BigInteger remainderTotal = remainders.values().stream().reduce(BigInteger.ZERO, BigInteger::add);
+            BigInteger intervalFirst = BigInteger.valueOf(interval.fromNanos())
+                    .add(monotonicOffset)
+                    .add(BigInteger.valueOf(interval.epochOffsetNanos()));
+            BigInteger intervalLast = BigInteger.valueOf(interval.toNanos())
+                    .add(monotonicOffset)
+                    .add(BigInteger.valueOf(interval.epochOffsetNanos()));
+            totals.firstEpoch = totals.firstEpoch == null ? intervalFirst : totals.firstEpoch.min(intervalFirst);
+            totals.lastEpoch = totals.lastEpoch == null ? intervalLast : totals.lastEpoch.max(intervalLast);
+            intervals.add(new Planned(interval, divided[0].longValueExact()));
+        });
+
+        BigInteger declared = parseUnsigned(source.selectedObservedDurationNanos(), "selected duration");
+        if (!declared.equals(totals.exact))
+            throw new IOException("Analysis selected duration does not match intervals");
+        BigInteger represented = totals.eventCount.multiply(quantum);
+        BigInteger omitted = totals.exact.subtract(represented);
+        BigInteger remainderTotal = BigInteger.ZERO;
+        for (long remainder : remainders) remainderTotal = remainderTotal.add(BigInteger.valueOf(remainder));
         if (!omitted.equals(remainderTotal)) throw new IOException("Internal quantization accounting mismatch");
         BigInteger now = BigInteger.valueOf(System.currentTimeMillis()).multiply(BigInteger.valueOf(1_000_000L));
         return new Plan(
                 List.copyOf(intervals),
-                eventCount.longValueExact(),
-                remainders.size(),
-                exact,
+                totals.eventCount.longValueExact(),
+                seen.cardinality(),
+                totals.exact,
                 represented,
-                represented.subtract(exact),
+                represented.subtract(totals.exact),
                 omitted,
-                firstEpoch == null ? now : firstEpoch,
-                lastEpoch == null ? now : lastEpoch);
+                totals.firstEpoch == null ? now : totals.firstEpoch,
+                totals.lastEpoch == null ? now : totals.lastEpoch);
     }
 
-    private static void writeTemporary(OfflineCorrelator.Analysis analysis, Path output, Options options, Plan plan)
+    private static void writeTemporary(SyntheticJfrSource source, Path output, Options options, Plan plan)
             throws IOException {
         long duration =
                 checkedLong(plan.lastEpoch().subtract(plan.firstEpoch()).add(BigInteger.ONE), "recording time range");
@@ -199,27 +201,28 @@ final class CompatibilityJfrWriter {
                         .withDuration(duration)
                         .withJdkTypeInitialization())) {
             JfrTypes types = registerTypes(recording);
-            writeMetadata(recording, types, analysis, options, plan);
-            BigInteger monotonicOffset = signedOffset(analysis.analysisInputs());
+            writeMetadata(recording, types, source, options, plan);
+            BigInteger monotonicOffset = signedOffset(source.analysisInputs());
             BigInteger startEpoch = plan.firstEpoch();
-            for (Planned interval : plan.intervals()) {
-                if (interval.count() == 0) continue;
-                TypedValue thread = thread(types, interval.match().sample());
-                TypedValue stack = stack(types, interval.match().sample());
+            for (Planned planned : plan.intervals()) {
+                if (planned.count() == 0) continue;
+                SyntheticJfrSource.Interval interval = planned.interval();
+                TypedValue thread = thread(types, source.thread(interval.threadId()));
+                TypedValue stack =
+                        stack(types, source.frames(interval.stackId()), source.truncated(interval.stackId()));
                 // AP's CPU converter admits STATE_DEFAULT for jdk.ExecutionSample.
                 TypedValue state = types.threadState().asValue(value -> value.putField("name", "STATE_DEFAULT"));
-                BigInteger width = interval.match().durationNanos();
-                for (long index = 0; index < interval.count(); index++) {
+                BigInteger width = BigInteger.valueOf(interval.durationNanos());
+                for (long index = 0; index < planned.count(); index++) {
                     // Midpoints keep every synthetic time strictly within a nonempty source interval.
                     BigInteger numerator = BigInteger.valueOf(index)
                             .multiply(BigInteger.TWO)
                             .add(BigInteger.ONE)
                             .multiply(width);
-                    BigInteger point = interval.match()
-                            .fromNanos()
+                    BigInteger point = BigInteger.valueOf(interval.fromNanos())
                             .add(numerator.divide(
-                                    BigInteger.valueOf(interval.count()).multiply(BigInteger.TWO)));
-                    BigInteger epoch = point.add(monotonicOffset).add(interval.epochOffsetNanos());
+                                    BigInteger.valueOf(planned.count()).multiply(BigInteger.TWO)));
+                    BigInteger epoch = point.add(monotonicOffset).add(BigInteger.valueOf(interval.epochOffsetNanos()));
                     long ticks = checkedLong(epoch.subtract(startEpoch).add(BigInteger.ONE), "event timestamp");
                     recording.writeEvent(types.executionSample()
                             .asValue(value -> value.putField("startTime", ticks)
@@ -287,9 +290,9 @@ final class CompatibilityJfrWriter {
     }
 
     private static void writeMetadata(
-            Recording recording, JfrTypes types, OfflineCorrelator.Analysis analysis, Options options, Plan plan)
+            Recording recording, JfrTypes types, SyntheticJfrSource source, Options options, Plan plan)
             throws IOException {
-        JsonObject inputs = analysis.analysisInputs();
+        JsonObject inputs = source.analysisInputs();
         JsonObject sourceArtifact = requiredObject(inputs, "sourceArtifact");
         JsonObject jfrArtifact = requiredObject(inputs, "jfrArtifact");
         String session = requiredString(inputs, "sessionId");
@@ -317,50 +320,43 @@ final class CompatibilityJfrWriter {
                         .putField("originalJfrSha256", jfrHash)));
     }
 
-    private static TypedValue thread(JfrTypes types, JsonObject sample) throws IOException {
-        Long osTid = optionalPositiveLong(sample, "osThreadId");
-        Long javaTid = optionalPositiveLong(sample, "javaThreadId");
-        String name = optionalString(sample, "threadName", "[unknown thread]");
+    private static TypedValue thread(JfrTypes types, JfrDictionaries.Thread thread) {
+        String name = thread.name() == null ? "[unknown thread]" : thread.name();
+        long osTid = thread.osThreadId();
+        long javaTid = thread.javaThreadId();
         return types.thread()
                 .asValue(value -> value.putField("osName", name)
-                        .putField("osThreadId", osTid == null ? 0L : osTid)
+                        .putField("osThreadId", osTid)
                         .putField("javaName", name)
-                        .putField("javaThreadId", javaTid == null ? 0L : javaTid));
+                        .putField("javaThreadId", javaTid));
     }
 
-    private static TypedValue stack(JfrTypes types, JsonObject sample) throws IOException {
-        JsonArray frames = requiredArray(sample, "frames");
-        if (frames.isEmpty()) {
-            frames = new JsonArray();
-            JsonObject unavailable = new JsonObject();
-            unavailable.addProperty("className", "jonoffcpu.synthetic");
-            unavailable.addProperty("methodName", "[stack unavailable]");
-            unavailable.addProperty("descriptor", "()V");
-            unavailable.addProperty("type", "unknown");
-            unavailable.addProperty("lineNumber", -1);
-            unavailable.addProperty("bytecodeIndex", -1);
-            frames.add(unavailable);
+    private static TypedValue stack(JfrTypes types, JfrDictionaries.Frame[] frames, boolean truncated) {
+        JfrDictionaries.Frame[] resolved = frames;
+        if (resolved.length == 0) {
+            resolved = new JfrDictionaries.Frame[] {
+                new JfrDictionaries.Frame("unknown", "jonoffcpu.synthetic", "[stack unavailable]", "()V", -1, -1)
+            };
         }
-        TypedValue[] values = new TypedValue[frames.size()];
-        for (int index = 0; index < frames.size(); index++) {
-            JsonObject frame = frames.get(index).getAsJsonObject();
+        TypedValue[] values = new TypedValue[resolved.length];
+        for (int index = 0; index < resolved.length; index++) {
+            JfrDictionaries.Frame frame = resolved[index];
             TypedValue method = method(types, frame);
-            int line = optionalInt(frame, "lineNumber", -1);
-            int bci = optionalInt(frame, "bytecodeIndex", -1);
-            String kind = optionalString(frame, "type", "unknown");
+            int line = frame.lineNumber();
+            int bci = frame.bytecodeIndex();
+            String kind = frame.type() == null ? "unknown" : frame.type();
             values[index] = types.stackFrame()
                     .asValue(value -> value.putField("method", method)
                             .putField("lineNumber", line)
                             .putField("bytecodeIndex", bci)
                             .putField("type", kind));
         }
-        boolean truncated = optionalBoolean(sample, "stackTruncated", false);
         return types.stackTrace()
                 .asValue(value -> value.putField("truncated", truncated).putField("frames", values));
     }
 
-    private static TypedValue method(JfrTypes types, JsonObject frame) {
-        String className = optionalString(frame, "className", "[unknown]");
+    private static TypedValue method(JfrTypes types, JfrDictionaries.Frame frame) {
+        String className = frame.className() == null ? "[unknown]" : frame.className();
         int separator = className.lastIndexOf('.');
         String packageName = separator < 0 ? "" : className.substring(0, separator);
         TypedValue loader = types.classType()
@@ -384,8 +380,8 @@ final class CompatibilityJfrWriter {
                         .putField("package", pkg)
                         .putField("modifiers", 0)
                         .putField("hidden", false));
-        String methodName = optionalString(frame, "methodName", "[unresolved]");
-        String descriptor = optionalString(frame, "descriptor", "");
+        String methodName = frame.methodName() == null ? "[unresolved]" : frame.methodName();
+        String descriptor = frame.descriptor() == null ? "" : frame.descriptor();
         return types.method()
                 .asValue(value -> value.putField("type", klass)
                         .putField("name", methodName)
@@ -394,45 +390,11 @@ final class CompatibilityJfrWriter {
                         .putField("hidden", false));
     }
 
-    private static void validateMatch(OfflineCorrelator.Match match) throws IOException {
-        if (match == null
-                || match.observation() == null
-                || match.sample() == null
-                || match.fromNanos() == null
-                || match.toNanos() == null
-                || match.durationNanos() == null
-                || match.fromNanos().signum() < 0
-                || match.toNanos().compareTo(match.fromNanos()) < 0
-                || !match.durationNanos().equals(match.toNanos().subtract(match.fromNanos()))) {
+    private static void validateInterval(SyntheticJfrSource.Interval interval) throws IOException {
+        if (interval.fromNanos() < 0
+                || interval.toNanos() < interval.fromNanos()
+                || interval.durationNanos() != interval.toNanos() - interval.fromNanos()) {
             throw new IOException("Invalid matched interval");
-        }
-        requiredArray(match.sample(), "frames");
-    }
-
-    private static String canonicalStack(JsonObject sample) throws IOException {
-        StringBuilder key = new StringBuilder(optionalBoolean(sample, "stackTruncated", false) ? "1" : "0");
-        for (JsonElement element : requiredArray(sample, "frames")) {
-            if (!element.isJsonObject()) throw new IOException("Invalid frame in matched sample");
-            JsonObject frame = element.getAsJsonObject();
-            for (String field :
-                    List.of("type", "className", "methodName", "descriptor", "lineNumber", "bytecodeIndex")) {
-                String value = frame.has(field) && !frame.get(field).isJsonNull()
-                        ? frame.get(field).getAsString()
-                        : "";
-                key.append('|').append(value.length()).append(':').append(value);
-            }
-        }
-        return key.toString();
-    }
-
-    private static BigInteger epochNanos(JsonObject sample) throws IOException {
-        try {
-            Instant instant = Instant.parse(requiredString(sample, "startTime"));
-            return BigInteger.valueOf(instant.getEpochSecond())
-                    .multiply(BILLION)
-                    .add(BigInteger.valueOf(instant.getNano()));
-        } catch (DateTimeParseException | ArithmeticException e) {
-            throw new IOException("Invalid sample start time", e);
         }
     }
 
@@ -440,10 +402,6 @@ final class CompatibilityJfrWriter {
         String text = requiredString(inputs, "monotonicOffsetNanos");
         if (!text.matches("0|-?[1-9][0-9]{0,19}")) throw new IOException("Invalid monotonic offset");
         return new BigInteger(text);
-    }
-
-    private static BigInteger decimal(JsonObject object, String field) throws IOException {
-        return parseUnsigned(requiredString(object, field), field);
     }
 
     private static BigInteger parseUnsigned(String text, String label) throws IOException {
@@ -460,19 +418,13 @@ final class CompatibilityJfrWriter {
     }
 
     private static JsonObject requiredObject(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
+        com.google.gson.JsonElement value = object.get(field);
         if (value == null || !value.isJsonObject()) throw new IOException("Missing object: " + field);
         return value.getAsJsonObject();
     }
 
-    private static JsonArray requiredArray(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
-        if (value == null || !value.isJsonArray()) throw new IOException("Missing array: " + field);
-        return value.getAsJsonArray();
-    }
-
     private static String requiredString(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
+        com.google.gson.JsonElement value = object.get(field);
         if (value == null || value.isJsonNull() || !value.isJsonPrimitive()) {
             throw new IOException("Missing string: " + field);
         }
@@ -485,32 +437,5 @@ final class CompatibilityJfrWriter {
         } catch (RuntimeException e) {
             throw new IOException("Invalid integer: " + field, e);
         }
-    }
-
-    private static Long optionalPositiveLong(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
-        if (value == null || value.isJsonNull()) return null;
-        try {
-            long parsed = value.getAsLong();
-            if (parsed <= 0) throw new IOException("Invalid positive integer: " + field);
-            return parsed;
-        } catch (NumberFormatException e) {
-            throw new IOException("Invalid integer: " + field, e);
-        }
-    }
-
-    private static int optionalInt(JsonObject object, String field, int fallback) {
-        JsonElement value = object.get(field);
-        return value == null || value.isJsonNull() ? fallback : value.getAsInt();
-    }
-
-    private static boolean optionalBoolean(JsonObject object, String field, boolean fallback) {
-        JsonElement value = object.get(field);
-        return value == null || value.isJsonNull() ? fallback : value.getAsBoolean();
-    }
-
-    private static String optionalString(JsonObject object, String field, String fallback) {
-        JsonElement value = object.get(field);
-        return value == null || value.isJsonNull() ? fallback : value.getAsString();
     }
 }
