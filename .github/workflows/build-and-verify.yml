@@ -9,7 +9,7 @@ on:
         default: 1.0.0
         type: string
       native_artifact_prefix:
-        description: Prefix for the architecture-specific native bundle artifacts
+        description: Prefix for the per-architecture, per-libc native bundle artifacts
         required: true
         type: string
       runnable_artifact_name:
@@ -64,25 +64,43 @@ jobs:
       - name: Check native collector formatting
         if: matrix.native-architecture == 'x86_64'
         run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
+      # Both C-library flavours are built natively on this runner; the glibc smoke
+      # runs on the runner's own JDK and the musl smoke in an Alpine container of
+      # the same architecture.
       - name: Build and run checks
         env:
           NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
         run: >-
           ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
           -PnativeArchitectures="$NATIVE_ARCHITECTURE"
+          -PnativeLibcs=all
           --no-daemon
-      - name: Run packaged agent end-to-end smoke test
+      - name: Run packaged agent end-to-end smoke test (glibc)
         run: |
           python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
+            --libc glibc \
             --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
             --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
             --test-classes jonoffcpu-agent/build/classes/java/test \
             --java-home "$JAVA_HOME" \
-            --output jonoffcpu-agent/build/packaged-smoke
+            --output jonoffcpu-agent/build/packaged-smoke-glibc
+      - name: Run packaged agent end-to-end smoke test (musl)
+        run: |
+          python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
+            --libc musl \
+            --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
+            --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
+            --test-classes jonoffcpu-agent/build/classes/java/test \
+            --output jonoffcpu-agent/build/packaged-smoke-musl
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.native_artifact_prefix }}-linux-${{ matrix.artifact-suffix }}
           path: jonoffcpu-agent/build/native/linux-${{ matrix.artifact-suffix }}/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-musl-${{ matrix.artifact-suffix }}
+          path: jonoffcpu-agent/build/native/linux-musl-${{ matrix.artifact-suffix }}/
           if-no-files-found: error
 
   package:
@@ -111,13 +129,22 @@ jobs:
         with:
           name: ${{ inputs.native_artifact_prefix }}-linux-aarch64
           path: jonoffcpu-agent/build/native/linux-aarch64
-      - name: Package and verify both native architectures
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-musl-x86_64
+          path: jonoffcpu-agent/build/native/linux-musl-x86_64
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.native_artifact_prefix }}-linux-musl-aarch64
+          path: jonoffcpu-agent/build/native/linux-musl-aarch64
+      - name: Package and verify all native bundles
         run: >-
           ./gradlew
           :jonoffcpu-agent:verifyRuntimeJar
           :jonoffcpu-correlator:verifyRuntimeJar
           -PprebuiltNative=true
           -PnativeArchitectures=all
+          -PnativeLibcs=all
           --no-daemon
       - name: Build the forked jfr-converter.jar
         run: make -C async-profiler build/jar/jfr-converter.jar

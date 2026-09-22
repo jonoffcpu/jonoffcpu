@@ -98,48 +98,95 @@ val verifyDependencyDigests = tasks.register("verifyDependencyDigests") {
     }
 }
 
-val allNativePlatforms = linkedMapOf("linux-x86_64" to 62, "linux-aarch64" to 183)
-val hostPlatform = providers.systemProperty("os.arch").map { architecture ->
+/** One embedded native bundle: a Linux architecture linked against one C library. */
+data class NativePlatform(
+    val name: String,
+    val architecture: String,
+    val libc: String,
+    val elfMachine: Int,
+    val dockerPlatform: String,
+    val dockerfile: String,
+    val taskSuffix: String
+)
+
+val allNativePlatforms = listOf(
+    NativePlatform("linux-x86_64", "x86_64", "glibc", 62, "linux/amd64", "Dockerfile.native-bundle", "LinuxX86_64"),
+    NativePlatform("linux-aarch64", "aarch64", "glibc", 183, "linux/arm64", "Dockerfile.native-bundle", "LinuxAarch64"),
+    NativePlatform(
+        "linux-musl-x86_64", "x86_64", "musl", 62, "linux/amd64", "Dockerfile.native-bundle-musl", "LinuxMuslX86_64"
+    ),
+    NativePlatform(
+        "linux-musl-aarch64", "aarch64", "musl", 183, "linux/arm64", "Dockerfile.native-bundle-musl", "LinuxMuslAarch64"
+    )
+).associateBy { it.name }
+val hostArchitecture = providers.systemProperty("os.arch").map { architecture ->
     when (architecture.lowercase()) {
-        "amd64", "x86_64" -> "linux-x86_64"
-        "aarch64", "arm64" -> "linux-aarch64"
+        "amd64", "x86_64" -> "x86_64"
+        "aarch64", "arm64" -> "aarch64"
         else -> throw GradleException("Unsupported build host architecture: $architecture")
     }
+}
+
+/** Detects the C library of the JVM running this build from its own mapped loader, as the agent does. */
+fun hostLibc(): String {
+    val maps = File("/proc/self/maps")
+    if (!maps.isFile) return "glibc"
+    val muslLoaderMapped = maps.readLines()
+        .map { line -> line.substringAfter(" /", "").substringAfterLast('/') }
+        .any { name -> name.startsWith("ld-musl-") || name.startsWith("libc.musl-") }
+    return if (muslLoaderMapped) "musl" else "glibc"
+}
+val hostPlatform = hostArchitecture.map { architecture ->
+    val libc = hostLibc()
+    if (libc == "musl") "linux-musl-$architecture" else "linux-$architecture"
 }
 val nativeArchitectureSelection = providers.gradleProperty("nativeArchitectures")
     .map { it.trim().lowercase() }
     .orElse("current")
-val selectedNativePlatformNames = when (val selection = nativeArchitectureSelection.get()) {
-    "current" -> setOf(hostPlatform.get())
-    "all", "both" -> allNativePlatforms.keys
-    "x86_64", "amd64", "linux-x86_64" -> setOf("linux-x86_64")
-    "aarch64", "arm64", "linux-aarch64" -> setOf("linux-aarch64")
+val selectedArchitectures = when (val selection = nativeArchitectureSelection.get()) {
+    "current" -> setOf(hostArchitecture.get())
+    "all", "both" -> setOf("x86_64", "aarch64")
+    "x86_64", "amd64", "linux-x86_64" -> setOf("x86_64")
+    "aarch64", "arm64", "linux-aarch64" -> setOf("aarch64")
     else -> throw GradleException(
         "Unsupported nativeArchitectures value '$selection'; expected current, all, x86_64, or aarch64"
     )
 }
-val nativePlatforms = allNativePlatforms.filterKeys(selectedNativePlatformNames::contains)
+val nativeLibcSelection = providers.gradleProperty("nativeLibcs")
+    .map { it.trim().lowercase() }
+    .orElse("musl")
+val selectedLibcs = when (val selection = nativeLibcSelection.get()) {
+    "all", "both" -> setOf("glibc", "musl")
+    "glibc", "gnu" -> setOf("glibc")
+    "musl" -> setOf("musl")
+    "current", "host" -> setOf(hostLibc())
+    else -> throw GradleException(
+        "Unsupported nativeLibcs value '$selection'; expected musl, glibc, all, or current"
+    )
+}
+val nativePlatforms = allNativePlatforms.filterValues {
+    it.architecture in selectedArchitectures && it.libc in selectedLibcs
+}
 val nativeFileNames = listOf("libjonoffcpu.so", "libjonoffcpu_native.so", "libasyncProfiler.so")
 val nativeRoot = layout.buildDirectory.dir("native")
-val dockerfile = layout.projectDirectory.file("tools/Dockerfile.native-bundle")
 val prebuiltNative = providers.gradleProperty("prebuiltNative").map(String::toBoolean).orElse(false)
 
-val nativeTasks = allNativePlatforms.mapValues { (platform, _) ->
-    val dockerPlatform = if (platform == "linux-x86_64") "linux/amd64" else "linux/arm64"
-    val taskSuffix = if (platform == "linux-x86_64") "LinuxX86_64" else "LinuxAarch64"
+val nativeTasks = allNativePlatforms.mapValues { (platform, spec) ->
+    val dockerfile = layout.projectDirectory.file("tools/${spec.dockerfile}")
     val output = nativeRoot.map { it.dir(platform) }
-    tasks.register<Exec>("build${taskSuffix}Native") {
+    tasks.register<Exec>("build${spec.taskSuffix}Native") {
         group = "native build"
         description = "Builds the agent, collector, and async-profiler libraries for $platform in Docker buildx."
         workingDir(rootProject.layout.projectDirectory)
         commandLine(
             "docker", "buildx", "build", "--progress=plain",
-            "--platform", dockerPlatform,
+            "--platform", spec.dockerPlatform,
             "--file", dockerfile.asFile.absolutePath,
             "--output", output.map { "type=local,dest=${it.asFile.absolutePath}" }.get(),
             rootProject.layout.projectDirectory.asFile.absolutePath
         )
         inputs.file(dockerfile)
+        inputs.file(layout.projectDirectory.file("tools/check-musl-needed.sh"))
         inputs.files(
             fileTree(rootProject.file("jonoffcpu-agent/src/main/c")),
             fileTree(rootProject.file("jonoffcpu-native/src")),
@@ -167,24 +214,40 @@ fun elfMachine(bytes: ByteArray): Int {
     return bytes[18].toUByte().toInt() or (bytes[19].toUByte().toInt() shl 8)
 }
 
+/**
+ * Checks that a native library is linked against the expected C library. glibc-linked
+ * libraries carry GLIBC_2.x symbol version needs; musl-linked libraries carry none.
+ */
+fun verifyLibc(bytes: ByteArray, expectedLibc: String, label: String) {
+    val glibcVersioned = String(bytes, StandardCharsets.ISO_8859_1).contains("GLIBC_2.")
+    if (expectedLibc == "glibc" && !glibcVersioned) {
+        throw GradleException("$label is labeled glibc but carries no glibc symbol versions")
+    }
+    if (expectedLibc == "musl" && glibcVersioned) {
+        throw GradleException("$label is labeled musl but carries glibc symbol versions")
+    }
+}
+
 val verifyNativeArchitectures = tasks.register("verifyNativeArchitectures") {
     group = "verification"
-    description = "Rejects missing, malformed, or mislabeled native libraries for the selected Linux architectures."
+    description = "Rejects missing, malformed, or mislabeled native libraries for the selected Linux platforms."
     if (!prebuiltNative.get()) {
         dependsOn(nativePlatforms.keys.map(nativeTasks::getValue))
     }
     inputs.files(nativePlatforms.keys.map { platform -> nativeRoot.map { it.dir(platform) } })
     doLast {
-        nativePlatforms.forEach { (platform, expectedMachine) ->
+        nativePlatforms.forEach { (platform, spec) ->
             nativeFileNames.forEach { name ->
                 val artifact = nativeRoot.get().dir(platform).file(name).asFile
                 if (!artifact.isFile) {
                     throw GradleException("Missing $platform/$name")
                 }
-                val actual = elfMachine(artifact.readBytes())
-                if (actual != expectedMachine) {
-                    throw GradleException("$platform/$name has ELF e_machine $actual, expected $expectedMachine")
+                val bytes = artifact.readBytes()
+                val actual = elfMachine(bytes)
+                if (actual != spec.elfMachine) {
+                    throw GradleException("$platform/$name has ELF e_machine $actual, expected ${spec.elfMachine}")
                 }
+                verifyLibc(bytes, spec.libc, "$platform/$name")
             }
         }
     }
@@ -245,9 +308,23 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     }
 }
 
+// Consumers of the Java API resolve apiElements/runtimeElements by default. The plain
+// JAR neither embeds nor declares its relocated dependencies, so only the shaded JAR
+// is a usable variant; publish it as the default and drop the plain-JAR variants.
+listOf(configurations.apiElements, configurations.runtimeElements).forEach { elements ->
+    elements.configure {
+        outgoing.artifacts.clear()
+        outgoing.artifact(jar)
+        attributes.attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.SHADOWED))
+    }
+}
+components.named<AdhocComponentWithVariants>("java") {
+    withVariantsFromConfiguration(configurations.named("shadowRuntimeElements").get()) { skip() }
+}
+
 val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
     group = "verification"
-    description = "Checks bundled native entries, ELF architectures, licenses, and recorded SHA-256 digests."
+    description = "Checks bundled native entries, ELF architectures, C libraries, licenses, and recorded SHA-256 digests."
     dependsOn(jar)
     inputs.file(jar.flatMap { it.archiveFile })
     doLast {
@@ -279,20 +356,21 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
             val recorded = mutableMapOf<String, String>()
             zip.getInputStream(checksumEntry).bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
                 lines.filter { it.isNotBlank() }.forEach { line ->
-                    val match = Regex("^([0-9a-f]{64})  (linux-(?:x86_64|aarch64)/[^/]+)\$").matchEntire(line)
+                    val match = Regex("^([0-9a-f]{64})  (linux-(?:musl-)?(?:x86_64|aarch64)/[^/]+)\$").matchEntire(line)
                         ?: throw GradleException("Malformed native checksum line: $line")
                     recorded[match.groupValues[2]] = match.groupValues[1]
                 }
             }
-            nativePlatforms.forEach { (platform, expectedMachine) ->
+            nativePlatforms.forEach { (platform, spec) ->
                 nativeFileNames.forEach { name ->
                     val relative = "$platform/$name"
                     val entry = zip.getEntry("META-INF/native/$relative")
                         ?: throw GradleException("Runtime JAR is missing $relative")
                     val bytes = zip.getInputStream(entry).use { it.readAllBytes() }
-                    if (elfMachine(bytes) != expectedMachine) {
+                    if (elfMachine(bytes) != spec.elfMachine) {
                         throw GradleException("Runtime JAR contains the wrong architecture at $relative")
                     }
+                    verifyLibc(bytes, spec.libc, "Runtime JAR entry $relative")
                     if (recorded[relative] != sha256(bytes)) {
                         throw GradleException("Runtime JAR checksum mismatch for $relative")
                     }
@@ -317,7 +395,8 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
 }
 
 val fixtureMains = mapOf(
-    "SignalCaptureController" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureControllerTest"
+    "SignalCaptureController" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureControllerTest",
+    "NativeLibc" to "io.github.lhotari.jonoffcpu.agent.NativeLibcTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {
@@ -344,7 +423,7 @@ val testNativeCollectorJni = tasks.register<JavaExec>("testNativeCollectorJni") 
     classpath = files(sourceSets.test.get().runtimeClasspath, jar.flatMap { it.archiveFile })
     mainClass = "io.github.lhotari.jonoffcpu.agent.NativeCollectorJniTest"
     jvmArgs("-ea")
-    onlyIf("selected native architectures include the current host") {
+    onlyIf("selected native platforms include the current host") {
         nativePlatforms.containsKey(hostPlatform.get())
     }
     doFirst {
@@ -359,7 +438,7 @@ val testNativeBundleLoader = tasks.register<JavaExec>("testNativeBundleLoader") 
     classpath = files(sourceSets.test.get().runtimeClasspath, jar.flatMap { it.archiveFile })
     mainClass = "io.github.lhotari.jonoffcpu.agent.NativeBundleLoaderTest"
     jvmArgs("-ea")
-    onlyIf("selected native architectures include the current host") {
+    onlyIf("selected native platforms include the current host") {
         nativePlatforms.containsKey(hostPlatform.get())
     }
 }

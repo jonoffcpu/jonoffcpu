@@ -26,6 +26,10 @@ final class NativeBundleLoader {
         }
         String platform = platform();
         Map<String, String> checksums = readChecksums();
+        if (checksums.keySet().stream().noneMatch(entry -> entry.startsWith(platform + "/"))) {
+            throw new UnsupportedOperationException("The agent JAR has no native bundle for " + platform
+                    + "; embedded bundles: " + bundledPlatforms(checksums));
+        }
         try {
             Path directory = createExtractionDirectory();
             setOwnerOnly(directory, true);
@@ -67,13 +71,23 @@ final class NativeBundleLoader {
         if (!model.equals("64")) {
             throw new UnsupportedOperationException("jonoffcpu requires a 64-bit JVM");
         }
-        return switch (System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)) {
-            case "amd64", "x86_64" -> "linux-x86_64";
-            case "aarch64", "arm64" -> "linux-aarch64";
-            default ->
-                throw new UnsupportedOperationException(
-                        "Unsupported jonoffcpu Linux architecture: " + System.getProperty("os.arch"));
-        };
+        String architecture =
+                switch (System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)) {
+                    case "amd64", "x86_64" -> "x86_64";
+                    case "aarch64", "arm64" -> "aarch64";
+                    default ->
+                        throw new UnsupportedOperationException(
+                                "Unsupported jonoffcpu Linux architecture: " + System.getProperty("os.arch"));
+                };
+        return NativeLibc.detect(architecture).platform(architecture);
+    }
+
+    private static String bundledPlatforms(Map<String, String> checksums) {
+        return checksums.keySet().stream()
+                .map(entry -> entry.substring(0, entry.indexOf('/')))
+                .distinct()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
     }
 
     private static Map<String, String> readChecksums() {

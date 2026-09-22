@@ -69,9 +69,13 @@ Ordinary local Java work builds only the current host architecture:
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check --no-daemon
 ```
 
-Use `-PnativeArchitectures=all` only when both Linux bundles are required, or
-select `x86_64` or `aarch64` explicitly. CI and release packaging must select
-`all` after placing both prebuilt bundles in the build directory.
+Use `-PnativeArchitectures=all` only when both Linux architectures are
+required, or select `x86_64` or `aarch64` explicitly. `-PnativeLibcs` selects
+the C-library flavour and defaults to `musl`; CI and release packaging must
+select `all` for both properties after placing all four prebuilt bundles in
+the build directory. The musl bundle is built in
+`jonoffcpu-agent/tools/Dockerfile.native-bundle-musl` and must keep depending
+only on musl itself.
 
 Java uses Palantir Java Format and Gradle Kotlin scripts use ktlint through Spotless. Run
 `./gradlew spotlessApply` after editing Java and `./gradlew spotlessCheck` to
@@ -91,8 +95,9 @@ tests. The packaged end-to-end entry point is:
 python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py --help
 ```
 
-CI builds and executes x86-64 and arm64 bundles on native runners. Do not add
-QEMU-based arm64 verification to CI. The arm64 collector must retain the
+CI builds and executes x86-64 and arm64 bundles on native runners, running the
+packaged smoke once per C-library flavour (Ubuntu for glibc, Alpine for musl).
+Do not add QEMU-based arm64 verification to CI. The arm64 collector must retain the
 `libgcc` link needed by outlined atomics, and the native-bundle build must keep
 rejecting unresolved `__aarch64_*` helpers.
 
@@ -106,7 +111,9 @@ and exact-cookie matches rather than only checking process exit status.
 - Keep the agent and correlator as shaded executable JARs. Relocate bundled
   dependencies to avoid conflicts for users of their Java APIs.
 - The agent JAR embeds Linux x86-64 and arm64 copies of the JNI bridge, native
-  collector, and patched async-profiler, plus their checksum manifest.
+  collector, and patched async-profiler, each in a glibc and a musl flavour,
+  plus their checksum manifest. The agent selects the flavour from the C
+  library mapped into the running JVM and never falls back to the other one.
 - Keep public configuration, manifest, NDJSON, report, and CLI changes backward
   compatible unless a format/version migration is designed and documented.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on

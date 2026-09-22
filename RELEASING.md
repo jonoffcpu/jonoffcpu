@@ -35,31 +35,40 @@ standard `version` project property.
 Run the complete build before tagging:
 
 ```sh
-./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check -PnativeArchitectures=all
+./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check \
+  -PnativeArchitectures=all -PnativeLibcs=all
 ```
 
-The release-equivalent build creates both Linux native bundles. A CI job that has already
-downloaded them to `jonoffcpu-agent/build/native/linux-x86_64/` and
-`jonoffcpu-agent/build/native/linux-aarch64/` uses:
+The release-equivalent build creates all four Linux native bundles: x86-64 and
+arm64, each linked against glibc and against musl. A CI job that has already
+downloaded them to `jonoffcpu-agent/build/native/linux-x86_64/`,
+`jonoffcpu-agent/build/native/linux-aarch64/`,
+`jonoffcpu-agent/build/native/linux-musl-x86_64/`, and
+`jonoffcpu-agent/build/native/linux-musl-aarch64/` uses:
 
 ```sh
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check \
-  -PprebuiltNative=true -PnativeArchitectures=all
+  -PprebuiltNative=true -PnativeArchitectures=all -PnativeLibcs=all
 ```
 
-The switch skips only the Docker native-build tasks. ELF architecture, checksum,
-packaging, JNI, and runtime checks still run.
+The switch skips only the Docker native-build tasks. ELF architecture, C-library
+flavour, checksum, packaging, JNI, and runtime checks still run.
 
 During local development, omit `nativeArchitectures` to build only the current
-host architecture. Either architecture can also be selected explicitly:
+host architecture. `nativeLibcs` defaults to `musl`; pass `glibc`, `all`, or
+`current` (the C library of the build JVM) to change the flavour. Either
+architecture can also be selected explicitly:
 
 ```sh
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check -PnativeArchitectures=x86_64
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check -PnativeArchitectures=aarch64
+./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check -PnativeLibcs=glibc
 ```
 
-An explicit cross-build skips host-native JNI tests when the selected JAR does
-not contain a bundle for the current host.
+A cross-build skips host-native JNI tests when the selected JAR does not contain
+a bundle for the current host's architecture and C library; on a glibc host the
+default musl-only build therefore skips them, while `-PnativeLibcs=all` or
+`glibc` runs them.
 
 Inspect a local Maven publication when needed:
 
@@ -82,9 +91,9 @@ git push origin v1.2.3
 
 The [release workflow](.github/workflows/release.yml) then:
 
-1. builds and verifies x86-64 on `ubuntu-26.04`;
-2. builds and verifies arm64 on `ubuntu-26.04-arm`;
-3. combines both verified bundles into the universal Java agent;
+1. builds and verifies the x86-64 glibc and musl bundles on `ubuntu-26.04`;
+2. builds and verifies the arm64 glibc and musl bundles on `ubuntu-26.04-arm`;
+3. combines all four verified bundles into the universal Java agent;
 4. signs and publishes the artifacts with
    `publishAndReleaseToMavenCentral`, waiting for Central Portal validation; and
 5. copies the executable artifacts to stable `jonoffcpu-agent.jar` and

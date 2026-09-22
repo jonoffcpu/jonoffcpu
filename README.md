@@ -117,10 +117,13 @@ kernel duration, the Java stack, and the delivery delay as separate values, and
 - Java 17 or newer for the agent; Java 21 or newer for the correlator.
 
 The agent JAR is self-contained. It embeds the JNI bridge, the native
-collector, and the patched async-profiler for Linux x86-64 and arm64, verifies
-them against a SHA-256 manifest, and extracts them to a private temporary
-directory at startup. Nothing needs to be installed on the host. If the
-temporary directory is mounted `noexec`, point
+collector, and the patched async-profiler for Linux x86-64 and arm64, each
+linked against both glibc and musl (Alpine), verifies them against a SHA-256
+manifest, and extracts them to a private temporary directory at startup.
+Nothing needs to be installed on the host. The agent picks the glibc or musl
+bundle from the C library mapped into the running JVM; on an unusual host,
+`-Dio.github.lhotari.jonoffcpu.nativeLibc=glibc` or `=musl` selects it
+explicitly. If the temporary directory is mounted `noexec`, point
 `-Dio.github.lhotari.jonoffcpu.nativeWorkDir` at an executable location.
 
 ## Quick start
@@ -270,7 +273,8 @@ dependencies {
 
 The correlator exposes
 `OffCpuCorrelator.correlate(sourcePath, jfrPath, outputDirectory)` using JDK
-types only.
+types only. The published Gradle module metadata and POM point at the shaded,
+self-contained JARs, so no further dependencies are needed.
 
 ## Building from source
 
@@ -287,7 +291,9 @@ The build needs [Amazon Corretto 25](https://aws.amazon.com/corretto/) and
 Docker with [BuildKit](https://docs.docker.com/build/buildkit/); the native
 libraries are compiled in a pinned container against the running kernel's BTF.
 Pass `-PnativeArchitectures=all` to embed both Linux x86-64 and arm64 bundles,
-or `x86_64` / `aarch64` to pick one. The executable JARs land in
+or `x86_64` / `aarch64` to pick one. Each architecture has a glibc and a musl
+flavour; `-PnativeLibcs` selects `musl` (the default), `glibc`, or `all`.
+Releases embed all four bundles. The executable JARs land in
 `jonoffcpu-agent/build/libs/` and `jonoffcpu-correlator/build/libs/`.
 
 Build the converter from the same fork:

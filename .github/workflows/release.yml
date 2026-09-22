@@ -70,6 +70,14 @@ jobs:
         with:
           name: release-native-linux-aarch64
           path: jonoffcpu-agent/build/native/linux-aarch64
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-native-linux-musl-x86_64
+          path: jonoffcpu-agent/build/native/linux-musl-x86_64
+      - uses: actions/download-artifact@v8
+        with:
+          name: release-native-linux-musl-aarch64
+          path: jonoffcpu-agent/build/native/linux-musl-aarch64
       - name: Publish and release Central Portal deployment
         env:
           ORG_GRADLE_PROJECT_version: ${{ needs.version.outputs.version }}
@@ -83,6 +91,7 @@ jobs:
           ./gradlew publishAndReleaseToMavenCentral
           -PprebuiltNative=true
           -PnativeArchitectures=all
+          -PnativeLibcs=all
           --no-daemon
       # The forked jfr-converter.jar was built and checked by the reusable workflow.
       - uses: actions/download-artifact@v8

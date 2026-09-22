@@ -126,7 +126,10 @@ poll/write loss make `captureEnd.state` incomplete. Stop responses are cached
 for safe retries, and a close timeout retains the native registry entry and
 worker ownership.
 
-Build and run the musl library and collector inside the pinned Alpine image:
+The packaged agent JAR embeds musl bundles built by
+`jonoffcpu-agent/tools/Dockerfile.native-bundle-musl`; the tools below are the
+standalone musl proofs for the collector itself. Build and run the musl library
+and collector inside the pinned Alpine image:
 
 ```sh
 tools/build-musl-in-docker.sh

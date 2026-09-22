@@ -168,6 +168,20 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     }
 }
 
+// Consumers of the Java API resolve apiElements/runtimeElements by default. The plain
+// JAR neither embeds nor declares its relocated dependencies, so only the shaded JAR
+// is a usable variant; publish it as the default and drop the plain-JAR variants.
+listOf(configurations.apiElements, configurations.runtimeElements).forEach { elements ->
+    elements.configure {
+        outgoing.artifacts.clear()
+        outgoing.artifact(jar)
+        attributes.attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.SHADOWED))
+    }
+}
+components.named<AdhocComponentWithVariants>("java") {
+    withVariantsFromConfiguration(configurations.named("shadowRuntimeElements").get()) { skip() }
+}
+
 val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
     group = "verification"
     description = "Checks the self-contained offline JAR and retained dependency licenses."

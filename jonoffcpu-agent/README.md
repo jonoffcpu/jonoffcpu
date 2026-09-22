@@ -25,22 +25,38 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64
 ```
 
 The resulting JAR contains `libjonoffcpu.so`, `libjonoffcpu_native.so`, and
-`libasyncProfiler.so` for every selected architecture under `META-INF/native/`.
-`META-INF/native/SHA256SUMS` records every native digest. `verifyRuntimeJar`
-independently checks those digests and each ELF architecture, so an x86-64 binary
-cannot be mislabeled as aarch64. At runtime, the agent extracts the matching
-bundle into an owner-only temporary directory, verifies each digest, and loads
-the colocated libraries. Nothing has to be installed outside the JAR.
+`libasyncProfiler.so` for every selected platform under `META-INF/native/`. A
+platform is an architecture linked against one C library: `linux-x86_64` and
+`linux-aarch64` are glibc bundles built in the Debian-based
+`tools/Dockerfile.native-bundle`; `linux-musl-x86_64` and `linux-musl-aarch64`
+are musl bundles for Alpine-based JVMs built in the Alpine-based
+`tools/Dockerfile.native-bundle-musl`. Each library depends only on its C
+library and bundle siblings; the musl Dockerfile enforces that with
+`tools/check-musl-needed.sh`. `META-INF/native/SHA256SUMS` records every native
+digest. `verifyRuntimeJar` independently checks those digests, each ELF
+architecture, and each C-library flavour, so an x86-64 binary cannot be
+mislabeled as aarch64 and a glibc binary cannot be mislabeled as musl.
+
+At runtime, the agent detects the JVM's C library from the loader mapped in
+`/proc/self/maps` (falling back to the presence of `/lib/ld-musl-<arch>.so.1`),
+extracts the matching bundle into an owner-only temporary directory, verifies
+each digest, and loads the colocated libraries. Nothing has to be installed
+outside the JAR. If the JAR has no bundle for the detected platform, startup
+fails with a message listing the embedded bundles rather than trying another
+flavour. `-Dio.github.lhotari.jonoffcpu.nativeLibc=glibc` or `=musl` overrides
+the detection.
 
 The native Docker stages intentionally use the running kernel's BTF to compile
-the CO-RE objects embedded in the collector. The architecture tasks are also
-available separately as `buildLinuxX86_64Native` and
-`buildLinuxAarch64Native`.
+the CO-RE objects embedded in the collector. The platform tasks are also
+available separately as `buildLinuxX86_64Native`, `buildLinuxAarch64Native`,
+`buildLinuxMuslX86_64Native`, and `buildLinuxMuslAarch64Native`.
 
 Use `-PnativeArchitectures=x86_64` or `-PnativeArchitectures=aarch64` to select
-one bundle explicitly. `-PnativeArchitectures=all` selects both; release builds
-use this setting. Host-native JNI tests run when the selection includes the
-current host architecture.
+one architecture explicitly; `-PnativeArchitectures=all` selects both.
+`-PnativeLibcs` selects the C-library flavour: `musl` (the default), `glibc`,
+`all`, or `current` for the build JVM's own C library. Release builds use
+`-PnativeArchitectures=all -PnativeLibcs=all`. Host-native JNI tests run when
+the selection includes the current host's architecture and C library.
 
 The publishable artifact is
 `build/libs/jonoffcpu-agent-1.0.0.jar`. Create a YAML configuration containing the
@@ -157,22 +173,34 @@ flow, Central Portal setup, and signing configuration.
 
 ## Native integration smoke
 
-CI runs a packaged end-to-end smoke test on native x86-64 and arm64 runners.
-To run the same check against already-built shaded JARs, use:
+CI runs a packaged end-to-end smoke test on native x86-64 and arm64 runners,
+once for each C-library flavour. To run the same checks against already-built
+shaded JARs, use:
 
 ```sh
 python3 tools/run-packaged-agent-smoke.py \
+  --libc glibc \
   --agent-jar build/libs/jonoffcpu-agent-1.0.0.jar \
   --correlator-jar ../jonoffcpu-correlator/build/libs/jonoffcpu-correlator-1.0.0.jar \
   --test-classes build/classes/java/test \
   --java-home "$JAVA_HOME" \
-  --output /path/to/new-smoke-directory
+  --output /path/to/new-glibc-smoke-directory
+python3 tools/run-packaged-agent-smoke.py \
+  --libc musl \
+  --agent-jar build/libs/jonoffcpu-agent-1.0.0.jar \
+  --correlator-jar ../jonoffcpu-correlator/build/libs/jonoffcpu-correlator-1.0.0.jar \
+  --test-classes build/classes/java/test \
+  --output /path/to/new-musl-smoke-directory
 ```
 
 The check starts the shaded agent JAR in privileged Docker, records a finite
 mixed workload through the native eBPF source and async-profiler, finalizes the
 capture, and invokes the shaded correlator JAR. It requires at least one valid,
-identity-verified off-CPU match.
+identity-verified off-CPU match. The glibc run uses `tools/Dockerfile.runtime`
+(Ubuntu) with the mounted `--java-home`; the musl run uses
+`tools/Dockerfile.runtime-musl` (Alpine Corretto), whose own JDK proves the
+musl bundle loads with nothing installed beside the JVM. The JAR must contain
+the flavour under test.
 
 An opt-in smoke test exercises the actual native launcher, BPF source, mixed
 CPU/allocation/wall/lock/JVM recording and both offline output formats. It uses

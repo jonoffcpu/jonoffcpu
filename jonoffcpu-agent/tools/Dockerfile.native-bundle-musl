@@ -1,0 +1,129 @@
+# syntax=docker/dockerfile:1.7
+# SPDX-License-Identifier: MIT
+
+# musl flavour of Dockerfile.native-bundle. Alpine-based JVMs cannot resolve
+# glibc-only symbols such as _dl_find_object from the glibc bundle, so the
+# same three libraries are also linked against musl. The Alpine Corretto image
+# provides the musl JDK; its multi-architecture digest selects the matching
+# x86-64 or arm64 build.
+FROM amazoncorretto:25-alpine@sha256:4955796538972099d9c7de6e31c6a259b1de65393a58b7e0996b7cc50d7d20a7 AS java-toolchain
+
+# Same pinned Alpine Rust image as the jonoffcpu-native musl proof tooling.
+FROM rust:1.85-alpine3.21@sha256:4333721398de61f53ccbe53b0b855bcc4bb49e55828e8f652d7a8ac33dd0c118 AS toolchain
+
+COPY --from=java-toolchain /usr/lib/jvm/java-25-amazon-corretto /opt/amazon-corretto-25
+ENV JAVA_HOME=/opt/amazon-corretto-25
+ENV PATH="$JAVA_HOME/bin:$PATH"
+
+# gettext-tiny provides autopoint and the gettext m4 macros for the vendored
+# elfutils configure without GNU libintl, whose header would redirect libelf's
+# dgettext calls away from musl's built-in implementation.
+RUN rustup component add rustfmt \
+    && apk add --no-cache \
+       argp-standalone \
+       autoconf \
+       automake \
+       bash \
+       binutils \
+       bison \
+       bpftool \
+       clang \
+       elfutils-dev \
+       flex \
+       g++ \
+       gawk \
+       gcc \
+       gettext-tiny-dev \
+       libtool \
+       linux-headers \
+       llvm \
+       make \
+       musl-dev \
+       musl-fts-dev \
+       musl-obstack-dev \
+       pax-utils \
+       pkgconf \
+       zlib-dev \
+       zstd-static
+
+# Every bundled library may depend only on musl itself and bundle siblings.
+COPY jonoffcpu-agent/tools/check-musl-needed.sh /usr/local/bin/check-musl-needed
+RUN chmod 755 /usr/local/bin/check-musl-needed
+
+FROM toolchain AS async-profiler-build
+WORKDIR /work
+COPY async-profiler async-profiler
+RUN mkdir -p async-profiler/build/lib \
+    && make -C async-profiler -j"$(nproc)" build/lib/libasyncProfiler.so \
+    && check-musl-needed async-profiler/build/lib/libasyncProfiler.so
+
+FROM toolchain AS collector-dependencies
+WORKDIR /work
+COPY jonoffcpu-native/Cargo.toml jonoffcpu-native/Cargo.lock jonoffcpu-native/
+RUN mkdir -p jonoffcpu-native/src/bin \
+    && touch jonoffcpu-native/src/lib.rs \
+       jonoffcpu-native/src/bin/transport_proof.rs \
+       jonoffcpu-native/src/bin/kprobe_gate.rs \
+       jonoffcpu-native/src/bin/finish_fentry_proof.rs \
+       jonoffcpu-native/src/bin/sched_exit_proof.rs \
+       jonoffcpu-native/src/bin/sequence_boundary_proof.rs \
+       jonoffcpu-native/src/bin/endpoint_boundary_measurement.rs \
+       jonoffcpu-native/src/bin/collector_smoke.rs \
+       jonoffcpu-native/src/bin/task_lifetime_proof.rs \
+       jonoffcpu-native/src/bin/time_namespace_negative.rs \
+       jonoffcpu-native/src/bin/signal_latency.rs \
+       jonoffcpu-native/src/bin/target_exit_proof.rs
+RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \
+    cargo fetch --locked --manifest-path jonoffcpu-native/Cargo.toml
+
+FROM collector-dependencies AS collector-build
+ARG TARGETARCH
+COPY jonoffcpu-native jonoffcpu-native
+# The Alpine Rust target defaults to a static CRT, which cannot produce a
+# loadable cdylib. With a dynamic CRT, Rust's unwinder links -lgcc_s, but
+# Alpine JVM images do not ship libgcc_s.so.1, so that name is resolved to a
+# linker script over GCC's static libgcc_eh and libgcc archives instead.
+# AArch64 keeps the explicit libgcc link for GCC's outlined atomics, as in the
+# glibc build.
+RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \
+    set -eux; \
+    gcc_lib_dir=$(dirname "$(gcc -print-libgcc-file-name)"); \
+    mkdir -p /work/static-gcc; \
+    printf 'GROUP(%s/libgcc_eh.a %s/libgcc.a)\n' "$gcc_lib_dir" "$gcc_lib_dir" \
+      > /work/static-gcc/libgcc_s.a; \
+    export RUSTFLAGS="-C target-feature=-crt-static -C link-arg=-Wl,-z,defs -L/work/static-gcc"; \
+    if [ "$TARGETARCH" = arm64 ]; then \
+      export RUSTFLAGS="$RUSTFLAGS -C link-arg=-lgcc"; \
+    fi; \
+    cargo build --locked --release --lib \
+      --manifest-path jonoffcpu-native/Cargo.toml \
+      --target-dir jonoffcpu-native/target; \
+    if [ "$TARGETARCH" = arm64 ] \
+      && readelf -Ws jonoffcpu-native/target/release/libjonoffcpu_native.so \
+        | grep -Eq 'UND +__aarch64_'; then \
+      echo "libjonoffcpu_native.so has unresolved AArch64 runtime helpers" >&2; \
+      exit 1; \
+    fi; \
+    check-musl-needed jonoffcpu-native/target/release/libjonoffcpu_native.so
+
+FROM toolchain AS agent-link
+WORKDIR /work
+COPY async-profiler/src/asprof.h async-profiler/src/asprof.h
+COPY jonoffcpu-native/include jonoffcpu-native/include
+COPY jonoffcpu-agent/src/main/c jonoffcpu-agent/src/main/c
+COPY --from=async-profiler-build /work/async-profiler/build/lib/libasyncProfiler.so /work/lib/
+COPY --from=collector-build /work/jonoffcpu-native/target/release/libjonoffcpu_native.so /work/lib/
+RUN set -eux; \
+    mkdir /out; \
+    cc -std=c11 -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+      -Ijonoffcpu-native/include -Iasync-profiler/src \
+      -Wl,-z,defs -Wl,-rpath,'$ORIGIN' -L/work/lib \
+      -o /out/libjonoffcpu.so jonoffcpu-agent/src/main/c/native_collector_jni.c \
+      -ljonoffcpu_native -ldl -lpthread; \
+    check-musl-needed /out/libjonoffcpu.so libjonoffcpu_native.so; \
+    cp /work/lib/libjonoffcpu_native.so /out/; \
+    cp /work/lib/libasyncProfiler.so /out/
+
+FROM scratch
+COPY --from=agent-link /out/ /
