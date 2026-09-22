@@ -9,6 +9,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -16,6 +17,7 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -167,6 +169,43 @@ final class OfflineCorrelator {
 
     private record Joined(Analysis analysis, SourceAggregate sourceAggregate) {}
 
+    /**
+     * Rebuilds today's {@code List<JsonObject> observations} and {@code Map<Long, JsonArray> stacks} from the
+     * streaming visitor, so the rest of this class stays untouched while {@link CaptureInput} stops retaining
+     * them itself. A later task replaces this collection with the columnar engine.
+     */
+    private static final class RowCollector implements CaptureInput.SourceVisitor {
+        final List<JsonObject> observations = new ArrayList<>();
+        final Map<Long, JsonArray> stacks = new LinkedHashMap<>();
+        private CaptureInput.Budget budget;
+
+        @Override
+        public void reading(CaptureInput.Budget budget, LongIntMap announcedStacks) {
+            this.budget = budget;
+        }
+
+        @Override
+        public void start(JsonObject captureStart) {}
+
+        @Override
+        public void stack(long stackId, int frameCount) throws IOException {
+            CaptureProto.Stack.Builder stack = CaptureProto.Stack.newBuilder().setId(stackId);
+            for (int frame = 0; frame < frameCount; frame++) {
+                stack.addFrame(CaptureProto.Frame.getDefaultInstance());
+            }
+            JsonObject row = CaptureStream.stackRow(stack.build());
+            budget.charge(row);
+            stacks.put(stackId, row.getAsJsonArray("frames"));
+        }
+
+        @Override
+        public void observation(int rowNumber, CaptureProto.Observation observation) throws IOException {
+            JsonObject row = CaptureStream.observationRow(observation);
+            budget.charge(row);
+            observations.add(row);
+        }
+    }
+
     private OfflineCorrelator() {}
 
     /**
@@ -174,8 +213,9 @@ final class OfflineCorrelator {
      * stacks.
      */
     public static Analysis correlate(Path source, Path jfr, Limits limits) throws IOException {
-        CaptureInput capture = CaptureInput.read(source, jfr, limits);
-        Joined joined = correlate(capture, jfr, limits, null);
+        RowCollector collector = new RowCollector();
+        CaptureInput capture = CaptureInput.read(source, jfr, limits, collector);
+        Joined joined = correlate(capture, jfr, limits, null, collector.observations, collector.stacks);
         capture.verifyUnchanged(source, jfr);
         return joined.analysis();
     }
@@ -185,8 +225,9 @@ final class OfflineCorrelator {
         if (selection == null) {
             return correlate(source, jfr, limits);
         }
-        CaptureInput capture = CaptureInput.read(source, jfr, limits, selection.partialInput());
-        Joined joined = correlate(capture, jfr, limits, selection);
+        RowCollector collector = new RowCollector();
+        CaptureInput capture = CaptureInput.read(source, jfr, limits, selection.partialInput(), collector);
+        Joined joined = correlate(capture, jfr, limits, selection, collector.observations, collector.stacks);
         capture.verifyUnchanged(source, jfr);
         return joined.analysis();
     }
@@ -197,11 +238,12 @@ final class OfflineCorrelator {
      * is inferred from missing metadata. Semantic and resource failures remain hard errors.
      */
     public static PartialAnalysis correlatePartial(Path source, Path jfr, Limits limits) throws IOException {
-        CaptureInput capture = CaptureInput.readPartial(source, jfr, limits);
+        RowCollector collector = new RowCollector();
+        CaptureInput capture = CaptureInput.readPartial(source, jfr, limits, collector);
         require(
                 limits.maxHandlerDelayNanos() == null || capture.inputs.has("monotonicOffsetNanos"),
                 "Partial analysis cannot apply a handler-delay limit without verified clock metadata");
-        Joined joined = correlate(capture, jfr, limits, null);
+        Joined joined = correlate(capture, jfr, limits, null, collector.observations, collector.stacks);
         capture.verifyUnchanged(source, jfr);
         Analysis result = joined.analysis();
         JsonObject window = new JsonObject();
@@ -233,11 +275,17 @@ final class OfflineCorrelator {
                 result.matches());
     }
 
-    private static Joined correlate(CaptureInput capture, Path jfr, Limits limits, JfrSelection selection)
+    private static Joined correlate(
+            CaptureInput capture,
+            Path jfr,
+            Limits limits,
+            JfrSelection selection,
+            List<JsonObject> observations,
+            Map<Long, JsonArray> stacks)
             throws IOException {
         List<Row> sources = new ArrayList<>();
         SamplingPolicy sampling = capture.sampling();
-        for (JsonObject observation : capture.observations) {
+        for (JsonObject observation : observations) {
             Row row = new Row(sources.size() + 2, observation, capture.inputs);
             validateSource(row, capture, sampling, limits);
             sources.add(row);
@@ -246,9 +294,11 @@ final class OfflineCorrelator {
         Gson gson = new GsonBuilder().serializeNulls().create();
         JsonObject[] observedStats = new JsonObject[1];
         SignalJfrExporter.RowConsumer consumer = raw -> {
+            capture.budget.countRow();
             JsonObject row = gson.toJsonTree(raw).getAsJsonObject();
-            capture.budget.charge(row);
-            switch (text(row, "recordType")) {
+            String recordType = text(row, "recordType");
+            if (!recordType.equals("sample")) capture.budget.charge(row);
+            switch (recordType) {
                 case "capture" -> {
                     identity(row, capture.inputs);
                     require(
@@ -328,7 +378,7 @@ final class OfflineCorrelator {
                 ? null
                 : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samples.size()));
         require(notParsed == null || notParsed.signum() >= 0, "JFR samples exceed submitted samples");
-        return join(capture, sources, samples, limits, notParsed, selectionMetadata);
+        return join(capture, sources, samples, limits, notParsed, selectionMetadata, stacks);
     }
 
     private static void validateStats(JsonObject row, JsonObject inputs) throws IOException {
@@ -371,7 +421,7 @@ final class OfflineCorrelator {
             JsonElement error = value.get(stack + "Error");
             if (error == null || error.isJsonNull()) {
                 require(stackId >= 0, "Unexplained negative stack id");
-                require(capture.stacks.containsKey(stackId), "Observation references an unannounced stack");
+                require(capture.announcedStacks.contains(stackId), "Observation references an unannounced stack");
             } else {
                 require(error.isJsonPrimitive() && error.getAsJsonPrimitive().isString(), "Invalid stack error");
             }
@@ -410,7 +460,8 @@ final class OfflineCorrelator {
             List<Row> samples,
             Limits limits,
             BigInteger notParsed,
-            JsonObject selectionMetadata)
+            JsonObject selectionMetadata,
+            Map<Long, JsonArray> stacks)
             throws IOException {
         Map<String, List<Row>> sourceIndex = index(sources);
         Map<String, List<Row>> sampleIndex = index(samples);
@@ -484,8 +535,8 @@ final class OfflineCorrelator {
             matches.add(new Match(source.value, sample.value, from, to.max(from), duration, delay, verified));
         }
         List<ClassifiedRecord> records = new ArrayList<>();
-        int invalidSource = classify("source", sources, records, capture.partial, capture.stacks);
-        int invalidJfr = classify("jfr", samples, records, capture.partial, capture.stacks);
+        int invalidSource = classify("source", sources, records, capture.partial, stacks);
+        int invalidJfr = classify("jfr", samples, records, capture.partial, stacks);
         Map<String, String> weights = new TreeMap<>();
         collapsed.forEach((key, value) -> weights.put(key, value.toString()));
         PopulationEstimate populationEstimate =

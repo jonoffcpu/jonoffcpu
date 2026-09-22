@@ -3,6 +3,7 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -345,7 +346,19 @@ public final class PartialCorrelatorTest {
         Files.write(source, concat(CaptureStreamFixture.encode(complete), CaptureStreamFixture.controlRecord("{}")));
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Rows follow captureFinalized");
         Files.write(source, prefix(complete, "observation"));
-        CaptureInput snapshot = CaptureInput.readPartial(source, jfr, DEFAULTS);
+        CaptureInput snapshot = CaptureInput.readPartial(source, jfr, DEFAULTS, new CaptureInput.SourceVisitor() {
+            @Override
+            public void reading(CaptureInput.Budget budget, LongIntMap announcedStacks) {}
+
+            @Override
+            public void start(JsonObject captureStart) {}
+
+            @Override
+            public void stack(long stackId, int frameCount) {}
+
+            @Override
+            public void observation(int rowNumber, CaptureProto.Observation observation) {}
+        });
         Files.write(source, prefix(complete, "captureStart"));
         rejects(() -> snapshot.verifyUnchanged(source, jfr), "Inputs changed");
         Files.write(source, prefix(complete, "observation"));

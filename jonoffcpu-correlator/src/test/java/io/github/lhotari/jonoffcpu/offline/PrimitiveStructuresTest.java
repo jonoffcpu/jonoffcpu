@@ -159,11 +159,29 @@ public final class PrimitiveStructuresTest {
         check(Reason.of((byte) Reason.INVALID_PAIR.ordinal()) == Reason.INVALID_PAIR, "Reason byte decoding is wrong");
     }
 
+    private static void budget() throws IOException {
+        var tight = new OfflineCorrelator.Limits(2, 1024 * 1024, 1024 * 1024, 4096, null, null, null);
+        CaptureInput.Budget rows = new CaptureInput.Budget(tight);
+        rows.countRow();
+        rows.countRow();
+        rejects(rows::countRow, "Input row limit exceeded");
+
+        var small = new OfflineCorrelator.Limits(100, 1024 * 1024, 4096, 4096, null, null, null);
+        CaptureInput.Budget retained = new CaptureInput.Budget(small);
+        // Structure retention replaces, rather than accumulates: it is the live size of the columns.
+        retained.structures(2048);
+        retained.structures(3072);
+        check(retained.retained() == 3072, "Structure retention accumulated instead of replacing");
+        check(retained.peak() == 3072, "Peak retention was not tracked");
+        rejects(() -> retained.structures(8192), "Decoded input budget exceeded");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
         dictionaries();
         columns();
+        budget();
         System.out.println("Primitive structure fixtures passed");
     }
 }

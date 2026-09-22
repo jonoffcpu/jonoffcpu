@@ -9,6 +9,7 @@ import com.google.gson.JsonPrimitive;
 import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -37,9 +38,10 @@ final class CaptureInput {
     final JsonObject start;
     final JsonObject end;
     final JsonObject inputs;
-    final List<JsonObject> observations;
-    /** Interned stacks by id: each is announced once, before the first observation that references it. */
-    final Map<Long, JsonArray> stacks;
+    /** The number of observations the stream carried; the counters in {@code captureEnd} must agree. */
+    final int observationCount;
+    /** Every announced stack id, mapped to its frame count. The frames themselves are not retained. */
+    final LongIntMap announcedStacks;
 
     final String sourceDigest;
     final String jfrDigest;
@@ -52,8 +54,8 @@ final class CaptureInput {
             JsonObject start,
             JsonObject end,
             JsonObject inputs,
-            List<JsonObject> observations,
-            Map<Long, JsonArray> stacks,
+            int observationCount,
+            LongIntMap announcedStacks,
             String sourceDigest,
             String jfrDigest,
             String apStoppedAtNanos,
@@ -63,8 +65,8 @@ final class CaptureInput {
         this.start = start;
         this.end = end;
         this.inputs = inputs;
-        this.observations = observations;
-        this.stacks = stacks;
+        this.observationCount = observationCount;
+        this.announcedStacks = announcedStacks;
         this.sourceDigest = sourceDigest;
         this.jfrDigest = jfrDigest;
         this.apStoppedAtNanos = apStoppedAtNanos;
@@ -73,8 +75,9 @@ final class CaptureInput {
         this.diagnostics = diagnostics;
     }
 
-    static CaptureInput read(Path source, Path jfr, OfflineCorrelator.Limits limits) throws IOException {
-        return read(source, jfr, limits, false, false);
+    static CaptureInput read(Path source, Path jfr, OfflineCorrelator.Limits limits, SourceVisitor visitor)
+            throws IOException {
+        return read(source, jfr, limits, false, false, visitor);
     }
 
     /** The validated sampling policy from {@code captureStart}. */
@@ -82,17 +85,24 @@ final class CaptureInput {
         return SamplingPolicy.parse(object(start, "sampling"));
     }
 
-    static CaptureInput read(Path source, Path jfr, OfflineCorrelator.Limits limits, boolean partialJfr)
+    static CaptureInput read(
+            Path source, Path jfr, OfflineCorrelator.Limits limits, boolean partialJfr, SourceVisitor visitor)
             throws IOException {
-        return read(source, jfr, limits, false, partialJfr);
+        return read(source, jfr, limits, false, partialJfr, visitor);
     }
 
-    static CaptureInput readPartial(Path source, Path jfr, OfflineCorrelator.Limits limits) throws IOException {
-        return read(source, jfr, limits, true, false);
+    static CaptureInput readPartial(Path source, Path jfr, OfflineCorrelator.Limits limits, SourceVisitor visitor)
+            throws IOException {
+        return read(source, jfr, limits, true, false, visitor);
     }
 
     private static CaptureInput read(
-            Path source, Path jfr, OfflineCorrelator.Limits limits, boolean partial, boolean partialJfr)
+            Path source,
+            Path jfr,
+            OfflineCorrelator.Limits limits,
+            boolean partial,
+            boolean partialJfr,
+            SourceVisitor visitor)
             throws IOException {
         Budget budget = new Budget(limits);
         MessageDigest rawHash = sha256();
@@ -103,9 +113,10 @@ final class CaptureInput {
         JsonObject start = null;
         JsonObject end = null;
         JsonObject footer = null;
-        List<JsonObject> observations = new ArrayList<>();
-        Map<Long, JsonArray> stacks = new LinkedHashMap<>();
+        int observations = 0;
+        LongIntMap announcedStacks = new LongIntMap(1 << 12);
         List<String> reasons = new ArrayList<>();
+        visitor.reading(budget, announcedStacks);
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
             byte[] header = CaptureStream.readHeader(input);
             wholeHash.update(header);
@@ -125,18 +136,15 @@ final class CaptureInput {
                     break;
                 }
                 String type = CaptureStream.recordType(framed.record());
+                budget.countRow();
+                boolean control = !type.equals("stack") && !type.equals("observation");
                 // Control records still carry JSON, and it is still parsed with the strict reader.
-                JsonObject row =
-                        switch (framed.record().getRecordCase()) {
-                            case STACK -> CaptureStream.stackRow(framed.record().getStack());
-                            case OBSERVATION ->
-                                CaptureStream.observationRow(framed.record().getObservation());
-                            default ->
-                                parse(CaptureStream.controlJson(framed.record())
-                                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
-                        };
-                budget.charge(row);
-                if (!type.equals("stack") && !type.equals("observation")) {
+                JsonObject row = control
+                        ? parse(CaptureStream.controlJson(framed.record())
+                                .getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                        : null;
+                if (control) {
+                    budget.charge(row);
                     require(number(row, "schemaVersion") == SCHEMA_VERSION, "Unsupported source schema");
                 }
                 if (!type.equals("captureFinalized")) {
@@ -152,19 +160,26 @@ final class CaptureInput {
                 }
                 switch (type) {
                     case "captureStart" -> {
-                        require(start == null && end == null && observations.isEmpty(), "Duplicate/out-of-order start");
+                        require(start == null && end == null && observations == 0, "Duplicate/out-of-order start");
                         start = row;
+                        requireStartFields(start);
+                        visitor.start(start);
                     }
                     case "stack" -> {
                         require(start != null && end == null, "Stack outside source capture");
-                        long stackId = number(row, "stackId");
+                        CaptureProto.Stack stack = framed.record().getStack();
+                        long stackId = stack.getId();
                         require(stackId >= 0, "Invalid stack id");
-                        JsonArray frames = frames(row, limits);
-                        require(stacks.putIfAbsent(stackId, frames) == null, "Duplicate stack record");
+                        require(stack.getFrameCount() <= limits.maxFrames(), "Stack frame count limit exceeded");
+                        require(!announcedStacks.contains(stackId), "Duplicate stack record");
+                        announcedStacks.put(stackId, stack.getFrameCount());
+                        visitor.stack(stackId, stack.getFrameCount());
                     }
                     case "observation" -> {
                         require(start != null && end == null, "Observation outside source capture");
-                        observations.add(row);
+                        // Source row numbers have always started at two; the classified records echo them.
+                        visitor.observation(observations + 2, framed.record().getObservation());
+                        observations++;
                     }
                     case "captureEnd" -> {
                         require(start != null && end == null, "Duplicate/out-of-order source end");
@@ -270,7 +285,7 @@ final class CaptureInput {
             require(!completeEnd || namespaceFailures.signum() == 0, "Source target namespace mapping failed");
             JsonObject counters = object(object(end, "counters"), "userspace");
             require(
-                    decimal(counters, "writtenObservations").equals(BigInteger.valueOf(observations.size())),
+                    decimal(counters, "writtenObservations").equals(BigInteger.valueOf(observations)),
                     "Source observation count mismatch");
             BigInteger received = decimal(counters, "receivedObservations");
             BigInteger written = decimal(counters, "writtenObservations");
@@ -356,7 +371,7 @@ final class CaptureInput {
                 end,
                 inputs,
                 observations,
-                stacks,
+                announcedStacks,
                 sourceHash,
                 jfrHash,
                 apStoppedAt,
@@ -483,6 +498,21 @@ final class CaptureInput {
                 text(row, "sessionId").equals(text(inputs, "sessionId"))
                         && number(row, "captureEpoch") == number(inputs, "captureEpoch"),
                 "Capture identity mismatch");
+    }
+
+    /**
+     * The {@code captureStart} fields an observation is validated against, checked as soon as the row is read so
+     * the engine can hoist them into constants. Each of these checks also runs in its original place below; only
+     * the point at which a malformed {@code captureStart} is reported moves earlier.
+     */
+    private static void requireStartFields(JsonObject start) throws IOException {
+        require(text(start, "sourceId").equals("jonoffcpu.offcpu.v1"), "Unsupported source");
+        require(text(start, "registrationToken").matches("[0-9a-f]{16}"), "Invalid process registration token");
+        SamplingPolicy.parse(object(start, "sampling"));
+        number(start, "hostTgid");
+        number(start, "targetPid");
+        decimal(start, "processGenerationNs");
+        decimal(start, "startedMonotonicNanos");
     }
 
     /** The frames of a stack record or a JFR sample row, held to the configured per-stack limit. */
@@ -624,19 +654,74 @@ final class CaptureInput {
         }
     }
 
-    /** Conservative decoded-object admission accounting, not a measurement of JVM resident memory. */
+    /**
+     * Receives the capture's per-interval records while the stream is read once, so no observation or native
+     * stack is retained as a decoded object. {@code start} is delivered as soon as {@code captureStart} has been
+     * read and its own fields checked, because every constant an observation is validated against — the target
+     * PID, the host TGID, the process generation, the registration token, the capture start time and the
+     * sampling policy — is in that row. The footer copies of those values are required to be identical further
+     * down, so validating an observation against {@code captureStart} is the same test.
+     */
+    interface SourceVisitor {
+        /** Called once, before the first record, with the budget and stack-id set this read will fill. */
+        void reading(Budget budget, LongIntMap announcedStacks) throws IOException;
+
+        void start(JsonObject captureStart) throws IOException;
+
+        void stack(long stackId, int frameCount) throws IOException;
+
+        void observation(int rowNumber, CaptureProto.Observation observation) throws IOException;
+    }
+
+    /**
+     * Admission accounting for the streaming correlator: a row counter over both inputs, the conservative
+     * decoded size of the few control objects that are retained, and the live size of the primitive structures
+     * the engine holds.
+     *
+     * <p>Before the columnar engine this charged every decoded record, which made it a proxy for input size
+     * rather than for retention and made {@code --max-retained-bytes} unusable as a guard: a 110 MB capture
+     * charged about 8 GB. It now charges what is actually retained — control documents, columns, cookie index,
+     * interned stacks, merge window — which is what the degradation ladder needs to steer on.
+     */
     static final class Budget {
         private final OfflineCorrelator.Limits limits;
-        private long retained;
+        private long documents;
+        private long structures;
+        private long peak;
         private int rows;
 
         Budget(OfflineCorrelator.Limits limits) {
             this.limits = limits;
         }
 
-        void charge(JsonElement value) throws IOException {
+        /** Counts one decoded record from either input against the total row limit. */
+        void countRow() throws IOException {
             require(++rows <= limits.maxRows(), "Input row limit exceeded");
-            retained = Math.addExact(retained, estimate(value));
+        }
+
+        /** Charges a control object that is retained for the whole run. */
+        void charge(JsonElement value) throws IOException {
+            documents = Math.addExact(documents, estimate(value));
+            enforce();
+        }
+
+        /** Replaces the live size of the engine's primitive structures. */
+        void structures(long bytes) throws IOException {
+            structures = bytes;
+            enforce();
+        }
+
+        long retained() {
+            return documents + structures;
+        }
+
+        long peak() {
+            return peak;
+        }
+
+        private void enforce() throws IOException {
+            long retained = Math.addExact(documents, structures);
+            peak = Math.max(peak, retained);
             require(retained <= limits.maxRetainedBytes(), "Decoded input budget exceeded");
         }
 
