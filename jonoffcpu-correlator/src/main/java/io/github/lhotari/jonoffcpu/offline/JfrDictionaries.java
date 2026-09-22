@@ -17,9 +17,22 @@ import java.util.Objects;
  * interns the delivery stacks itself: a sample keeps only an id, and the frames, the collapsed key
  * and the thread identity are stored once. Two stacks share an id exactly when {@code
  * CompatibilityJfrWriter.canonicalStack} would give them the same key — the truncation flag and
- * every frame's type, class, method, descriptor, line and bytecode index. Record equality and that
- * key can only disagree for an <em>empty</em> class name, which differs from a null one in the
- * canonical key but not in the synthetic writer's output; {@code RecordedMethod} never reports one.
+ * every frame's type, class, method, descriptor, line and bytecode index.
+ *
+ * <p>{@code canonicalStack} collapses a missing key, a JSON {@code null}, and a present-but-empty
+ * string to the same {@code ""} segment, and likewise collapses a missing numeric field to {@code
+ * ""}. This interner's {@code Frame} record does not: it distinguishes a null field from an empty
+ * one, and (in principle) a missing numeric field from an explicit zero. That distinction is never
+ * exercised. The sole producer of these frame maps is {@code SignalJfrExporter.frame(RecordedFrame)},
+ * which unconditionally populates all six keys for every frame — {@code type}, {@code lineNumber}
+ * and {@code bytecodeIndex} straight from {@code RecordedFrame}, and {@code className}, {@code
+ * methodName} and {@code descriptor} all set together from one {@code RecordedMethod} (or all three
+ * left null together when the method itself is null). {@code RecordedMethod} never reports an empty
+ * string for any of them. So a missing key never occurs, and null and {@code ""} are never both in
+ * play for the same field: wherever the two keying schemes could disagree, this interner is strictly
+ * <em>finer</em> than {@code canonicalStack} — it would intern separately what the canonical key
+ * would merge, never the reverse. That direction can only split what should stay one stack, never
+ * merge two genuinely distinct ones, which is the property the golden outputs depend on.
  *
  * <p>Interning is done without materializing a key per sample: a 64-bit hash is folded over the raw
  * frame list, and a hash hit is confirmed by comparing the raw list against the stored frames. Only
