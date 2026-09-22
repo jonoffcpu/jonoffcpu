@@ -16,6 +16,7 @@ ordinary async-profiler JFR.
   - [What the Java stack means](#what-the-java-stack-means)
 - [Requirements](#requirements)
   - [Kernel settings](#kernel-settings)
+    - [Applying them to a VM's kernel](#applying-them-to-a-vms-kernel)
     - [Running the collector without root](#running-the-collector-without-root)
   - [Profiling in Docker](#profiling-in-docker)
     - [Docker Desktop on macOS and Windows](#docker-desktop-on-macos-and-windows)
@@ -281,7 +282,34 @@ make the values persist across reboots, put them in
 
 In a container, these are host-wide kernel settings: `kernel.perf_event_*` and
 `kernel.kptr_restrict` are not namespaced, so set them on the host, not inside
-the container.
+the container. For the same reason `docker run --sysctl` refuses them, since it
+accepts only namespaced keys.
+
+#### Applying them to a VM's kernel
+
+With Docker Desktop on macOS or Windows, and with Colima, Lima or any other
+Linux VM, the kernel that matters is the VM's: `sysctl` on the workstation
+changes nothing that the containers can see. Write the values from a privileged
+container, which shares the VM kernel's `/proc/sys`:
+
+```sh
+docker run --rm --privileged alpine sh -c '
+  echo 1    > /proc/sys/kernel/perf_event_paranoid
+  echo 0    > /proc/sys/kernel/kptr_restrict
+  echo 1024 > /proc/sys/kernel/perf_event_max_stack
+  echo 2048 > /proc/sys/kernel/perf_event_mlock_kb
+  echo 0    > /proc/sys/kernel/unprivileged_bpf_disabled'
+```
+
+`--privileged` is what makes `/proc/sys` writable; without it the container gets
+it read-only, and adding `--cap-add SYS_ADMIN` or
+`--security-opt seccomp=unconfined` changes nothing that `--privileged` has not
+already granted. The writes affect the whole VM and last until it restarts, so
+this is a per-boot step rather than a one-time setup. The commands are listed
+one per line on purpose: the last one fails with `EPERM` on a kernel where
+`unprivileged_bpf_disabled` already reads `1`, and chaining them with `&&` would
+hide the earlier successes behind that failure. It is also the one line that is
+optional — see [Running the collector without root](#running-the-collector-without-root).
 
 #### Running the collector without root
 
@@ -368,7 +396,9 @@ the blunt alternative; it is what this repository's own proof scripts use.
 There the containers run in a Linux VM, and the kernel is the VM's, not the
 host operating system's. Bind mounting `/sys/kernel/tracing` cannot work, since
 that path would be resolved on macOS or Windows; the `local` volume above does
-work, because Docker mounts it inside the VM.
+work, because Docker mounts it inside the VM. The sysctls are the VM's too, and
+are set as described in
+[Applying them to a VM's kernel](#applying-them-to-a-vms-kernel).
 
 The kernel features are the real question. jonoffcpu needs BTF, eBPF task
 storage, `bpf_send_signal_task`, and the `tp_btf/sched_exit_tp` tracepoint,
