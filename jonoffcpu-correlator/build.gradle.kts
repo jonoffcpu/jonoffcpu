@@ -271,6 +271,12 @@ val fixtureTasks = fixtureMains.map { (taskName, className) ->
     }
 }
 
+// Spec acceptance 4: the scale fixture's assertion is the heap cap itself, so it must run under
+// exactly the bound it proves, not whatever heap the other fixtures happen to get.
+tasks.named<JavaExec>("testStreamingCorrelator") {
+    jvmArgs("-ea", "-Xmx1g")
+}
+
 val testCorrelatorPublicApi = tasks.register<JavaExec>("testCorrelatorPublicApi") {
     group = "verification"
     description = "Checks the published correlator JAR's dependency-free public API."
