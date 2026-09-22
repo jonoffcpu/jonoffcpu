@@ -91,16 +91,17 @@ git push origin v1.2.3
 
 The [release workflow](.github/workflows/release.yml) then:
 
-1. builds and verifies the x86-64 glibc and musl bundles on `ubuntu-26.04`;
-2. builds and verifies the arm64 glibc and musl bundles on `ubuntu-26.04-arm`;
-3. combines all four verified bundles into the universal Java agent;
-4. signs and publishes the artifacts with
+1. builds and verifies the x86-64 glibc and musl bundles on `ubuntu-26.04`
+   and the arm64 glibc and musl bundles on `ubuntu-26.04-arm`, as four
+   parallel matrix jobs;
+2. combines all four verified bundles into the universal Java agent;
+3. signs and publishes the artifacts with
    `publishAndReleaseToMavenCentral`, waiting for Central Portal validation; and
-5. copies the executable artifacts to stable `jonoffcpu-agent.jar` and
+4. copies the executable artifacts to stable `jonoffcpu-agent.jar` and
    `jonoffcpu-correlator.jar` names and adds `jfr-converter.jar`, the converter
    that the reusable workflow built from the pinned async-profiler fork and
    checked against a collapsed off-CPU profile; and
-6. creates the GitHub Release with generated notes and all three JAR downloads
+5. creates the GitHub Release with generated notes and all three JAR downloads
    only after publication succeeds.
 
 Generated release-note categories are configured in

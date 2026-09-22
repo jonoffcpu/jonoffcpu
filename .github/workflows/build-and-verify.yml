@@ -23,21 +23,28 @@ permissions:
 
 jobs:
   native-build-and-verify:
-    name: Build and verify on ${{ matrix.name }}
+    name: Build and verify ${{ matrix.libc }} on ${{ matrix.name }}
+    # One job per architecture and C library, so all four bundles build in
+    # parallel on native runners. The bundle directory is linux-<arch> for glibc
+    # and linux-musl-<arch> for musl, matching the agent's META-INF/native layout.
     strategy:
       fail-fast: false
       matrix:
+        native-architecture: [x86_64, aarch64]
+        libc: [glibc, musl]
         include:
-          - name: Linux x86-64
+          - native-architecture: x86_64
+            name: Linux x86-64
             runner: ubuntu-26.04
             host-arch: x86_64
-            artifact-suffix: x86_64
-            native-architecture: x86_64
-          - name: Linux arm64
+          - native-architecture: aarch64
+            name: Linux arm64
             runner: ubuntu-26.04-arm
             host-arch: aarch64
-            artifact-suffix: aarch64
-            native-architecture: aarch64
+          - libc: glibc
+            bundle-prefix: linux
+          - libc: musl
+            bundle-prefix: linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     env:
@@ -55,52 +62,46 @@ jobs:
           distribution: corretto
           java-version: 25
       - uses: dtolnay/rust-toolchain@8d8cc9a8e0d47b64af669de71110e76860d6afbd # 1.91.0
-        if: matrix.native-architecture == 'x86_64'
+        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
         with:
           components: rustfmt
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
           cache-provider: basic
       - name: Check native collector formatting
-        if: matrix.native-architecture == 'x86_64'
+        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
         run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
-      # Both C-library flavours are built natively on this runner; the glibc smoke
-      # runs on the runner's own JDK and the musl smoke in an Alpine container of
-      # the same architecture.
+      # The glibc runner JDK exercises the host-native JNI fixtures in check; the
+      # musl bundle cannot load into the glibc build JVM, so its evidence is the
+      # packaged smoke in an Alpine container of the same architecture.
       - name: Build and run checks
         env:
           NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
+          NATIVE_LIBC: ${{ matrix.libc }}
         run: >-
           ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
           -PnativeArchitectures="$NATIVE_ARCHITECTURE"
-          -PnativeLibcs=all
+          -PnativeLibcs="$NATIVE_LIBC"
           --no-daemon
-      - name: Run packaged agent end-to-end smoke test (glibc)
+      - name: Run packaged agent end-to-end smoke test
+        env:
+          NATIVE_LIBC: ${{ matrix.libc }}
         run: |
+          java_home_option=()
+          if [ "$NATIVE_LIBC" = glibc ]; then
+            java_home_option=(--java-home "$JAVA_HOME")
+          fi
           python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
-            --libc glibc \
+            --libc "$NATIVE_LIBC" \
             --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
             --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
             --test-classes jonoffcpu-agent/build/classes/java/test \
-            --java-home "$JAVA_HOME" \
-            --output jonoffcpu-agent/build/packaged-smoke-glibc
-      - name: Run packaged agent end-to-end smoke test (musl)
-        run: |
-          python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
-            --libc musl \
-            --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
-            --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
-            --test-classes jonoffcpu-agent/build/classes/java/test \
-            --output jonoffcpu-agent/build/packaged-smoke-musl
+            "${java_home_option[@]}" \
+            --output jonoffcpu-agent/build/packaged-smoke
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ inputs.native_artifact_prefix }}-linux-${{ matrix.artifact-suffix }}
-          path: jonoffcpu-agent/build/native/linux-${{ matrix.artifact-suffix }}/
-          if-no-files-found: error
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ inputs.native_artifact_prefix }}-linux-musl-${{ matrix.artifact-suffix }}
-          path: jonoffcpu-agent/build/native/linux-musl-${{ matrix.artifact-suffix }}/
+          name: ${{ inputs.native_artifact_prefix }}-${{ matrix.bundle-prefix }}-${{ matrix.native-architecture }}
+          path: jonoffcpu-agent/build/native/${{ matrix.bundle-prefix }}-${{ matrix.native-architecture }}/
           if-no-files-found: error
 
   package:
