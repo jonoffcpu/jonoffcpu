@@ -15,6 +15,10 @@ ordinary async-profiler JFR.
   - [Files jonoffcpu writes](#files-jonoffcpu-writes)
   - [What the Java stack means](#what-the-java-stack-means)
 - [Requirements](#requirements)
+  - [Kernel settings](#kernel-settings)
+    - [Running the collector without root](#running-the-collector-without-root)
+  - [Profiling in Docker](#profiling-in-docker)
+    - [Docker Desktop on macOS and Windows](#docker-desktop-on-macos-and-windows)
 - [Quick start](#quick-start)
   - [1. Get the JARs](#1-get-the-jars)
   - [2. Record](#2-record)
@@ -223,7 +227,9 @@ kernel duration, the Java stack, and the delivery delay as separate values, and
 - 64-bit Linux with BTF, eBPF task storage, the `tp_btf/sched_exit_tp`
   tracepoint, and the `bpf_send_signal_task` helper. The agent checks the
   running kernel and fails closed if any of these is missing.
-- Privileges to load and attach the BPF programs.
+- Privileges to load and attach the BPF programs: `CAP_BPF` and
+  `CAP_PERFMON`, or root. See [Kernel settings](#kernel-settings) for the
+  sysctls that async-profiler needs alongside them.
 - Java 17 or newer for the agent; Java 21 or newer for the correlator.
 - On Java 24 and newer, add `--sun-misc-unsafe-memory-access=allow` to the JVM
   being profiled and to the correlator. The bundled protobuf codec that reads
@@ -240,6 +246,150 @@ bundle from the C library mapped into the running JVM; on an unusual host,
 `-Dio.github.lhotari.jonoffcpu.nativeLibc=glibc` or `=musl` selects it
 explicitly. If the temporary directory is mounted `noexec`, point
 `-Dio.github.lhotari.jonoffcpu.nativeWorkDir` at an executable location.
+
+### Kernel settings
+
+jonoffcpu's own eBPF collector needs privileges (`CAP_BPF` and `CAP_PERFMON`, or
+root), and nothing else. The settings below are about the *other* half of the
+capture: async-profiler runs inside the JVM, usually unprivileged, and the
+kernel restricts by default what an unprivileged process may observe. Without
+them the capture still completes, but parts of it are degraded — typically
+missing kernel frames, truncated native stacks, or no `cpu` event at all.
+
+| Setting | Suggested value | Why |
+| --- | --- | --- |
+| `kernel.perf_event_paranoid` | `1` | The gate on `perf_event_open`. The common default `2` lets an unprivileged process measure only its own user space, so async-profiler's `cpu` engine cannot sample kernel stacks; `>= 2` is also the usual reason `perf_event_open` fails outright and the profiler falls back or errors. `1` allows per-process profiling including kernel stacks. `CAP_PERFMON` bypasses the check. |
+| `kernel.kptr_restrict` | `0` | Kernel symbol addresses in `/proc/kallsyms` read back as zeros unless the reader has `CAP_SYSLOG` (`1`), or for everyone (`2`). Both async-profiler and jonoffcpu's collector symbolize kernel frames from that file, so with addresses hidden the kernel part of a stack stays as raw addresses. |
+| `kernel.perf_event_max_stack` | `1024` | The maximum call-chain depth `perf_events` records, `127` by default, which silently truncates deep JVM native stacks. Raising it only affects async-profiler: jonoffcpu's BPF stack map has a fixed depth of 127. Do not lower it below 127 — the collector's stack map cannot be created if the sysctl is smaller than the map's depth. |
+| `kernel.perf_event_mlock_kb` | `2048` | async-profiler mmaps an 8 KB perf buffer per thread, bounded by `ulimit -l` plus this value times the number of CPUs. On a thread-heavy application the default `516` runs out and native stacks are dropped for the remaining threads. |
+
+Apply them for the current boot:
+
+```sh
+sudo sysctl -w kernel.perf_event_paranoid=1
+sudo sysctl -w kernel.kptr_restrict=0
+sudo sysctl -w kernel.perf_event_max_stack=1024
+sudo sysctl -w kernel.perf_event_mlock_kb=2048
+```
+
+Use `sysctl` rather than `sudo echo 1 > /proc/sys/…`: the redirection is
+performed by the calling shell, which is still unprivileged, so that form fails
+with "Permission denied" before `sudo` runs. `sudo tee`
+(`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`) works as well. To
+make the values persist across reboots, put them in
+`/etc/sysctl.d/99-jonoffcpu.conf` as `key = value` lines.
+
+In a container, these are host-wide kernel settings: `kernel.perf_event_*` and
+`kernel.kptr_restrict` are not namespaced, so set them on the host, not inside
+the container.
+
+#### Running the collector without root
+
+`kernel.unprivileged_bpf_disabled = 0` re-enables the `bpf()` syscall for
+callers that hold no BPF capability:
+
+```sh
+sudo sysctl -w kernel.unprivileged_bpf_disabled=0
+```
+
+It does **not** make jonoffcpu work unprivileged. Unprivileged `bpf()` only ever
+permitted socket-filter programs, while the collector loads tracepoint programs
+and uses helpers that require `CAP_BPF` plus `CAP_PERFMON`; with those
+capabilities the sysctl is not consulted at all. It is worth setting only where
+something else in the toolchain trips over the syscall gate. Note that the value
+`1` is a one-way latch: once the sysctl reads `1`, the kernel refuses to change
+it until the next boot, so a host that has disabled unprivileged BPF that way
+has to be rebooted (distributions that default to `2` can be changed at
+runtime).
+
+### Profiling in Docker
+
+The agent and the collector both run inside the container with the JVM: the
+agent extracts the collector from its JAR and starts it as a child process, and
+the eBPF program resolves thread ids inside the target's own PID namespace. So
+the container is profiled as it is: neither `--pid=host` nor `--net=host` is
+needed, and no kernel headers have to be mounted, because the collector is CO-RE
+and reads the kernel's own BTF. General-purpose BPF toolbox images ask for all
+of these because they trace the whole host from outside, and because BCC
+compiles its programs against kernel headers at runtime. The only case that
+needs `--pid=host`, or `--pid=container:<id>`, is running the standalone
+collector against a target in another container, which is what this
+repository's proof scripts do.
+
+| The container needs | How | Why |
+| --- | --- | --- |
+| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading the programs is `bpf(BPF_PROG_LOAD)`; attaching the `sched_switch` tracepoint is `perf_event_open`. Docker's default seccomp profile permits both once the matching capability is present, so `--security-opt seccomp=unconfined` is not required. |
+| `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | libbpf reads the tracepoint's numeric id from `events/sched/sched_switch/id`. A container gets the directory but no filesystem mounted on it. |
+| Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
+| An executable temporary directory | `-Dio.github.lhotari.jonoffcpu.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
+
+BTF needs nothing: `/sys/kernel/btf/vmlinux` is part of the container's own
+`sysfs` and is readable already.
+
+Mount `tracefs` with a `local` volume, which passes its options straight to
+`mount`:
+
+```sh
+docker volume create --driver local \
+  --opt type=tracefs --opt device=tracefs --opt o=ro tracefs
+
+docker run --rm \
+  --cap-add BPF --cap-add PERFMON \
+  -v tracefs:/sys/kernel/tracing \
+  your-image \
+  java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
+```
+
+Read-only is enough, because jonoffcpu only reads the tracepoint id. The
+equivalent in Compose:
+
+```yaml
+volumes:
+  tracefs:
+    driver: local
+    driver_opts: { type: tracefs, device: tracefs, o: ro }
+services:
+  app:
+    cap_add: [BPF, PERFMON]
+    volumes:
+      - tracefs:/sys/kernel/tracing
+```
+
+Docker performs this mount itself, before the container starts, so it works in
+an unprivileged container and needs nothing bind-mounted from the host. Bind
+mounting the host's `/sys/kernel/tracing` is equivalent where the host is Linux.
+Mounting `tracefs` from inside the container instead requires `--privileged`:
+`/sys` is mounted read-only and locked, so `--cap-add SYS_ADMIN` alone cannot do
+it. If a hardened runtime refuses the capability-based setup, `--privileged` is
+the blunt alternative; it is what this repository's own proof scripts use.
+
+#### Docker Desktop on macOS and Windows
+
+There the containers run in a Linux VM, and the kernel is the VM's, not the
+host operating system's. Bind mounting `/sys/kernel/tracing` cannot work, since
+that path would be resolved on macOS or Windows; the `local` volume above does
+work, because Docker mounts it inside the VM.
+
+The kernel features are the real question. jonoffcpu needs BTF, eBPF task
+storage, `bpf_send_signal_task`, and the `tp_btf/sched_exit_tp` tracepoint,
+which is recent enough that Docker Desktop's LinuxKit kernel and a stock WSL2
+kernel may not have it; the agent then fails closed rather than producing
+degraded data. Check the VM you have before going further:
+
+```sh
+docker run --rm --privileged alpine sh -c '
+  uname -r
+  ls -l /sys/kernel/btf/vmlinux
+  mount -t tracefs tracefs /sys/kernel/tracing &&
+    cat /sys/kernel/tracing/events/sched/sched_switch/id
+  grep -ac btf_trace_sched_exit_tp /sys/kernel/btf/vmlinux'
+```
+
+All four must succeed, the last one printing a non-zero count. If they do not,
+supply a newer kernel — on Windows through `kernel=` in `.wslconfig`, on macOS
+through a VM manager that lets you choose the image — or profile on a Linux
+host. Either way, only a JVM running inside that Linux VM can be profiled; a
+JVM running natively on macOS or Windows is invisible to it.
 
 ## Quick start
 
@@ -523,6 +673,18 @@ git clone --recurse-submodules https://github.com/lhotari/jonoffcpu.git
 cd jonoffcpu
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
 ```
+
+Development is expected to happen on Linux, on x86-64 or arm64 (`aarch64`).
+The correlator and the converter are ordinary Java and build anywhere, but
+`:jonoffcpu-agent:check` does not: the agent refuses to load its native bundle
+on anything except 64-bit Linux, the native and integration tests need a Linux
+kernel with BTF and the eBPF features listed under
+[Requirements](#requirements), and several of them need privileged Docker. On
+macOS the containers run in a Linux VM whose kernel is not the one the build
+detects, and the build's own C-library detection reads `/proc/self/maps`. On
+Windows, work inside WSL2, which is a Linux VM and behaves like one. Build only
+the host architecture locally: the other one runs under QEMU emulation and is
+far slower than it is worth, and CI covers it on native runners.
 
 The build needs [Amazon Corretto 25](https://aws.amazon.com/corretto/) and
 Docker with [BuildKit](https://docs.docker.com/build/buildkit/); the native
