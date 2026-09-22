@@ -33,6 +33,92 @@ pub mod bpf_endpoint_boundary {
     include!(concat!(env!("OUT_DIR"), "/endpoint_boundary.skel.rs"));
 }
 
+/// The capture stream schema, generated from docs/schema/jonoffcpu-capture.proto.
+#[allow(clippy::all)]
+pub mod capture {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/io.github.lhotari.jonoffcpu.capture.v1.rs"
+    ));
+
+    /// Header written once at the start of a capture file: the magic, a zero byte, and the format
+    /// version. A reader that does not find it is looking at something else entirely.
+    pub const MAGIC: &[u8; 10] = b"JONOFFCPU\0";
+    pub const FORMAT_VERSION: u16 = 1;
+    pub const HEADER_LEN: usize = MAGIC.len() + 2;
+
+    pub fn header() -> [u8; HEADER_LEN] {
+        let mut bytes = [0u8; HEADER_LEN];
+        bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+        bytes[MAGIC.len()..].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        bytes
+    }
+
+    /// Decodes a whole capture file. Proof tools and tests read streams this way; the correlator has
+    /// its own reader that also reports a truncated tail instead of rejecting it.
+    pub fn decode(bytes: &[u8]) -> anyhow::Result<Vec<Record>> {
+        use anyhow::{Context, bail};
+        use prost::Message;
+        if bytes.len() < HEADER_LEN || &bytes[..MAGIC.len()] != MAGIC {
+            bail!("not a jonoffcpu capture stream");
+        }
+        let version = u16::from_le_bytes([bytes[MAGIC.len()], bytes[MAGIC.len() + 1]]);
+        if version != FORMAT_VERSION {
+            bail!("unsupported capture format version {version}");
+        }
+        let mut rest = &bytes[HEADER_LEN..];
+        let mut records = Vec::new();
+        while !rest.is_empty() {
+            records
+                .push(Record::decode_length_delimited(&mut rest).context("decode capture record")?);
+        }
+        Ok(records)
+    }
+
+    /// The debug projection of a record: the JSON shape the stream used to have, for proof tools and
+    /// for `jonoffcpu-correlator --dump`.
+    pub fn to_json(record: &Record) -> serde_json::Value {
+        use serde_json::json;
+        match &record.record {
+            Some(record::Record::CaptureStart(control))
+            | Some(record::Record::CaptureEnd(control))
+            | Some(record::Record::CaptureFinalized(control)) => {
+                serde_json::from_str(&control.json).unwrap_or(serde_json::Value::Null)
+            }
+            Some(record::Record::Stack(stack)) => json!({
+                "recordType": "stack",
+                "stackId": stack.id,
+                "frames": stack.frame.iter().map(|frame| json!({
+                    "address": format!("{:016x}", frame.address),
+                    "symbol": frame.symbol,
+                    "module": frame.module,
+                })).collect::<Vec<_>>(),
+            }),
+            Some(record::Record::Observation(observation)) => json!({
+                "recordType": "observation",
+                "correlationId": format!("{:016x}", observation.correlation_id),
+                "hostTgid": observation.host_tgid,
+                "hostTid": observation.host_tid,
+                "targetTgid": observation.target_tgid,
+                "targetTid": observation.target_tid,
+                "processGenerationNs": observation.process_generation_ns.to_string(),
+                "threadGenerationNs": observation.thread_generation_ns.to_string(),
+                "registrationToken": format!("{:016x}", observation.registration_token),
+                "startMonotonicNanos": observation.start_monotonic_ns.to_string(),
+                "endMonotonicNanos": observation.end_monotonic_ns.to_string(),
+                "admissionThreshold": observation.admission_threshold,
+                "signalResult": observation.signal_result,
+                "comm": observation.comm,
+                "kernelStackId": observation.kernel_stack_id,
+                "userStackId": observation.user_stack_id,
+                "kernelStackError": observation.kernel_stack_error,
+                "userStackError": observation.user_stack_error,
+            }),
+            None => serde_json::Value::Null,
+        }
+    }
+}
+
 mod collector;
 
 pub const ABI_VERSION: u32 = 1;

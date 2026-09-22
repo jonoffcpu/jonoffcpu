@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT
 use crate::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
+use crate::capture;
 use anyhow::{Context, Result, anyhow, bail};
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -1193,6 +1195,9 @@ fn worker(
     // Rows with symbolized stacks run to a few kilobytes; a large buffer keeps a drain batch to a
     // handful of write syscalls instead of one per row.
     let mut writer = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file);
+    writer
+        .write_all(&capture::header())
+        .context("write source artifact header")?;
 
     let mut object = MaybeUninit::uninit();
     let open = JonoffcpuCookieSkelBuilder::default()
@@ -1707,7 +1712,10 @@ trait TerminalSink {
 
 impl TerminalSink for BufWriter<File> {
     fn append_terminal(&mut self, value: &Value) -> Result<()> {
-        write_row(self, value)
+        write_record(
+            self,
+            &control_record(value, capture::record::Record::CaptureEnd),
+        )
     }
 
     fn flush_terminal(&mut self) -> Result<()> {
@@ -1896,7 +1904,10 @@ fn enable_capture(
         "wallClockCalibration": wall_clock_calibration.json(),
         "signalEnvironment": signal_environment.clone(),
     });
-    write_row(writer, &start)?;
+    write_record(
+        writer,
+        &control_record(&start, capture::record::Record::CaptureStart),
+    )?;
     writer.flush().context("flush captureStart")?;
     *capture = Some(CaptureState {
         config: enable.clone(),
@@ -2107,8 +2118,8 @@ fn drain_events(
         if kernel_error.is_some() || user_error.is_some() {
             capture.userspace.symbolization_failures += 1;
         }
-        let row = observation_row(capture, &event, kernel_error, user_error);
-        match write_row(writer, &row) {
+        let row = observation_record(&event, kernel_error, user_error);
+        match write_record(writer, &row) {
             Ok(()) => capture.userspace.written_observations += 1,
             Err(_) => capture.userspace.write_failures += 1,
         }
@@ -2166,16 +2177,13 @@ fn emit_stack(
         Ok(frames) => frames,
         Err(error) => return Some(error.to_string()),
     };
-    let row = json!({
-        "schemaVersion": SCHEMA_VERSION,
-        "recordType": "stack",
-        "sourceId": SOURCE_ID,
-        "sessionId": capture.config.session_id,
-        "captureEpoch": capture.config.capture_epoch,
-        "stackId": stack_id,
-        "frames": frames,
-    });
-    if write_row(writer, &row).is_err() {
+    let row = capture::Record {
+        record: Some(capture::record::Record::Stack(capture::Stack {
+            id: stack_id,
+            frame: frames,
+        })),
+    };
+    if write_record(writer, &row).is_err() {
         capture.userspace.write_failures += 1;
         return Some("stack_record_write_failure".to_string());
     }
@@ -2183,48 +2191,44 @@ fn emit_stack(
     None
 }
 
-fn observation_row(
-    capture: &CaptureState,
+fn observation_record(
     event: &Observation,
     kernel_stack_error: Option<String>,
     user_stack_error: Option<String>,
-) -> Value {
+) -> capture::Record {
     let comm_end = event
         .comm
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(event.comm.len());
-    json!({
-        "schemaVersion": SCHEMA_VERSION,
-        "recordType": "observation",
-        "sourceId": SOURCE_ID,
-        "sessionId": capture.config.session_id,
-        "captureEpoch": event.capture_epoch,
-        "correlationId": format!("{:016x}", event.correlation_id),
-        "hostTgid": event.host_tgid,
-        "hostTid": event.host_tid,
-        "targetTgid": event.target_tgid,
-        "targetTid": event.target_tid,
-        "processGenerationNs": event.process_generation_ns.to_string(),
-        "threadGenerationNs": event.thread_generation_ns.to_string(),
-        "registrationToken": format!("{:016x}", event.registration_token),
-        "startMonotonicNanos": event.start_monotonic_ns.to_string(),
-        "endMonotonicNanos": event.end_monotonic_ns.to_string(),
-        "admissionThreshold": event.admission_threshold,
-        "signalResult": event.signal_result,
-        "comm": String::from_utf8_lossy(&event.comm[..comm_end]),
-        "kernelStackId": event.kernel_stack_id,
-        "userStackId": event.user_stack_id,
-        "kernelStackError": kernel_stack_error,
-        "userStackError": user_stack_error,
-    })
+    capture::Record {
+        record: Some(capture::record::Record::Observation(capture::Observation {
+            correlation_id: event.correlation_id,
+            host_tgid: event.host_tgid,
+            host_tid: event.host_tid,
+            target_tgid: event.target_tgid,
+            target_tid: event.target_tid,
+            process_generation_ns: event.process_generation_ns,
+            thread_generation_ns: event.thread_generation_ns,
+            registration_token: event.registration_token,
+            start_monotonic_ns: event.start_monotonic_ns,
+            end_monotonic_ns: event.end_monotonic_ns,
+            admission_threshold: event.admission_threshold,
+            signal_result: event.signal_result,
+            comm: String::from_utf8_lossy(&event.comm[..comm_end]).into_owned(),
+            kernel_stack_id: event.kernel_stack_id,
+            user_stack_id: event.user_stack_id,
+            kernel_stack_error: kernel_stack_error.unwrap_or_default(),
+            user_stack_error: user_stack_error.unwrap_or_default(),
+        })),
+    }
 }
 
 fn materialize_frames(
     map: &impl MapCore,
     stack_id: i64,
     mut resolve: impl FnMut(u64) -> (Option<String>, Option<String>),
-) -> Result<Vec<Value>> {
+) -> Result<Vec<capture::Frame>> {
     if stack_id < 0 {
         bail!("bpf_stack_error_{stack_id}");
     }
@@ -2238,11 +2242,11 @@ fn materialize_frames(
             break;
         }
         let (symbol, module) = resolve(address);
-        frames.push(json!({
-            "address": format!("{address:016x}"),
-            "symbol": symbol,
-            "module": module,
-        }));
+        frames.push(capture::Frame {
+            address,
+            symbol: symbol.unwrap_or_default(),
+            module: module.unwrap_or_default(),
+        });
     }
     Ok(frames)
 }
@@ -2349,10 +2353,24 @@ fn read_stats(map: &impl MapCore) -> Result<KernelStats> {
     Ok(total)
 }
 
-fn write_row(writer: &mut BufWriter<File>, value: &Value) -> Result<()> {
-    serde_json::to_writer(&mut *writer, value)?;
-    writer.write_all(b"\n")?;
+/// Appends one length-delimited record: a varint byte count followed by the encoded message.
+fn write_record(writer: &mut BufWriter<File>, record: &capture::Record) -> Result<()> {
+    let mut encoded = Vec::with_capacity(record.encoded_len() + 8);
+    record.encode_length_delimited(&mut encoded)?;
+    writer.write_all(&encoded)?;
     Ok(())
+}
+
+/// A control record carries the JSON object it has always carried; only three exist per capture.
+fn control_record(
+    value: &Value,
+    slot: fn(capture::ControlJson) -> capture::record::Record,
+) -> capture::Record {
+    capture::Record {
+        record: Some(slot(capture::ControlJson {
+            json: value.to_string(),
+        })),
+    }
 }
 
 /// This thread's ID in the process's own PID namespace, which is also the target's namespace.

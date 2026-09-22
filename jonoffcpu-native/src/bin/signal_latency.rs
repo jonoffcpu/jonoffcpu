@@ -148,10 +148,10 @@ fn main() -> Result<()> {
     thread::sleep(Duration::from_millis(100));
     child.stop_and_wait()?;
 
-    let rows = fs::read_to_string(&output)?
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rows = jonoffcpu_native::capture::decode(&fs::read(&output)?)?
+        .iter()
+        .map(jonoffcpu_native::capture::to_json)
+        .collect::<Vec<_>>();
     let mut source = HashMap::new();
     let mut duplicate_source = 0u64;
     let mut signal_request_failures = 0u64;

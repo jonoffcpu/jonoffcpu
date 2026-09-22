@@ -1,7 +1,7 @@
 # jonoffcpu signal capture agent
 
 The agent owns one source/async-profiler capture and writes two authoritative
-artifacts: the original JFR and a self-contained correlation NDJSON file. The
+artifacts: the original JFR and a self-contained correlation stream. The
 last correlation row is written only after source drain, an identity-guarded AP
 stop, clean public-JDK JFR parsing, and matching terminal counters.
 
@@ -63,7 +63,7 @@ The publishable artifact is
 output path and the async-profiler options:
 
 ```yaml
-correlationOutput: /data/jonoffcpu-capture.ndjson
+correlationOutput: /data/jonoffcpu-capture.pb
 asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/data/jonoffcpu-capture.jfr
 sampling:
   minOffCpuMicros: 100
@@ -106,12 +106,13 @@ that mode, everything before `asprofpath` belongs to jonoffcpu and everything
 after it is forwarded to async-profiler:
 
 ```sh
-java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.ndjson,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
+java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.pb,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
 ```
 
 Options before `asprofpath` belong to JONOFFCPU:
 
-- `jonoffcpuoutput` (required): exact correlation NDJSON path.
+- `jonoffcpuoutput` (required): exact correlation stream path. The stream is
+  length-delimited protobuf, defined by `docs/schema/jonoffcpu-capture.proto`.
 - `jonoffcpudelivery=queued|coalescing`: signal delivery policy; defaults to `queued`.
 - `sampling-policy=none|uniform|proportional` (required): the admission policy,
   `sampling.admission.policy` in YAML.
@@ -173,7 +174,7 @@ For the Java-agent configuration, choose coalescing cookie delivery with
 form is:
 
 ```sh
-java -agentpath:/path/to/build/lib/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.ndjson,jonoffcpudelivery=coalescing,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
+java -agentpath:/path/to/build/lib/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.pb,jonoffcpudelivery=coalescing,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
 ```
 
 A `cookiesignal` option in the async-profiler options may

@@ -185,11 +185,11 @@ fn parent_proof() -> Result<()> {
     }
     call(|out| unsafe { jonoffcpu_collector_close(handle, out) })?;
 
-    let source = fs::read_to_string(&output).context("read retained partial source")?;
-    let rows = source
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let source = fs::read(&output).context("read retained partial source")?;
+    let rows = jonoffcpu_native::capture::decode(&source)?
+        .iter()
+        .map(jonoffcpu_native::capture::to_json)
+        .collect::<Vec<_>>();
     let capture_end_rows = rows
         .iter()
         .filter(|row| row["recordType"] == "captureEnd")
@@ -246,9 +246,11 @@ fn terminate_child(child: &mut Child) {
 fn wait_for_capture_end(path: &str, timeout: Duration) -> Result<Value> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Ok(source) = fs::read_to_string(path) {
-            for line in source.lines().rev() {
-                if let Ok(row) = serde_json::from_str::<Value>(line) {
+        // A partially written trailing record is expected while the collector is still finalizing.
+        if let Ok(bytes) = fs::read(path) {
+            if let Ok(records) = jonoffcpu_native::capture::decode(&bytes) {
+                for record in records.iter().rev() {
+                    let row = jonoffcpu_native::capture::to_json(record);
                     if row["recordType"] == "captureEnd" {
                         return Ok(row);
                     }

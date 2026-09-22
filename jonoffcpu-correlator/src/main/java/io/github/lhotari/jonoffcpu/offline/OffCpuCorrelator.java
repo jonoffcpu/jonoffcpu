@@ -3,6 +3,7 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import java.io.BufferedWriter;
@@ -77,6 +78,54 @@ public final class OffCpuCorrelator {
         if (status != 0) System.exit(status);
     }
 
+    /**
+     * Prints the capture stream as one JSON object per line, with each observation's interned stacks
+     * expanded, so humans and tools can read a binary capture without the correlator's analysis.
+     */
+    private static void dump(Path source) throws IOException {
+        Gson gson = new GsonBuilder().serializeNulls().create();
+        Map<Long, JsonArray> stacks = new java.util.HashMap<>();
+        try (java.io.InputStream input = new java.io.BufferedInputStream(java.nio.file.Files.newInputStream(source));
+                BufferedWriter writer = new BufferedWriter(
+                        new java.io.OutputStreamWriter(System.out, java.nio.charset.StandardCharsets.UTF_8))) {
+            CaptureStream.readHeader(input);
+            CaptureStream.Framed framed;
+            while ((framed = CaptureStream.next(
+                            input, OfflineCorrelator.Limits.defaults().maxLineBytes()))
+                    != null) {
+                if (framed.truncated()) {
+                    writer.write(gson.toJson(java.util.Map.of("truncatedTailBytes", framed.bytes().length)));
+                    writer.newLine();
+                    break;
+                }
+                JsonObject row =
+                        switch (framed.record().getRecordCase()) {
+                            case STACK -> {
+                                JsonObject stack =
+                                        CaptureStream.stackRow(framed.record().getStack());
+                                stacks.put(stack.get("stackId").getAsLong(), stack.getAsJsonArray("frames"));
+                                yield stack;
+                            }
+                            case OBSERVATION -> {
+                                JsonObject observation = CaptureStream.observationRow(
+                                        framed.record().getObservation());
+                                for (String stack : List.of("kernelStack", "userStack")) {
+                                    JsonArray frames = stacks.get(
+                                            observation.get(stack + "Id").getAsLong());
+                                    observation.add(stack + "Frames", frames == null ? new JsonArray() : frames);
+                                }
+                                yield observation;
+                            }
+                            default ->
+                                com.google.gson.JsonParser.parseString(CaptureStream.controlJson(framed.record()))
+                                        .getAsJsonObject();
+                        };
+                writer.write(gson.toJson(row));
+                writer.newLine();
+            }
+        }
+    }
+
     /** Returns 0 for complete analysis or 2 for explicitly incomplete diagnostics; failures throw. */
     public static int run(String[] args) throws Exception {
         // No arguments is a request for help, not a failed analysis.
@@ -88,11 +137,17 @@ public final class OffCpuCorrelator {
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
                     + " [--partial true|false (partial format: diagnostics|collapsed)]");
+            System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
+                    + "   (prints the capture stream as NDJSON, stacks expanded)");
             System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
                     + OutputFiles.COLLAPSED + ", " + OutputFiles.SYNTHETIC_JFR + ", "
                     + OutputFiles.CLASSIFIED_RECORDS + ", " + OutputFiles.MATCHES + " and, last, "
                     + OutputFiles.COMPLETE + "; --partial true writes " + OutputFiles.INCOMPLETE_PREFIX
                     + "* files and " + OutputFiles.PARTIAL + " instead.");
+            return 0;
+        }
+        if (args.length == 3 && args[0].equals("--dump") && args[1].equals("--source")) {
+            dump(Path.of(args[2]));
             return 0;
         }
         Map<String, String> options = new HashMap<>();

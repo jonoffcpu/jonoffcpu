@@ -79,6 +79,8 @@ RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/
 FROM collector-dependencies AS collector-build
 ARG TARGETARCH
 COPY jonoffcpu-native jonoffcpu-native
+# The capture stream schema: build.rs compiles it into the collector's codec.
+COPY docs/schema docs/schema
 # The Alpine Rust target defaults to a static CRT, which cannot produce a
 # loadable cdylib. With a dynamic CRT, Rust's unwinder links -lgcc_s, but
 # Alpine JVM images do not ship libgcc_s.so.1, so that name is resolved to a

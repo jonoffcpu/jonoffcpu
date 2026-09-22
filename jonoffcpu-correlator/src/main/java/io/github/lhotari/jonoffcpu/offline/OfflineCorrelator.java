@@ -356,7 +356,8 @@ final class OfflineCorrelator {
     private static void validateSource(Row row, CaptureInput capture, SamplingPolicy sampling, Limits limits)
             throws IOException {
         JsonObject value = row.value;
-        require(optionalTid(value, "targetTid") != null, "Missing target namespace TID");
+        // The kernel only submits an observation with a resolved namespace TID, so zero means missing.
+        require(number(value, "targetTid") > 0, "Missing target namespace TID");
         require(number(value, "targetTgid") > 0 && number(value, "targetTgid") <= 0xffffffffL, "Invalid target TGID");
         require(number(value, "hostTid") > 0 && number(value, "hostTid") <= 0xffffffffL, "Invalid host TID");
         number(value, "signalResult");
@@ -388,7 +389,6 @@ final class OfflineCorrelator {
                 || number(value, "hostTgid") != number(capture.inputs, "hostTgid")
                 // The kernel recorded the threshold it drew against; it must be the policy's value for this duration.
                 || !BigInteger.valueOf(threshold).equals(sampling.admissionThreshold(duration))
-                || !text(value, "sourceId").equals("jonoffcpu.offcpu.v1")
                 || !generation.equals(decimal(capture.start, "processGenerationNs"))
                 || !text(value, "registrationToken").equals(text(capture.start, "registrationToken"))) {
             row.invalid = "source-policy-or-target-mismatch";
@@ -732,12 +732,11 @@ final class OfflineCorrelator {
             this.number = number;
             this.value = value;
             try {
-                require(text(value, "sessionId").equals(text(inputs, "sessionId")), "Capture session mismatch");
+                // The record belongs to the capture by construction: session and epoch are in captureStart.
                 String candidate = text(value, "correlationId");
                 require(candidate.matches("[0-9a-f]{16}"), "Invalid cookie");
-                // The join key is (session, cookie). Keep even an invalid copy in its duplicate bucket.
+                // The join key is the cookie. Keep even an invalid copy in its duplicate bucket.
                 cookie = candidate;
-                identity(value, inputs);
                 long bits = Long.parseUnsignedLong(candidate, 16);
                 require(
                         bits >>> 32 == number(inputs, "captureEpoch") && (bits & 0xffffffffL) != 0,

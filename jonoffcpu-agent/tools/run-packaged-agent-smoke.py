@@ -64,7 +64,7 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "jonoffcpu.yaml").write_text(
-        "correlationOutput: /out/jonoffcpu-capture.ndjson\n"
+        "correlationOutput: /out/jonoffcpu-capture.pb\n"
         "asyncProfilerOptions: "
         "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr\n"
         "signalDelivery: queued\n"
@@ -115,7 +115,7 @@ def main():
     manifest = json.loads(require_file(manifest_path, "Capture manifest").read_text())
     if manifest.get("complete") is not True or manifest.get("state") != "complete":
         raise RuntimeError(f"Capture did not complete: {manifest_path}")
-    for path in (output / "jonoffcpu-capture.ndjson", output / "jonoffcpu-capture.jfr"):
+    for path in (output / "jonoffcpu-capture.pb", output / "jonoffcpu-capture.jfr"):
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError(f"Capture artifact is missing or empty: {path}")
 
@@ -133,7 +133,7 @@ def main():
         [
             *common,
             java, "-jar", "/artifacts/jonoffcpu-correlator.jar",
-            "--source", "/out/jonoffcpu-capture.ndjson",
+            "--source", "/out/jonoffcpu-capture.pb",
             "--jfr", "/out/jonoffcpu-capture.jfr",
             "--output", "/out/analysis",
         ],

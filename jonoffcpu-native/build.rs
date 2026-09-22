@@ -77,9 +77,25 @@ fn main() -> Result<()> {
         .build_and_generate(out.join("endpoint_boundary.skel.rs"))
         .context("compile finish_task_switch to sched_exit_tp measurement object")?;
 
+    generate_capture_codec(&out)?;
+
     println!("cargo:rerun-if-changed=src/bpf/jonoffcpu_cookie.bpf.c");
     println!("cargo:rerun-if-changed=src/bpf/include/jonoffcpu_cookie.h");
     println!("cargo:rerun-if-changed=src/bpf/endpoint_boundary.bpf.c");
+    Ok(())
+}
+
+/// Compiles the capture stream schema with protox, a pure-Rust protobuf compiler, so the pinned
+/// build containers need no protoc.
+fn generate_capture_codec(out: &std::path::Path) -> Result<()> {
+    let schema = PathBuf::from("../docs/schema/jonoffcpu-capture.proto");
+    let descriptors =
+        protox::compile([&schema], ["../docs/schema"]).context("compile capture schema")?;
+    prost_build::Config::new()
+        .out_dir(out)
+        .compile_fds(descriptors)
+        .context("generate capture codec")?;
+    println!("cargo:rerun-if-changed=../docs/schema/jonoffcpu-capture.proto");
     Ok(())
 }
 

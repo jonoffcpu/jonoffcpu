@@ -55,7 +55,7 @@ java_command=(
   --enable-native-access=ALL-UNNAMED
   -Xms128m
   -Xmx256m
-  "-agentpath:$agent_build/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,jonoffcpudelivery=$JONOFFCPU_DELIVERY,asprofpath=$ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr"
+  "-agentpath:$agent_build/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.pb,jonoffcpudelivery=$JONOFFCPU_DELIVERY,asprofpath=$ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr"
   -cp "$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
   io.github.lhotari.jonoffcpu.agent.NativeAgentWorkload
   "$JONOFFCPU_SECONDS"
@@ -68,7 +68,7 @@ classpath="$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
 "$JAVA_HOME/bin/java" -cp "$classpath" io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck \
   /out/jonoffcpu-capture.jfr /out/event-counts.json > /out/category-check.log 2>&1
 "$JAVA_HOME/bin/java" -cp "$classpath" io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator \
-  --source /out/jonoffcpu-capture.ndjson \
+  --source /out/jonoffcpu-capture.pb \
   --jfr /out/jonoffcpu-capture.jfr \
   --output /out/analysis > /out/analysis.log 2>&1
 "$JAVA_HOME/bin/jfr" summary /out/analysis/jonoffcpu-offcpu-synthetic.jfr \

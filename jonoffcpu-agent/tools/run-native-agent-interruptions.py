@@ -8,6 +8,13 @@ import os
 import subprocess
 import time
 from pathlib import Path
+def capture_rows(jdk, classpath, source):
+    """The capture stream as JSON rows; the stream itself is length-delimited protobuf."""
+    dumped = subprocess.run(
+        [str(jdk / "bin/java"), "-cp", classpath,
+         "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
+        check=True, capture_output=True, text=True).stdout
+    return [json.loads(line) for line in dumped.splitlines()]
 
 
 MODES = ("halt", "sigkill", "timeout", "master-stop")
@@ -39,7 +46,7 @@ def java_command(module, ap, jdk, case, mode, seconds):
         "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
         "-v", f"{case}:/out", "-w", "/out", "jonoffcpu-agent-runtime:ubuntu24.04",
         "/jdk/bin/java", "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
+        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.pb,"
         f"{controller}shutdowntimeoutmillis=30000,nativestoptimeoutmillis=10000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
         f"{profiler}event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
@@ -75,8 +82,8 @@ def run_sigkill(command, case):
             raise RuntimeError(f"SIGKILL container exited with {return_code}")
 
 
-def footer(case):
-    rows = [json.loads(line) for line in (case / "jonoffcpu-capture.ndjson").read_text().splitlines()]
+def footer(case, jdk, classpath):
+    rows = capture_rows(jdk, classpath, case / "jonoffcpu-capture.pb")
     footers = [row for row in rows if row.get("recordType") == "captureFinalized"]
     if len(footers) != 1 or rows[-1] is not footers[0] or footers[0].get("state") != "complete":
         raise RuntimeError("Expected exactly one complete terminal footer")
@@ -84,7 +91,7 @@ def footer(case):
 
 
 def verify_abrupt(module, jdk, case):
-    source = case / "jonoffcpu-capture.ndjson"
+    source = case / "jonoffcpu-capture.pb"
     jfr = case / "jonoffcpu-capture.jfr"
     manifest_path = case / "jonoffcpu-capture.manifest.json"
     if not source.is_file() or source.stat().st_size == 0 or not jfr.exists():
@@ -110,7 +117,8 @@ def verify_abrupt(module, jdk, case):
 
 
 def verify_ap_first(module, jdk, case, expected_reason):
-    terminal = footer(case)
+    classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
+    terminal = footer(case, jdk, classpath)
     receipt = terminal.get("apStopResponse", "")
     if f" reason={expected_reason}" not in receipt or " finalized=true " not in receipt:
         raise RuntimeError(f"Unexpected retained AP receipt: {receipt}")
@@ -124,7 +132,7 @@ def verify_ap_first(module, jdk, case, expected_reason):
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
+         "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
          "--output", case / "analysis"], case / "analysis.log")
 
     report = json.loads((case / "analysis/jonoffcpu-report.json").read_text())

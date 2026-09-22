@@ -3,14 +3,13 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.BufferedInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -73,11 +72,22 @@ final class ArtifactVerifier {
         long observations = 0;
         Set<Long> announcedStacks = new HashSet<>();
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
-            String line;
-            while ((line = readLine(input)) != null) {
-                JsonObject row = JsonSupport.parseObject(line, "source NDJSON row", MAX_LINE_BYTES);
-                JsonSupport.requireNumber(row, "schemaVersion", SCHEMA_VERSION, SCHEMA_VERSION);
-                String type = JsonSupport.requireString(row, "recordType");
+            CaptureStream.readHeader(input);
+            CaptureProto.Record record;
+            while ((record = CaptureStream.next(input, MAX_LINE_BYTES)) != null) {
+                String type = CaptureStream.recordType(record);
+                JsonObject row =
+                        switch (record.getRecordCase()) {
+                            case STACK -> CaptureStream.stackRow(record.getStack());
+                            case OBSERVATION -> CaptureStream.observationRow(record.getObservation());
+                            default ->
+                                JsonSupport.parseObject(
+                                        CaptureStream.controlJson(record), "source control record", MAX_LINE_BYTES);
+                        };
+                if (record.getRecordCase() != CaptureProto.Record.RecordCase.STACK
+                        && record.getRecordCase() != CaptureProto.Record.RecordCase.OBSERVATION) {
+                    JsonSupport.requireNumber(row, "schemaVersion", SCHEMA_VERSION, SCHEMA_VERSION);
+                }
                 if (end != null) {
                     throw new IOException("Source rows follow captureEnd");
                 }
@@ -121,9 +131,6 @@ final class ArtifactVerifier {
                     }
                     case "stack" -> {
                         if (start == null) throw new IOException("Stack before captureStart");
-                        requireIdentity(row, sessionId, epoch);
-                        JsonSupport.requireEqual(
-                                "stack sourceId", "jonoffcpu.offcpu.v1", JsonSupport.requireString(row, "sourceId"));
                         long stackId = JsonSupport.requireNumber(row, "stackId", 0, Integer.MAX_VALUE);
                         if (!announcedStacks.add(stackId)) {
                             throw new IOException("Duplicate stack record: " + stackId);
@@ -236,9 +243,7 @@ final class ArtifactVerifier {
 
     /** Creates a correlation stream that holds only a finalization footer, for captures without an eBPF source. */
     static void writeFooterOnly(Path source, JsonObject footer) throws IOException {
-        byte[] bytes = (footer + "\n").getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > JsonSupport.MAX_CONTROL_BYTES)
-            throw new IOException("captureFinalized footer exceeds 64 KiB");
+        byte[] bytes = CaptureStream.footerStream(footer);
         try (FileChannel file = FileChannel.open(source, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
             ByteBuffer buffer = ByteBuffer.wrap(bytes);
             while (buffer.hasRemaining()) file.write(buffer);
@@ -275,9 +280,7 @@ final class ArtifactVerifier {
         if (!raw.rawBytes().equals(current.rawBytes()) || !raw.rawSha256().equals(current.rawSha256())) {
             throw new IOException("Correlation file changed after native finalization validation");
         }
-        byte[] bytes = (footer + "\n").getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > JsonSupport.MAX_CONTROL_BYTES)
-            throw new IOException("captureFinalized footer exceeds 64 KiB");
+        byte[] bytes = CaptureStream.footerRecord(footer);
         long expected = Long.parseLong(raw.rawBytes());
         try (FileChannel file = FileChannel.open(source, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             if (file.size() != expected || file.position() != expected) {
@@ -315,9 +318,7 @@ final class ArtifactVerifier {
             JsonObject verifiedIdentity,
             Set<Long> announcedStacks)
             throws IOException {
-        requireIdentity(row, sessionId, epoch);
-        JsonSupport.requireEqual(
-                "observation sourceId", "jonoffcpu.offcpu.v1", JsonSupport.requireString(row, "sourceId"));
+        // Session, epoch and source id are in captureStart: a record cannot disagree with them.
         JsonSupport.requireEqual(
                 "observation hostTgid", hostTgid, JsonSupport.requireNumber(row, "hostTgid", 1, 0xffffffffL));
         JsonSupport.requireNumber(row, "hostTid", 1, 0xffffffffL);
@@ -360,20 +361,6 @@ final class ArtifactVerifier {
             } else if (!announcedStacks.contains(stackId)) {
                 throw new IOException("Observation references an unannounced " + stack + ": " + stackId);
             }
-        }
-    }
-
-    private static String readLine(InputStream input) throws IOException {
-        ByteArrayOutputStream line = new ByteArrayOutputStream();
-        while (true) {
-            int value = input.read();
-            if (value < 0) {
-                if (line.size() == 0) return null;
-                throw new IOException("Source NDJSON final row has no newline");
-            }
-            if (value == '\n') return line.toString(StandardCharsets.UTF_8);
-            if (line.size() == MAX_LINE_BYTES) throw new IOException("Source NDJSON row exceeds 1 MiB");
-            line.write(value);
         }
     }
 

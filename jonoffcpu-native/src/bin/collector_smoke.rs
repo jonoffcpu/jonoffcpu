@@ -122,11 +122,10 @@ fn main() -> Result<()> {
             .open(&output)
             .context("source artifact was not appendable after close")?,
     );
-    let source = fs::read_to_string(&output)?;
-    let rows = source
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let rows = jonoffcpu_native::capture::decode(&fs::read(&output)?)?
+        .iter()
+        .map(jonoffcpu_native::capture::to_json)
+        .collect::<Vec<_>>();
     if rows.first().and_then(|row| row["recordType"].as_str()) != Some("captureStart")
         || rows.last().and_then(|row| row["recordType"].as_str()) != Some("captureEnd")
     {

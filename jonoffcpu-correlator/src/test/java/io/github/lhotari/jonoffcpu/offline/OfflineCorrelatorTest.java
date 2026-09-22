@@ -9,7 +9,6 @@ import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -212,13 +211,14 @@ public final class OfflineCorrelatorTest {
         }
         counters.add("kernel", kernel);
         end.add("counters", counters);
-        StringBuilder raw = new StringBuilder(start + "\n");
+        List<JsonObject> rows = new ArrayList<>();
+        rows.add(start);
         // Stacks are announced once, before the observations that reference them.
-        raw.append(stack(KERNEL_STACK_ID, "kernel_wait")).append('\n');
-        raw.append(stack(USER_STACK_ID, "user_wait")).append('\n');
-        for (JsonObject observation : observations) raw.append(observation).append('\n');
-        raw.append(end).append('\n');
-        byte[] bytes = raw.toString().getBytes(StandardCharsets.UTF_8);
+        rows.add(stack(KERNEL_STACK_ID, "kernel_wait"));
+        rows.add(stack(USER_STACK_ID, "user_wait"));
+        rows.addAll(observations);
+        rows.add(end);
+        byte[] bytes = CaptureStreamFixture.encode(rows);
         JsonObject footer = row("captureFinalized");
         footer.addProperty("state", "complete");
         JsonObject inputs = start.deepCopy();
@@ -257,8 +257,9 @@ public final class OfflineCorrelatorTest {
                         + " capture-failures=0 submitted="
                         + samples.size()
                         + "\n");
-        Path result = dir.resolve("source.jsonl");
-        Files.writeString(result, raw + footer.toString() + "\n");
+        Path result = dir.resolve("source.capture");
+        rows.add(footer);
+        Files.write(result, CaptureStreamFixture.encode(rows));
         return result;
     }
 
@@ -320,26 +321,48 @@ public final class OfflineCorrelatorTest {
      */
     private static void mutateSource(Path source, String recordType, java.util.function.Consumer<JsonObject> mutation)
             throws IOException {
-        List<String> lines = Files.readAllLines(source);
+        List<JsonObject> rows = readRows(source);
         int rowIndex = -1;
-        for (int i = 0; i < lines.size(); i++) {
-            JsonObject candidate =
-                    com.google.gson.JsonParser.parseString(lines.get(i)).getAsJsonObject();
-            if (candidate.get("recordType").getAsString().equals(recordType)) rowIndex = i;
+        for (int i = 0; i < rows.size(); i++) {
+            if (rows.get(i).get("recordType").getAsString().equals(recordType)) rowIndex = i;
         }
         check(rowIndex >= 0, "No " + recordType + " row to mutate");
-        JsonObject row =
-                com.google.gson.JsonParser.parseString(lines.get(rowIndex)).getAsJsonObject();
-        mutation.accept(row);
-        lines.set(rowIndex, row.toString());
-        int last = lines.size() - 1;
-        byte[] prefix = (String.join("\n", lines.subList(0, last)) + "\n").getBytes(StandardCharsets.UTF_8);
-        JsonObject footer =
-                com.google.gson.JsonParser.parseString(lines.get(last)).getAsJsonObject();
+        mutation.accept(rows.get(rowIndex));
+        int last = rows.size() - 1;
+        byte[] prefix = CaptureStreamFixture.encode(rows.subList(0, last));
+        JsonObject footer = rows.get(last);
         JsonObject artifact = footer.getAsJsonObject("analysisInputs").getAsJsonObject("sourceArtifact");
         artifact.addProperty("rawBytes", Integer.toString(prefix.length));
         artifact.addProperty("rawSha256", CaptureInput.hex(CaptureInput.sha256().digest(prefix)));
-        Files.writeString(source, new String(prefix, StandardCharsets.UTF_8) + footer + "\n");
+        Files.write(source, CaptureStreamFixture.encode(rows));
+    }
+
+    static byte[] concat(byte[] first, byte[] second) {
+        byte[] joined = java.util.Arrays.copyOf(first, first.length + second.length);
+        System.arraycopy(second, 0, joined, first.length, second.length);
+        return joined;
+    }
+
+    /** The stream decoded back into the JSON rows the fixtures manipulate. */
+    static List<JsonObject> readRows(Path source) throws IOException {
+        List<JsonObject> rows = new ArrayList<>();
+        try (java.io.InputStream input = new java.io.BufferedInputStream(Files.newInputStream(source))) {
+            CaptureStream.readHeader(input);
+            CaptureStream.Framed framed;
+            while ((framed = CaptureStream.next(input, 1024 * 1024)) != null) {
+                check(!framed.truncated(), "Truncated fixture record");
+                rows.add(
+                        switch (framed.record().getRecordCase()) {
+                            case STACK -> CaptureStream.stackRow(framed.record().getStack());
+                            case OBSERVATION ->
+                                CaptureStream.observationRow(framed.record().getObservation());
+                            default ->
+                                com.google.gson.JsonParser.parseString(CaptureStream.controlJson(framed.record()))
+                                        .getAsJsonObject();
+                        });
+            }
+        }
+        return rows;
     }
 
     private static void check(boolean test, String message) {
@@ -746,22 +769,39 @@ public final class OfflineCorrelatorTest {
                             .remove("targetNamespaceFailures"));
             rejects(source, jfr, defaults, "targetNamespaceFailures");
             source = source(dir, jfr, List.of(observation));
-            String valid = Files.readString(source);
-            Files.writeString(source, valid.replace("stopped-at=9000", "stopped-at=3000"));
+            byte[] valid = Files.readAllBytes(source);
+            List<JsonObject> rows = readRows(source);
+            mutateSource(
+                    source,
+                    "captureFinalized",
+                    row -> row.addProperty(
+                            "apStopResponse",
+                            row.get("apStopResponse").getAsString().replace("stopped-at=9000", "stopped-at=3000")));
             result = OfflineCorrelator.correlate(source, jfr, defaults);
             check(
                     result.matched() == 0 && result.invalidSource() == 1 && result.invalidJfr() == 1,
                     "Source interval after AP stop still joined");
-            Files.writeString(source, valid.replace("\"hostTid\":456", "\"hostTid\":457"));
+            // A record edited without re-signing the prefix must fail the digest, not the semantics.
+            List<JsonObject> tampered = readRows(source);
+            for (JsonObject row : tampered) {
+                if (row.get("recordType").getAsString().equals("observation")) row.addProperty("hostTid", 457);
+            }
+            Files.write(source, CaptureStreamFixture.encode(tampered));
             rejects(source, jfr, defaults, "Source digest mismatch");
-            Files.writeString(source, valid.substring(0, valid.length() - 1));
-            rejects(source, jfr, defaults, "missing newline");
-            Files.writeString(source, valid + "{}\n");
+            Files.write(source, java.util.Arrays.copyOf(valid, valid.length - 1));
+            rejects(source, jfr, defaults, "truncated tail");
+            Files.write(source, concat(valid, CaptureStreamFixture.controlRecord("{}")));
             rejects(source, jfr, defaults, "Rows follow");
-            Files.writeString(
-                    source, valid.replaceFirst("\"schemaVersion\":2", "\"schemaVersion\":2,\"schemaVersion\":2"));
+            check(!rows.isEmpty(), "fixture rows missing");
+            // A control record's JSON is still read with the strict parser.
+            Files.write(
+                    source,
+                    concat(
+                            CaptureStreamFixture.header(),
+                            CaptureStreamFixture.controlRecord(
+                                    "{\"schemaVersion\":2,\"schemaVersion\":2,\"recordType\":\"captureStart\"}")));
             rejects(source, jfr, defaults, "Duplicate JSON field");
-            Files.writeString(source, valid);
+            Files.write(source, valid);
             rejects(
                     source,
                     jfr,
@@ -771,7 +811,7 @@ public final class OfflineCorrelatorTest {
                     source,
                     jfr,
                     new OfflineCorrelator.Limits(100, 10, 1024 * 1024, 4096, null, null, null),
-                    "line byte limit");
+                    "record byte limit");
             rejects(source, jfr, new OfflineCorrelator.Limits(100, 1024 * 1024, 256, 4096, null, null, null), "budget");
             byte[] original = Files.readAllBytes(jfr);
             original[original.length - 1] ^= 1;

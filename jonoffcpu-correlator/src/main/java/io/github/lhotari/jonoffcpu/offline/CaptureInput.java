@@ -10,7 +10,6 @@ import com.google.gson.Strictness;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import java.io.BufferedInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringReader;
@@ -108,24 +107,41 @@ final class CaptureInput {
         Map<Long, JsonArray> stacks = new LinkedHashMap<>();
         List<String> reasons = new ArrayList<>();
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
-            byte[] line;
-            while ((line = line(input, limits.maxLineBytes())) != null) {
+            byte[] header = CaptureStream.readHeader(input);
+            wholeHash.update(header);
+            rawHash.update(header);
+            sourceBytes = header.length;
+            rawBytes = header.length;
+            CaptureStream.Framed framed;
+            while ((framed = CaptureStream.next(input, limits.maxLineBytes())) != null) {
                 require(footer == null, "Rows follow captureFinalized");
-                wholeHash.update(line);
-                sourceBytes = Math.addExact(sourceBytes, line.length);
-                if (line[line.length - 1] != '\n') {
-                    require(partial, "Incomplete source row: missing newline");
-                    trailingBytes = line.length;
+                byte[] bytes = framed.bytes();
+                wholeHash.update(bytes);
+                sourceBytes = Math.addExact(sourceBytes, bytes.length);
+                if (framed.truncated()) {
+                    require(partial, "Incomplete source record: truncated tail");
+                    trailingBytes = bytes.length;
                     reasons.add("unterminated-source-tail");
                     break;
                 }
-                JsonObject row = parse(line);
+                String type = CaptureStream.recordType(framed.record());
+                // Control records still carry JSON, and it is still parsed with the strict reader.
+                JsonObject row =
+                        switch (framed.record().getRecordCase()) {
+                            case STACK -> CaptureStream.stackRow(framed.record().getStack());
+                            case OBSERVATION ->
+                                CaptureStream.observationRow(framed.record().getObservation());
+                            default ->
+                                parse(CaptureStream.controlJson(framed.record())
+                                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                        };
                 budget.charge(row);
-                require(number(row, "schemaVersion") == SCHEMA_VERSION, "Unsupported source schema");
-                String type = text(row, "recordType");
+                if (!type.equals("stack") && !type.equals("observation")) {
+                    require(number(row, "schemaVersion") == SCHEMA_VERSION, "Unsupported source schema");
+                }
                 if (!type.equals("captureFinalized")) {
-                    rawHash.update(line);
-                    rawBytes = Math.addExact(rawBytes, line.length);
+                    rawHash.update(bytes);
+                    rawBytes = Math.addExact(rawBytes, bytes.length);
                 }
                 if (type.equals("captureFinalized")
                         && start == null
@@ -554,16 +570,6 @@ final class CaptureInput {
 
     static String hex(byte[] bytes) {
         return HexFormat.of().formatHex(bytes);
-    }
-
-    private static byte[] line(InputStream input, int limit) throws IOException {
-        ByteArrayOutputStream line = new ByteArrayOutputStream();
-        for (int ch; (ch = input.read()) >= 0; ) {
-            require(line.size() < limit, "Source line byte limit exceeded");
-            line.write(ch);
-            if (ch == '\n') return line.toByteArray();
-        }
-        return line.size() == 0 ? null : line.toByteArray();
     }
 
     private static JsonObject parse(byte[] bytes) throws IOException {

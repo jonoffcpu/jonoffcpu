@@ -14,6 +14,7 @@ plugins {
     // The base plugin: the full plugin would publish components["java"], but only the shaded JAR is published.
     id("com.vanniktech.maven.publish.base") version "0.37.0"
     id("com.gradleup.shadow") version "9.6.1"
+    id("com.google.protobuf") version "0.10.0"
 }
 
 group = "io.github.lhotari"
@@ -51,8 +52,32 @@ val asyncProfilerDir = rootProject.layout.projectDirectory.dir("async-profiler")
 val asyncProfilerConverter = asyncProfilerDir.file("build/bin/jfrconv")
 
 dependencies {
+    // The capture stream codec, generated from docs/schema/jonoffcpu-capture.proto.
+    embeddedRuntime("com.google.protobuf:protobuf-javalite:4.33.1")
     embeddedRuntime("com.google.code.gson:gson:2.14.0")
     embeddedRuntime("org.yaml:snakeyaml:2.7")
+}
+
+sourceSets {
+    main {
+        proto.setSrcDirs(listOf(rootProject.layout.projectDirectory.dir("docs/schema")))
+    }
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.33.1"
+    }
+    generateProtoTasks {
+        all().configureEach {
+            builtins {
+                named("java") {
+                    // The lite runtime has no descriptors or reflection, which is all the stream needs.
+                    option("lite")
+                }
+            }
+        }
+    }
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -66,6 +91,7 @@ tasks.withType<Javadoc>().configureEach {
 }
 
 val expectedDependencyDigests = mapOf(
+    "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
     "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
     "snakeyaml-2.7.jar" to "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e"
 )
@@ -88,7 +114,7 @@ fun sha256File(input: File): String {
 
 val verifyDependencyDigests = tasks.register("verifyDependencyDigests") {
     group = "verification"
-    description = "Checks the exact Gson and SnakeYAML artifacts before embedding them."
+    description = "Checks the exact protobuf, Gson and SnakeYAML artifacts before embedding them."
     inputs.files(embeddedRuntime)
     doLast {
         embeddedRuntime.files.forEach { artifact ->
@@ -284,6 +310,7 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     dependsOn(verifyDependencyDigests, generateNativeChecksums)
     archiveClassifier = ""
     configurations = listOf(embeddedRuntime)
+    relocate("com.google.protobuf", "io.github.lhotari.jonoffcpu.internal.shaded.protobuf")
     relocate("com.google.gson", "io.github.lhotari.jonoffcpu.internal.shaded.gson")
     relocate("org.yaml.snakeyaml", "io.github.lhotari.jonoffcpu.internal.shaded.snakeyaml")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -342,12 +369,15 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
                 throw GradleException("Runtime JAR must not embed the async-profiler Java API")
             }
             if (zip.entries().asSequence().any {
-                    it.name.startsWith("com/google/gson/") || it.name.startsWith("org/yaml/snakeyaml/")
+                    it.name.startsWith("com/google/gson/")
+                            || it.name.startsWith("org/yaml/snakeyaml/")
+                            || it.name.startsWith("com/google/protobuf/")
                 }) {
                 throw GradleException("Agent JAR contains unrelocated dependency packages")
             }
             for (name in listOf(
                 "io/github/lhotari/jonoffcpu/internal/shaded/gson/Gson.class",
+                "io/github/lhotari/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
                 "io/github/lhotari/jonoffcpu/internal/shaded/snakeyaml/Yaml.class"
             )) {
                 if (zip.getEntry(name) == null) throw GradleException("Agent JAR is missing relocated class $name")

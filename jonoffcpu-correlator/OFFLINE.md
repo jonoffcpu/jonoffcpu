@@ -7,19 +7,33 @@ footer binds the source prefix and JFR hashes, capture identity and stop counter
 No separate manifest or exporter subprocess is required. Stored artifact paths
 are advisory, so recordings can be moved together or supplied from new locations.
 
-The stream is `schemaVersion` 2 NDJSON: a `captureStart` header, a `stack` record
-for each distinct native stack, one `observation` per recorded off-CPU interval,
-a `captureEnd`, and the footer. Stacks are interned: an observation names its two
-stacks through `kernelStackId`/`userStackId`, and a stack record always precedes
-the first observation that references it. When the kernel could not produce a
-stack there is no record and the observation carries `kernelStackError` or
-`userStackError` instead. An unannounced reference, a duplicate `stackId` and an
-unexplained negative id are all hard errors. The classified records re-expand
-both stacks, so an audit row remains self-contained.
+The stream is defined by [`docs/schema/jonoffcpu-capture.proto`](../docs/schema/jonoffcpu-capture.proto):
+a 12-byte header, then length-delimited protobuf records. A capture holds a
+`captureStart`, a `stack` record for each distinct native stack, one
+`observation` per recorded off-CPU interval, a `captureEnd`, and the
+`captureFinalized` footer. The three control records carry the JSON object they
+have always carried, at `schemaVersion` 2, and that JSON is still read with the
+strict parser; observations and stacks are native protobuf. Read a capture with
+`java -jar jonoffcpu-correlator.jar --dump --source <file>`, which prints one
+JSON object per record with each observation's stacks expanded.
+
+Stacks are interned: an observation names its two stacks through
+`kernelStackId`/`userStackId`, and a stack record always precedes the first
+observation that references it. When the kernel could not produce a stack there
+is no record and the observation carries `kernelStackError` or `userStackError`
+instead. An unannounced reference, a duplicate `stackId` and an unexplained
+negative id are all hard errors. The classified records re-expand both stacks,
+so an audit row remains self-contained.
+
+A record's length prefix is checked against the record limit before any bytes
+are read, so a corrupt length cannot drive an allocation. A truncated final
+record is the partial-mode tail: its bytes are reported as
+`ignoredTrailingBytes` and the prefix before it is analyzed; in complete mode it
+is an error.
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
-  --source jonoffcpu-capture.ndjson --jfr jonoffcpu-capture.jfr --output analysis
+  --source jonoffcpu-capture.pb --jfr jonoffcpu-capture.jfr --output analysis
 ```
 
 A stream whose only row is a `captureFinalized` footer with
@@ -135,8 +149,8 @@ not silently converted into matches.
 relative seconds or epoch timestamps. Either bound can be omitted. A matching
 handler event outside the interval still identifies an overlapping source interval.
 
-Default admission limits are one million total source/JFR rows, 1 MiB per source
-line, 4,096 frames per stack record and per JFR sample, and 256 MiB of
+Default admission limits are one million total source/JFR records, 1 MiB per
+source record, 4,096 frames per stack record and per JFR sample, and 256 MiB of
 conservative decoded-object accounting.
 Use `--max-rows` or `--max-retained-bytes` to change the corresponding limits.
 These are admission budgets, not a hard JVM heap limit. Failures reject the

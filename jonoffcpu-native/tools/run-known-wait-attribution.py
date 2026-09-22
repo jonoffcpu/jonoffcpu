@@ -79,7 +79,7 @@ def main():
         output / "runtime-build.log")
     build = module / "build"
     options = (
-        "jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,jonoffcpudelivery=queued,"
+        "jonoffcpuoutput=/out/jonoffcpu-capture.pb,jonoffcpudelivery=queued,"
         "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
@@ -106,10 +106,10 @@ def main():
 
     classpath = f"{build / 'jonoffcpu-agent.jar'}:{build / 'test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", output / "jonoffcpu-capture.ndjson", "--jfr", output / "jonoffcpu-capture.jfr",
+         "--source", output / "jonoffcpu-capture.pb", "--jfr", output / "jonoffcpu-capture.jfr",
          "--output", output / "analysis"], output / "analysis.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.KnownWaitAttributionCheck",
-         output / "jonoffcpu-capture.ndjson", output / "jonoffcpu-capture.jfr", output / "workload.json",
+         output / "jonoffcpu-capture.pb", output / "jonoffcpu-capture.jfr", output / "workload.json",
          output / "known-wait-report.json"], output / "known-wait-check.log")
     report = json.loads((output / "known-wait-report.json").read_text())
     if report.get("result") != "pass" or set(report.get("threads", {})) != {

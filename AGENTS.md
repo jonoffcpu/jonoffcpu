@@ -21,10 +21,16 @@ smallest relevant layer before running privileged end-to-end tests.
 ## Architecture contracts
 
 - A capture has two authoritative inputs: the original combined JFR and the
-  finalized correlation NDJSON stream. Do not silently repair, guess, or join
+  finalized correlation stream. Do not silently repair, guess, or join
   incomplete data in normal mode.
 - Join records by capture identity and the exact 64-bit cookie. Timestamps are
   for clipping and delivery-delay analysis, never a heuristic join key.
+- The capture stream is length-delimited protobuf defined by
+  `docs/schema/jonoffcpu-capture.proto`, which is the format's single
+  definition: the collector generates its codec from it with protox (no protoc
+  in the build containers) and both Java modules with the protobuf Gradle
+  plugin. Control records keep their JSON object, still read with the strict
+  parser. Do not add a second definition of the wire format.
 - Native stacks are interned in the stream: one `stack` record per distinct BPF
   stack id, always written before the first observation that references it, and
   observations carry only the ids. Keep that ordering guarantee, keep the
@@ -88,8 +94,16 @@ Ordinary local Java work builds only the current host architecture:
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check --no-daemon
 ```
 
+Never build or test the other architecture's native bundle on a development
+machine: an arm64 bundle on an x86-64 host (or the reverse) runs under QEMU
+emulation and is far slower than it is worth. Build only the host architecture
+locally, on Linux and on macOS alike, and let CI's native arm64 and x86-64
+runners cover the other one. Windows development belongs in WSL2, which is a
+Linux VM and follows the same rule.
+
 Use `-PnativeArchitectures=all` only when both Linux architectures are
-required, or select `x86_64` or `aarch64` explicitly. `-PnativeLibcs` selects
+genuinely required and the machine can build both natively, or select `x86_64`
+or `aarch64` explicitly. `-PnativeLibcs` selects
 the C-library flavour and defaults to `musl`; CI and release packaging must
 select `all` for both properties after placing all four prebuilt bundles in
 the build directory. The musl bundle is built in
@@ -145,7 +159,7 @@ and exact-cookie matches rather than only checking process exit status.
   correlator's names are the `OutputFiles` constants, and the agent derives
   its manifest and default JFR from the stem of `correlationOutput` via
   `ManifestStore.sibling`. Never spell an output name inline.
-- Keep public configuration, manifest, NDJSON, report, and CLI changes backward
+- Keep public configuration, manifest, capture stream, report, and CLI changes backward
   compatible unless a format/version migration is designed and documented.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on
   `jdk.jfr.internal.*` implementation classes.

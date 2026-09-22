@@ -8,6 +8,13 @@ import os
 import subprocess
 import time
 from pathlib import Path
+def capture_rows(jdk, classpath, source):
+    """The capture stream as JSON rows; the stream itself is length-delimited protobuf."""
+    dumped = subprocess.run(
+        [str(jdk / "bin/java"), "-cp", classpath,
+         "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
+        check=True, capture_output=True, text=True).stdout
+    return [json.loads(line) for line in dumped.splitlines()]
 
 
 MODES = ("return", "exit", "sigterm")
@@ -28,7 +35,7 @@ def java_command(module, ap, jdk, case, mode, seconds):
         "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
         "-v", f"{case}:/out", "-w", "/out", "jonoffcpu-agent-runtime:ubuntu24.04",
         "/jdk/bin/java", "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
+        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.pb,"
         "shutdowntimeoutmillis=30000,nativestoptimeoutmillis=10000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,"
         "lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
@@ -71,12 +78,9 @@ def make_readable(case):
     ], check=True)
 
 
-def verify_footer(case):
-    source = case / "jonoffcpu-capture.ndjson"
-    data = source.read_bytes()
-    if not data.endswith(b"\n"):
-        raise RuntimeError("Correlation artifact is not LF terminated")
-    rows = [json.loads(line) for line in data.splitlines()]
+def verify_footer(case, jdk, classpath):
+    source = case / "jonoffcpu-capture.pb"
+    rows = capture_rows(jdk, classpath, source)
     footers = [row for row in rows if row.get("recordType") == "captureFinalized"]
     if len(footers) != 1 or rows[-1] is not footers[0]:
         raise RuntimeError("Expected exactly one terminal captureFinalized row")
@@ -92,12 +96,12 @@ def verify_footer(case):
 
 
 def verify_case(module, ap, jdk, case):
-    verify_footer(case)
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
+    verify_footer(case, jdk, classpath)
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
+         "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
          "--output", case / "analysis"], case / "analysis.log")
     report = json.loads((case / "analysis/jonoffcpu-report.json").read_text())
     if report["matched"] <= 0 or report["invalidSource"] or report["invalidJfr"]:

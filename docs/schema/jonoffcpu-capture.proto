@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: MIT
+//
+// The jonoffcpu capture stream: the file the agent writes during a capture and the correlator reads
+// offline. This schema is the format's definition; the Rust collector and both Java modules generate
+// their codecs from it.
+//
+// Layout: a 12-byte header, then length-delimited `Record` messages (a varint byte count followed by
+// the message), appended in order. The agent appends the final `capture_finalized` record after the
+// collector has closed the file, so the bytes before it are a stable prefix that the footer's digest
+// covers.
+//
+// Stacks are interned: a `stack` record is written the first time its id is seen, always before the
+// first observation that references it.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.capture.v1;
+
+option java_package = "io.github.lhotari.jonoffcpu.capture";
+option java_outer_classname = "CaptureProto";
+option optimize_for = LITE_RUNTIME;
+
+message Record {
+  oneof record {
+    // Control records keep the JSON object they have always carried: there are three per capture, so
+    // their size does not matter, and the agent, the manifest and the correlator compare them
+    // structurally against the same values that travel over the JSON control protocol.
+    ControlJson capture_start = 1;
+    Stack stack = 2;
+    Observation observation = 3;
+    ControlJson capture_end = 4;
+    ControlJson capture_finalized = 5;
+  }
+}
+
+message ControlJson {
+  string json = 1;
+}
+
+message Stack {
+  int64 id = 1;
+  repeated Frame frame = 2;
+}
+
+message Frame {
+  uint64 address = 1;
+  // Empty when the address could not be resolved.
+  string symbol = 2;
+  string module = 3;
+}
+
+message Observation {
+  fixed64 correlation_id = 1;
+  uint32 host_tgid = 2;
+  uint32 host_tid = 3;
+  uint32 target_tgid = 4;
+  uint32 target_tid = 5;
+  uint64 process_generation_ns = 6;
+  uint64 thread_generation_ns = 7;
+  fixed64 registration_token = 8;
+  uint64 start_monotonic_ns = 9;
+  uint64 end_monotonic_ns = 10;
+  uint64 admission_threshold = 11;
+  sint64 signal_result = 12;
+  string comm = 13;
+  // The interned stacks, or a negative id with the matching error when the kernel produced none.
+  sint64 kernel_stack_id = 14;
+  sint64 user_stack_id = 15;
+  string kernel_stack_error = 16;
+  string user_stack_error = 17;
+}

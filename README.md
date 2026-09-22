@@ -148,7 +148,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
    JDK events.
 4. A [native collector](jonoffcpu-native/src/collector.rs) in the JVM process
    drains the ring buffer, resolves the
-   native stacks, and appends each observation to an NDJSON correlation stream.
+   native stacks, and appends each observation to the correlation stream.
    The Java agent finalizes that stream with a footer that binds the JFR's size
    and SHA-256.
 5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/lhotari/jonoffcpu/offline/OffCpuCorrelator.java)
@@ -161,7 +161,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 A `profiler.SignalSample` says only that a sampled interval ended. Everything
 that turns it into a measurement lives in the correlation stream:
 
-| | JFR `profiler.SignalSample` | NDJSON observation |
+| | JFR `profiler.SignalSample` | stream observation |
 | --- | --- | --- |
 | Correlation key | yes | yes |
 | Java stack, captured after the thread resumed | yes | no |
@@ -184,11 +184,11 @@ capture files take their stem from `correlationOutput`; the analysis files are
 named by the correlator.
 
 Capture, written by the agent next to `correlationOutput` (the examples assume
-`correlationOutput: /tmp/jonoffcpu-capture.ndjson`):
+`correlationOutput: /tmp/jonoffcpu-capture.pb`):
 
 | File | Contents | Name comes from |
 | --- | --- | --- |
-| `jonoffcpu-capture.ndjson` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256 | `correlationOutput` |
+| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`docs/schema/jonoffcpu-capture.proto`](docs/schema/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar --dump --source <file>` prints it as NDJSON | `correlationOutput` |
 | `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
 | `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
 
@@ -225,6 +225,11 @@ kernel duration, the Java stack, and the delivery delay as separate values, and
   running kernel and fails closed if any of these is missing.
 - Privileges to load and attach the BPF programs.
 - Java 17 or newer for the agent; Java 21 or newer for the correlator.
+- On Java 24 and newer, add `--sun-misc-unsafe-memory-access=allow` to the JVM
+  being profiled and to the correlator. The bundled protobuf codec that reads
+  and writes the capture stream uses `sun.misc.Unsafe`, which the JDK reports
+  once per JVM as a terminally deprecated call; the flag silences that warning
+  and changes nothing else.
 
 The agent JAR is self-contained. It embeds the JNI bridge, the native
 collector, and the patched async-profiler for Linux x86-64 and arm64, each
@@ -254,7 +259,7 @@ instead of the latest one.
 | JAR | What it is | When you use it |
 | --- | --- | --- |
 | `jonoffcpu-agent.jar` | The Java agent. Bundles the eBPF collector, the JNI bridge, and the patched async-profiler for Linux x86-64 and arm64, and drives the whole capture lifecycle. | Attached to the JVM being profiled with `-javaagent`. |
-| `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation NDJSON stream, verifies integrity, and writes derived outputs such as collapsed stacks and a synthetic JFR. | Run after the capture, on any machine with Java 21+. |
+| `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation stream, verifies integrity, and writes derived outputs such as collapsed stacks and a synthetic JFR. | Run after the capture, on any machine with Java 21+. |
 | `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the pinned fork so that it understands the `profiler.Signal*` events and accepts `--units` to label the flame graph in microseconds. | Renders the correlator's collapsed stacks as an off-CPU flame graph whose widths are microseconds of off-CPU time. |
 
 The examples below assume all three JARs are in the current directory.
@@ -264,7 +269,7 @@ The examples below assume all three JARs are in the current directory.
 Create `jonoffcpu.yaml`:
 
 ```yaml
-correlationOutput: /tmp/jonoffcpu-capture.ndjson
+correlationOutput: /tmp/jonoffcpu-capture.pb
 asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/tmp/jonoffcpu-capture.jfr
 sampling:
   minOffCpuMicros: 100
@@ -295,7 +300,7 @@ partial result.
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
-  --source /tmp/jonoffcpu-capture.ndjson \
+  --source /tmp/jonoffcpu-capture.pb \
   --jfr /tmp/jonoffcpu-capture.jfr \
   --output /tmp/jonoffcpu-analysis
 ```
@@ -332,7 +337,7 @@ The synthetic JFR opens directly in
 
 | Option | Meaning |
 | --- | --- |
-| `correlationOutput` | Required. Path of the correlation NDJSON stream. Must not exist yet. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](#files-jonoffcpu-writes). |
+| `correlationOutput` | Required. Path of the correlation stream. Must not exist yet. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](#files-jonoffcpu-writes). |
 | `asyncProfilerOptions` | Required. async-profiler options, including one absolute `file=` path for the JFR. |
 | `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
 | `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
@@ -426,7 +431,7 @@ else is paid only for intervals that are actually recorded:
 | eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
 | Ring-buffer record + signal | each recorded interval | a 120-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
 | Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
-| Drain and write | each recorded interval | a JSON row of roughly 600 bytes | the collector's own thread; rows are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
+| Drain and write | each recorded interval | a protobuf record of roughly 120 bytes | the collector's own thread; records are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
 | Symbolize | each **distinct** native stack | one stack-map lookup and per-frame symbol resolution, written once as a `stack` record | the collector's own thread, on first sight of that stack |
 
 The second and third stages are the observer effect: the signal and the stack
@@ -445,11 +450,11 @@ raise `recordAllAboveMicros` or `minOffCpuMicros`.
 
 Data volume follows the same rule. Stacks are interned: each distinct kernel
 and user stack is symbolized and written once as a `stack` record, and every
-observation references it by id, so a row costs about 600 bytes no matter how
-deep the stack is. A thousand recorded intervals per second write about
-0.6 MB/s of correlation stream, and the same knobs bound disk usage and
-correlation time. In a measured smoke capture 1521 observations referenced
-28 distinct stacks, so interning removed 80 % of the stream.
+observation references it by id, so a record costs about 120 bytes no matter
+how deep the stack is. A thousand recorded intervals per second write about
+0.12 MB/s of correlation stream, and the same knobs bound disk usage and
+correlation time. Interning and the binary encoding together took a measured
+smoke capture from 3.3 KB to 116 bytes per observation.
 
 Feedback loops — the profiler observing its own waits — are closed in the
 kernel: the collector's drain thread and the agent's controller thread report

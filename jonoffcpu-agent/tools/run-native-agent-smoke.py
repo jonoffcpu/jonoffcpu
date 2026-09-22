@@ -52,7 +52,7 @@ def main():
                "-v", "/sys/kernel/btf:/sys/kernel/btf:ro", "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
                "-v", f"{output}:/out", "-w", "/out", image, "/jdk/bin/java",
                "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-               "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
+               "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.pb,"
                f"jonoffcpudelivery={args.delivery},asprofpath=/ap/build/lib/libasyncProfiler.so,"
                "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
                "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes", "io.github.lhotari.jonoffcpu.agent.NativeAgentWorkload", args.seconds]
@@ -62,7 +62,7 @@ def main():
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
          output / "jonoffcpu-capture.jfr", output / "event-counts.json"], output / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", output / "jonoffcpu-capture.ndjson", "--jfr", output / "jonoffcpu-capture.jfr",
+         "--source", output / "jonoffcpu-capture.pb", "--jfr", output / "jonoffcpu-capture.jfr",
          "--output", output / "analysis"], output / "analysis.log")
     report = json.loads((output / "analysis/jonoffcpu-report.json").read_text())
     if report["matched"] <= 0:

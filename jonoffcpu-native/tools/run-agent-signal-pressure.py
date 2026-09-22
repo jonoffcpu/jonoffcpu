@@ -12,6 +12,13 @@ import os
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
+def capture_rows(jdk, classpath, source):
+    """The capture stream as JSON rows; the stream itself is length-delimited protobuf."""
+    dumped = subprocess.run(
+        [str(jdk / "bin/java"), "-cp", classpath,
+         "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
+        check=True, capture_output=True, text=True).stdout
+    return [json.loads(line) for line in dumped.splitlines()]
 
 
 DELIVERIES = ("queued", "coalescing")
@@ -53,7 +60,7 @@ def cpu_model():
 def java_command(module, ap, jdk, case, delivery, signo, blocked_ms, recovery_ms):
     build = module / "build"
     options = (
-        f"jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,jonoffcpudelivery={delivery},"
+        f"jonoffcpuoutput=/out/jonoffcpu-capture.pb,jonoffcpudelivery={delivery},"
         "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
@@ -77,8 +84,8 @@ def java_command(module, ap, jdk, case, delivery, signo, blocked_ms, recovery_ms
     ]
 
 
-def rows(path):
-    return [json.loads(line) for line in path.read_text().splitlines()]
+def rows(jdk, classpath, path):
+    return capture_rows(jdk, classpath, path)
 
 
 def classified(path):
@@ -146,7 +153,7 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
     for name, extra in (("analysis-exact", []),
                         ("analysis-delay-filtered", ["--max-handler-delay-ns", str(DELAY_LIMIT_NS)])):
         run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-             "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
+             "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
              "--output", case / name, "--max-retained-bytes", str(1024 * 1024 * 1024),
              *extra], case / f"{name}.log")
 
@@ -164,7 +171,7 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
             or exact["identityUnverified"]:
         raise RuntimeError("Exact analysis contains orphan, invalid, or unverified rows")
 
-    source_rows = rows(case / "jonoffcpu-capture.ndjson")
+    source_rows = rows(jdk, classpath, case / "jonoffcpu-capture.pb")
     start = next(row for row in source_rows if row.get("recordType") == "captureStart")
     end = next(row for row in source_rows if row.get("recordType") == "captureEnd")
     footer = source_rows[-1]

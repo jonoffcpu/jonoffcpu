@@ -14,6 +14,7 @@ plugins {
     // The base plugin: the full plugin would publish components["java"], but only the shaded JAR is published.
     id("com.vanniktech.maven.publish.base") version "0.37.0"
     id("com.gradleup.shadow") version "9.6.1"
+    id("com.google.protobuf") version "0.10.0"
 }
 
 group = "io.github.lhotari"
@@ -54,9 +55,33 @@ val asyncProfilerDir = rootProject.layout.projectDirectory.dir("async-profiler")
 val asyncProfilerConverter = asyncProfilerDir.file("build/bin/jfrconv")
 
 dependencies {
+    // The capture stream codec, generated from docs/schema/jonoffcpu-capture.proto.
+    embeddedRuntime("com.google.protobuf:protobuf-javalite:4.33.1")
     embeddedRuntime("com.google.code.gson:gson:2.14.0")
     embeddedRuntime("org.openjdk.jmc:flightrecorder.writer:9.1.2")
     jmcWriterSources("org.openjdk.jmc:flightrecorder.writer:9.1.2:sources@jar")
+}
+
+sourceSets {
+    main {
+        proto.setSrcDirs(listOf(rootProject.layout.projectDirectory.dir("docs/schema")))
+    }
+}
+
+protobuf {
+    protoc {
+        artifact = "com.google.protobuf:protoc:4.33.1"
+    }
+    generateProtoTasks {
+        all().configureEach {
+            builtins {
+                named("java") {
+                    // The lite runtime has no descriptors or reflection, which is all the stream needs.
+                    option("lite")
+                }
+            }
+        }
+    }
 }
 
 tasks.withType<JavaCompile>().configureEach {
@@ -79,6 +104,7 @@ val buildAsyncProfilerConverter = tasks.register<Exec>("buildAsyncProfilerConver
 }
 
 val expectedDependencyDigests = mapOf(
+    "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
     "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
     "flightrecorder.writer-9.1.2.jar" to
         "8313e66f798f31de144c65b257a0434afca07b1bce1b59f17e63aed38c0dc9c1",
@@ -101,7 +127,7 @@ fun sha256File(input: File): String {
 
 val verifyDependencyDigests = tasks.register("verifyDependencyDigests") {
     group = "verification"
-    description = "Checks the exact Gson and patched JMC writer artifacts before embedding them."
+    description = "Checks the exact protobuf, Gson and patched JMC writer artifacts before embedding them."
     inputs.files(embeddedRuntime, jmcWriterSources)
     doLast {
         (embeddedRuntime.files + jmcWriterSources.files).forEach { artifact ->
@@ -155,6 +181,7 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     dependsOn(compileJmcWriterPatch, verifyDependencyDigests)
     archiveClassifier = ""
     configurations = listOf(embeddedRuntime)
+    relocate("com.google.protobuf", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.protobuf")
     relocate("com.google.gson", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.gson")
     relocate("org.openjdk.jmc", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.jmc")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
@@ -205,12 +232,15 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
                 if (zip.getEntry(name) == null) throw GradleException("Offline JAR is missing $name")
             }
             if (zip.entries().asSequence().any {
-                    it.name.startsWith("com/google/gson/") || it.name.startsWith("org/openjdk/jmc/")
+                    it.name.startsWith("com/google/gson/")
+                            || it.name.startsWith("org/openjdk/jmc/")
+                            || it.name.startsWith("com/google/protobuf/")
                 }) {
                 throw GradleException("Correlator JAR contains unrelocated dependency packages")
             }
             listOf(
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/gson/Gson.class",
+                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class"
             ).forEach { name ->

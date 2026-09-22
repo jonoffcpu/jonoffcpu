@@ -103,8 +103,8 @@ public final class SignalCaptureControllerTest {
         check(Files.isRegularFile(correlation), "source artifact missing");
         check(profiler.ordinaryStops == 0, "ordinary AP stop was used");
         check(source.closeCalls == 1, "native handle was not closed once");
-        String last = Files.readAllLines(correlation).get(2);
-        JsonObject footer = JsonParser.parseString(last).getAsJsonObject();
+        java.util.List<JsonObject> rows = CaptureStreamFixture.rows(correlation);
+        JsonObject footer = rows.get(rows.size() - 1);
         check(footer.get("recordType").getAsString().equals("captureFinalized"), "final footer missing");
         check(footer.get("apStopResponse").getAsString().contains("finalized=true"), "receipt not retained");
     }
@@ -132,9 +132,9 @@ public final class SignalCaptureControllerTest {
                 json.getAsJsonObject("analysisInputs").get("mode").getAsString().equals("profilerOnly"),
                 "analysis inputs mode missing");
         Path correlation = root.resolve("correlation.ndjson");
-        var rows = Files.readAllLines(correlation);
-        check(rows.size() == 1, "profiler-only stream must hold exactly one row");
-        JsonObject footer = JsonParser.parseString(rows.get(0)).getAsJsonObject();
+        var rows = CaptureStreamFixture.rows(correlation);
+        check(rows.size() == 1, "profiler-only stream must hold exactly one record");
+        JsonObject footer = rows.get(0);
         check(footer.get("recordType").getAsString().equals("captureFinalized"), "footer missing");
         check(footer.get("state").getAsString().equals("profilerOnly"), "footer state must be profilerOnly");
         check(footer.get("sourceDisabled").getAsBoolean(), "footer must flag the disabled source");
@@ -155,9 +155,8 @@ public final class SignalCaptureControllerTest {
         check(controller.state() == SignalCaptureController.State.COMPLETE, "external stop was not finalized");
         check(profiler.guardedStops == 0, "a guarded cookie stop must never be issued in profiler-only mode");
         check(source.prepareCalls == 0 && source.closeCalls == 0, "eBPF source must stay untouched");
-        JsonObject footer = JsonParser.parseString(
-                        Files.readAllLines(root.resolve("correlation.ndjson")).get(0))
-                .getAsJsonObject();
+        JsonObject footer =
+                CaptureStreamFixture.rows(root.resolve("correlation.ndjson")).get(0);
         check(footer.get("state").getAsString().equals("profilerOnly"), "footer missing after external stop");
     }
 
@@ -179,9 +178,13 @@ public final class SignalCaptureControllerTest {
         controller.start();
         controller.stop();
         check(controller.state() == SignalCaptureController.State.COMPLETE, "Coalescing capture did not complete");
-        String source = Files.readString(root.resolve("source.ndjson"));
+        java.util.List<JsonObject> rows = CaptureStreamFixture.rows(root.resolve("source.ndjson"));
         check(
-                source.contains("\"signalDelivery\":\"coalescing\"") && source.contains("delivery=coalescing"),
+                rows.get(0).get("signalDelivery").getAsString().equals("coalescing")
+                        && rows.get(rows.size() - 1)
+                                .get("apStopResponse")
+                                .getAsString()
+                                .contains("delivery=coalescing"),
                 "Delivery policy missing from source/footer/receipt");
     }
 
@@ -195,11 +198,22 @@ public final class SignalCaptureControllerTest {
         check(
                 controller.state() == SignalCaptureController.State.COMPLETE,
                 "Missing native stack rejected complete source");
-        String rows = Files.readString(root.resolve("correlation.ndjson"));
+        java.util.List<JsonObject> rows = CaptureStreamFixture.rows(root.resolve("correlation.ndjson"));
+        JsonObject observation = rows.stream()
+                .filter(row -> row.get("recordType").getAsString().equals("observation"))
+                .findFirst()
+                .orElseThrow();
         check(
-                rows.contains("\"symbolizationFailures\":\"1\"")
-                        && rows.contains("\"userStackError\":\"bpf_stack_error_-7\"")
-                        && rows.contains("\"recordType\":\"stack\""),
+                rows.stream()
+                                .anyMatch(row ->
+                                        row.get("recordType").getAsString().equals("stack"))
+                        && observation.get("userStackError").getAsString().equals("bpf_stack_error_-7")
+                        && rows.get(rows.size() - 2)
+                                .getAsJsonObject("counters")
+                                .getAsJsonObject("userspace")
+                                .get("symbolizationFailures")
+                                .getAsString()
+                                .equals("1"),
                 "Native stack failure evidence not retained");
     }
 
@@ -285,7 +299,7 @@ public final class SignalCaptureControllerTest {
                 "owned AP capture remained active after terminal native failure");
         check(source.closeCalls == 1, "incomplete native source was not closed");
         check(
-                Files.readAllLines(root.resolve("correlation.ndjson")).size() == 2,
+                CaptureStreamFixture.rows(root.resolve("correlation.ndjson")).size() == 2,
                 "incomplete native source received a success footer");
     }
 
@@ -348,7 +362,7 @@ public final class SignalCaptureControllerTest {
             check(expected.getMessage().contains("did not finalize"), "wrong AP finalization failure");
         }
         check(
-                Files.readAllLines(root.resolve("correlation.ndjson")).size() == 2,
+                CaptureStreamFixture.rows(root.resolve("correlation.ndjson")).size() == 2,
                 "incomplete AP capture received a success footer");
         check(source.closeCalls == 1, "settled native handle was not closed");
     }
@@ -1026,7 +1040,7 @@ public final class SignalCaptureControllerTest {
             start.addProperty("pidNamespaceDevice", "4");
             start.addProperty("pidNamespaceInode", "43");
             try {
-                Files.writeString(source, start + "\n");
+                Files.write(source, CaptureStreamFixture.encode(java.util.List.of(start)));
             } catch (IOException error) {
                 throw new IllegalStateException(error);
             }
@@ -1068,6 +1082,8 @@ public final class SignalCaptureControllerTest {
                     observation.addProperty("registrationToken", "0123456789abcdef");
                     observation.addProperty("startMonotonicNanos", "9");
                     observation.addProperty("endMonotonicNanos", "10");
+                    observation.addProperty("signalResult", 0);
+                    observation.addProperty("comm", "fixture");
                     // One announced stack for the kernel side; the user side failed, so it has no record.
                     JsonObject stack = new JsonObject();
                     stack.addProperty("schemaVersion", 2);
@@ -1077,7 +1093,7 @@ public final class SignalCaptureControllerTest {
                     stack.addProperty("captureEpoch", 7);
                     stack.addProperty("stackId", 5);
                     stack.add("frames", new com.google.gson.JsonArray());
-                    Files.writeString(source, stack + "\n", java.nio.file.StandardOpenOption.APPEND);
+                    CaptureStreamFixture.append(source, stack);
                     observation.addProperty("kernelStackId", 5);
                     observation.addProperty("userStackId", -7);
                     observation.addProperty("userStackError", "bpf_stack_error_-7");
@@ -1086,9 +1102,9 @@ public final class SignalCaptureControllerTest {
                     userspace.addProperty("receivedObservations", "1");
                     userspace.addProperty("writtenObservations", "1");
                     userspace.addProperty("symbolizationFailures", "1");
-                    Files.writeString(source, observation + "\n", java.nio.file.StandardOpenOption.APPEND);
+                    CaptureStreamFixture.append(source, observation);
                 }
-                Files.writeString(source, captureEnd + "\n", java.nio.file.StandardOpenOption.APPEND);
+                CaptureStreamFixture.append(source, captureEnd);
             } catch (IOException error) {
                 throw new IllegalStateException(error);
             }
@@ -1111,7 +1127,7 @@ public final class SignalCaptureControllerTest {
             if (captureEnd == null && session != null) {
                 captureEnd = captureEnd(session, false);
                 try {
-                    Files.writeString(source, captureEnd + "\n", java.nio.file.StandardOpenOption.APPEND);
+                    CaptureStreamFixture.append(source, captureEnd);
                 } catch (IOException error) {
                     throw new IllegalStateException(error);
                 }
