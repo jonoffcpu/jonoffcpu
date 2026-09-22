@@ -145,7 +145,7 @@ instead of the latest one.
 | --- | --- | --- |
 | `jonoffcpu-agent.jar` | The Java agent. Bundles the eBPF collector, the JNI bridge, and the patched async-profiler for Linux x86-64 and arm64, and drives the whole capture lifecycle. | Attached to the JVM being profiled with `-javaagent`. |
 | `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation NDJSON stream, verifies integrity, and writes derived outputs such as collapsed stacks and a synthetic JFR. | Run after the capture, on any machine with Java 21+. |
-| `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the pinned fork so that it understands the `profiler.Signal*` events. | Renders the correlator's output as a flame graph. |
+| `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the pinned fork so that it understands the `profiler.Signal*` events and accepts `--units` to label the flame graph in microseconds. | Renders the correlator's collapsed stacks as an off-CPU flame graph whose widths are microseconds of off-CPU time. |
 
 The examples below assume all three JARs are in the current directory.
 
@@ -204,7 +204,10 @@ java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
 ```
 
 Open `offcpu.html` in a browser. Frame widths are proportional to the total
-time threads spent blocked under that Java stack. Add `--reverse` to see which
+off-CPU time observed under that Java stack. The collapsed weights are
+microseconds of off-CPU time, and `--units µs` makes the flame graph say so
+instead of counting "samples"; that option is a fork addition, so use the
+provided `jfr-converter.jar` rather than a stock `jfrconv`. Add `--reverse` to see which
 blocking calls dominate regardless of caller, or `-I`/`-X` regular expressions
 to keep or drop stacks by frame. Any tool that reads the collapsed-stack
 format, such as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph)

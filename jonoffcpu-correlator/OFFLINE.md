@@ -65,6 +65,13 @@ remainder is less than one quantum per stack. The report and a metadata event
 record exact duration, represented duration and quantization error. This is a
 compatibility view for CPU flamegraph tooling, not a recording of CPU execution.
 The collapsed output uses rounded integer microsecond weights; the report retains exact nanosecond totals.
+Render it with the `jfr-converter.jar` from the same release, whose `--units`
+option labels the flame graph in those microseconds:
+
+```sh
+java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
+  offcpu-signal-delivery-stacks.collapsed offcpu.html
+```
 
 Use `--estimate-population true` to add a separate, opt-in
 `populationEstimate` object to `report.json`. It estimates total duration for the
