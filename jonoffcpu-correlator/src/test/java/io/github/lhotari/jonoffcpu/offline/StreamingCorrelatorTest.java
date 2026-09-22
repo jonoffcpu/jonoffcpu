@@ -257,6 +257,18 @@ public final class StreamingCorrelatorTest {
                 new OfflineCorrelator.Limits(rows * 2 + 16, 1024 * 1024, 400L * 1024 * 1024, 4096, null, null, null);
         var result = CorrelationEngine.correlate(source, jfr, limits, null, false);
         check(result.matched() == rows, "Scale fixture lost matches: " + result.matched());
+        // The uniform round robin asks for 2000 distinct depths, but the JVM's default JFR
+        // stack-capture depth (FlightRecorderOptions=stackdepth, 64 by default) truncates any deeper
+        // recursion to the same leaf-first prefix, so depths past that cap collapse together; the
+        // fixture has never actually reached 2000 distinct stacks. What matters here is a floor that
+        // catches a real fan-out regression (a prior fixture bug collapsed this fixture to ~21
+        // distinct stacks) without pinning an exact count that depends on JIT/inlining behavior this
+        // fixture does not control.
+        int minimumDistinctStacks = Math.min(100, rows);
+        check(
+                result.dictionaries().stackCount() >= minimumDistinctStacks,
+                "Scale fixture produced " + result.dictionaries().stackCount() + " distinct stacks, expected at least "
+                        + minimumDistinctStacks + "; the fixture's fan-out coverage regressed");
         check(
                 result.dictionaries().stackCount() <= 4000,
                 "Scale fixture produced more distinct stacks than intended: "
@@ -273,7 +285,7 @@ public final class StreamingCorrelatorTest {
     /** Spec acceptance 7: thinning is usable only if the towers keep their proportions. */
     private static void thinningAccuracy(Path dir) throws Exception {
         int rows = 200_000;
-        Path jfr = ScaleFixture.recording(dir, rows, 8);
+        Path jfr = ScaleFixture.recordingSkewed(dir, rows, 8);
         Path source = ScaleFixture.capture(dir, jfr, rows);
         var limits = new OfflineCorrelator.Limits(rows * 2 + 16, 1024 * 1024, 400L << 20, 4096, null, null, null);
         var exact = CorrelationEngine.correlate(source, jfr, limits, null, false, Thinning.NONE);
@@ -398,6 +410,25 @@ public final class StreamingCorrelatorTest {
          * session's own buffers happened to flush.
          */
         static Path recording(Path dir, int rows, int distinctStacks) throws IOException {
+            return recording(dir, rows, distinctStacks, false);
+        }
+
+        /**
+         * Like {@link #recording(Path, int, int)}, but with a skewed (power-of-two) distribution
+         * across distinct stacks instead of a uniform round robin, so distinct stacks carry
+         * distinctly separated weights. The thinning-accuracy fixture needs this: under a uniform
+         * round robin every stack is exactly tied in weight, and thinning's ~2-4% per-stack sampling
+         * noise would then decide the top-stack ranking essentially at random, which is an unwinnable
+         * comparison against the exact run. {@code scale()} must not use this: it exists specifically
+         * to exercise the stack dictionary near its real fan-out (spec acceptance 4), which a skewed
+         * distribution — where {@code numberOfTrailingZeros(row + 1)} never reaches large values for
+         * a two-million-row recording — would silently collapse to a couple dozen distinct stacks.
+         */
+        static Path recordingSkewed(Path dir, int rows, int distinctStacks) throws IOException {
+            return recording(dir, rows, distinctStacks, true);
+        }
+
+        private static Path recording(Path dir, int rows, int distinctStacks, boolean skewed) throws IOException {
             Path contextFile = dir.resolve("scale-context-" + rows + ".jfr");
             try (Recording context = new Recording()) {
                 context.enable(OfflineCorrelatorTest.Capture.class);
@@ -419,11 +450,12 @@ public final class StreamingCorrelatorTest {
                     // too, or every row past the point where the fixed default falls behind is classified
                     // invalid-handler-delay instead of matched.
                     sample.monotonicTimeNanos = 5000L + row;
-                    // A skewed (power-of-two) distribution across distinct stacks, not a uniform round
-                    // robin: distinct stacks then carry distinctly separated weights, so the top-stack
-                    // ranking the thinning-accuracy fixture checks cannot be reordered by thinning's
-                    // sampling noise on stacks that would otherwise be exactly tied.
-                    commitAtDepth(1 + (Integer.numberOfTrailingZeros(row + 1) % distinctStacks), sample);
+                    // A skewed (power-of-two) distribution gives distinct stacks distinctly separated
+                    // weights, needed only by the thinning-accuracy fixture (see recordingSkewed).
+                    int depth = skewed
+                            ? 1 + (Integer.numberOfTrailingZeros(row + 1) % distinctStacks)
+                            : 1 + (row % distinctStacks);
+                    commitAtDepth(depth, sample);
                 }
                 OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
                 stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = rows;
