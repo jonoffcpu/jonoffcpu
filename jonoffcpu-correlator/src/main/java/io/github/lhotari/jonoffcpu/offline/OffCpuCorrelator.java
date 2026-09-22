@@ -367,6 +367,8 @@ public final class OffCpuCorrelator {
             JsonObject view = new JsonObject();
             view.addProperty("path", compatibility.output().getFileName().toString());
             view.addProperty("quantumNanos", Long.toString(compatibility.quantumNanos()));
+            view.addProperty("requestedQuantumNanos", Long.toString(compatibility.requestedQuantumNanos()));
+            view.addProperty("quantumRaisedForEventLimit", compatibility.quantumRaised());
             view.addProperty("syntheticEvents", Long.toString(compatibility.syntheticEvents()));
             view.addProperty("representedNanos", compatibility.representedNanos());
             view.addProperty("quantizationErrorNanos", compatibility.quantizationErrorNanos());

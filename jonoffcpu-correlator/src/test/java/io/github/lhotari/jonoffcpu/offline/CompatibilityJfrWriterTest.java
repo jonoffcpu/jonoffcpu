@@ -235,13 +235,23 @@ public final class CompatibilityJfrWriterTest {
             check(secondIntervalEvents == 1, "Carried weight timestamp convention changed");
 
             Path capped = directory.resolve("capped.jfr");
+            var coarsened =
+                    CompatibilityJfrWriter.write(analysis, capped, new CompatibilityJfrWriter.Options(QUANTUM, 6));
+            check(coarsened.quantumRaised(), "Expansion cap did not coarsen the quantum");
+            check(coarsened.syntheticEvents() <= 6, "Coarsened plan still exceeded the cap");
+            check(coarsened.requestedQuantumNanos() == QUANTUM, "Requested quantum was not reported");
+            check(Files.isRegularFile(capped), "Coarsened plan published no output");
+            Path failing = directory.resolve("failing.jfr");
             try {
-                CompatibilityJfrWriter.write(analysis, capped, new CompatibilityJfrWriter.Options(QUANTUM, 6));
-                throw new AssertionError("Expansion cap was ignored");
+                CompatibilityJfrWriter.write(
+                        analysis,
+                        failing,
+                        new CompatibilityJfrWriter.Options(QUANTUM, 6, CompatibilityJfrWriter.EventLimitPolicy.FAIL));
+                throw new AssertionError("Expansion cap was ignored under the fail policy");
             } catch (IOException expected) {
                 check(expected.getMessage().contains("limit"), "Unexpected cap failure: " + expected);
             }
-            check(!Files.exists(capped), "Cap failure published partial output");
+            check(!Files.exists(failing), "Cap failure published partial output");
 
             Path occupied = directory.resolve("occupied.jfr");
             Files.writeString(occupied, "keep");

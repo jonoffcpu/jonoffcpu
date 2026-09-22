@@ -33,11 +33,22 @@ final class CompatibilityJfrWriter {
     private static final String EXECUTION_SAMPLE = "jdk.ExecutionSample";
     private static final String METADATA = "jonoffcpu.SyntheticOffCpuMetadata";
 
-    public record Options(long quantumNanos, long maxSyntheticEvents) {
+    /** Whether a quantum that would exceed the expansion cap is raised until it fits, or rejected. */
+    public enum EventLimitPolicy {
+        COARSEN,
+        FAIL
+    }
+
+    public record Options(long quantumNanos, long maxSyntheticEvents, EventLimitPolicy onEventLimit) {
         public Options {
             if (quantumNanos <= 0 || maxSyntheticEvents <= 0) {
                 throw new IllegalArgumentException("Quantum and maximum event count must be positive");
             }
+            Objects.requireNonNull(onEventLimit, "onEventLimit");
+        }
+
+        public Options(long quantumNanos, long maxSyntheticEvents) {
+            this(quantumNanos, maxSyntheticEvents, EventLimitPolicy.COARSEN);
         }
 
         public static Options defaults() {
@@ -51,6 +62,8 @@ final class CompatibilityJfrWriter {
             int matchedIntervals,
             int canonicalStacks,
             long quantumNanos,
+            long requestedQuantumNanos,
+            boolean quantumRaised,
             String exactSelectedNanos,
             String representedNanos,
             String quantizationErrorNanos,
@@ -67,7 +80,10 @@ final class CompatibilityJfrWriter {
             BigInteger error,
             BigInteger omitted,
             BigInteger firstEpoch,
-            BigInteger lastEpoch) {}
+            BigInteger lastEpoch,
+            long quantumNanos,
+            long requestedQuantumNanos,
+            boolean quantumRaised) {}
 
     private record JfrTypes(
             Type executionSample,
@@ -121,7 +137,9 @@ final class CompatibilityJfrWriter {
                 plan.events(),
                 plan.intervals().size(),
                 plan.stacks(),
-                options.quantumNanos(),
+                plan.quantumNanos(),
+                plan.requestedQuantumNanos(),
+                plan.quantumRaised(),
                 plan.exact().toString(),
                 plan.represented().toString(),
                 plan.error().toString(),
@@ -129,7 +147,10 @@ final class CompatibilityJfrWriter {
     }
 
     private static Plan plan(SyntheticJfrSource source, Options options) throws IOException {
-        BigInteger quantum = BigInteger.valueOf(options.quantumNanos());
+        QuantumPlanner.Plan chosen = options.onEventLimit() == EventLimitPolicy.FAIL
+                ? new QuantumPlanner.Plan(options.quantumNanos(), options.quantumNanos(), 0, false)
+                : QuantumPlanner.plan(source.stackNanos(), options.quantumNanos(), options.maxSyntheticEvents());
+        BigInteger quantum = BigInteger.valueOf(chosen.quantumNanos());
         BigInteger monotonicOffset = signedOffset(source.analysisInputs());
         long[] remainders = new long[source.stackCount()];
         BitSet seen = new BitSet(source.stackCount());
@@ -186,7 +207,10 @@ final class CompatibilityJfrWriter {
                 represented.subtract(totals.exact),
                 omitted,
                 totals.firstEpoch == null ? now : totals.firstEpoch,
-                totals.lastEpoch == null ? now : totals.lastEpoch);
+                totals.lastEpoch == null ? now : totals.lastEpoch,
+                chosen.quantumNanos(),
+                chosen.requestedQuantumNanos(),
+                chosen.raised());
     }
 
     private static void writeTemporary(SyntheticJfrSource source, Path output, Options options, Plan plan)
@@ -266,6 +290,7 @@ final class CompatibilityJfrWriter {
                         .addField("sessionId", Types.Builtin.STRING)
                         .addField("captureEpoch", Types.Builtin.LONG)
                         .addField("quantumNanos", Types.Builtin.LONG)
+                        .addField("requestedQuantumNanos", Types.Builtin.LONG)
                         .addField("maxSyntheticEvents", Types.Builtin.LONG)
                         .addField("syntheticEvents", Types.Builtin.LONG)
                         .addField("matchedIntervals", Types.Builtin.INT)
@@ -307,7 +332,8 @@ final class CompatibilityJfrWriter {
                         .putField("timestampConvention", "interval-interior-remainder-carry")
                         .putField("sessionId", session)
                         .putField("captureEpoch", epoch)
-                        .putField("quantumNanos", options.quantumNanos())
+                        .putField("quantumNanos", plan.quantumNanos())
+                        .putField("requestedQuantumNanos", plan.requestedQuantumNanos())
                         .putField("maxSyntheticEvents", options.maxSyntheticEvents())
                         .putField("syntheticEvents", plan.events())
                         .putField("matchedIntervals", plan.intervals().size())

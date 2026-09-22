@@ -176,12 +176,30 @@ public final class PrimitiveStructuresTest {
         rejects(() -> retained.structures(8192), "Decoded input budget exceeded");
     }
 
+    private static void quantum() throws IOException {
+        long[] weights = {10_000, 3_000, 1};
+        var exact = QuantumPlanner.plan(weights, 1000, 1_000_000);
+        check(exact.quantumNanos() == 1000 && !exact.raised(), "A fitting quantum must not be raised");
+        check(exact.syntheticEvents() == 13, "Event count is not the sum of per-stack floors");
+        var raised = QuantumPlanner.plan(weights, 1000, 6);
+        check(raised.raised() && raised.requestedQuantumNanos() == 1000, "The request must be reported as raised");
+        check(raised.syntheticEvents() <= 6, "Raising the quantum did not bring the event count under the cap");
+        check(raised.quantumNanos() > 1000, "The quantum was not raised");
+        // A coarser quantum is a rendering choice: the totals it represents never grow.
+        check(
+                raised.syntheticEvents() * raised.quantumNanos() <= 13_001,
+                "A coarser quantum represented more time than was measured");
+        var empty = QuantumPlanner.plan(new long[0], 1000, 10);
+        check(empty.syntheticEvents() == 0 && !empty.raised(), "An empty correlation needs no coarsening");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
         dictionaries();
         columns();
         budget();
+        quantum();
         System.out.println("Primitive structure fixtures passed");
     }
 }
