@@ -36,11 +36,23 @@ final class ManifestStore {
         write(true);
     }
 
+    /**
+     * A capture file that sits next to the correlation stream and shares its stem: {@code jonoffcpu-capture.ndjson}
+     * gets {@code jonoffcpu-capture.manifest.json}, so the whole capture is recognisable by one name. Only the
+     * final extension of the file name is replaced; a leading dot or a dot in a directory name is not one.
+     */
+    static Path sibling(Path correlation, String suffix) {
+        String name = correlation.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        String stem = dot > 0 ? name.substring(0, dot) : name;
+        return correlation.resolveSibling(stem + suffix);
+    }
+
     static ManifestStore create(AgentConfig config, String sessionId) throws IOException {
         Path correlation = config.correlationOutput();
         Path directory = correlation.getParent();
-        Path jfr = config.jfrOutput() == null ? Path.of(correlation + ".jfr") : config.jfrOutput();
-        Path manifestPath = Path.of(correlation + ".manifest.json");
+        Path jfr = config.jfrOutput() == null ? sibling(correlation, ".jfr") : config.jfrOutput();
+        Path manifestPath = sibling(correlation, ".manifest.json");
         if (correlation.equals(jfr) || correlation.equals(manifestPath) || jfr.equals(manifestPath)) {
             throw new IOException("Capture artifact paths must be distinct");
         }

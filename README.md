@@ -12,6 +12,7 @@ ordinary async-profiler JFR.
 - [The problem](#the-problem)
 - [How it works](#how-it-works)
   - [Why two files?](#why-two-files)
+  - [Files jonoffcpu writes](#files-jonoffcpu-writes)
   - [What the Java stack means](#what-the-java-stack-means)
 - [Requirements](#requirements)
 - [Quick start](#quick-start)
@@ -168,9 +169,42 @@ that turns it into a measurement lives in the correlation stream:
 | Signal request result and kernel-side loss counters | no | yes |
 | Footer binding the JFR's size and digest | no | yes |
 
+### Files jonoffcpu writes
+
+Every file the agent or the correlator creates carries the `jonoffcpu` name,
+so a capture is recognisable in a shared directory or a support bundle. The
+capture files take their stem from `correlationOutput`; the analysis files are
+named by the correlator.
+
+Capture, written by the agent next to `correlationOutput` (the examples assume
+`correlationOutput: /tmp/jonoffcpu-capture.ndjson`):
+
+| File | Contents | Name comes from |
+| --- | --- | --- |
+| `jonoffcpu-capture.ndjson` | The correlation stream: `captureStart`, one `observation` per recorded off-CPU interval, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256 | `correlationOutput` |
+| `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
+| `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
+
+Analysis, written by the correlator into `--output`:
+
+| File | Contents |
+| --- | --- |
+| `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate |
+| `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs |
+| `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
+| `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing |
+| `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay |
+| `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate |
+
+`--partial true` inspects an interrupted capture and writes a visibly different
+set instead: `INCOMPLETE-jonoffcpu-report.json`,
+`INCOMPLETE-jonoffcpu-classified-records.jsonl`, `INCOMPLETE-jonoffcpu-pairs.jsonl`,
+optionally `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed`, and the marker
+`jonoffcpu-partial.json`. It never writes `jonoffcpu-complete.json`.
+
 Counting `SignalSample` events on their own would give a signal-frequency
 profile, not an off-CPU profile: ten 1 ms parks and one 10 s socket read would
-look identical. The JFR supplies *which Java code* was blocked; the stream
+look identical. The JFR supplies *which Java code* was waiting; the stream
 supplies *for how long* and *in which kernel path*. Observations that never
 received a matching sample are kept and reported as loss, never dropped.
 
@@ -207,7 +241,7 @@ explicitly. If the temporary directory is mounted `noexec`, point
 
 Download the latest
 [GitHub Release](https://github.com/lhotari/jonoffcpu/releases), which
-contains the three executable JARs:
+contains the three JARs:
 
 ```sh
 gh release download -p '*.jar' -R lhotari/jonoffcpu
@@ -229,8 +263,8 @@ The examples below assume all three JARs are in the current directory.
 Create `jonoffcpu.yaml`:
 
 ```yaml
-correlationOutput: /tmp/example.correlation.ndjson
-asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/tmp/example.jfr
+correlationOutput: /tmp/jonoffcpu-capture.ndjson
+asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/tmp/jonoffcpu-capture.jfr
 sampling:
   minOffCpuMicros: 100
   admission:
@@ -260,27 +294,22 @@ partial result.
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
-  --source /tmp/example.correlation.ndjson \
-  --jfr /tmp/example.jfr \
-  --output /tmp/example-analysis
+  --source /tmp/jonoffcpu-capture.ndjson \
+  --jfr /tmp/jonoffcpu-capture.jfr \
+  --output /tmp/jonoffcpu-analysis
 ```
 
-The output directory contains:
-
-| File | Contents |
-| --- | --- |
-| `report.json` | Lifecycle, loss, classification, duration, and delivery-delay accounting |
-| `offcpu-signal-delivery-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time |
-| `offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
-| `classified-records.jsonl`, `matches.jsonl` | Every row and every match, for auditing |
-| `complete.json` | Written last, only after all inputs and outputs validate |
+The output directory then holds `jonoffcpu-report.json`,
+`jonoffcpu-offcpu-stacks.collapsed`, `jonoffcpu-offcpu-synthetic.jfr`, the
+row-level audit files, and `jonoffcpu-complete.json` as the last file written;
+[Files jonoffcpu writes](#files-jonoffcpu-writes) describes each one.
 
 ### 4. Render the flame graph
 
 ```sh
 java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
-  /tmp/example-analysis/offcpu-signal-delivery-stacks.collapsed \
-  /tmp/example-analysis/offcpu.html
+  /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-stacks.collapsed \
+  /tmp/jonoffcpu-analysis/offcpu.html
 ```
 
 Open `offcpu.html` in a browser. Frame widths are proportional to the total
@@ -302,7 +331,7 @@ The synthetic JFR opens directly in
 
 | Option | Meaning |
 | --- | --- |
-| `correlationOutput` | Required. Path of the correlation NDJSON stream. Must not exist yet. |
+| `correlationOutput` | Required. Path of the correlation NDJSON stream. Must not exist yet. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](#files-jonoffcpu-writes). |
 | `asyncProfilerOptions` | Required. async-profiler options, including one absolute `file=` path for the JFR. |
 | `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
 | `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
@@ -398,7 +427,7 @@ The agent can also be started programmatically with
 | `--from-ns`, `--to-ns` | Clip matched intervals to a window in the source monotonic clock. |
 | `--format collapsed\|jfr` | Produce only one of the two derived outputs. |
 | `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
-| `--partial true` | Inspect an interrupted capture. Exits with status 2 and never writes `complete.json` or the synthetic JFR. |
+| `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json` or the synthetic JFR. |
 
 By default the correlator refuses a JFR whose size or SHA-256 differs from the
 one recorded in the stream's footer. The full output, integrity, and weighting
@@ -439,8 +468,9 @@ libraries are compiled in a pinned container against the running kernel's BTF.
 Pass `-PnativeArchitectures=all` to embed both Linux x86-64 and arm64 bundles,
 or `x86_64` / `aarch64` to pick one. Each architecture has a glibc and a musl
 flavour; `-PnativeLibcs` selects `musl` (the default), `glibc`, or `all`.
-Releases embed all four bundles. The executable JARs land in
-`jonoffcpu-agent/build/libs/` and `jonoffcpu-correlator/build/libs/`.
+Releases embed all four bundles. The agent JAR lands in
+`jonoffcpu-agent/build/libs/` and the runnable correlator JAR in
+`jonoffcpu-correlator/build/libs/`.
 
 The converter is built from the same fork's `src/converter` sources by the
 `jonoffcpu-jfr-converter` module:

@@ -52,25 +52,25 @@ def main():
                "-v", "/sys/kernel/btf:/sys/kernel/btf:ro", "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
                "-v", f"{output}:/out", "-w", "/out", image, "/jdk/bin/java",
                "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-               "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/correlation.ndjson,"
+               "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
                f"jonoffcpudelivery={args.delivery},asprofpath=/ap/build/lib/libasyncProfiler.so,"
-               "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/original.jfr",
+               "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
                "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes", "io.github.lhotari.jonoffcpu.agent.NativeAgentWorkload", args.seconds]
     (output / "command.json").write_text(json.dumps([str(part) for part in command], indent=2) + "\n")
     run(command, output / "process.log")
     classpath = f"{build / 'jonoffcpu-agent.jar'}:{build / 'test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
-         output / "original.jfr", output / "event-counts.json"], output / "category-check.log")
+         output / "jonoffcpu-capture.jfr", output / "event-counts.json"], output / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", output / "correlation.ndjson", "--jfr", output / "original.jfr",
+         "--source", output / "jonoffcpu-capture.ndjson", "--jfr", output / "jonoffcpu-capture.jfr",
          "--output", output / "analysis"], output / "analysis.log")
-    report = json.loads((output / "analysis/report.json").read_text())
+    report = json.loads((output / "analysis/jonoffcpu-report.json").read_text())
     if report["matched"] <= 0:
         raise RuntimeError("No matched off-CPU observations")
     if report["invalidSource"] or report["invalidJfr"] or report["identityUnverified"]:
-        raise RuntimeError("Invalid or unverified matches: inspect analysis/report.json")
+        raise RuntimeError("Invalid or unverified matches: inspect analysis/jonoffcpu-report.json")
     converted = output / "analysis/compatibility-view.collapsed"
-    run([ap / "build/bin/jfrconv", "--cpu", output / "analysis/offcpu-synthetic.jfr", converted],
+    run([ap / "build/bin/jfrconv", "--cpu", output / "analysis/jonoffcpu-offcpu-synthetic.jfr", converted],
         output / "converter.log")
     count = sum(int(line.rsplit(" ", 1)[1]) for line in converted.read_text().splitlines())
     if count != int(report["syntheticJfr"]["syntheticEvents"]):

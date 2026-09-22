@@ -63,14 +63,20 @@ The publishable artifact is
 output path and the async-profiler options:
 
 ```yaml
-correlationOutput: /data/run.correlation.ndjson
-asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/data/run.jfr
+correlationOutput: /data/jonoffcpu-capture.ndjson
+asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/data/jonoffcpu-capture.jfr
 sampling:
   minOffCpuMicros: 100
   admission:
     policy: proportional
     recordAllAboveMicros: 10000
 ```
+
+The agent writes the manifest next to the stream as `<stem>.manifest.json`
+(`/data/jonoffcpu-capture.manifest.json` above) and, when `file=` is omitted,
+records the JFR as `<stem>.jfr`; the stem is `correlationOutput` without its
+final extension. Naming the stream `jonoffcpu-capture.ndjson` therefore keeps
+every capture file recognisable.
 
 The agent uses SnakeYAML's safe constructor, rejects duplicate and unknown keys,
 and does not allow aliases. The `sampling` block is required; the top-level
@@ -100,7 +106,7 @@ that mode, everything before `asprofpath` belongs to jonoffcpu and everything
 after it is forwarded to async-profiler:
 
 ```sh
-java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/run.correlation.ndjson,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/run.jfr ...
+java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.ndjson,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
 ```
 
 Options before `asprofpath` belong to JONOFFCPU:
@@ -163,7 +169,7 @@ For the Java-agent configuration, choose coalescing cookie delivery with
 form is:
 
 ```sh
-java -agentpath:/path/to/build/lib/libjonoffcpu.so=jonoffcpuoutput=/data/run.correlation.ndjson,jonoffcpudelivery=coalescing,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/run.jfr ...
+java -agentpath:/path/to/build/lib/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.ndjson,jonoffcpudelivery=coalescing,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...
 ```
 
 A `cookiesignal` option in the async-profiler options may

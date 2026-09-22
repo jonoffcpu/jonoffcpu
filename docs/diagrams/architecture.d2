@@ -183,15 +183,15 @@ offrow: "" {
 
       jfr: Combined JFR recording {
         class: [file; file-cyan]
-        detail: "async-profiler + profiler.SignalSample\n+ JDK JFR events" {class: detail}
+        detail: "jonoffcpu-capture.jfr\nasync-profiler + profiler.SignalSample\n+ JDK JFR events" {class: detail}
       }
       ndjson: Correlation stream {
         class: [file; file-teal]
-        detail: "NDJSON: off-CPU intervals (durations),\nnative stacks, loss counters, finalized footer" {class: detail}
+        detail: "jonoffcpu-capture.ndjson\noff-CPU intervals (durations), native stacks,\nloss counters, finalized footer" {class: detail}
       }
       manifest: Audit manifest {
         class: [file; file-neutral]
-        detail: "manifest.json" {class: detail}
+        detail: "jonoffcpu-capture.manifest.json" {class: detail}
       }
     }
   }
@@ -210,7 +210,7 @@ offrow: "" {
         class: [comp; comp-violet]
         detail: "jonoffcpu-correlator.jar\nJoins each SignalSample (JVM stack) with its\noff-CPU interval + native stack by correlation key\nWeights stacks by off-CPU duration" {class: detail}
       }
-      note: "JFR sample = which Java code was blocked\nObservation = for how long, in which kernel path\nUnmatched rows are kept as loss, never dropped" {class: note}
+      note: "JFR sample = which Java code was waiting\nObservation = for how long, in which kernel path\nUnmatched rows are kept as loss, never dropped" {class: note}
     }
 
     # Grid is safe here: edges only enter this panel, none leave it (rule 5).
@@ -222,23 +222,23 @@ offrow: "" {
 
       report: Report {
         class: [file; file-neutral]
-        detail: "report.json" {class: detail}
+        detail: "jonoffcpu-report.json" {class: detail}
       }
       rows: Row-level audit {
         class: [file; file-neutral]
-        detail: "classified-records.jsonl\nmatches.jsonl" {class: detail}
+        detail: "jonoffcpu-classified-records.jsonl\njonoffcpu-matches.jsonl" {class: detail}
       }
       complete: Completion marker {
         class: [file; file-neutral]
-        detail: "complete.json" {class: detail}
+        detail: "jonoffcpu-complete.json" {class: detail}
       }
       collapsed: Off-CPU flame graph {
         class: [file; file-green]
-        detail: "collapsed stack text format" {class: [detail; detail-green]}
+        detail: "jonoffcpu-offcpu-stacks.collapsed" {class: [detail; detail-green]}
       }
       synthetic: Synthetic JFR {
         class: [file; file-neutral]
-        detail: "jdk.ExecutionSample view" {class: detail}
+        detail: "jonoffcpu-offcpu-synthetic.jfr\njdk.ExecutionSample view" {class: detail}
       }
       # Invisible spacer balances the columns (3 + 3) so no cell is stretched (rule 3).
       spacer: "" {style.opacity: 0}

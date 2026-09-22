@@ -362,16 +362,17 @@ public final class OfflineCorrelatorTest {
             check(result.collapsedNanos().containsValue("3000"), "Collapsed duration missing");
             Path output = dir.resolve("analysis");
             OffCpuCorrelator.write(result, output);
-            check(Files.isRegularFile(output.resolve("complete.json")), "Missing output completion marker");
+            check(Files.isRegularFile(output.resolve(OutputFiles.COMPLETE)), "Missing output completion marker");
             check(
-                    Files.readString(output.resolve("offcpu-signal-delivery-stacks.collapsed"))
+                    Files.readString(output.resolve(OutputFiles.COLLAPSED))
                             .strip()
                             .endsWith(" 3"),
                     "Collapsed output is not weighted in integer microseconds");
             check(
-                    Files.readString(output.resolve("report.json")).contains("signal-delivery stack"),
+                    Files.readString(output.resolve(OutputFiles.REPORT)).contains("signal-delivery stack"),
                     "Missing stack caveat");
-            JsonObject report = com.google.gson.JsonParser.parseString(Files.readString(output.resolve("report.json")))
+            JsonObject report = com.google.gson.JsonParser.parseString(
+                            Files.readString(output.resolve(OutputFiles.REPORT)))
                     .getAsJsonObject();
             check(
                     report.getAsJsonObject("handlerDelayNanos")
@@ -416,7 +417,7 @@ public final class OfflineCorrelatorTest {
                 sampleTime.toString()
             });
             JsonObject rangeReport = com.google.gson.JsonParser.parseString(
-                            Files.readString(selectedOutput.resolve("report.json")))
+                            Files.readString(selectedOutput.resolve(OutputFiles.REPORT)))
                     .getAsJsonObject();
             check(
                     rangeReport
@@ -454,7 +455,9 @@ public final class OfflineCorrelatorTest {
                 "--partial-jfr",
                 "true"
             });
-            check(Files.isRegularFile(partialOutput.resolve("complete.json")), "Partial JFR analysis did not complete");
+            check(
+                    Files.isRegularFile(partialOutput.resolve(OutputFiles.COMPLETE)),
+                    "Partial JFR analysis did not complete");
 
             Path estimated = dir.resolve("analysis-estimate");
             OffCpuCorrelator.main(new String[] {
@@ -470,7 +473,7 @@ public final class OfflineCorrelatorTest {
                 "true"
             });
             JsonObject estimate = com.google.gson.JsonParser.parseString(
-                            Files.readString(estimated.resolve("report.json")))
+                            Files.readString(estimated.resolve(OutputFiles.REPORT)))
                     .getAsJsonObject()
                     .getAsJsonObject("populationEstimate");
             check(
@@ -562,10 +565,24 @@ public final class OfflineCorrelatorTest {
                             .addProperty("targetNamespaceFailures", "+0"));
             rejects(source, jfr, defaults, "Invalid unsigned decimal");
             source = source(dir, jfr, List.of(observation));
-            check(Files.isRegularFile(output.resolve("offcpu-synthetic.jfr")), "Missing default JFR output");
-            check(
-                    Files.isRegularFile(output.resolve("offcpu-signal-delivery-stacks.collapsed")),
-                    "Missing default collapsed output");
+            check(Files.isRegularFile(output.resolve(OutputFiles.SYNTHETIC_JFR)), "Missing default JFR output");
+            try (var listing = Files.list(output)) {
+                java.util.Set<String> names =
+                        listing.map(path -> path.getFileName().toString()).collect(java.util.stream.Collectors.toSet());
+                check(
+                        names.equals(java.util.Set.of(
+                                OutputFiles.REPORT,
+                                OutputFiles.COLLAPSED,
+                                OutputFiles.SYNTHETIC_JFR,
+                                OutputFiles.CLASSIFIED_RECORDS,
+                                OutputFiles.MATCHES,
+                                OutputFiles.COMPLETE)),
+                        "Complete analysis wrote an unexpected file set: " + names);
+                check(
+                        names.stream().allMatch(name -> name.startsWith(OutputFiles.PREFIX)),
+                        "Every output must carry the jonoffcpu- prefix: " + names);
+            }
+            check(Files.isRegularFile(output.resolve(OutputFiles.COLLAPSED)), "Missing default collapsed output");
             check(report.has("syntheticJfr"), "Missing JFR quantization metadata");
             for (String format : List.of("collapsed", "jfr")) {
                 Path selected = dir.resolve("analysis-" + format);
@@ -582,14 +599,13 @@ public final class OfflineCorrelatorTest {
                     "1000"
                 });
                 check(
-                        Files.exists(selected.resolve("offcpu-synthetic.jfr")) == format.equals("jfr"),
+                        Files.exists(selected.resolve(OutputFiles.SYNTHETIC_JFR)) == format.equals("jfr"),
                         "JFR output format selection ignored");
                 check(
-                        Files.exists(selected.resolve("offcpu-signal-delivery-stacks.collapsed"))
-                                == format.equals("collapsed"),
+                        Files.exists(selected.resolve(OutputFiles.COLLAPSED)) == format.equals("collapsed"),
                         "Collapsed output format selection ignored");
                 JsonObject selectedReport = com.google.gson.JsonParser.parseString(
-                                Files.readString(selected.resolve("report.json")))
+                                Files.readString(selected.resolve(OutputFiles.REPORT)))
                         .getAsJsonObject();
                 check(selectedReport.has("syntheticJfr") == format.equals("jfr"), "Incorrect JFR metadata selection");
                 if (format.equals("jfr")) {

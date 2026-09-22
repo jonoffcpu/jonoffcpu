@@ -13,7 +13,7 @@ on:
         required: true
         type: string
       runnable_artifact_name:
-        description: Name of the artifact containing the executable JARs and the forked jfr-converter.jar
+        description: Name of the artifact containing the agent and correlator JARs and the forked jfr-converter.jar
         required: false
         default: jonoffcpu-runnable-jars
         type: string
@@ -148,7 +148,7 @@ jobs:
           -PnativeArchitectures=all
           -PnativeLibcs=all
           --no-daemon
-      - name: Prepare downloadable executable JARs
+      - name: Prepare downloadable JARs
         run: |
           mkdir workflow-downloads
           mapfile -t agent_jars < <(find jonoffcpu-agent/build/libs -maxdepth 1 -type f \
@@ -161,7 +161,7 @@ jobs:
             -name 'jonoffcpu-jfr-converter-*.jar' \
             ! -name '*-sources.jar' ! -name '*-javadoc.jar')
           if [[ ${#agent_jars[@]} -ne 1 || ${#correlator_jars[@]} -ne 1 || ${#converter_jars[@]} -ne 1 ]]; then
-            echo "Expected exactly one executable JAR from each module" >&2
+            echo "Expected exactly one shaded JAR from each module" >&2
             printf 'Agent JARs: %s\n' "${agent_jars[*]}" >&2
             printf 'Correlator JARs: %s\n' "${correlator_jars[*]}" >&2
             printf 'Converter JARs: %s\n' "${converter_jars[*]}" >&2

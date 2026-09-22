@@ -64,9 +64,9 @@ def main():
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     (output / "jonoffcpu.yaml").write_text(
-        "correlationOutput: /out/correlation.ndjson\n"
+        "correlationOutput: /out/jonoffcpu-capture.ndjson\n"
         "asyncProfilerOptions: "
-        "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/original.jfr\n"
+        "event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr\n"
         "signalDelivery: queued\n"
         "sampling:\n"
         "  minOffCpuMicros: 100\n"
@@ -111,11 +111,11 @@ def main():
         output / "agent.log",
     )
 
-    manifest_path = output / "correlation.ndjson.manifest.json"
+    manifest_path = output / "jonoffcpu-capture.manifest.json"
     manifest = json.loads(require_file(manifest_path, "Capture manifest").read_text())
     if manifest.get("complete") is not True or manifest.get("state") != "complete":
         raise RuntimeError(f"Capture did not complete: {manifest_path}")
-    for path in (output / "correlation.ndjson", output / "original.jfr"):
+    for path in (output / "jonoffcpu-capture.ndjson", output / "jonoffcpu-capture.jfr"):
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError(f"Capture artifact is missing or empty: {path}")
 
@@ -124,7 +124,7 @@ def main():
             *common,
             java, "-cp", "/artifacts/jonoffcpu-agent.jar:/test-classes",
             "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
-            "/out/original.jfr", "/out/event-counts.json",
+            "/out/jonoffcpu-capture.jfr", "/out/event-counts.json",
         ],
         output / "recording-check.log",
     )
@@ -133,13 +133,13 @@ def main():
         [
             *common,
             java, "-jar", "/artifacts/jonoffcpu-correlator.jar",
-            "--source", "/out/correlation.ndjson",
-            "--jfr", "/out/original.jfr",
+            "--source", "/out/jonoffcpu-capture.ndjson",
+            "--jfr", "/out/jonoffcpu-capture.jfr",
             "--output", "/out/analysis",
         ],
         output / "correlator.log",
     )
-    report_path = output / "analysis/report.json"
+    report_path = output / "analysis/jonoffcpu-report.json"
     report = json.loads(require_file(report_path, "Correlation report").read_text())
     if report.get("matched", 0) <= 0:
         raise RuntimeError(f"Correlator produced no matched off-CPU samples: {report_path}")

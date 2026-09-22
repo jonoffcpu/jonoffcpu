@@ -28,10 +28,10 @@ def java_command(module, ap, jdk, case, mode, seconds):
         "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
         "-v", f"{case}:/out", "-w", "/out", "jonoffcpu-agent-runtime:ubuntu24.04",
         "/jdk/bin/java", "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/correlation.ndjson,"
+        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
         "shutdowntimeoutmillis=30000,nativestoptimeoutmillis=10000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,"
-        "lock=1ms,jfrsync=profile,file=/out/original.jfr",
+        "lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
         "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes",
         "io.github.lhotari.jonoffcpu.agent.NativeAgentShutdownWorkload", mode, str(seconds), "/out/ready",
     ]
@@ -72,7 +72,7 @@ def make_readable(case):
 
 
 def verify_footer(case):
-    source = case / "correlation.ndjson"
+    source = case / "jonoffcpu-capture.ndjson"
     data = source.read_bytes()
     if not data.endswith(b"\n"):
         raise RuntimeError("Correlation artifact is not LF terminated")
@@ -86,7 +86,7 @@ def verify_footer(case):
     receipt = footer.get("apStopResponse", "")
     if " finalized=true " not in receipt or not receipt.startswith("signal-capture-v1 stopped "):
         raise RuntimeError("Shutdown footer lacks a finalized async-profiler receipt")
-    manifest = json.loads((case / "correlation.ndjson.manifest.json").read_text())
+    manifest = json.loads((case / "jonoffcpu-capture.manifest.json").read_text())
     if manifest.get("complete") is not True or manifest.get("state") != "complete":
         raise RuntimeError("Audit manifest is incomplete")
 
@@ -95,11 +95,11 @@ def verify_case(module, ap, jdk, case):
     verify_footer(case)
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
-         case / "original.jfr", case / "event-counts.json"], case / "category-check.log")
+         case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", case / "correlation.ndjson", "--jfr", case / "original.jfr",
+         "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
          "--output", case / "analysis"], case / "analysis.log")
-    report = json.loads((case / "analysis/report.json").read_text())
+    report = json.loads((case / "analysis/jonoffcpu-report.json").read_text())
     if report["matched"] <= 0 or report["invalidSource"] or report["invalidJfr"]:
         raise RuntimeError("Shutdown artifacts did not produce verified off-CPU matches")
 

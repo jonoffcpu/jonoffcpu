@@ -332,26 +332,26 @@ public final class PartialCorrelatorTest {
         };
         check(OffCpuCorrelator.run(cli) == 2, "Partial API/CLI status must be 2");
         check(
-                !Files.exists(output.resolve("complete.json"))
-                        && !Files.exists(output.resolve("offcpu-synthetic.jfr"))
-                        && !Files.exists(output.resolve("offcpu-signal-delivery-stacks.collapsed")),
+                !Files.exists(output.resolve(OutputFiles.COMPLETE))
+                        && !Files.exists(output.resolve(OutputFiles.SYNTHETIC_JFR))
+                        && !Files.exists(output.resolve(OutputFiles.COLLAPSED)),
                 "Partial publication resembles complete output");
-        JsonObject marker = json(output.resolve("partial.json"));
+        JsonObject marker = json(output.resolve(OutputFiles.PARTIAL));
         check(
                 marker.get("state").getAsString().equals("incomplete")
                         && !marker.get("coverageComplete").getAsBoolean(),
                 "Partial marker promoted completion");
-        JsonObject report = json(output.resolve("INCOMPLETE-report.json"));
+        JsonObject report = json(output.resolve(OutputFiles.INCOMPLETE_REPORT));
         check(
                 !report.has("populationEstimate")
                         && report.get("analysisMode").getAsString().equals("partial"),
                 "Partial report estimates complete population");
         check(
-                Files.readString(output.resolve("INCOMPLETE-offcpu-signal-delivery-stacks.collapsed"))
+                Files.readString(output.resolve(OutputFiles.INCOMPLETE_COLLAPSED))
                         .startsWith("[INCOMPLETE capture: observed prefix only];"),
                 "Graph lost incomplete root label");
         check(
-                Files.readString(output.resolve("INCOMPLETE-pairs.jsonl")).contains("\"handlerDelayNanos\":null"),
+                Files.readString(output.resolve(OutputFiles.INCOMPLETE_PAIRS)).contains("\"handlerDelayNanos\":null"),
                 "Missing clock proof got a guessed delay");
         rejects(() -> OffCpuCorrelator.run(cli), "partial-output");
         for (List<String> extra : List.of(
@@ -396,8 +396,29 @@ public final class PartialCorrelatorTest {
             throw new AssertionError("Partial CLI subprocess timed out");
         }
         check(
-                process.exitValue() == 2 && Files.exists(subprocess.resolve("partial.json")),
+                process.exitValue() == 2 && Files.exists(subprocess.resolve(OutputFiles.PARTIAL)),
                 "Partial CLI process exit/marker mismatch: " + Files.readString(log));
+        // Running the JAR with no arguments is a request for help, not a failed analysis.
+        Path helpLog = dir.resolve("help-subprocess.log");
+        Process help = new ProcessBuilder(
+                        Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                        "-cp",
+                        System.getProperty("java.class.path"),
+                        OffCpuCorrelator.class.getName())
+                .redirectErrorStream(true)
+                .redirectOutput(helpLog.toFile())
+                .start();
+        if (!help.waitFor(30, TimeUnit.SECONDS)) {
+            help.destroyForcibly();
+            throw new AssertionError("Help subprocess timed out");
+        }
+        String helpText = Files.readString(helpLog);
+        check(
+                help.exitValue() == 0
+                        && helpText.startsWith("Usage: java -jar jonoffcpu-correlator.jar")
+                        && helpText.contains(OutputFiles.REPORT)
+                        && helpText.contains(OutputFiles.PARTIAL),
+                "No-argument run must print usage and exit 0: " + helpText);
     }
 
     public static void main(String[] args) throws Exception {

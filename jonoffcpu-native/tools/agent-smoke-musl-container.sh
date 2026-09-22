@@ -55,7 +55,7 @@ java_command=(
   --enable-native-access=ALL-UNNAMED
   -Xms128m
   -Xmx256m
-  "-agentpath:$agent_build/lib/libjonoffcpu.so=jonoffcpuoutput=/out/correlation.ndjson,jonoffcpudelivery=$JONOFFCPU_DELIVERY,asprofpath=$ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/original.jfr"
+  "-agentpath:$agent_build/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,jonoffcpudelivery=$JONOFFCPU_DELIVERY,asprofpath=$ap/build/lib/libasyncProfiler.so,event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr"
   -cp "$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
   io.github.lhotari.jonoffcpu.agent.NativeAgentWorkload
   "$JONOFFCPU_SECONDS"
@@ -66,14 +66,14 @@ printf '\n' >> /out/java-command.txt
 
 classpath="$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
 "$JAVA_HOME/bin/java" -cp "$classpath" io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck \
-  /out/original.jfr /out/event-counts.json > /out/category-check.log 2>&1
+  /out/jonoffcpu-capture.jfr /out/event-counts.json > /out/category-check.log 2>&1
 "$JAVA_HOME/bin/java" -cp "$classpath" io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator \
-  --source /out/correlation.ndjson \
-  --jfr /out/original.jfr \
+  --source /out/jonoffcpu-capture.ndjson \
+  --jfr /out/jonoffcpu-capture.jfr \
   --output /out/analysis > /out/analysis.log 2>&1
-"$JAVA_HOME/bin/jfr" summary /out/analysis/offcpu-synthetic.jfr \
+"$JAVA_HOME/bin/jfr" summary /out/analysis/jonoffcpu-offcpu-synthetic.jfr \
   > /out/synthetic-jfr-summary.log 2>&1
-"$ap/build/bin/jfrconv" --cpu /out/analysis/offcpu-synthetic.jfr \
+"$ap/build/bin/jfrconv" --cpu /out/analysis/jonoffcpu-offcpu-synthetic.jfr \
   /out/analysis/compatibility-view.collapsed > /out/converter.log 2>&1
 
 python3 - <<'PY'
@@ -81,7 +81,7 @@ import json
 from pathlib import Path
 
 out = Path('/out')
-report = json.loads((out / 'analysis/report.json').read_text())
+report = json.loads((out / 'analysis/jonoffcpu-report.json').read_text())
 events = json.loads((out / 'event-counts.json').read_text())
 collapsed = (out / 'analysis/compatibility-view.collapsed').read_text().splitlines()
 converted = sum(int(line.rsplit(' ', 1)[1]) for line in collapsed)

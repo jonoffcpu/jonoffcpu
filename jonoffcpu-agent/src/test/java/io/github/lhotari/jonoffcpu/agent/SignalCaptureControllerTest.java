@@ -69,6 +69,7 @@ public final class SignalCaptureControllerTest {
             samplingProbabilityParsing(root.resolve("sampling-probability"));
             samplingConfigParsing(root.resolve("sampling-config"));
             proportionalAdmissionThreshold();
+            siblingCaptureFileNames();
             unsignedStopCountersParse();
             System.out.println("SignalCaptureController fixtures passed");
         } finally {
@@ -85,7 +86,7 @@ public final class SignalCaptureControllerTest {
         SignalCaptureController controller = controller(root, profiler, source);
         Path directory = controller.start();
         check(controller.state() == SignalCaptureController.State.SOURCE_ENABLED, "source was not enabled");
-        check(Files.isRegularFile(root.resolve("correlation.ndjson.jfr")), "JFR path was not reserved");
+        check(Files.isRegularFile(root.resolve("correlation.jfr")), "JFR path was not reserved");
         Path manifest = controller.stop();
         check(controller.state() == SignalCaptureController.State.COMPLETE, "capture did not complete");
         JsonObject json = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
@@ -137,7 +138,7 @@ public final class SignalCaptureControllerTest {
         check(footer.get("recordType").getAsString().equals("captureFinalized"), "footer missing");
         check(footer.get("state").getAsString().equals("profilerOnly"), "footer state must be profilerOnly");
         check(footer.get("sourceDisabled").getAsBoolean(), "footer must flag the disabled source");
-        check(Files.size(root.resolve("correlation.ndjson.jfr")) > 0, "JFR recording missing");
+        check(Files.size(root.resolve("correlation.jfr")) > 0, "JFR recording missing");
         check(controller.stop().equals(manifest), "repeated stop must be idempotent");
     }
 
@@ -738,6 +739,23 @@ public final class SignalCaptureControllerTest {
                 // rejected as intended
             }
         }
+    }
+
+    private static void siblingCaptureFileNames() {
+        String[][] cases = {
+            {"/data/jonoffcpu-capture.ndjson", "/data/jonoffcpu-capture.manifest.json"},
+            {"/data/capture", "/data/capture.manifest.json"},
+            {"/data/.hidden", "/data/.hidden.manifest.json"},
+            {"/data/run.v1/capture", "/data/run.v1/capture.manifest.json"},
+            {"/data/capture.tar.gz", "/data/capture.tar.manifest.json"},
+        };
+        for (String[] pair : cases) {
+            Path actual = ManifestStore.sibling(Path.of(pair[0]), ".manifest.json");
+            check(actual.equals(Path.of(pair[1])), "sibling of " + pair[0] + " was " + actual);
+        }
+        check(
+                ManifestStore.sibling(Path.of("/data/capture.ndjson"), ".jfr").equals(Path.of("/data/capture.jfr")),
+                "default JFR sibling");
     }
 
     private static void proportionalAdmissionThreshold() {

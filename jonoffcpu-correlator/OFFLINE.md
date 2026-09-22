@@ -9,7 +9,7 @@ are advisory, so recordings can be moved together or supplied from new locations
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
-  --source capture.jsonl --jfr original.jfr --output analysis
+  --source jonoffcpu-capture.ndjson --jfr jonoffcpu-capture.jfr --output analysis
 ```
 
 A stream whose only row is a `captureFinalized` footer with
@@ -30,21 +30,17 @@ That mode permits missing capture-context and terminal-stat events, validates
 each retained sample against the source capture epoch, and reports source rows
 whose JFR sample was cut away as `sample-not-present-in-selected-jfr`.
 
-The output directory must not exist. A successful run writes:
+The output directory must not exist. Every file is named `jonoffcpu-…` so it is
+recognisable wherever the directory ends up. A successful run writes:
 
-- `report.json`: capture counters, classifications, handler-delay percentiles and
-  interpretation notes.
-- `classified-records.jsonl`: source and resolved JFR rows, including rejected
-  and unmatched observations, with their classification.
-- `matches.jsonl`: cookies, clipped intervals, delivery delays and whether the
-  target-to-JFR thread mapping could be verified.
-- `offcpu-signal-delivery-stacks.collapsed`: root-first stacks weighted in
-  integer microseconds instead of sample counts. Exact nanosecond durations remain
-  in the report. There is no inverse-probability scaling.
-- `offcpu-synthetic.jfr`: an explicitly synthetic CPU-compatible view, using
-  duration-quantized `jdk.ExecutionSample` events.
-- `complete.json`: written last. An interrupted directory without a valid
-  completion marker is not a complete analysis.
+| File | Contents | Written when |
+| --- | --- | --- |
+| `jonoffcpu-report.json` | Capture counters, classifications, handler-delay percentiles, interpretation notes and the opt-in population estimate | always |
+| `jonoffcpu-classified-records.jsonl` | Source and resolved JFR rows, including rejected and unmatched observations, with their classification | always |
+| `jonoffcpu-matches.jsonl` | Cookies, clipped intervals, delivery delays and whether the target-to-JFR thread mapping could be verified | always |
+| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling | `--format both` (default) or `collapsed` |
+| `jonoffcpu-offcpu-synthetic.jfr` | An explicitly synthetic CPU-compatible view, using duration-quantized `jdk.ExecutionSample` events | `--format both` (default) or `jfr` |
+| `jonoffcpu-complete.json` | Completion marker | last; a directory without it is not a complete analysis |
 
 The original combined JFR is never rewritten. CPU, allocation, lock, wall and JVM
 events in it remain available to other tools. Both derived formats are produced by default. Use `--format collapsed` or
@@ -71,11 +67,11 @@ option labels the flame graph in those microseconds:
 
 ```sh
 java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
-  offcpu-signal-delivery-stacks.collapsed offcpu.html
+  jonoffcpu-offcpu-stacks.collapsed offcpu.html
 ```
 
 Use `--estimate-population true` to add a separate, opt-in
-`populationEstimate` object to `report.json`. It estimates the total duration of
+`populationEstimate` object to `jonoffcpu-report.json`. It estimates the total duration of
 the completed, duration-eligible source interval population by weighting each
 valid source row with `duration * 2^32 / admissionThreshold`, where
 `admissionThreshold` is the exact threshold the kernel drew against for that row
@@ -165,12 +161,17 @@ java -jar jonoffcpu-correlator.jar \
 A successfully written partial diagnostic run exits with **status 2**. Complete
 analysis exits with status 0; errors exit with status 1. Partial mode never promotes
 its result to complete, even if the supplied inputs happen to be finalized.
-Its new output directory contains `INCOMPLETE-report.json`,
-`INCOMPLETE-classified-records.jsonl`, `INCOMPLETE-pairs.jsonl`, and a `partial.json`
-marker published last with `state: incomplete` and `coverageComplete: false`.
-There is no `complete.json` or normal synthetic JFR. Add `--format collapsed` for
-`INCOMPLETE-offcpu-signal-delivery-stacks.collapsed`; every stack has an explicit
-incomplete root label that survives ordinary flame graph rendering.
+Its new output directory holds a visibly different file set:
+
+| File | Contents | Written when |
+| --- | --- | --- |
+| `INCOMPLETE-jonoffcpu-report.json` | Diagnostics for the observed prefix | always |
+| `INCOMPLETE-jonoffcpu-classified-records.jsonl` | Classified source rows and JFR samples from the prefix | always |
+| `INCOMPLETE-jonoffcpu-pairs.jsonl` | Exact-cookie pairs found in the prefix, with null delivery delays where the clock could not be verified | always |
+| `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed` | Prefix stacks, each under an explicit incomplete root label that survives ordinary flame graph rendering | `--format collapsed` |
+| `jonoffcpu-partial.json` | Marker with `state: incomplete` and `coverageComplete: false` | last |
+
+There is never a `jonoffcpu-complete.json` or a synthetic JFR in partial mode.
 
 Only fully decoded records are retained. A final source row without its newline
 is discarded and its byte count reported; a malformed complete row remains an

@@ -98,7 +98,7 @@ The [release workflow](.github/workflows/release.yml) then:
 2. combines all four verified bundles into the universal Java agent;
 3. signs and publishes the artifacts with
    `publishAndReleaseToMavenCentral`, waiting for Central Portal validation; and
-4. copies the executable artifacts to stable `jonoffcpu-agent.jar` and
+4. copies the JARs to stable `jonoffcpu-agent.jar` and
    `jonoffcpu-correlator.jar` names and adds `jfr-converter.jar`, the
    `jonoffcpu-jfr-converter` JAR that the reusable workflow built from the
    pinned async-profiler fork's sources and checked against a collapsed

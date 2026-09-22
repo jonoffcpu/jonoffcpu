@@ -79,14 +79,20 @@ public final class OffCpuCorrelator {
 
     /** Returns 0 for complete analysis or 2 for explicitly incomplete diagnostics; failures throw. */
     public static int run(String[] args) throws Exception {
-        if (args.length == 1 && args[0].equals("--help")) {
+        // No arguments is a request for help, not a failed analysis.
+        if (args.length == 0 || args.length == 1 && (args[0].equals("--help") || args[0].equals("-h"))) {
             System.out.println("Usage: java -jar jonoffcpu-correlator.jar"
-                    + " --source capture.jsonl --jfr original.jfr --output new-directory"
+                    + " --source jonoffcpu-capture.ndjson --jfr jonoffcpu-capture.jfr --output new-directory"
                     + " [--from TIME] [--to TIME] [--partial-jfr true|false]"
                     + " [--from-ns N] [--to-ns N] [--max-handler-delay-ns N]"
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
                     + " [--partial true|false (partial format: diagnostics|collapsed)]");
+            System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
+                    + OutputFiles.COLLAPSED + ", " + OutputFiles.SYNTHETIC_JFR + ", "
+                    + OutputFiles.CLASSIFIED_RECORDS + ", " + OutputFiles.MATCHES + " and, last, "
+                    + OutputFiles.COMPLETE + "; --partial true writes " + OutputFiles.INCOMPLETE_PREFIX
+                    + "* files and " + OutputFiles.PARTIAL + " instead.");
             return 0;
         }
         Map<String, String> options = new HashMap<>();
@@ -190,7 +196,7 @@ public final class OffCpuCorrelator {
 
     /**
      * Writes to a new directory, never replacing existing inputs or reports. Consumers must require
-     * {@code complete.json}: it is created last. An interrupted output has no completion marker and
+     * {@code jonoffcpu-complete.json}: it is created last. An interrupted output has no completion marker and
      * is not a complete analysis, even if a partial collapsed file is present.
      */
     static void write(OfflineCorrelator.Analysis result, Path directory) throws IOException {
@@ -205,7 +211,7 @@ public final class OffCpuCorrelator {
         Files.createDirectory(directory);
         Gson gson = new GsonBuilder().serializeNulls().create();
         if (options.collapsed()) {
-            try (BufferedWriter writer = newFile(directory.resolve("offcpu-signal-delivery-stacks.collapsed"))) {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COLLAPSED))) {
                 for (var entry : new TreeMap<>(result.collapsedNanos()).entrySet()) {
                     writer.write(entry.getKey());
                     writer.write(' ');
@@ -215,15 +221,16 @@ public final class OffCpuCorrelator {
             }
         }
         CompatibilityJfrWriter.Result compatibility = options.compatibilityJfr()
-                ? CompatibilityJfrWriter.write(result, directory.resolve("offcpu-synthetic.jfr"), options.jfrOptions())
+                ? CompatibilityJfrWriter.write(
+                        result, directory.resolve(OutputFiles.SYNTHETIC_JFR), options.jfrOptions())
                 : null;
-        try (BufferedWriter writer = newFile(directory.resolve("classified-records.jsonl"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
             for (var row : result.records()) {
                 gson.toJson(row, writer);
                 writer.newLine();
             }
         }
-        try (BufferedWriter writer = newFile(directory.resolve("matches.jsonl"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.MATCHES))) {
             for (var match : result.matches()) {
                 JsonObject row = new JsonObject();
                 row.addProperty(
@@ -297,12 +304,12 @@ public final class OffCpuCorrelator {
             view.addProperty("omittedRemainderNanos", compatibility.omittedRemainderNanos());
             report.add("syntheticJfr", view);
         }
-        try (BufferedWriter writer = newFile(directory.resolve("report.json"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.REPORT))) {
             // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
             new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
             writer.newLine();
         }
-        try (BufferedWriter writer = newFile(directory.resolve("complete.json"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
             writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
         }
     }
@@ -316,8 +323,7 @@ public final class OffCpuCorrelator {
         Files.createDirectory(directory);
         Gson gson = new GsonBuilder().serializeNulls().create();
         if (collapsed) {
-            try (BufferedWriter writer =
-                    newFile(directory.resolve("INCOMPLETE-offcpu-signal-delivery-stacks.collapsed"))) {
+            try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_COLLAPSED))) {
                 for (var entry : new TreeMap<>(result.collapsedNanos()).entrySet()) {
                     writer.write("[INCOMPLETE capture: observed prefix only];");
                     writer.write(entry.getKey());
@@ -327,7 +333,7 @@ public final class OffCpuCorrelator {
                 }
             }
         }
-        try (BufferedWriter writer = newFile(directory.resolve("INCOMPLETE-classified-records.jsonl"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_CLASSIFIED_RECORDS))) {
             for (var record : result.records()) {
                 JsonObject row = gson.toJsonTree(record).getAsJsonObject();
                 row.addProperty("state", "incomplete");
@@ -336,7 +342,7 @@ public final class OffCpuCorrelator {
                 writer.newLine();
             }
         }
-        try (BufferedWriter writer = newFile(directory.resolve("INCOMPLETE-pairs.jsonl"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_PAIRS))) {
             for (var pair : result.pairs()) {
                 JsonObject row = new JsonObject();
                 row.addProperty("state", "incomplete");
@@ -380,7 +386,7 @@ public final class OffCpuCorrelator {
         report.addProperty("sourceSelectedObservedDurationNanos", result.sourceSelectedObservedDurationNanos());
         report.addProperty("pairedSelectedObservedDurationNanos", result.pairedSelectedObservedDurationNanos());
         report.addProperty("submittedButNotParsed", result.submittedButNotParsed());
-        try (BufferedWriter writer = newFile(directory.resolve("INCOMPLETE-report.json"))) {
+        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_REPORT))) {
             new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
             writer.newLine();
         }
@@ -394,7 +400,7 @@ public final class OffCpuCorrelator {
         Path temporary = Files.createTempFile(directory, ".partial-marker-", ".tmp");
         try {
             Files.writeString(temporary, gson.toJson(marker) + "\n", StandardCharsets.UTF_8);
-            Files.createLink(directory.resolve("partial.json"), temporary);
+            Files.createLink(directory.resolve(OutputFiles.PARTIAL), temporary);
         } finally {
             Files.deleteIfExists(temporary);
         }

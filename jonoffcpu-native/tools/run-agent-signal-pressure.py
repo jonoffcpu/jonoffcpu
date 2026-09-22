@@ -53,12 +53,12 @@ def cpu_model():
 def java_command(module, ap, jdk, case, delivery, signo, blocked_ms, recovery_ms):
     build = module / "build"
     options = (
-        f"jonoffcpuoutput=/out/correlation.ndjson,jonoffcpudelivery={delivery},"
+        f"jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,jonoffcpudelivery={delivery},"
         "sampling-policy=uniform,sampling-probability=1,min-off-cpu-micros=1000,deliverygracemillis=3000,"
         "nativestoptimeoutmillis=30000,shutdowntimeoutmillis=30000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
         f"cookiesignal={signo},event=cpu,alloc=1m,wall=10ms,lock=1ms,"
-        "jfrsync=profile,file=/out/original.jfr"
+        "jfrsync=profile,file=/out/jonoffcpu-capture.jfr"
     )
     return [
         "docker", "run", "--rm", "--privileged", "--memory=1g", "--ulimit", "core=0",
@@ -142,29 +142,29 @@ def exact_cookie_check(records, allow_delay_rejections):
 def analyze_case(module, ap, jdk, case, delivery, signo):
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
-         case / "original.jfr", case / "event-counts.json"], case / "category-check.log")
+         case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     for name, extra in (("analysis-exact", []),
                         ("analysis-delay-filtered", ["--max-handler-delay-ns", str(DELAY_LIMIT_NS)])):
         run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-             "--source", case / "correlation.ndjson", "--jfr", case / "original.jfr",
+             "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
              "--output", case / name, "--max-retained-bytes", str(1024 * 1024 * 1024),
              *extra], case / f"{name}.log")
 
-    exact = json.loads((case / "analysis-exact/report.json").read_text())
-    delayed = json.loads((case / "analysis-delay-filtered/report.json").read_text())
+    exact = json.loads((case / "analysis-exact/jonoffcpu-report.json").read_text())
+    delayed = json.loads((case / "analysis-delay-filtered/jonoffcpu-report.json").read_text())
     reconcile(exact)
     reconcile(delayed)
     exact_reasons, _ = exact_cookie_check(
-        classified(case / "analysis-exact/classified-records.jsonl"), False)
+        classified(case / "analysis-exact/jonoffcpu-classified-records.jsonl"), False)
     delayed_reasons, delay_pairs = exact_cookie_check(
-        classified(case / "analysis-delay-filtered/classified-records.jsonl"), True)
+        classified(case / "analysis-delay-filtered/jonoffcpu-classified-records.jsonl"), True)
     if exact["matched"] <= 0 or exact["unmatchedSource"] <= 0:
         raise RuntimeError("Pressure run needs both delivered and lost/coalesced source observations")
     if exact["orphanJfr"] or exact["invalidSource"] or exact["invalidJfr"] \
             or exact["identityUnverified"]:
         raise RuntimeError("Exact analysis contains orphan, invalid, or unverified rows")
 
-    source_rows = rows(case / "correlation.ndjson")
+    source_rows = rows(case / "jonoffcpu-capture.ndjson")
     start = next(row for row in source_rows if row.get("recordType") == "captureStart")
     end = next(row for row in source_rows if row.get("recordType") == "captureEnd")
     footer = source_rows[-1]
@@ -192,7 +192,7 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
         raise RuntimeError("Terminal mask audit did not observe the deliberately blocked Java thread")
 
     converted = case / "analysis-exact/compatibility-view.collapsed"
-    run([ap / "build/bin/jfrconv", "--cpu", case / "analysis-exact/offcpu-synthetic.jfr", converted],
+    run([ap / "build/bin/jfrconv", "--cpu", case / "analysis-exact/jonoffcpu-offcpu-synthetic.jfr", converted],
         case / "converter.log")
     converted_count = sum(int(line.rsplit(" ", 1)[1]) for line in converted.read_text().splitlines())
     if converted_count != int(exact["syntheticJfr"]["syntheticEvents"]):

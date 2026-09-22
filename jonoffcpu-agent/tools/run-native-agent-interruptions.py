@@ -39,10 +39,10 @@ def java_command(module, ap, jdk, case, mode, seconds):
         "-v", "/sys/kernel/tracing:/sys/kernel/tracing",
         "-v", f"{case}:/out", "-w", "/out", "jonoffcpu-agent-runtime:ubuntu24.04",
         "/jdk/bin/java", "--enable-native-access=ALL-UNNAMED", "-Xms128m", "-Xmx256m",
-        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/correlation.ndjson,"
+        "-agentpath:/agent/lib/libjonoffcpu.so=jonoffcpuoutput=/out/jonoffcpu-capture.ndjson,"
         f"{controller}shutdowntimeoutmillis=30000,nativestoptimeoutmillis=10000,"
         "asprofpath=/ap/build/lib/libasyncProfiler.so,"
-        f"{profiler}event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/original.jfr",
+        f"{profiler}event=cpu,alloc=1m,wall=10ms,lock=1ms,jfrsync=profile,file=/out/jonoffcpu-capture.jfr",
         "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes",
         "io.github.lhotari.jonoffcpu.agent.NativeAgentShutdownWorkload", workload_mode, str(seconds), "/out/ready",
     ]
@@ -76,7 +76,7 @@ def run_sigkill(command, case):
 
 
 def footer(case):
-    rows = [json.loads(line) for line in (case / "correlation.ndjson").read_text().splitlines()]
+    rows = [json.loads(line) for line in (case / "jonoffcpu-capture.ndjson").read_text().splitlines()]
     footers = [row for row in rows if row.get("recordType") == "captureFinalized"]
     if len(footers) != 1 or rows[-1] is not footers[0] or footers[0].get("state") != "complete":
         raise RuntimeError("Expected exactly one complete terminal footer")
@@ -84,9 +84,9 @@ def footer(case):
 
 
 def verify_abrupt(module, jdk, case):
-    source = case / "correlation.ndjson"
-    jfr = case / "original.jfr"
-    manifest_path = case / "correlation.ndjson.manifest.json"
+    source = case / "jonoffcpu-capture.ndjson"
+    jfr = case / "jonoffcpu-capture.jfr"
+    manifest_path = case / "jonoffcpu-capture.manifest.json"
     if not source.is_file() or source.stat().st_size == 0 or not jfr.exists():
         raise RuntimeError("Abrupt exit did not retain its partial source/JFR paths")
     if b"captureFinalized" in source.read_bytes():
@@ -99,7 +99,7 @@ def verify_abrupt(module, jdk, case):
     result = run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
                   "--source", source, "--jfr", jfr, "--output", analysis],
                  case / "analysis-rejected.log", check=False)
-    if result == 0 or (analysis / "report.json").exists():
+    if result == 0 or (analysis / "jonoffcpu-report.json").exists():
         raise RuntimeError("Abrupt partial artifacts were accepted as complete analysis")
     (case / "partial-artifacts.json").write_text(json.dumps({
         "sourceBytes": source.stat().st_size,
@@ -114,7 +114,7 @@ def verify_ap_first(module, jdk, case, expected_reason):
     receipt = terminal.get("apStopResponse", "")
     if f" reason={expected_reason}" not in receipt or " finalized=true " not in receipt:
         raise RuntimeError(f"Unexpected retained AP receipt: {receipt}")
-    manifest = json.loads((case / "correlation.ndjson.manifest.json").read_text())
+    manifest = json.loads((case / "jonoffcpu-capture.manifest.json").read_text())
     if manifest.get("complete") is not True or manifest.get("state") != "complete":
         raise RuntimeError("AP-first audit manifest is incomplete")
     retained = manifest.get("asyncProfilerStop", {}).get("response", "")
@@ -122,19 +122,19 @@ def verify_ap_first(module, jdk, case, expected_reason):
         raise RuntimeError("Footer and audit manifest retained different AP receipts")
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.agent.MixedRecordingCheck",
-         case / "original.jfr", case / "event-counts.json"], case / "category-check.log")
+         case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     run([jdk / "bin/java", "-cp", classpath, "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-         "--source", case / "correlation.ndjson", "--jfr", case / "original.jfr",
+         "--source", case / "jonoffcpu-capture.ndjson", "--jfr", case / "jonoffcpu-capture.jfr",
          "--output", case / "analysis"], case / "analysis.log")
 
-    report = json.loads((case / "analysis/report.json").read_text())
+    report = json.loads((case / "analysis/jonoffcpu-report.json").read_text())
     source_total = report["matched"] + report["unmatchedSource"] + report["invalidSource"]
     jfr_total = report["matched"] + report["orphanJfr"] + report["invalidJfr"]
     if source_total != report["sourceRows"] or jfr_total != report["jfrSamples"]:
         raise RuntimeError("Offline source/JFR classifications do not reconcile")
     cutoff = int(report["apStoppedAtNanos"])
     after = []
-    for line in (case / "analysis/classified-records.jsonl").read_text().splitlines():
+    for line in (case / "analysis/jonoffcpu-classified-records.jsonl").read_text().splitlines():
         row = json.loads(line)
         if row["stream"] != "source":
             continue

@@ -121,7 +121,8 @@ and exact-cookie matches rather than only checking process exit status.
 
 ## Packaging and compatibility
 
-- Keep the agent and correlator as shaded executable JARs. Relocate bundled
+- Keep the agent and correlator as shaded, self-contained JARs: the agent is a
+  `-javaagent` JAR, the correlator a runnable one. Relocate bundled
   dependencies to avoid conflicts for users of their Java APIs. The
   jfr-converter has no dependencies and keeps its upstream `one.*` packages and
   Apache-2.0 license.
@@ -129,6 +130,10 @@ and exact-cookie matches rather than only checking process exit status.
   collector, and patched async-profiler, each in a glibc and a musl flavour,
   plus their checksum manifest. The agent selects the flavour from the C
   library mapped into the running JVM and never falls back to the other one.
+- Every file the agent or the correlator creates is named `jonoffcpu-…`: the
+  correlator's names are the `OutputFiles` constants, and the agent derives
+  its manifest and default JFR from the stem of `correlationOutput` via
+  `ManifestStore.sibling`. Never spell an output name inline.
 - Keep public configuration, manifest, NDJSON, report, and CLI changes backward
   compatible unless a format/version migration is designed and documented.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on
