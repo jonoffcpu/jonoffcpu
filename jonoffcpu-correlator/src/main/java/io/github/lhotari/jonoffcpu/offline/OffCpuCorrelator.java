@@ -142,7 +142,8 @@ public final class OffCpuCorrelator {
                     + " [--from-ns N] [--to-ns N] [--max-handler-delay-ns N]"
                     + " [--max-rows N] [--max-retained-bytes N] [--format both|collapsed|jfr]"
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
-                    + " [--audit none|matches|full] [--partial true|false (partial format: diagnostics|collapsed)]");
+                    + " [--audit none|matches|full] [--thinning Q (0 < Q <= 1, keep probability)]"
+                    + " [--partial true|false (partial format: diagnostics|collapsed)]");
             System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
                     + "   (prints the capture stream as NDJSON, stacks expanded)");
             System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
@@ -174,7 +175,8 @@ public final class OffCpuCorrelator {
                 "--from",
                 "--to",
                 "--partial-jfr",
-                "--audit");
+                "--audit",
+                "--thinning");
         for (int i = 0; i < args.length; i += 2) {
             if (i + 1 == args.length
                     || !allowed.contains(args[i])
@@ -208,13 +210,19 @@ public final class OffCpuCorrelator {
         if (estimatePopulation && (partialJfr || hasJfrRange)) {
             throw new IllegalArgumentException("Population estimates require the complete unselected JFR");
         }
+        if (estimatePopulation && options.containsKey("--thinning")) {
+            throw new IllegalArgumentException("Population estimates require the unthinned source");
+        }
+        Thinning thinning =
+                options.containsKey("--thinning") ? Thinning.of(options.get("--thinning"), 0L) : Thinning.NONE;
         String format = options.getOrDefault("--format", partial ? "diagnostics" : "both");
         if (partial) {
             if (!Set.of("diagnostics", "collapsed").contains(format)
                     || estimatePopulation
                     || options.containsKey("--quantum-ns")
                     || options.containsKey("--max-synthetic-events")
-                    || options.containsKey("--audit")) {
+                    || options.containsKey("--audit")
+                    || options.containsKey("--thinning")) {
                 throw new IllegalArgumentException("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -244,7 +252,7 @@ public final class OffCpuCorrelator {
                     range == null ? null : range.from(), range == null ? null : range.to(), partialJfr);
         }
         CorrelationResult result =
-                CorrelationEngine.correlate(Path.of(options.get("--source")), jfr, limits, selection, false);
+                CorrelationEngine.correlate(Path.of(options.get("--source")), jfr, limits, selection, false, thinning);
         write(
                 AnalysisOutput.of(result, Path.of(options.get("--source")), jfr, selection),
                 Path.of(options.get("--output")),
@@ -307,9 +315,19 @@ public final class OffCpuCorrelator {
                 }
             }
         }
+        // The synthetic JFR keeps its observed scale: thinning shrinks the quantum an event consumes so
+        // that, once reweighted by the caller, one event still represents one requested quantum of
+        // estimated time.
+        CompatibilityJfrWriter.Options requestedJfrOptions = options.jfrOptions();
+        CompatibilityJfrWriter.Options effectiveJfrOptions = output.thinning().active()
+                ? new CompatibilityJfrWriter.Options(
+                        output.thinning().scaleQuantum(requestedJfrOptions.quantumNanos()),
+                        requestedJfrOptions.maxSyntheticEvents(),
+                        requestedJfrOptions.onEventLimit())
+                : requestedJfrOptions;
         CompatibilityJfrWriter.Result compatibility = options.compatibilityJfr()
                 ? CompatibilityJfrWriter.write(
-                        output.synthetic(), directory.resolve(OutputFiles.SYNTHETIC_JFR), options.jfrOptions())
+                        output.synthetic(), directory.resolve(OutputFiles.SYNTHETIC_JFR), effectiveJfrOptions)
                 : null;
         if (options.audit() == AuditLevel.FULL) {
             try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.CLASSIFIED_RECORDS))) {
@@ -329,6 +347,15 @@ public final class OffCpuCorrelator {
         report.addProperty(
                 "weightSemantics",
                 "collapsed stacks use rounded integer microseconds; exact selected duration remains in nanoseconds");
+        if (output.thinning().active()) {
+            report.add("sourceThinning", output.thinning().report());
+            report.addProperty("keptSourceRows", Integer.toString(output.sourceRows()));
+            report.addProperty("observedKeptDurationNanos", Long.toString(output.observedKeptDurationNanos()));
+            report.addProperty(
+                    "weightSemantics",
+                    "collapsed stacks are inverse-probability estimates from a thinned subsample;"
+                            + " observed kept nanoseconds are reported separately");
+        }
         report.add("analysisInputs", output.analysisInputs());
         report.add("sourceCounters", output.sourceCounters());
         report.addProperty("apStoppedAtNanos", output.apStoppedAtNanos());
@@ -366,8 +393,12 @@ public final class OffCpuCorrelator {
         if (compatibility != null) {
             JsonObject view = new JsonObject();
             view.addProperty("path", compatibility.output().getFileName().toString());
-            view.addProperty("quantumNanos", Long.toString(compatibility.quantumNanos()));
+            // quantumNanos is the requested quantum at estimated scale (what one reweighted event
+            // represents); observedQuantumNanos is the actual, possibly thinning-shrunk and
+            // event-limit-raised, quantum of observed time an event was built from.
+            view.addProperty("quantumNanos", Long.toString(requestedJfrOptions.quantumNanos()));
             view.addProperty("requestedQuantumNanos", Long.toString(compatibility.requestedQuantumNanos()));
+            view.addProperty("observedQuantumNanos", Long.toString(compatibility.quantumNanos()));
             view.addProperty("quantumRaisedForEventLimit", compatibility.quantumRaised());
             view.addProperty("syntheticEvents", Long.toString(compatibility.syntheticEvents()));
             view.addProperty("representedNanos", compatibility.representedNanos());

@@ -45,6 +45,12 @@ interface AnalysisOutput {
 
     String selectedObservedDurationNanos();
 
+    /** The unscaled selected observed duration of the kept subsample, before any thinning reweight. */
+    long observedKeptDurationNanos();
+
+    /** {@link Thinning#NONE} unless a correlation-time thinning stage was applied. */
+    Thinning thinning();
+
     String submittedButNotParsed();
 
     /** Collapsed weights by root-first stack key, only for stacks with positive selected duration. */
@@ -135,6 +141,16 @@ interface AnalysisOutput {
             }
 
             @Override
+            public long observedKeptDurationNanos() {
+                return Long.parseLong(analysis.selectedObservedDurationNanos());
+            }
+
+            @Override
+            public Thinning thinning() {
+                return Thinning.NONE;
+            }
+
+            @Override
             public String submittedButNotParsed() {
                 return analysis.submittedButNotParsed();
             }
@@ -200,6 +216,9 @@ interface AnalysisOutput {
     /** The streamed view: counters come off the columns, and the per-row output re-reads the two files. */
     static AnalysisOutput of(
             CorrelationResult result, Path source, Path jfr, OfflineCorrelator.JfrSelection selection) {
+        String label = result.thinning().active()
+                ? "[thinned q=" + result.thinning().probability() + "; inverse-probability estimate];"
+                : "";
         return new AnalysisOutput() {
             @Override
             public JsonObject analysisInputs() {
@@ -267,7 +286,19 @@ interface AnalysisOutput {
 
             @Override
             public String selectedObservedDurationNanos() {
-                return Long.toString(result.selectedObservedDurationNanos());
+                return result.thinning()
+                        .scale(result.selectedObservedDurationNanos())
+                        .toString();
+            }
+
+            @Override
+            public long observedKeptDurationNanos() {
+                return result.selectedObservedDurationNanos();
+            }
+
+            @Override
+            public Thinning thinning() {
+                return result.thinning();
             }
 
             @Override
@@ -277,7 +308,16 @@ interface AnalysisOutput {
 
             @Override
             public Map<String, String> collapsedNanos() {
-                return OfflineCorrelator.collapsedNanos(result);
+                Map<String, String> weights = new java.util.TreeMap<>();
+                for (int id = 0; id < result.collapsedNanos().length; id++) {
+                    long nanos = result.collapsedNanos()[id];
+                    if (nanos > 0) {
+                        weights.put(
+                                label + result.dictionaries().collapsedKey(id),
+                                result.thinning().scale(nanos).toString());
+                    }
+                }
+                return weights;
             }
 
             @Override

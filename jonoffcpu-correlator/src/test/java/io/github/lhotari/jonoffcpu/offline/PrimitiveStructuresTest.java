@@ -193,6 +193,43 @@ public final class PrimitiveStructuresTest {
         check(empty.syntheticEvents() == 0 && !empty.raised(), "An empty correlation needs no coarsening");
     }
 
+    private static void thinning() {
+        check(!Thinning.NONE.active() && Thinning.NONE.keeps(1234L), "q = 1 must keep every cookie");
+        check(Thinning.NONE.scale(3000).equals(java.math.BigInteger.valueOf(3000)), "q = 1 must not reweight");
+        Thinning tenth = Thinning.of("0.1", 0);
+        check(tenth.active(), "q = 0.1 must be active");
+        int kept = 0;
+        for (long cookie = 1; cookie <= 200_000; cookie++) {
+            if (tenth.keeps(0x8000000100000000L | cookie)) kept++;
+        }
+        // 200k draws at q = 0.1: five sigma is about 670, so this band cannot fail by chance.
+        check(kept > 19_000 && kept < 21_000, "Thinning kept " + kept + " of 200000, which is not about a tenth");
+        for (long cookie = 1; cookie <= 1000; cookie++) {
+            check(
+                    tenth.keeps(0x8000000100000000L | cookie)
+                            == Thinning.of("0.1", 0).keeps(0x8000000100000000L | cookie),
+                    "The keep decision must depend only on the cookie, the probability and the seed");
+        }
+        check(
+                Thinning.of("0.1", 1).keeps(0x8000000100000001L) != tenth.keeps(0x8000000100000001L)
+                        || Thinning.of("0.1", 1).threshold() == tenth.threshold(),
+                "A different seed must be able to change a decision");
+        // Reweighting is the exact reciprocal of the realised keep probability, not of the requested one.
+        java.math.BigInteger realised = U64.big(tenth.threshold());
+        java.math.BigInteger expected = java.math.BigInteger.valueOf(1000)
+                .shiftLeft(64)
+                .add(realised.shiftRight(1))
+                .divide(realised);
+        check(
+                tenth.scale(1000).equals(expected),
+                "Reweighting is not the exact reciprocal of the realised probability");
+        check(
+                tenth.scale(1000).compareTo(java.math.BigInteger.valueOf(9990)) > 0
+                        && tenth.scale(1000).compareTo(java.math.BigInteger.valueOf(10010)) < 0,
+                "q = 0.1 must scale a thousand observed nanoseconds to about ten thousand");
+        check(tenth.scaleQuantum(1_000_000) < 1_000_000, "A thinned run must spend fewer observed nanos per event");
+    }
+
     public static void main(String[] args) throws Exception {
         unsigned();
         cookieIndex();
@@ -200,6 +237,7 @@ public final class PrimitiveStructuresTest {
         columns();
         budget();
         quantum();
+        thinning();
         System.out.println("Primitive structure fixtures passed");
     }
 }

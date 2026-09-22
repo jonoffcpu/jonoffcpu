@@ -92,6 +92,7 @@ public final class StreamingCorrelatorTest {
         for (JsonObject report : List.of(streamedReport, retainedReport)) {
             report.getAsJsonObject("syntheticJfr").remove("quantumNanos");
             report.getAsJsonObject("syntheticJfr").remove("requestedQuantumNanos");
+            report.getAsJsonObject("syntheticJfr").remove("observedQuantumNanos");
             report.getAsJsonObject("syntheticJfr").remove("quantumRaisedForEventLimit");
         }
         check(streamedReport.equals(retainedReport), "Reports differ beyond the synthetic quantum fields");
@@ -269,6 +270,109 @@ public final class StreamingCorrelatorTest {
         System.out.println("Scale fixture peak retained bytes: " + result.peakRetainedBytes());
     }
 
+    /** Spec acceptance 7: thinning is usable only if the towers keep their proportions. */
+    private static void thinningAccuracy(Path dir) throws Exception {
+        int rows = 200_000;
+        Path jfr = ScaleFixture.recording(dir, rows, 8);
+        Path source = ScaleFixture.capture(dir, jfr, rows);
+        var limits = new OfflineCorrelator.Limits(rows * 2 + 16, 1024 * 1024, 400L << 20, 4096, null, null, null);
+        var exact = CorrelationEngine.correlate(source, jfr, limits, null, false, Thinning.NONE);
+        var thinned = CorrelationEngine.correlate(source, jfr, limits, null, false, Thinning.of("0.1", 0));
+        List<String> exactTop = topStacks(exact, 5);
+        List<String> thinnedTop = topStacks(thinned, 5);
+        check(exactTop.equals(thinnedTop), "Thinning reordered the top stacks: " + thinnedTop + " vs " + exactTop);
+        for (String key : exactTop) {
+            java.math.BigInteger full = weight(exact, key);
+            java.math.BigInteger estimate = weight(thinned, key);
+            java.math.BigInteger difference = estimate.subtract(full).abs().multiply(java.math.BigInteger.valueOf(100));
+            check(
+                    difference.compareTo(full.multiply(java.math.BigInteger.TEN)) <= 0,
+                    "Reweighted total for " + key + " is more than 10% from the exact one: " + estimate + " vs "
+                            + full);
+        }
+    }
+
+    /** Spec acceptance 8: the same capture, the same q, byte-identical output, order-independent. */
+    private static void thinningDeterminism(Path dir) throws Exception {
+        int rows = 20_000;
+        Path jfr = ScaleFixture.recording(dir, rows, 8);
+        Path source = ScaleFixture.capture(dir, jfr, rows);
+        Path first = dir.resolve("thinned-1");
+        Path second = dir.resolve("thinned-2");
+        for (Path output : List.of(first, second)) {
+            OffCpuCorrelator.main(new String[] {
+                "--source",
+                source.toString(),
+                "--jfr",
+                jfr.toString(),
+                "--output",
+                output.toString(),
+                "--format",
+                "collapsed",
+                "--audit",
+                "none",
+                "--thinning",
+                "0.1"
+            });
+        }
+        check(
+                Files.readString(first.resolve(OutputFiles.COLLAPSED))
+                        .equals(Files.readString(second.resolve(OutputFiles.COLLAPSED))),
+                "The same capture and q produced different collapsed stacks");
+        Path shuffled = ScaleFixture.shuffledCapture(dir, jfr, rows, 20260922L);
+        Path third = dir.resolve("thinned-3");
+        OffCpuCorrelator.main(new String[] {
+            "--source",
+            shuffled.toString(),
+            "--jfr",
+            jfr.toString(),
+            "--output",
+            third.toString(),
+            "--format",
+            "collapsed",
+            "--audit",
+            "none",
+            "--thinning",
+            "0.1"
+        });
+        check(
+                Files.readString(first.resolve(OutputFiles.COLLAPSED))
+                        .equals(Files.readString(third.resolve(OutputFiles.COLLAPSED))),
+                "Shuffling the capture changed the thinned result");
+    }
+
+    /** The top {@code limit} collapsed stacks by thinning-reweighted duration, descending, ties broken on key. */
+    private static List<String> topStacks(CorrelationResult result, int limit) {
+        record Entry(String key, java.math.BigInteger weight) {}
+        List<Entry> entries = new ArrayList<>();
+        for (int id = 0; id < result.collapsedNanos().length; id++) {
+            long nanos = result.collapsedNanos()[id];
+            if (nanos > 0) {
+                entries.add(new Entry(
+                        result.dictionaries().collapsedKey(id),
+                        result.thinning().scale(nanos)));
+            }
+        }
+        entries.sort(
+                Comparator.comparing(Entry::weight, Comparator.reverseOrder()).thenComparing(Entry::key));
+        List<String> top = new ArrayList<>();
+        for (Entry entry : entries) {
+            if (top.size() >= limit) break;
+            top.add(entry.key());
+        }
+        return top;
+    }
+
+    /** The thinning-reweighted duration of the given collapsed stack key. */
+    private static java.math.BigInteger weight(CorrelationResult result, String key) {
+        for (int id = 0; id < result.collapsedNanos().length; id++) {
+            if (result.dictionaries().collapsedKey(id).equals(key)) {
+                return result.thinning().scale(result.collapsedNanos()[id]);
+            }
+        }
+        throw new AssertionError("Stack not found: " + key);
+    }
+
     /**
      * Builds the scale fixture's JFR and capture stream without ever retaining more than one row:
      * the JFR is produced by {@code jdk.jfr.Recording}'s own native buffering, and the capture stream
@@ -315,7 +419,11 @@ public final class StreamingCorrelatorTest {
                     // too, or every row past the point where the fixed default falls behind is classified
                     // invalid-handler-delay instead of matched.
                     sample.monotonicTimeNanos = 5000L + row;
-                    commitAtDepth(1 + (row % distinctStacks), sample);
+                    // A skewed (power-of-two) distribution across distinct stacks, not a uniform round
+                    // robin: distinct stacks then carry distinctly separated weights, so the top-stack
+                    // ranking the thinning-accuracy fixture checks cannot be reordered by thinning's
+                    // sampling noise on stacks that would otherwise be exactly tied.
+                    commitAtDepth(1 + (Integer.numberOfTrailingZeros(row + 1) % distinctStacks), sample);
                 }
                 OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
                 stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = rows;
@@ -511,6 +619,55 @@ public final class StreamingCorrelatorTest {
             Files.delete(body);
             return result;
         }
+
+        /**
+         * The same rows as {@link #capture}, emitted in a seeded permutation, with the footer's
+         * {@code rawBytes}/{@code rawSha256} recomputed for the reordered body. The stack records stay
+         * ahead of every observation, which the format requires regardless of observation order.
+         */
+        static Path shuffledCapture(Path dir, Path jfr, int rows, long seed) throws Exception {
+            JfrSummary summary = jfrSummary(jfr);
+            int[] order = new int[rows];
+            for (int row = 0; row < rows; row++) order[row] = row;
+            java.util.Random random = new java.util.Random(seed);
+            for (int index = rows - 1; index > 0; index--) {
+                int swapWith = random.nextInt(index + 1);
+                int value = order[index];
+                order[index] = order[swapWith];
+                order[swapWith] = value;
+            }
+            Path body = dir.resolve("scale-shuffled-body-" + rows + "-" + seed + ".tmp");
+            MessageDigest digest = CaptureInput.sha256();
+            try (var out = new BufferedOutputStream(new DigestOutputStream(Files.newOutputStream(body), digest))) {
+                out.write(CaptureStreamFixture.header());
+                CaptureStreamFixture.record(captureStart()).writeDelimitedTo(out);
+                CaptureStreamFixture.record(
+                                OfflineCorrelatorTest.stack(OfflineCorrelatorTest.KERNEL_STACK_ID, "kernel_wait"))
+                        .writeDelimitedTo(out);
+                CaptureStreamFixture.record(
+                                OfflineCorrelatorTest.stack(OfflineCorrelatorTest.USER_STACK_ID, "user_wait"))
+                        .writeDelimitedTo(out);
+                for (int row : order) {
+                    JsonObject observation = OfflineCorrelatorTest.observation(summary.threadId());
+                    observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
+                    observation.addProperty("startMonotonicNanos", Long.toString(1000L + row));
+                    observation.addProperty("endMonotonicNanos", Long.toString(4000L + row));
+                    CaptureStreamFixture.record(observation).writeDelimitedTo(out);
+                }
+                CaptureStreamFixture.record(captureEnd(rows)).writeDelimitedTo(out);
+            }
+            long rawBytes = Files.size(body);
+            String rawSha256 = CaptureInput.hex(digest.digest());
+            JsonObject footer = footer(jfr, summary, rawBytes, rawSha256, rows);
+            Path result = dir.resolve("scale-shuffled-source-" + rows + "-" + seed + ".capture");
+            try (var out = new BufferedOutputStream(Files.newOutputStream(result));
+                    var in = new BufferedInputStream(Files.newInputStream(body))) {
+                in.transferTo(out);
+                CaptureStreamFixture.record(footer).writeDelimitedTo(out);
+            }
+            Files.delete(body);
+            return result;
+        }
     }
 
     public static void main(String[] args) throws Exception {
@@ -521,6 +678,8 @@ public final class StreamingCorrelatorTest {
             syntheticFromColumns(dir);
             syntheticOrderTiesBreakOnCookie(dir);
             scale(dir);
+            thinningAccuracy(dir);
+            thinningDeterminism(dir);
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

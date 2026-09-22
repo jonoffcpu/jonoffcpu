@@ -40,6 +40,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     /** Fixed-point scale for the inverse-probability sum; see {@link #sourceAggregate}. */
     private static final int ESTIMATE_FRACTION_BITS = 64;
 
+    /** Marks a cookie that was observed but thinned away, so duplicate detection still sees it. */
+    private static final int DROPPED = Integer.MAX_VALUE;
+
     record SourceAggregate(BigInteger duration, BigInteger estimatedDuration, int rows) {}
 
     private final OfflineCorrelator.Limits limits;
@@ -48,8 +51,12 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private final JfrDictionaries dictionaries = new JfrDictionaries();
     private final LongIntMap sourceIndex;
     private final LongIntMap sampleIndex;
+    private final Thinning thinning;
     private CaptureInput.Budget budget;
     private LongIntMap announcedStacks;
+    // Total JFR samples the exporter delivered, kept or thinned away: the JFR-side parse-completeness
+    // check counts what was parsed, not what this stage retained.
+    private long samplesSeen;
 
     // Hoisted out of captureStart, so an observation is validated without touching a document.
     private long captureEpoch;
@@ -60,12 +67,14 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private long startedMonotonicNanos;
     private SamplingPolicy sampling;
 
-    private CorrelationEngine(OfflineCorrelator.Limits limits, int expectedSources, int expectedSamples) {
+    private CorrelationEngine(
+            OfflineCorrelator.Limits limits, int expectedSources, int expectedSamples, Thinning thinning) {
         this.limits = limits;
         this.sources = new SourceColumns(expectedSources);
         this.samples = new SampleColumns(expectedSamples);
         this.sourceIndex = new LongIntMap(expectedSources);
         this.sampleIndex = new LongIntMap(expectedSamples);
+        this.thinning = thinning;
     }
 
     static CorrelationResult correlate(
@@ -75,9 +84,20 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             OfflineCorrelator.JfrSelection selection,
             boolean partial)
             throws IOException {
+        return correlate(source, jfr, limits, selection, partial, Thinning.NONE);
+    }
+
+    static CorrelationResult correlate(
+            Path source,
+            Path jfr,
+            OfflineCorrelator.Limits limits,
+            OfflineCorrelator.JfrSelection selection,
+            boolean partial,
+            Thinning thinning)
+            throws IOException {
         // One observation is 99 bytes of capture stream; the estimate only sizes the first allocation.
         int expected = (int) Math.min(1 << 22, Math.max(1024, java.nio.file.Files.size(source) / 96));
-        CorrelationEngine engine = new CorrelationEngine(limits, expected, expected);
+        CorrelationEngine engine = new CorrelationEngine(limits, expected, expected, thinning);
         boolean partialJfr = selection != null && selection.partialInput();
         CaptureInput capture = partial
                 ? CaptureInput.readPartial(source, jfr, limits, engine)
@@ -151,6 +171,10 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         } else {
             reason = Reason.NONE;
         }
+        boolean kept = thinning.keeps(cookie);
+        // Duplicate detection stays global and exact: a dropped row still claims its cookie.
+        sourceIndex.observe(cookie, kept ? sources.size() : DROPPED);
+        if (!kept) return;
         sources.add(cookie, start, end, threshold, (int) targetTid, observation.getSignalResult() != 0, reason);
         if (sources.size() % WATERMARK_ROWS == 0) budget.structures(retainedBytes());
     }
@@ -203,7 +227,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 case "end" ->
                     require(
                             Boolean.TRUE.equals(raw.get("parseComplete"))
-                                    && Long.parseUnsignedLong((String) raw.get("samples")) == samples.size(),
+                                    && Long.parseUnsignedLong((String) raw.get("samples")) == samplesSeen,
                             "Incomplete JFR parse");
                 default -> throw new IOException("Unknown JFR row");
             }
@@ -213,7 +237,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         JsonObject stats = inputs.has("apStats") ? object(inputs, "apStats") : observedStats[0];
         BigInteger notParsed = stats == null || selection != null
                 ? null
-                : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samples.size()));
+                : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samplesSeen));
         require(notParsed == null || notParsed.signum() >= 0, "JFR samples exceed submitted samples");
         return join(capture, selectionMetadata, notParsed);
     }
@@ -223,6 +247,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         require(frames instanceof List<?>, "Missing stack frames");
         String cookieText = (String) raw.get("correlationId");
         long cookie = Long.parseUnsignedLong(cookieText, 16);
+        samplesSeen++;
+        boolean kept = thinning.keeps(cookie);
+        // Duplicate detection stays global and exact: a dropped sample still claims its cookie.
+        sampleIndex.observe(cookie, kept ? samples.size() : DROPPED);
+        if (!kept) return;
         long monotonic = U64.requireSigned(unsignedDecimal(raw, "monotonicTimeNanos"), "monotonicTimeNanos");
         Long osThreadId = optionalTid(raw, "osThreadId");
         Long javaThreadId = (Long) raw.get("javaThreadId");
@@ -291,8 +320,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
 
     private CorrelationResult join(CaptureInput capture, JsonObject selectionMetadata, BigInteger notParsed)
             throws IOException {
-        for (int slot = 0; slot < sources.size(); slot++) sourceIndex.observe(sources.cookie(slot), slot);
-        for (int slot = 0; slot < samples.size(); slot++) sampleIndex.observe(samples.cookie(slot), slot);
+        // The cookie indices are populated as each row streams in (see observation/sample), so a
+        // dropped row still claims its cookie for duplicate detection without landing in the columns.
         // A duplicated source cookie invalidates every copy and its counterpart.
         invalidate(sourceIndex);
         SourceAggregate aggregate = sourceAggregate();
@@ -427,7 +456,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 withoutSelectedSample,
                 estimate,
                 aggregate,
-                capture.budget.peak());
+                capture.budget.peak(),
+                thinning);
     }
 
     /** Marks every row on both sides whose cookie this index saw more than once. */
@@ -490,6 +520,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         JsonObject kernel = object(counters, "kernel");
         JsonObject userspace = object(counters, "userspace");
         List<String> reasons = new java.util.ArrayList<>();
+        // A second, independent thinning stage composes with this inverse-probability estimate but
+        // must not be silently folded into it: report the estimate unavailable instead.
+        if (thinning.active()) {
+            reasons.add("correlation-time-thinned-source");
+        }
         if (aggregate.rows() != sources.size()) {
             reasons.add("intrinsically-invalid-or-duplicate-source-rows");
         }

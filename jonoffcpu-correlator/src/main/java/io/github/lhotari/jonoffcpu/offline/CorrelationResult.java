@@ -37,7 +37,8 @@ record CorrelationResult(
         int sourceRowsWithoutSelectedJfrSample,
         OfflineCorrelator.PopulationEstimate populationEstimate,
         CorrelationEngine.SourceAggregate sourceAggregate,
-        long peakRetainedBytes) {
+        long peakRetainedBytes,
+        Thinning thinning) {
 
     int sourceRows() {
         return sources.size();
