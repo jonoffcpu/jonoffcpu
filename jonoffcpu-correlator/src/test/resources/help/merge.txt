@@ -1,0 +1,7 @@
+Usage: java -jar jonoffcpu-correlator.jar merge [-hV] [--output=FILE] [--profiles=FILE[,FILE...]]...
+Sums the counters of several stack profiles into one. Thinned profiles cannot be merged.
+      --profiles=FILE[,FILE...]
+                      The profiles to merge, comma-separated. Required.
+      --output=FILE   The merged profile to write. Required.
+  -h, --help          Show this help message and exit.
+  -V, --version       Print version information and exit.

@@ -201,7 +201,7 @@ Capture, written by the agent next to `correlationOutput` (the examples assume
 
 | File | Contents | Name comes from |
 | --- | --- | --- |
-| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`docs/schema/jonoffcpu-capture.proto`](docs/schema/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar --dump --source <file>` prints it as NDJSON | `correlationOutput` |
+| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`docs/schema/jonoffcpu-capture.proto`](docs/schema/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as NDJSON | `correlationOutput` |
 | `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
 | `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
 
@@ -901,6 +901,12 @@ recorded interval, plus one retained copy of each distinct Java and native stack
 and the stack profile's entries — retention
 tracks distinct stacks, not capture length, so a long capture with few distinct
 call paths costs little more than a short one.
+
+`java -jar jonoffcpu-correlator.jar help <command>` (or `<command> --help`)
+prints every option of a command with its default, and `--version` the build
+and the async-profiler fork commit. The correlator exits with status 0 for a
+complete result, 2 for narrowed or partial output, and 64 for an invalid
+command line, which it reports with the command's usage.
 
 By default the correlator refuses a JFR whose size or SHA-256 differs from the
 one recorded in the stream's footer. The full output, integrity, and weighting

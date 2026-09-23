@@ -1,0 +1,65 @@
+Usage: java -jar jonoffcpu-correlator.jar correlate [-hV] [--audit=LEVEL]
+       [--collapsed-reason-frame=MODE] [--estimate-population=true|false] [--format=FORMAT]
+       [--from=TIME] [--from-ns=N] [--jfr=FILE] [--max-handler-delay-ns=N]
+       [--max-profile-entries=N] [--max-retained-bytes=N] [--max-rows=N] [--max-synthetic-events=N]
+       [--on-limit=POLICY] [--output=DIR] [--partial=true|false] [--partial-jfr=true|false]
+       [--profile-group-by=LIST] [--profile-output=true|false] [--quantum-ns=N] [--source=FILE]
+       [--thinning=Q] [--thinning-seed=N] [--to=TIME] [--to-ns=N]
+Correlates a capture with its JFR into a new output directory (the default command).
+      --source=FILE          The finalized capture stream the agent wrote (jonoffcpu-capture.pb).
+                               Required.
+      --jfr=FILE             The combined JFR recorded with the capture. Required.
+      --output=DIR           The output directory, which must not exist yet. Required.
+      --from=TIME            Select samples from this JFR event time: an ISO-8601 timestamp, epoch
+                               milliseconds, a duration, or an offset from the recording start such
+                               as 30s or 2m.
+      --to=TIME              Select samples up to this JFR event time.
+      --partial-jfr=true|false
+                             Accept a JFR that another tool has cut; source rows without a sample
+                               in it are expected omissions, not loss. Default: false.
+      --from-ns=N            Clip matched intervals to start at this source monotonic time.
+      --to-ns=N              Clip matched intervals to end at this source monotonic time.
+      --max-handler-delay-ns=N
+                             Reject matches whose Java stack was captured more than this long after
+                               the interval ended.
+      --max-rows=N           Most source rows admitted. Default: 100000000.
+      --max-retained-bytes=N Retained-bytes budget. Default: sixty percent of the heap, never below
+                               256 MiB.
+      --format=FORMAT        Which derived outputs to write: both, collapsed or jfr; with --partial
+                               true, diagnostics or collapsed. Default: both, or diagnostics with
+                               --partial true.
+      --quantum-ns=N         Off-CPU time one synthetic JFR event represents. Default: 1000000.
+      --max-synthetic-events=N
+                             Most synthetic JFR events; the quantum is raised to fit. Default:
+                               10000000.
+      --estimate-population=true|false
+                             Report the inverse-probability population estimate. Requires the
+                               complete, unselected JFR and an unthinned source. Default: false.
+      --audit=LEVEL          Per-row audit output: full, matches or none. Default: matches, which
+                               writes jonoffcpu-matches.jsonl but not jonoffcpu-classified-records.
+                               jsonl.
+      --thinning=Q           Keep each recorded interval with probability Q (0 < Q <= 1) and
+                               reweight by 1/Q, deterministically in the cookie. Default: chosen
+                               automatically, and 1 whenever the input fits.
+      --thinning-seed=N      Changes the deterministic draw --thinning uses. Default: 0.
+      --on-limit=POLICY      What to do when the retained-bytes budget is reached: degrade
+                               (coarsen, drop audit, thin, narrow, reporting each step), fail, or
+                               truncate (narrow the window directly). Default: degrade.
+      --partial=true|false   Inspect an interrupted capture: writes INCOMPLETE-jonoffcpu-* files
+                               and jonoffcpu-partial.json, exits with status 2, and never writes
+                               jonoffcpu-complete.json. Default: false.
+      --collapsed-reason-frame=MODE
+                             Whether each line of jonoffcpu-offcpu-stacks.collapsed starts with its
+                               [offcpu: <reason>] frame: auto (when the capture mixes reasons),
+                               always or never. Default: auto.
+      --profile-output=true|false
+                             Whether to write jonoffcpu-offcpu-profile.pb. Default: true.
+      --profile-group-by=LIST
+                             The profile's optional dimensions besides the Java stack and the
+                               reason: any of kernel, user, thread, or none. Default: kernel,user,
+                               thread.
+      --max-profile-entries=N
+                             Entry limit for the profile; past it the thread, then the user and the
+                               kernel stack are dropped from the grouping. Default: 2000000.
+  -h, --help                 Show this help message and exit.
+  -V, --version              Print version information and exit.

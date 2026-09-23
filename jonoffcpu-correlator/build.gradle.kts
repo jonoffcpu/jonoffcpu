@@ -59,12 +59,42 @@ dependencies {
     embeddedRuntime("com.google.protobuf:protobuf-javalite:4.33.1")
     embeddedRuntime("com.google.code.gson:gson:2.14.0")
     embeddedRuntime("org.openjdk.jmc:flightrecorder.writer:9.1.2")
+    embeddedRuntime("info.picocli:picocli:4.7.7")
     jmcWriterSources("org.openjdk.jmc:flightrecorder.writer:9.1.2:sources@jar")
 }
+
+// The build version and the async-profiler fork commit, for --version.
+val asyncProfilerCommit =
+    providers
+        .exec {
+            // The pinned gitlink, which is what the build embeds whether or not the submodule is checked out.
+            commandLine("git", "-C", rootProject.projectDir.absolutePath, "rev-parse", "HEAD:async-profiler")
+            isIgnoreExitValue = true
+        }.standardOutput.asText
+        .map { it.trim().ifEmpty { "unknown" } }
+val generateVersionResource =
+    tasks.register("generateVersionResource") {
+        val version = project.version.toString()
+        val commit = asyncProfilerCommit
+        val outputDir = layout.buildDirectory.dir("generated/version-resource")
+        inputs.property("version", version)
+        inputs.property("asyncProfilerCommit", commit)
+        outputs.dir(outputDir)
+        doLast {
+            val file =
+                outputDir
+                    .get()
+                    .file("io/github/lhotari/jonoffcpu/offline/version.properties")
+                    .asFile
+            file.parentFile.mkdirs()
+            file.writeText("version=$version\nasyncProfilerCommit=${commit.get()}\n")
+        }
+    }
 
 sourceSets {
     main {
         proto.setSrcDirs(listOf(rootProject.layout.projectDirectory.dir("docs/schema")))
+        resources.srcDir(generateVersionResource)
     }
 }
 
@@ -106,6 +136,7 @@ val buildAsyncProfilerConverter = tasks.register<Exec>("buildAsyncProfilerConver
 val expectedDependencyDigests = mapOf(
     "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
     "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
+    "picocli-4.7.7.jar" to "f86e30fffd10d2b13b8caa8d4b237a7ee61f2ffccf5b1941de718b765d235bf8",
     "flightrecorder.writer-9.1.2.jar" to
         "8313e66f798f31de144c65b257a0434afca07b1bce1b59f17e63aed38c0dc9c1",
     "flightrecorder.writer-9.1.2-sources.jar" to
@@ -127,7 +158,7 @@ fun sha256File(input: File): String {
 
 val verifyDependencyDigests = tasks.register("verifyDependencyDigests") {
     group = "verification"
-    description = "Checks the exact protobuf, Gson and patched JMC writer artifacts before embedding them."
+    description = "Checks the exact protobuf, Gson, picocli and patched JMC writer artifacts before embedding them."
     inputs.files(embeddedRuntime, jmcWriterSources)
     doLast {
         (embeddedRuntime.files + jmcWriterSources.files).forEach { artifact ->
@@ -184,6 +215,7 @@ val jar = tasks.named<ShadowJar>("shadowJar") {
     relocate("com.google.protobuf", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.protobuf")
     relocate("com.google.gson", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.gson")
     relocate("org.openjdk.jmc", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.jmc")
+    relocate("picocli", "io.github.lhotari.jonoffcpu.correlator.internal.shaded.picocli")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
     isPreserveFileTimestamps = false
     isReproducibleFileOrder = true
@@ -235,6 +267,7 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
                     it.name.startsWith("com/google/gson/")
                             || it.name.startsWith("org/openjdk/jmc/")
                             || it.name.startsWith("com/google/protobuf/")
+                            || it.name.startsWith("picocli/")
                 }) {
                 throw GradleException("Correlator JAR contains unrelocated dependency packages")
             }
@@ -242,7 +275,8 @@ val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/gson/Gson.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
-                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class"
+                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class",
+                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/picocli/CommandLine.class"
             ).forEach { name ->
                 if (zip.getEntry(name) == null) throw GradleException("Correlator JAR is missing relocated class $name")
             }
@@ -259,7 +293,8 @@ val fixtureMains = mapOf(
     "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest",
     "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest",
     "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest",
-    "StackProfile" to "io.github.lhotari.jonoffcpu.offline.StackProfileTest"
+    "StackProfile" to "io.github.lhotari.jonoffcpu.offline.StackProfileTest",
+    "CommandLine" to "io.github.lhotari.jonoffcpu.offline.CommandLineTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {
@@ -274,6 +309,12 @@ val fixtureTasks = fixtureMains.map { (taskName, className) ->
 
 // Spec acceptance 4: the scale fixture's assertion is the heap cap itself, so it must run under
 // exactly the bound it proves, not whatever heap the other fixtures happen to get.
+// The README's option tables are checked against the parser, so documentation and help cannot drift.
+tasks.named<JavaExec>("testCommandLine") {
+    inputs.file(rootProject.file("README.md"))
+    systemProperty("jonoffcpu.readme", rootProject.file("README.md").absolutePath)
+}
+
 tasks.named<JavaExec>("testStreamingCorrelator") {
     jvmArgs("-ea", "-Xmx1g")
 }
