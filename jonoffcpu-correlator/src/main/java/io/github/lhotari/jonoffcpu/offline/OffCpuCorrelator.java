@@ -174,7 +174,7 @@ public final class OffCpuCorrelator {
                     + " --output out.collapsed [--reason all|blocked,runnable,preempted,unspecified]"
                     + " [--stack java|kernel|user|java+kernel|java+user+kernel] [--weights observed|estimated]"
                     + " [--reason-frame auto|always|never] [--time total|sleeping|runqueue|split]"
-                    + " [--summary summary.json]"
+                    + " [--package-names full|abbreviate|drop] [--summary summary.json]"
                     + " [--include REGEX]... [--exclude REGEX]...");
             System.out.println(
                     "       java -jar jonoffcpu-correlator.jar merge --profiles a.pb,b.pb --output merged.pb");
@@ -712,6 +712,7 @@ public final class OffCpuCorrelator {
                         "--weights",
                         "--reason-frame",
                         "--time",
+                        "--package-names",
                         "--summary"),
                 options);
         requireOptions(options, "--profile", "--output");
@@ -722,6 +723,8 @@ public final class OffCpuCorrelator {
         StackProfileRenderer.Weights weights =
                 StackProfileRenderer.Weights.parse(options.getOrDefault("--weights", "observed"));
         StackProfileRenderer.Time time = StackProfileRenderer.Time.parse(options.getOrDefault("--time", "total"));
+        StackProfileRenderer.PackageNames packages =
+                StackProfileRenderer.PackageNames.parse(options.getOrDefault("--package-names", "full"));
         StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
                 repeated.getOrDefault("--include", List.of()), repeated.getOrDefault("--exclude", List.of()));
         StackProfileRenderer.Slice slice = StackProfileRenderer.render(
@@ -731,11 +734,13 @@ public final class OffCpuCorrelator {
                 weights,
                 StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--reason-frame", "auto")),
                 time,
-                filter);
+                filter,
+                packages);
         try (BufferedWriter writer = newFile(Path.of(options.get("--output")))) {
             StackProfileRenderer.writeCollapsed(slice, writer);
         }
-        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, time, filter);
+        JsonObject summary =
+                StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, time, filter, packages);
         if (options.containsKey("--summary")) {
             try (BufferedWriter writer = newFile(Path.of(options.get("--summary")))) {
                 new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(summary, writer);

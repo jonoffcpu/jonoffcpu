@@ -640,6 +640,11 @@ java -jar jonoffcpu-correlator.jar stacks \
 java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
   --time split --output split.collapsed
+
+# Shorter frames: io.netty.channel.epoll.Native.epollWait0 becomes i.n.c.e.Native.epollWait0
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --package-names abbreviate --output short.collapsed
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
@@ -655,7 +660,11 @@ estimate is available. `--time` picks which part of each interval's time is
 weighed: `total` (the default), `sleeping`, `runqueue`, or `split`, which keeps
 the whole time and ends each line in a `[sleeping]`, `[runqueue]` or
 `[unsplit]` frame so one flame graph shows both waits; every mode but `total`
-needs a profile whose capture recorded the split. Rendered with its defaults, a
+needs a profile whose capture recorded the split. `--package-names abbreviate`
+shortens each Java frame's package to its initials (`i.n.c.e.Native.epollWait0`)
+and `--package-names drop` removes it (`Native.epollWait0`); `full` is the
+default. Stacks that become identical merge into one line, and
+`--include`/`--exclude` still match the full names. Rendered with its defaults, a
 profile reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 
 `--exclude REGEX` drops every interval with a frame matching the pattern, and
