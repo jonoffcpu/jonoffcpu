@@ -53,6 +53,8 @@ volatile __u64 record_all_above_scaled;
 volatile __u32 record_all_above_shift;
 volatile __u32 has_min_off_cpu;
 volatile __u32 has_max_off_cpu;
+/* Bit (1 << reason) is set for each selected switch-out reason. */
+volatile __u32 reason_mask;
 volatile __u32 enabled;
 volatile __u64 next_sequence;
 volatile __u64 target_pid_namespace_device;
@@ -112,8 +114,15 @@ static __always_inline __u32 allocate_sequence(struct jonoffcpu_stats *s)
     return (__u32)old;
 }
 
-SEC("tp/sched/sched_switch")
-int record_switch_out(void *ctx)
+/* The raw tracepoint, not the trace event: `preempt` is the scheduler's own
+ * verdict, and `prev_state` is the state captured before the switch rather than
+ * a re-read of prev->__state, which races with a concurrent wakeup. The
+ * four-argument prototype exists since Linux 5.18; on an older kernel the
+ * verifier rejects the access to the fourth argument and the load fails closed.
+ * The hook runs in the outgoing task's context, so the current task is prev. */
+SEC("tp_btf/sched_switch")
+int BPF_PROG(record_switch_out, bool preempt, struct task_struct *prev,
+             struct task_struct *next, unsigned int prev_state)
 {
     struct task_struct *task = bpf_get_current_task_btf();
     struct task_struct *leader = 0;
@@ -123,6 +132,7 @@ int record_switch_out(void *ctx)
     struct jonoffcpu_stats *s;
     struct bpf_pidns_info self_ids = {};
     __u64 pid_tgid;
+    __u8 reason;
 
     pid_tgid = bpf_get_current_pid_tgid();
     /* The numeric host TGID is only an optional, verified fast filter. */
@@ -145,18 +155,39 @@ int record_switch_out(void *ctx)
                                      &self_ids, sizeof(self_ids)) &&
         (self_ids.pid == collector_tid || self_ids.pid == agent_tid))
         return 0;
+    if (preempt)
+        reason = JONOFFCPU_REASON_PREEMPTED;
+    else if (prev_state == 0)
+        reason = JONOFFCPU_REASON_RUNNABLE;
+    else
+        reason = JONOFFCPU_REASON_BLOCKED;
+    s = current_stats();
+    if (s) {
+        if (reason == JONOFFCPU_REASON_PREEMPTED)
+            __sync_fetch_and_add(&s->switch_outs_preempted, 1);
+        else if (reason == JONOFFCPU_REASON_RUNNABLE)
+            __sync_fetch_and_add(&s->switch_outs_runnable, 1);
+        else
+            __sync_fetch_and_add(&s->switch_outs_blocked, 1);
+    }
     initial.start_monotonic_ns = bpf_ktime_get_ns();
     initial.thread_generation_ns = BPF_CORE_READ(task, start_boottime);
+    initial.prev_task_state = prev_state;
+    initial.reason = reason;
+    initial.preempted = preempt ? 1 : 0;
+    /* The state is stored for every reason and filtered at switch-in: skipping
+     * the store would leave an older start time behind for the next interval. */
     state = bpf_task_storage_get(&thread_states, task, &initial,
                                  BPF_LOCAL_STORAGE_GET_F_CREATE);
     if (state) {
         state->start_monotonic_ns = initial.start_monotonic_ns;
         state->thread_generation_ns = initial.thread_generation_ns;
-        s = current_stats();
+        state->prev_task_state = initial.prev_task_state;
+        state->reason = initial.reason;
+        state->preempted = initial.preempted;
         if (s)
             __sync_fetch_and_add(&s->switch_outs, 1);
     } else {
-        s = current_stats();
         if (s)
             __sync_fetch_and_add(&s->thread_state_failures, 1);
     }
@@ -225,6 +256,15 @@ int BPF_KPROBE(capture_switch_in)
     duration_us = duration_ns / 1000;
     if (!enabled)
         goto cleanup;
+    /* Reason filter, then duration bounds, then admission. */
+    if (state->reason > JONOFFCPU_REASON_PREEMPTED ||
+        !(reason_mask & (1U << state->reason))) {
+        if (s) {
+            __sync_fetch_and_add(&s->reason_rejections, 1);
+            __sync_fetch_and_add(&s->reason_rejected_duration_us, duration_us);
+        }
+        goto cleanup;
+    }
     if ((has_min_off_cpu && duration_ns <= min_off_cpu_ns) ||
         (has_max_off_cpu && duration_ns >= max_off_cpu_ns))
         goto cleanup;
@@ -281,6 +321,9 @@ int BPF_KPROBE(capture_switch_in)
     event->target_tgid = target_ids.tgid;
     event->target_tid = target_ids.pid;
     event->capture_epoch = capture_epoch;
+    event->prev_task_state = state->prev_task_state;
+    event->reason = state->reason;
+    event->preempted = state->preempted;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     stack_id = bpf_get_stackid(ctx, &stack_traces, 0);
     event->kernel_stack_id = stack_id;

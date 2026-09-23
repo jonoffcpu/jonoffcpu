@@ -161,7 +161,7 @@ runtime: "" {
 
       bpf: CO-RE eBPF program {
         class: [comp; comp-teal]
-        detail: "jonoffcpu_cookie.bpf.c\nsched_switch → sched_exit_tp\nEmits interval start/end + key to the ring buffer\nSignals the thread with only the 64-bit key" {class: detail}
+        detail: "jonoffcpu_cookie.bpf.c\nsched_switch (+ reason) → sched_exit_tp\nEmits interval start/end + key to the ring buffer\nSignals the thread with only the 64-bit key" {class: detail}
       }
     }
   }
@@ -214,7 +214,7 @@ offrow: "" {
     }
 
     # Grid is safe here: edges only enter this panel, none leave it (rule 5).
-    # Column-major fill: left column report/rows/complete, right column flame graph/synthetic/spacer (rule 2).
+    # Column-major fill: left column report/rows/complete, right column flame graph/synthetic/profile (rule 2).
     outputs: Analysis outputs {
       class: panel-violet
       grid-columns: 2
@@ -240,8 +240,10 @@ offrow: "" {
         class: [file; file-neutral]
         detail: "jonoffcpu-offcpu-synthetic.jfr\njdk.ExecutionSample view" {class: detail}
       }
-      # Invisible spacer balances the columns (3 + 3) so no cell is stretched (rule 3).
-      spacer: "" {style.opacity: 0}
+      profile: Stack profile {
+        class: [file; file-neutral]
+        detail: "jonoffcpu-offcpu-profile.pb\nre-render any slice: stacks" {class: detail}
+      }
     }
   }
 }
@@ -270,4 +272,5 @@ offrow.analysis.offline.correlator -> offrow.analysis.outputs.report: {class: fl
 offrow.analysis.offline.correlator -> offrow.analysis.outputs.rows: {class: flow-violet}
 offrow.analysis.offline.correlator -> offrow.analysis.outputs.collapsed: {class: flow-green}
 offrow.analysis.offline.correlator -> offrow.analysis.outputs.synthetic: {class: flow-violet}
+offrow.analysis.offline.correlator -> offrow.analysis.outputs.profile: {class: flow-violet}
 offrow.analysis.offline.correlator -> offrow.analysis.outputs.complete: {class: flow-violet}

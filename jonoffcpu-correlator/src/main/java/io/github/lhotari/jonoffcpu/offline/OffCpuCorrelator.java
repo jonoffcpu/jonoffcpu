@@ -6,6 +6,7 @@ import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.offline.StackProfile.Header;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -13,6 +14,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,8 +30,11 @@ public final class OffCpuCorrelator {
             AuditLevel audit,
             CompatibilityJfrWriter.Options jfrOptions,
             String prefix,
-            Degradation ladder) {
+            Degradation ladder,
+            boolean stackProfile,
+            StackProfileRenderer.ReasonFrame reasonFrame) {
         public OutputOptions {
+            if (reasonFrame == null) throw new IllegalArgumentException("Missing reason frame mode");
             if (!collapsed && !compatibilityJfr)
                 throw new IllegalArgumentException("Select at least one output format");
             if (audit == null) throw new IllegalArgumentException("Missing audit level");
@@ -51,7 +56,9 @@ public final class OffCpuCorrelator {
                     AuditLevel.FULL,
                     CompatibilityJfrWriter.Options.defaults(),
                     OutputFiles.PREFIX,
-                    Degradation.none());
+                    Degradation.none(),
+                    true,
+                    StackProfileRenderer.ReasonFrame.AUTO);
         }
     }
 
@@ -160,7 +167,18 @@ public final class OffCpuCorrelator {
                     + " [--quantum-ns N] [--max-synthetic-events N] [--estimate-population true|false]"
                     + " [--audit none|matches|full] [--thinning Q (0 < Q <= 1, keep probability)]"
                     + " [--thinning-seed N] [--on-limit degrade|fail|truncate]"
-                    + " [--partial true|false (partial format: diagnostics|collapsed)]");
+                    + " [--partial true|false (partial format: diagnostics|collapsed)]"
+                    + " [--collapsed-reason-frame auto|always|never] [--profile-output true|false]"
+                    + " [--profile-group-by kernel,user,thread|none] [--max-profile-entries N]");
+            System.out.println("       java -jar jonoffcpu-correlator.jar stacks --profile " + OutputFiles.PROFILE
+                    + " --output out.collapsed [--reason all|blocked,runnable,preempted,unspecified]"
+                    + " [--stack java|kernel|user|java+kernel|java+user+kernel] [--weights observed|estimated]"
+                    + " [--reason-frame auto|always|never] [--summary summary.json]"
+                    + " [--include REGEX]... [--exclude REGEX]...");
+            System.out.println(
+                    "       java -jar jonoffcpu-correlator.jar merge --profiles a.pb,b.pb --output merged.pb");
+            System.out.println("       java -jar jonoffcpu-correlator.jar export --profile " + OutputFiles.PROFILE
+                    + " --format csv|jsonl --output entries.csv");
             System.out.println("       java -jar jonoffcpu-correlator.jar --dump --source jonoffcpu-capture.pb"
                     + "   (prints the capture stream as NDJSON, stacks expanded)");
             System.out.println("Writes into the output directory: " + OutputFiles.REPORT + ", "
@@ -173,6 +191,21 @@ public final class OffCpuCorrelator {
         if (args.length == 3 && args[0].equals("--dump") && args[1].equals("--source")) {
             dump(Path.of(args[2]));
             return 0;
+        }
+        // Every correlate option starts with "--", so a bare first word is free for a subcommand.
+        switch (args[0]) {
+            case "stacks" -> {
+                return stacks(Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "merge" -> {
+                return merge(Arrays.copyOfRange(args, 1, args.length));
+            }
+            case "export" -> {
+                return export(Arrays.copyOfRange(args, 1, args.length));
+            }
+            default -> {
+                // correlate
+            }
         }
         Map<String, String> options = new HashMap<>();
         Set<String> allowed = Set.of(
@@ -195,14 +228,12 @@ public final class OffCpuCorrelator {
                 "--audit",
                 "--thinning",
                 "--thinning-seed",
-                "--on-limit");
-        for (int i = 0; i < args.length; i += 2) {
-            if (i + 1 == args.length
-                    || !allowed.contains(args[i])
-                    || options.putIfAbsent(args[i], args[i + 1]) != null) {
-                throw new IllegalArgumentException("Unknown, duplicate or missing option: " + args[i]);
-            }
-        }
+                "--on-limit",
+                "--collapsed-reason-frame",
+                "--profile-output",
+                "--profile-group-by",
+                "--max-profile-entries");
+        parseOptions(args, allowed, options);
         for (String required : Set.of("--source", "--jfr", "--output")) {
             if (!options.containsKey(required)) throw new IllegalArgumentException("Missing " + required);
         }
@@ -239,7 +270,11 @@ public final class OffCpuCorrelator {
                     || options.containsKey("--quantum-ns")
                     || options.containsKey("--max-synthetic-events")
                     || options.containsKey("--audit")
-                    || options.containsKey("--thinning")) {
+                    || options.containsKey("--thinning")
+                    || options.containsKey("--collapsed-reason-frame")
+                    || options.containsKey("--profile-output")
+                    || options.containsKey("--profile-group-by")
+                    || options.containsKey("--max-profile-entries")) {
                 throw new IllegalArgumentException("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -268,6 +303,13 @@ public final class OffCpuCorrelator {
             selection = new OfflineCorrelator.JfrSelection(
                     range == null ? null : range.from(), range == null ? null : range.to(), partialJfr);
         }
+        boolean stackProfile = booleanOption(options, "--profile-output", true);
+        ProfileAccumulator.Options profileOptions = ProfileAccumulator.Options.parse(
+                options.getOrDefault("--profile-group-by", "kernel,user,thread"),
+                options.getOrDefault(
+                        "--max-profile-entries", Integer.toString(ProfileAccumulator.DEFAULT_MAX_ENTRIES)));
+        StackProfileRenderer.ReasonFrame reasonFrame =
+                StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--collapsed-reason-frame", "auto"));
         Path sourcePath = Path.of(options.get("--source"));
         Thinning requestedThinning = options.containsKey("--thinning")
                 ? Thinning.of(options.get("--thinning"), Long.parseLong(options.getOrDefault("--thinning-seed", "0")))
@@ -284,7 +326,8 @@ public final class OffCpuCorrelator {
         while (result == null) {
             settings = ladder.settings();
             try {
-                result = CorrelationEngine.correlate(sourcePath, jfr, limits, selection, false, settings);
+                result = CorrelationEngine.correlate(
+                        sourcePath, jfr, limits, selection, false, settings, profileOptions);
             } catch (RetentionLimitExceeded limit) {
                 if (!ladder.advance(limit)) throw new IOException(ladder.refusal(limit), limit);
             }
@@ -302,7 +345,9 @@ public final class OffCpuCorrelator {
                         ladder.audit(),
                         jfrOptions,
                         prefix,
-                        ladder),
+                        ladder,
+                        stackProfile,
+                        reasonFrame),
                 () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
         System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + options.get("--output")
@@ -352,14 +397,21 @@ public final class OffCpuCorrelator {
         Gson gson = new GsonBuilder().serializeNulls().create();
         String prefix = options.prefix();
         boolean narrowed = options.ladder().narrowed();
+        // The combined file keeps every recorded interval. When it mixes switch-out reasons, each line starts with
+        // its reason's frame, because an unlabelled graph would merge waiting with being denied the CPU; a
+        // single-reason capture, which includes every capture without classification, is written as before.
+        List<OffCpuReason> reasonsPresent = output.reasonsPresent();
+        boolean reasonFrames =
+                !reasonsPresent.isEmpty() && options.reasonFrame().applies(reasonsPresent.size());
         if (options.collapsed()) {
-            try (BufferedWriter writer =
-                    newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)))) {
-                for (var entry : new TreeMap<>(output.collapsedNanos()).entrySet()) {
-                    writer.write(entry.getKey());
-                    writer.write(' ');
-                    writer.write(collapsedMicros(entry.getValue()));
-                    writer.newLine();
+            writeCollapsed(
+                    directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)),
+                    reasonFrames ? output.collapsedNanos(null) : output.collapsedNanos());
+            if (reasonsPresent.size() > 1) {
+                for (OffCpuReason reason : reasonsPresent) {
+                    writeCollapsed(
+                            directory.resolve(OutputFiles.collapsedForReason(prefix, reason)),
+                            output.collapsedNanos(reason));
                 }
             }
         }
@@ -470,12 +522,40 @@ public final class OffCpuCorrelator {
             view.addProperty("omittedRemainderNanos", compatibility.omittedRemainderNanos());
             report.add("syntheticJfr", view);
         }
+        JsonObject offCpuReasons = output.offCpuReasons();
+        if (offCpuReasons != null) report.add("offCpuReasons", offCpuReasons);
         // Always present, with an empty stepsApplied when nothing was needed, so a consumer can see that
         // degradation was considered and declined.
         report.add("degradation", options.ladder().report(output.peakRetainedBytes()));
+        StackProfile profile = options.stackProfile() ? output.stackProfile("") : null;
+        if (profile != null) {
+            JsonObject view = new JsonObject();
+            view.addProperty("path", OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX));
+            view.addProperty("entries", profile.entries().size());
+            view.add("dimensions", gson.toJsonTree(profile.header().dimensions()));
+            view.add("dimensionsDropped", gson.toJsonTree(profile.header().dimensionsDropped()));
+            view.addProperty("estimateAvailable", profile.header().estimateAvailable());
+            report.add("stackProfile", view);
+        }
+        // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
+        String reportJson =
+                new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report);
+        if (profile != null) {
+            // The profile carries the report it was produced with, so it stays interpretable on its own.
+            Header header = profile.header();
+            new StackProfile(
+                            new Header(
+                                    header.sources(),
+                                    header.dimensions(),
+                                    header.estimateAvailable(),
+                                    reportJson,
+                                    header.label(),
+                                    header.dimensionsDropped()),
+                            profile.entries())
+                    .write(directory.resolve(OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX)));
+        }
         try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.REPORT_SUFFIX)))) {
-            // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
-            new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
+            writer.write(reportJson);
             writer.newLine();
         }
         verify.verify();
@@ -601,7 +681,138 @@ public final class OffCpuCorrelator {
         }
     }
 
-    private static String collapsedMicros(String nanoseconds) {
+    private static void writeCollapsed(Path file, Map<String, String> weights) throws IOException {
+        try (BufferedWriter writer = newFile(file)) {
+            for (var entry : new TreeMap<>(weights).entrySet()) {
+                writer.write(entry.getKey());
+                writer.write(' ');
+                writer.write(collapsedMicros(entry.getValue()));
+                writer.newLine();
+            }
+        }
+    }
+
+    // ---- stack profile subcommands --------------------------------------------------------------
+
+    /** Renders one collapsed slice of a stack profile. */
+    private static int stacks(String[] args) throws IOException {
+        Map<String, String> options = new HashMap<>();
+        Map<String, List<String>> repeated = new HashMap<>();
+        args = takeRepeated(args, Set.of("--include", "--exclude"), repeated);
+        parseOptions(
+                args,
+                Set.of("--profile", "--output", "--reason", "--stack", "--weights", "--reason-frame", "--summary"),
+                options);
+        requireOptions(options, "--profile", "--output");
+        StackProfile profile = StackProfile.read(Path.of(options.get("--profile")));
+        Set<OffCpuReason> reasons = reasons(options.getOrDefault("--reason", "all"));
+        StackProfileRenderer.StackKinds kinds =
+                StackProfileRenderer.StackKinds.parse(options.getOrDefault("--stack", "java"));
+        StackProfileRenderer.Weights weights =
+                StackProfileRenderer.Weights.parse(options.getOrDefault("--weights", "observed"));
+        StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
+                repeated.getOrDefault("--include", List.of()), repeated.getOrDefault("--exclude", List.of()));
+        StackProfileRenderer.Slice slice = StackProfileRenderer.render(
+                profile,
+                reasons,
+                kinds,
+                weights,
+                StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--reason-frame", "auto")),
+                filter);
+        try (BufferedWriter writer = newFile(Path.of(options.get("--output")))) {
+            StackProfileRenderer.writeCollapsed(slice, writer);
+        }
+        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, filter);
+        if (options.containsKey("--summary")) {
+            try (BufferedWriter writer = newFile(Path.of(options.get("--summary")))) {
+                new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(summary, writer);
+                writer.newLine();
+            }
+        }
+        System.out.println("Wrote " + slice.nanos().size() + " collapsed stacks to " + options.get("--output") + ": "
+                + slice.intervals() + " intervals, " + slice.totalNanos() + " ns"
+                + (filter.active()
+                        ? "; filtered out " + slice.filteredIntervals() + " intervals, " + slice.filteredNanos()
+                                + " ns, matching " + String.join(",", StackProfileRenderer.Filter.scope(profile))
+                                + " stacks"
+                        : ""));
+        return 0;
+    }
+
+    /** Moves each occurrence of a repeatable option's value into {@code repeated}; returns the other arguments. */
+    private static String[] takeRepeated(String[] args, Set<String> names, Map<String, List<String>> repeated) {
+        List<String> rest = new java.util.ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            if (names.contains(args[i])) {
+                if (i + 1 == args.length) throw new IllegalArgumentException("Missing value for option: " + args[i]);
+                repeated.computeIfAbsent(args[i], name -> new java.util.ArrayList<>())
+                        .add(args[++i]);
+            } else {
+                rest.add(args[i]);
+                // An ordinary option's value is not an option name, even when it looks like one.
+                if (i + 1 < args.length) rest.add(args[++i]);
+            }
+        }
+        return rest.toArray(String[]::new);
+    }
+
+    /** Sums the counters of several stack profiles into one. */
+    private static int merge(String[] args) throws IOException {
+        Map<String, String> options = new HashMap<>();
+        parseOptions(args, Set.of("--profiles", "--output"), options);
+        requireOptions(options, "--profiles", "--output");
+        List<StackProfile> profiles = new java.util.ArrayList<>();
+        for (String path : options.get("--profiles").split(",", -1)) {
+            if (path.isEmpty()) throw new IllegalArgumentException("Empty profile path in --profiles");
+            profiles.add(StackProfile.read(Path.of(path)));
+        }
+        StackProfile merged = StackProfile.merge(profiles);
+        merged.write(Path.of(options.get("--output")));
+        System.out.println("Merged " + profiles.size() + " profiles into " + options.get("--output") + ": "
+                + merged.entries().size() + " entries");
+        return 0;
+    }
+
+    /** Writes one row per profile entry, stacks expanded, for ad-hoc tools such as DuckDB. */
+    private static int export(String[] args) throws IOException {
+        Map<String, String> options = new HashMap<>();
+        parseOptions(args, Set.of("--profile", "--format", "--output"), options);
+        requireOptions(options, "--profile", "--output");
+        StackProfile profile = StackProfile.read(Path.of(options.get("--profile")));
+        try (BufferedWriter writer = newFile(Path.of(options.get("--output")))) {
+            StackProfileRenderer.export(profile, options.getOrDefault("--format", "csv"), writer);
+        }
+        return 0;
+    }
+
+    private static Set<OffCpuReason> reasons(String text) throws IOException {
+        if (text.equals("all")) return null;
+        Set<OffCpuReason> reasons = java.util.EnumSet.noneOf(OffCpuReason.class);
+        for (String label : text.split(",", -1)) {
+            if (!reasons.add(OffCpuReason.parse(label))) {
+                throw new IllegalArgumentException("Duplicate reason: " + label);
+            }
+        }
+        return reasons;
+    }
+
+    private static void parseOptions(String[] args, Set<String> allowed, Map<String, String> options) {
+        for (int i = 0; i < args.length; i += 2) {
+            if (i + 1 == args.length
+                    || !allowed.contains(args[i])
+                    || options.putIfAbsent(args[i], args[i + 1]) != null) {
+                throw new IllegalArgumentException("Unknown, duplicate or missing option: " + args[i]);
+            }
+        }
+    }
+
+    private static void requireOptions(Map<String, String> options, String... required) {
+        for (String key : required) {
+            if (!options.containsKey(key)) throw new IllegalArgumentException("Missing " + key);
+        }
+    }
+
+    static String collapsedMicros(String nanoseconds) {
         BigInteger nanos = new BigInteger(nanoseconds);
         if (nanos.signum() <= 0) return "0";
         return nanos.add(BigInteger.valueOf(500))

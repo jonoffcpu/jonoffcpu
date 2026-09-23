@@ -89,6 +89,11 @@ public final class StreamingCorrelatorTest {
         JsonObject retainedReport = com.google.gson.JsonParser.parseString(
                         Files.readString(retained.resolve(OutputFiles.REPORT)))
                 .getAsJsonObject();
+        // Only the streamed path has the columns a stack profile is built from.
+        check(streamedReport.remove("stackProfile") != null, "The streamed report must describe its stack profile");
+        check(
+                Files.isRegularFile(streamed.resolve(OutputFiles.PROFILE)),
+                "The streamed run must write a stack profile");
         for (JsonObject report : List.of(streamedReport, retainedReport)) {
             report.getAsJsonObject("syntheticJfr").remove("quantumNanos");
             report.getAsJsonObject("syntheticJfr").remove("requestedQuantumNanos");
@@ -192,7 +197,7 @@ public final class StreamingCorrelatorTest {
             "--on-limit",
             "truncate",
             "--max-retained-bytes",
-            "23000000"
+            "26500000"
         });
         check(status == 2, "A narrowed full audit must still report an incomplete window, got " + status);
         JsonObject narrowedReport = com.google.gson.JsonParser.parseString(
@@ -504,11 +509,12 @@ public final class StreamingCorrelatorTest {
         // Measured against this fixture: the cookie indices and the source/sample columns are all sized
         // off the input files up front, so they dominate retention and barely shrink under thinning.
         // At the heaviest thinning rung (q=0.01, which this budget's headroom always selects) peak
-        // retention floors around 21.5 MB. An unthinned, unnarrowed run exceeds 23,000,000 bytes only
+        // retention floors around 25 MB (21.5 MB before a source slot grew from 38 to 51 bytes for the
+        // stack profile). An unthinned, unnarrowed run exceeds 26,500,000 bytes only
         // partway through the JFR pass; narrowing to the cut the watermark hands back there (the
         // triggering sample's own source row) converges, through a few further watermark-driven cuts, to
         // a window whose full source-and-sample retention fits the same budget.
-        long budgetBytes = 23_000_000L;
+        long budgetBytes = 26_500_000L;
         Path thinnedOnly = dir.resolve("ladder-thinned");
         int status = OffCpuCorrelator.run(new String[] {
             "--source",

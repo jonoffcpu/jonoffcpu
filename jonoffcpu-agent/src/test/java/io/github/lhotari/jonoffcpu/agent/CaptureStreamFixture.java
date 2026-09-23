@@ -113,7 +113,7 @@ final class CaptureStreamFixture {
     }
 
     private static CaptureProto.Observation observation(JsonObject row) {
-        return CaptureProto.Observation.newBuilder()
+        CaptureProto.Observation.Builder builder = CaptureProto.Observation.newBuilder()
                 .setCorrelationId(
                         Long.parseUnsignedLong(row.get("correlationId").getAsString(), 16))
                 .setHostTgid((int) row.get("hostTgid").getAsLong())
@@ -139,8 +139,21 @@ final class CaptureStreamFixture {
                 .setKernelStackId(row.get("kernelStackId").getAsLong())
                 .setUserStackId(row.get("userStackId").getAsLong())
                 .setKernelStackError(text(row, "kernelStackError"))
-                .setUserStackError(text(row, "userStackError"))
-                .build();
+                .setUserStackError(text(row, "userStackError"));
+        JsonElement reason = row.get("offCpuReason");
+        if (reason != null && !reason.isJsonNull()) {
+            builder.setReasonValue(
+                    switch (reason.getAsString()) {
+                        case "blocked" -> 1;
+                        case "runnable" -> 2;
+                        case "preempted" -> 3;
+                        default -> throw new IllegalArgumentException("fixture reason: " + reason);
+                    });
+        }
+        if (row.has("prevTaskState"))
+            builder.setPrevTaskState((int) row.get("prevTaskState").getAsLong());
+        if (row.has("preempted")) builder.setPreempted(row.get("preempted").getAsBoolean());
+        return builder.build();
     }
 
     private static String text(JsonObject row, String key) {

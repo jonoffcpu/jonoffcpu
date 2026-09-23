@@ -2,7 +2,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use jonoffcpu_native::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
-use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder, TracepointCategory};
+use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
 use serde::Serialize;
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -52,6 +52,10 @@ struct Observation {
     capture_epoch: u32,
     sequence: u32,
     comm: [u8; 16],
+    prev_task_state: u32,
+    reason: u8,
+    preempted: u8,
+    reserved: [u8; 2],
 }
 
 #[repr(C)]
@@ -74,6 +78,11 @@ struct KernelStats {
     signal_failures: u64,
     ring_reserve_failures: u64,
     target_namespace_failures: u64,
+    switch_outs_blocked: u64,
+    switch_outs_runnable: u64,
+    switch_outs_preempted: u64,
+    reason_rejections: u64,
+    reason_rejected_duration_us: u64,
 }
 
 impl KernelStats {
@@ -201,7 +210,7 @@ fn prove_process_reuse() -> Result<serde_json::Value> {
     let switch_out = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, "sched_switch")
+        .attach()
         .context("attach T07 START")?;
     let switch_in = skel
         .progs
@@ -311,7 +320,7 @@ fn prove_thread_reuse() -> Result<serde_json::Value> {
     let start = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, "sched_switch")
+        .attach()
         .context("attach T08 START")?;
     skel.maps.bss_data.as_deref_mut().unwrap().enabled = 1;
     let (leader_host_tgid, leader_generation) =
@@ -354,7 +363,7 @@ fn prove_thread_reuse() -> Result<serde_json::Value> {
     let positive_start = skel
         .progs
         .record_switch_out
-        .attach_tracepoint(TracepointCategory::Sched, "sched_switch")
+        .attach()
         .context("reattach T08 START")?;
     reset_signal_state();
     let positive_report = exercise_thread(&replacement)?;
@@ -413,6 +422,8 @@ fn configure(
     bss.has_min_off_cpu = 0;
     bss.has_max_off_cpu = 0;
     bss.sample_threshold = 1u64 << 32;
+    // Every switch-out reason stays eligible, as before the reason filter existed.
+    bss.reason_mask = 0b1110;
     bss.next_sequence = 1;
     bss.enabled = 0;
 }

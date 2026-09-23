@@ -148,7 +148,7 @@ public final class SignalCaptureControllerTest {
         FakeSource source = new FakeSource();
         // A zero uniform probability resolves to the explicit none policy.
         SignalCaptureController controller = controller(
-                root, profiler, source, new SamplingConfig(null, null, SamplingConfig.uniform(BigDecimal.ZERO)));
+                root, profiler, source, new SamplingConfig(null, null, null, SamplingConfig.uniform(BigDecimal.ZERO)));
         controller.start();
         profiler.stopExternally();
         controller.pollProfiler();
@@ -524,6 +524,24 @@ public final class SignalCaptureControllerTest {
         check(
                 proportional.sampling().admission().equals(new SamplingConfig.Proportional(250)),
                 "proportional native options not parsed");
+        check(
+                config.sampling().reasons().equals(SamplingConfig.DEFAULT_REASONS),
+                "native options must default to blocked intervals");
+        AgentConfig reasons = AgentConfig.parseNativeOptions(
+                "jonoffcpuoutput="
+                        + root.resolve("reasons.ndjson")
+                        + ",sampling-policy=proportional,record-all-above-micros=250,"
+                        + "sampling-reasons=runnable+blocked,asprofpath="
+                        + ap
+                        + ",event=cpu,file="
+                        + root.resolve("reasons.jfr"),
+                nativeLibrary);
+        check(
+                reasons.sampling()
+                        .orderedReasons()
+                        .equals(java.util.List.of(
+                                SamplingConfig.OffCpuReason.BLOCKED, SamplingConfig.OffCpuReason.RUNNABLE)),
+                "sampling-reasons native option not parsed: " + reasons.sampling());
         check(config.asyncProfilerOptions().contains("event=cpu,alloc=1m,jfrsync=profile"), "AP tail changed");
         check(config.jfrOutput().equals(jfr), "AP output path not retained");
 
@@ -603,7 +621,10 @@ public final class SignalCaptureControllerTest {
         check(
                 config.sampling()
                         .equals(new SamplingConfig(
-                                10L, 1000L, new SamplingConfig.Uniform(new BigDecimal("0.125"), 536_870_912L))),
+                                SamplingConfig.DEFAULT_REASONS,
+                                10L,
+                                1000L,
+                                new SamplingConfig.Uniform(new BigDecimal("0.125"), 536_870_912L))),
                 "YAML sampling policy not parsed exactly: " + config.sampling());
         try {
             AgentConfig.parse("correlationOutput: /tmp/a\nunknownOption: true\n");
@@ -702,6 +723,10 @@ public final class SignalCaptureControllerTest {
             },
             {"sampling:\n  admission:\n    policy: none\n", "none"},
             {"sampling:\n  admission:\n    policy: uniform\n    probability: 1\n", "uniform"},
+            {
+                "sampling:\n  reasons: [preempted, blocked]\n  admission:\n    policy: uniform\n    probability: 1\n",
+                "uniform"
+            },
         }) {
             counter++;
             String yaml = prefix.formatted(
@@ -722,9 +747,30 @@ public final class SignalCaptureControllerTest {
                         .sampling()
                         .json()
                         .toString()
-                        .equals("{\"minOffCpuMicros\":100,\"maxOffCpuMicros\":null,"
+                        .equals("{\"reasons\":[\"blocked\"],\"minOffCpuMicros\":100,\"maxOffCpuMicros\":null,"
                                 + "\"admission\":{\"policy\":\"proportional\",\"recordAllAboveMicros\":10000}}"),
                 "unexpected sampling JSON: " + proportional.sampling().json());
+        // Reasons are serialized in canonical order whatever the order they were given in.
+        AgentConfig everything =
+                AgentConfig.parse(prefix.formatted(root.resolve("r.ndjson"), ap, nativeLibrary, root.resolve("r.jfr"))
+                        + "sampling:\n  reasons: [preempted, blocked, runnable]\n  admission:\n"
+                        + "    policy: uniform\n    probability: 1\n");
+        check(
+                everything
+                        .sampling()
+                        .json()
+                        .get("reasons")
+                        .toString()
+                        .equals("[\"blocked\",\"runnable\",\"preempted\"]"),
+                "reasons not canonical: " + everything.sampling().json());
+        check(
+                AgentConfig.parse(prefix.formatted(root.resolve("n.ndjson"), ap, nativeLibrary, root.resolve("n.jfr"))
+                                + "sampling:\n  admission:\n    policy: none\n")
+                        .sampling()
+                        .json()
+                        .get("reasons")
+                        .isJsonNull(),
+                "policy none must not select reasons");
         for (String invalid : new String[] {
             "",
             "sampling: {}\n",
@@ -740,6 +786,11 @@ public final class SignalCaptureControllerTest {
             "sampling:\n  minOffCpuMicros: 5\n  maxOffCpuMicros: 5\n  admission:\n    policy: none\n",
             "sampling:\n  sampleProbability: 1\n  admission:\n    policy: none\n",
             "sampleProbability: 1\n",
+            "sampling:\n  reasons: []\n  admission:\n    policy: uniform\n    probability: 1\n",
+            "sampling:\n  reasons: [blocked, blocked]\n  admission:\n    policy: uniform\n    probability: 1\n",
+            "sampling:\n  reasons: [sleeping]\n  admission:\n    policy: uniform\n    probability: 1\n",
+            "sampling:\n  reasons: blocked\n  admission:\n    policy: uniform\n    probability: 1\n",
+            "sampling:\n  reasons: [blocked]\n  admission:\n    policy: none\n",
         }) {
             counter++;
             String yaml = prefix.formatted(
@@ -788,10 +839,15 @@ public final class SignalCaptureControllerTest {
         long justBelow = SamplingConfig.admissionThreshold(shifted - 1, shifted);
         check(justBelow >= certain - 2 && justBelow < certain, "shifted just below: " + justBelow);
         check(SamplingConfig.admissionThreshold(-2L, -1L) == certain, "u64 max reference");
-        SamplingConfig proportional = new SamplingConfig(null, null, new SamplingConfig.Proportional(10_000));
+        SamplingConfig proportional =
+                new SamplingConfig(SamplingConfig.DEFAULT_REASONS, null, null, new SamplingConfig.Proportional(10_000));
         check(proportional.admissionThreshold(1_000_000) == certain / 10, "policy delegation");
         check(
-                new SamplingConfig(null, null, new SamplingConfig.Uniform(BigDecimal.ONE, certain))
+                new SamplingConfig(
+                                        SamplingConfig.DEFAULT_REASONS,
+                                        null,
+                                        null,
+                                        new SamplingConfig.Uniform(BigDecimal.ONE, certain))
                                 .admissionThreshold(1)
                         == certain,
                 "uniform ignores duration");
@@ -823,9 +879,9 @@ public final class SignalCaptureControllerTest {
         check(stopped.manifestCounters().get("submittedSamples").equals(max), "u64 AP counter rejected");
     }
 
-    private static final SamplingConfig NONE = new SamplingConfig(null, null, new SamplingConfig.None());
-    private static final SamplingConfig SPARSE =
-            new SamplingConfig(null, null, SamplingConfig.uniform(new BigDecimal("0.0000000233")));
+    private static final SamplingConfig NONE = new SamplingConfig(null, null, null, new SamplingConfig.None());
+    private static final SamplingConfig SPARSE = new SamplingConfig(
+            SamplingConfig.DEFAULT_REASONS, null, null, SamplingConfig.uniform(new BigDecimal("0.0000000233")));
 
     private static SignalCaptureController controller(Path root, FakeProfiler profiler, FakeSource source)
             throws IOException {
@@ -1023,7 +1079,7 @@ public final class SignalCaptureControllerTest {
             identity.addProperty("monotonicOffsetNanos", "0");
             result.add("verifiedIdentity", identity);
             JsonObject start = new JsonObject();
-            start.addProperty("schemaVersion", 2);
+            start.addProperty("schemaVersion", 3);
             start.addProperty("recordType", "captureStart");
             start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             start.addProperty("sessionId", session);
@@ -1062,7 +1118,7 @@ public final class SignalCaptureControllerTest {
             try {
                 if (nativeStackFailure) {
                     JsonObject observation = new JsonObject();
-                    observation.addProperty("schemaVersion", 2);
+                    observation.addProperty("schemaVersion", 3);
                     observation.addProperty("recordType", "observation");
                     observation.addProperty("sourceId", "jonoffcpu.offcpu.v1");
                     observation.addProperty("sessionId", session);
@@ -1083,10 +1139,13 @@ public final class SignalCaptureControllerTest {
                     observation.addProperty("startMonotonicNanos", "9");
                     observation.addProperty("endMonotonicNanos", "10");
                     observation.addProperty("signalResult", 0);
+                    observation.addProperty("offCpuReason", "blocked");
+                    observation.addProperty("prevTaskState", 1);
+                    observation.addProperty("preempted", false);
                     observation.addProperty("comm", "fixture");
                     // One announced stack for the kernel side; the user side failed, so it has no record.
                     JsonObject stack = new JsonObject();
-                    stack.addProperty("schemaVersion", 2);
+                    stack.addProperty("schemaVersion", 3);
                     stack.addProperty("recordType", "stack");
                     stack.addProperty("sourceId", "jonoffcpu.offcpu.v1");
                     stack.addProperty("sessionId", session);
@@ -1139,7 +1198,7 @@ public final class SignalCaptureControllerTest {
 
         private static JsonObject captureEnd(String session, boolean complete) {
             JsonObject end = new JsonObject();
-            end.addProperty("schemaVersion", 2);
+            end.addProperty("schemaVersion", 3);
             end.addProperty("recordType", "captureEnd");
             end.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             end.addProperty("sessionId", session);
@@ -1169,7 +1228,12 @@ public final class SignalCaptureControllerTest {
                 "userStackFailures",
                 "signalFailures",
                 "ringReserveFailures",
-                "targetNamespaceFailures"
+                "targetNamespaceFailures",
+                "switchOutsBlocked",
+                "switchOutsRunnable",
+                "switchOutsPreempted",
+                "reasonRejections",
+                "reasonRejectedDurationMicros"
             }) kernel.addProperty(key, "0");
             JsonObject userspace = new JsonObject();
             for (String key : new String[] {

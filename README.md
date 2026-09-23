@@ -14,6 +14,7 @@ ordinary async-profiler JFR.
   - [Why two files?](#why-two-files)
   - [Files jonoffcpu writes](#files-jonoffcpu-writes)
   - [What the Java stack means](#what-the-java-stack-means)
+  - [Why the thread left the CPU](#why-the-thread-left-the-cpu)
 - [Requirements](#requirements)
   - [Kernel settings](#kernel-settings)
     - [Applying them to a VM's kernel](#applying-them-to-a-vms-kernel)
@@ -25,6 +26,7 @@ ordinary async-profiler JFR.
   - [2. Record](#2-record)
   - [3. Correlate](#3-correlate)
   - [4. Render the flame graph](#4-render-the-flame-graph)
+  - [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile)
 - [Configuration](#configuration)
   - [Agent options](#agent-options)
   - [Choosing what to sample](#choosing-what-to-sample)
@@ -94,7 +96,10 @@ Off-CPU time is measured, not sampled: the scheduler records the exact moment
 a thread left the CPU and the exact moment it returned, so every interval is a
 real duration and the flame graph's widths are microseconds of off-CPU time.
 `jonoffcpu` measures the whole interval, from switch-out to switch-in, so
-run-queue delay under CPU contention is included alongside sleeping.
+run-queue delay under CPU contention is included alongside sleeping. It also
+records *why* the thread left the CPU — it blocked, or it was still runnable —
+and by default records only the blocked intervals; see
+[Why the thread left the CPU](#why-the-thread-left-the-cpu).
 
 Further reading:
 
@@ -138,10 +143,11 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 
 1. A [CO-RE eBPF program](jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c)
    hooks `sched_switch` and `sched_exit_tp`. When a
-   thread of the target JVM is switched out it records the timestamp; when the
-   same thread is switched back in it has a complete off-CPU interval with its
-   kernel and user native stacks.
-2. Intervals that pass the configured duration bounds and admission policy
+   thread of the target JVM is switched out it records the timestamp and why
+   the scheduler took it off the CPU; when the same thread is switched back in
+   it has a complete off-CPU interval with its kernel and user native stacks.
+2. Intervals of the selected switch-out reasons that pass the configured
+   duration bounds and admission policy
    are written to a ring buffer together with a fresh 64-bit correlation key.
    The kernel then sends the resumed thread a signal whose payload is only that
    key.
@@ -159,7 +165,8 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/lhotari/jonoffcpu/offline/OffCpuCorrelator.java)
    runs offline. It joins each `SignalSample` to its
    observation by key, weights the Java stack by the kernel-measured duration,
-   and writes a report, a collapsed-stack file, and a synthetic JFR.
+   and writes a report, a collapsed-stack file, a stack profile from which
+   other slices can be rendered later, and a synthetic JFR.
 
 ### Why two files?
 
@@ -202,7 +209,9 @@ Analysis, written by the correlator into `--output`:
 | File | Contents |
 | --- | --- |
 | `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate |
-| `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs |
+| `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
+| `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
+| `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`docs/schema/jonoffcpu-profile.proto`](docs/schema/jonoffcpu-profile.proto) |
 | `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
 | `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
@@ -233,6 +242,36 @@ set instead: `INCOMPLETE-jonoffcpu-report.json`,
 `INCOMPLETE-jonoffcpu-classified-records.jsonl`, `INCOMPLETE-jonoffcpu-pairs.jsonl`,
 optionally `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed`, and the marker
 `jonoffcpu-partial.json`. It never writes `jonoffcpu-complete.json`.
+
+### Why the thread left the CPU
+
+`sched_switch` tells the kernel why the outgoing thread is leaving the CPU,
+and `jonoffcpu` records it on every interval:
+
+| Reason | What the scheduler saw | Typical cause |
+| --- | --- | --- |
+| `blocked` | The thread left in a waiting state (`TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, …) | A futex (lock, `park`, `Future.get()`), a socket or `epoll` wait, a timer, disk I/O, a page fault |
+| `runnable` | The thread left at an ordinary scheduling point while still `TASK_RUNNING` | **Preemption of running Java code**: a thread preempted by the scheduler tick is switched out on its return to user mode, where the kernel sees an ordinary `schedule()` — and `sched_yield` |
+| `preempted` | The kernel preempted the thread at a preemption point inside the kernel | Preemption while the thread was in a system call or a page fault |
+
+`runnable` and `preempted` are both time spent *waiting for a CPU*: a stack
+that is wide under them is where execution stopped, not what the thread was
+waiting for, and the investigation belongs to CPU saturation, cgroup
+throttling, thread-pool sizing or IRQ load rather than to that code. Measured
+on a 16-CPU 7.1 kernel, more spinning threads than CPUs came back 2,861
+`runnable` against 2 `preempted`, so read the two together.
+
+The reason describes the *switch-out*, not a split of the interval's time. A
+`blocked` interval runs until the thread is switched back in, so it also
+contains the run-queue delay between its wakeup and its next turn on a CPU;
+the report says so, and splitting the two with `sched_wakeup` is future work.
+
+The kernel keeps the original value (`prev_task_state`) and the `preempt` flag
+next to the reason, and the agent and the correlator recompute the reason from
+them for every row. The kernel also counts every switch-out by reason before
+filtering, so even a blocked-only capture reports how often its threads were
+denied the CPU; the report's `offCpuReasons` object carries those counts next
+to the matched intervals of each selected reason.
 
 ### What the Java stack means
 
@@ -366,8 +405,8 @@ repository's proof scripts do.
 
 | The container needs | How | Why |
 | --- | --- | --- |
-| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading the programs is `bpf(BPF_PROG_LOAD)`; attaching the `sched_switch` tracepoint is `perf_event_open`. Docker's default seccomp profile permits both once the matching capability is present, so `--security-opt seccomp=unconfined` is not required. |
-| `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | libbpf reads the tracepoint's numeric id from `events/sched/sched_switch/id`. A container gets the directory but no filesystem mounted on it. |
+| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default seccomp profile permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
+| `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | Earlier releases attached `sched_switch` as a classic tracepoint, for which libbpf reads the numeric id from `events/sched/sched_switch/id`. Both hooks are now BTF raw tracepoints, and on a Linux host the packaged smoke passes without `tracefs` mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
 | Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
 | An executable temporary directory | `-Dio.github.lhotari.jonoffcpu.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
 
@@ -388,8 +427,7 @@ docker run --rm \
   java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
 ```
 
-Read-only is enough, because jonoffcpu only reads the tracepoint id. The
-equivalent in Compose:
+Read-only is enough, because nothing writes to it. The equivalent in Compose:
 
 ```yaml
 volumes:
@@ -523,13 +561,85 @@ off-CPU time observed under that Java stack. The collapsed weights are
 microseconds of off-CPU time, and `--units µs` makes the flame graph say so
 instead of counting "samples"; that option is a fork addition, so use the
 provided `jfr-converter.jar` rather than a stock `jfrconv`. Add `--reverse` to see which
-blocking calls dominate regardless of caller, or `-I`/`-X` regular expressions
-to keep or drop stacks by frame. Any tool that reads the collapsed-stack
+blocking calls dominate regardless of caller. To keep or drop stacks by frame,
+render the slice from the stack profile with `--include`/`--exclude` (step 5),
+which also matches frames the graph does not show. Any tool that reads the collapsed-stack
 format, such as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph)
 with `--countname=µs`, works on the same file.
 
 The synthetic JFR opens directly in
 [JDK Mission Control](https://jdk.java.net/jmc/) and other JFR viewers.
+
+### 5. Slice and filter with the stack profile
+
+`jonoffcpu-offcpu-profile.pb` holds every distinct stack once with its
+counters, so any other collapsed file is a sub-second projection of it rather
+than a new correlation (913 KB and 0.3 s for a capture that takes a minute to
+correlate):
+
+```sh
+# Time spent waiting for a CPU, whatever the Java code was doing
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --reason runnable,preempted --output cpu-wait.collapsed
+
+# Java stacks continued by the kernel stack, so the wait mechanism is visible
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --stack java+kernel --summary blocked.json --output blocked.collapsed
+
+# ... without idle waits on a socket or an epoll loop
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --stack java+kernel --exclude '(ep_poll|sock_recvmsg|tcp_recvmsg)_\[k\]' \
+  --summary busy.json --output busy.collapsed
+
+# Java stacks only, without the Netty event loops' idle epoll waits
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude 'io\.netty\.channel\.epoll\.Native\.epollWait0' --output app.collapsed
+```
+
+`--reason` takes `all` (the default) or a comma-separated list of `blocked`,
+`runnable`, `preempted` and `unspecified` (a capture recorded before
+classification); a slice with more than one reason starts each line with its
+`[offcpu: <reason>]` frame unless `--reason-frame never` is given. `--stack` is
+`java` (the default), `kernel`, `user`, `java+kernel` or `java+user+kernel`;
+native frames are shown without their `+0x` offsets, kernel frames carry the
+`_[k]` suffix, and the profiler's own tracing frames at the leaf of a kernel
+stack are left out. `--weights estimated` renders the inverse-probability
+estimate instead of the observed durations, when the capture's population
+estimate is available. Rendered with its defaults, a profile reproduces
+`jonoffcpu-offcpu-stacks.collapsed` byte for byte.
+
+`--exclude REGEX` drops every interval with a frame matching the pattern, and
+`--include REGEX` keeps only intervals with one; both can be repeated (any
+pattern matches), and an exclusion wins. Filtering happens on the profile's
+entries, before they are merged into collapsed lines, so it removes whole
+intervals and matches every stack the profile holds, whichever `--stack`
+renders: `--stack java --exclude 'ep_poll_\[k\]'` drops the epoll waits from a
+Java-only graph. Patterns are searched for in each frame as it would be
+rendered (Java names, offset-free native symbols, kernel symbols with `_[k]`,
+and `[kernel stack unavailable]`/`[user stack unavailable]` for a missing
+stack); anchor them with `^…$` for an exact frame. The `--summary` file
+records the slice's interval count and total nanoseconds, the patterns, the
+stacks they were matched against (`filterScope`), and under `filtered` what
+the filters removed, so the kept and removed time add up to the unfiltered
+slice. The converter's own `-I`/`-X` still work on a rendered file, but see
+only the frames in its lines and cannot account for what they drop.
+
+Profiles merge and export as well:
+
+```sh
+java -jar jonoffcpu-correlator.jar merge --profiles run1.pb,run2.pb --output runs.pb
+java -jar jonoffcpu-correlator.jar export --profile runs.pb --format csv --output entries.csv
+duckdb -c "SELECT reason, java_stack, sum(observed_nanos) / 1e9 AS seconds
+           FROM read_csv('entries.csv') GROUP BY ALL ORDER BY seconds DESC LIMIT 20"
+```
+
+A merged profile sums durations across its inputs: it shows what dominates
+across the runs, not what fraction of any one run's time it took. Thinned
+profiles cannot be merged, because each is rescaled by its own probability.
 
 ## Configuration
 
@@ -540,6 +650,7 @@ The synthetic JFR opens directly in
 | `correlationOutput` | Required. Path of the correlation stream. Must not exist yet. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](#files-jonoffcpu-writes). |
 | `asyncProfilerOptions` | Required. async-profiler options, including one absolute `file=` path for the JFR. |
 | `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
+| `sampling.reasons` | Optional list of switch-out reasons to record: `blocked`, `runnable`, `preempted`. Default `[blocked]`; see [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
 | `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
 | `sampling.maxOffCpuMicros` | Optional strict upper bound on the off-CPU duration, in microseconds. |
 | `sampling.admission.policy` | Required. `proportional`, `uniform`, or `none`. |
@@ -562,9 +673,16 @@ application rather than the profiler; see
 decisions are made in the kernel after the interval's duration is known, in
 this order:
 
-1. **`minOffCpuMicros` / `maxOffCpuMicros`** — strict bounds. Intervals outside
+1. **`reasons`** — which switch-out reasons are recorded, `[blocked]` unless
+   given. Intervals of other reasons are counted by reason and dropped. Adding
+   `runnable` and `preempted` records every preemption of a busy thread, which
+   can multiply the recording rate: pair it with `minOffCpuMicros` or a low
+   `uniform` probability. Before this option existed every interval was
+   recorded whatever its reason, which `reasons: [blocked, runnable, preempted]`
+   reproduces.
+2. **`minOffCpuMicros` / `maxOffCpuMicros`** — strict bounds. Intervals outside
    them are never recorded and never counted.
-2. **`admission.policy`** — which of the remaining intervals to record:
+3. **`admission.policy`** — which of the remaining intervals to record:
    - `proportional`: an interval of at least `recordAllAboveMicros` is always
      recorded; a shorter one is recorded with probability
      `length / recordAllAboveMicros`. With `10000`, a 1 ms wait has a 10 %
@@ -628,8 +746,8 @@ else is paid only for intervals that are actually recorded:
 
 | Stage | Applies to | Cost | Where it lands |
 | --- | --- | --- | --- |
-| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
-| Ring-buffer record + signal | each recorded interval | a 120-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
+| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the reason, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
+| Ring-buffer record + signal | each recorded interval | a 128-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
 | Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
 | Drain and write | each recorded interval | a protobuf record of roughly 120 bytes | the collector's own thread; records are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
 | Symbolize | each **distinct** native stack | one stack-map lookup and per-frame symbol resolution, written once as a `stack` record | the collector's own thread, on first sight of that stack |
@@ -694,11 +812,16 @@ The agent can also be started programmatically with
 | `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: coarsen the synthetic quantum, drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses immediately, like earlier releases. `truncate` skips thinning and narrows the window directly. |
 | `--thinning <q>` | Keep each recorded interval with probability `q` and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
 | `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
+| `--collapsed-reason-frame auto\|always\|never` | Whether each line of `jonoffcpu-offcpu-stacks.collapsed` starts with its `[offcpu: <reason>]` frame. Default `auto`: only when the capture mixes reasons. |
+| `--profile-output true\|false` | Whether to write `jonoffcpu-offcpu-profile.pb`. Default `true`. |
+| `--profile-group-by <list>` | Which optional dimensions the profile keeps besides the Java stack and the reason: any of `kernel`, `user`, `thread`, or `none`. Default all three. |
+| `--max-profile-entries <n>` | Entry limit for the profile. Past it the thread, then the user stack, then the kernel stack are dropped from the grouping, which merges entries and changes no total; the report names what was dropped. Default 2,000,000. |
 
 `--max-rows` and `--max-retained-bytes` bound admission; the default
 `--max-retained-bytes` is sixty percent of the JVM's `-Xmx`, never below 256 MiB.
-Plan a capture's memory against roughly 80 bytes of correlator retention per
-recorded interval, plus one retained copy of each distinct Java stack — retention
+Plan a capture's memory against roughly 95 bytes of correlator retention per
+recorded interval, plus one retained copy of each distinct Java and native stack
+and the stack profile's entries — retention
 tracks distinct stacks, not capture length, so a long capture with few distinct
 call paths costs little more than a short one.
 

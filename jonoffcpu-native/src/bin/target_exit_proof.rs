@@ -79,6 +79,7 @@ fn parent_proof() -> Result<()> {
             "targetPid": child_pid,
             "outputPath": output,
             "sampling": {
+                "reasons": ["blocked", "runnable", "preempted"],
                 "minOffCpuMicros": null,
                 "maxOffCpuMicros": null,
                 "admission": {

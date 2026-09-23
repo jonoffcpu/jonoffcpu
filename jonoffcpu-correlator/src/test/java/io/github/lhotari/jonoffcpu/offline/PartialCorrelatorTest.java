@@ -293,7 +293,7 @@ public final class PartialCorrelatorTest {
         }
         // Rows are shared objects now, so fixtures mutate copies.
         JsonObject header = row(complete, "captureStart").deepCopy();
-        header.addProperty("schemaVersion", 3);
+        header.addProperty("schemaVersion", 4);
         Files.write(source, CaptureStreamFixture.encode(List.of(header)));
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Unsupported source schema");
         header.addProperty("schemaVersion", 2);

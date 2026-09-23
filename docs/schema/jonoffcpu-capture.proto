@@ -68,4 +68,27 @@ message Observation {
   sint64 user_stack_id = 15;
   string kernel_stack_error = 16;
   string user_stack_error = 17;
+  // Why the scheduler took the thread off the CPU, derived by the kernel from the two fields below.
+  // Unspecified in a schemaVersion 2 capture, which predates the classification.
+  OffCpuReason reason = 18;
+  // The raw task state `sched_switch` reported for the outgoing thread; 0 is TASK_RUNNING. Explicit
+  // presence, because 0 is meaningful and absence means the capture is not classified.
+  optional uint32 prev_task_state = 19;
+  // The `preempt` argument of `sched_switch`.
+  optional bool preempted = 20;
+  // Field 21 is reserved for the wakeup timestamp that splits an interval into sleeping and run-queue
+  // time.
+  reserved 21;
+}
+
+// A thread is `blocked` when it left the CPU in a waiting state (sleeping on a futex, a socket, a timer,
+// or uninterruptibly on I/O). It is `runnable` when it left at an ordinary scheduling point while still
+// running: this is how a user-space thread is preempted by the scheduler tick (on its return to user
+// mode), and also `sched_yield`. It is `preempted` when the kernel preempted it at a preemption point
+// inside the kernel. `runnable` and `preempted` are both time spent waiting for a CPU.
+enum OffCpuReason {
+  OFF_CPU_REASON_UNSPECIFIED = 0;
+  OFF_CPU_REASON_BLOCKED = 1;
+  OFF_CPU_REASON_RUNNABLE = 2;
+  OFF_CPU_REASON_PREEMPTED = 3;
 }

@@ -60,7 +60,8 @@ RUN mkdir -p jonoffcpu-native/src/bin \
        jonoffcpu-native/src/bin/task_lifetime_proof.rs \
        jonoffcpu-native/src/bin/time_namespace_negative.rs \
        jonoffcpu-native/src/bin/signal_latency.rs \
-       jonoffcpu-native/src/bin/target_exit_proof.rs
+       jonoffcpu-native/src/bin/target_exit_proof.rs \
+       jonoffcpu-native/src/bin/offcpu_reason_proof.rs
 RUN --mount=type=cache,id=jonoffcpu-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     cargo fetch --locked --manifest-path jonoffcpu-native/Cargo.toml
 

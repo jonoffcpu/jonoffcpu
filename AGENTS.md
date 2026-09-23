@@ -30,7 +30,11 @@ smallest relevant layer before running privileged end-to-end tests.
   definition: the collector generates its codec from it with protox (no protoc
   in the build containers) and both Java modules with the protobuf Gradle
   plugin. Control records keep their JSON object, still read with the strict
-  parser. Do not add a second definition of the wire format.
+  parser. Do not add a second definition of the wire format. The stack
+  profile the correlator writes is a separate, derived format with its own
+  single definition in `docs/schema/jonoffcpu-profile.proto`; only the
+  correlator generates it, and a default rendering of a profile must keep
+  reproducing `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 - Native stacks are interned in the stream: one `stack` record per distinct BPF
   stack id, always written before the first observation that references it, and
   observations carry only the ids. Keep that ordering guarantee, keep the
@@ -46,16 +50,25 @@ smallest relevant layer before running privileged end-to-end tests.
   publish completion last.
 - `queued` and `coalescing` signal delivery have different loss behavior. Never
   fall back silently from one policy to the other.
-- Sampling is one required `sampling` object: optional strict
-  `minOffCpuMicros`/`maxOffCpuMicros` bounds, applied in the kernel before the
-  admission policy, and `admission.policy` of `none`, `uniform`
+- Sampling is one required `sampling` object: the switch-out `reasons` to keep
+  (`blocked`, `runnable`, `preempted`; default `[blocked]`, serialized in that
+  canonical order), optional strict `minOffCpuMicros`/`maxOffCpuMicros` bounds,
+  applied in the kernel after the reason filter and before the admission
+  policy, and `admission.policy` of `none`, `uniform`
   (`probability`) or `proportional` (`recordAllAboveMicros`). Each policy has
-  exactly one parameter; `none` rejects bounds. The same resolved object is
+  exactly one parameter; `none` rejects bounds and reasons. The same resolved object is
   sent to the native source, echoed by it, and written into the manifest,
   `captureStart` and `analysisInputs`; consumers compare it structurally.
   Every observation row carries the exact `admissionThreshold` the kernel drew
   against, recomputable from the policy and the row's duration, so population
-  estimates stay exact inverse-probability sums. A future rate cap belongs in a
+  estimates stay exact inverse-probability sums. Every observation likewise
+  carries its switch-out `reason` beside the raw `sched_switch` arguments it
+  was derived from (`prev_task_state`, `preempted`), and consumers recompute
+  and check it. The switch-out hook is the raw `tp_btf/sched_switch`, whose
+  `preempt` argument and pre-switch `prev_state` are authoritative; do not
+  derive the reason from the trace event's encoded `prev_state` or from a
+  re-read of `prev->__state`. Keep the reason (why the interval began) apart
+  from any future sleeping/run-queue split of its time. A future rate cap belongs in a
   separate `sampling.limit` block, orthogonal to `admission`, because its loss
   is not random and must be reported, not reweighted.
 - Partial JFR and interrupted-capture modes must remain explicit and visibly

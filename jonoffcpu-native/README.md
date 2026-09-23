@@ -15,12 +15,35 @@ Run the production scheduler-exit transport fixture:
 tools/run-sched-exit-proof.sh
 ```
 
-The production path records switch-out with `sched/sched_switch`, then observes
+The production path records switch-out with the raw BTF tracepoint
+`tp_btf/sched_switch`, reading its `preempt` argument and the `prev_state` the
+scheduler captured before the switch, and classifies the interval as
+`preempted`, `runnable` (`prev_state` is `TASK_RUNNING`) or `blocked`. The
+four-argument prototype exists since Linux 5.18; on an older kernel the verifier
+rejects the program and the collector fails closed at load. It then observes
 the resumed current task at `tp_btf/sched_exit_tp` when `is_switch=true`. This
 BTF tracepoint runs after `finish_task_switch` and the runqueue unlock. It retains
 the original current-task ID, comm, kernel-stack, and user-stack semantics while
 using `BPF_PROG_TYPE_TRACING`, for which the kernel permits
 `bpf_send_signal_task`.
+
+Run the switch-out reason proof:
+
+```sh
+tools/run-offcpu-reason-proof.sh
+```
+
+It runs a sleeping thread, a thread calling `sched_yield` on a CPU it shares with
+a spinner, and more spinners than CPUs they may use, first with every reason
+selected and then with only `blocked`. It requires every interval's reason to
+match its recorded `sched_switch` arguments, the sleeper to be predominantly
+`blocked`, the yielder `runnable`, the spinners `runnable` or `preempted`, the
+per-reason switch-out counters to account for every switch-out, and the
+blocked-only phase to keep no other reason while still counting the rejected
+ones. On the tested 16-CPU 7.1.5 kernel the spinners came back 2,861
+`runnable` and 2 `preempted`: a user-space thread preempted by the tick is
+switched out on its return to user mode, where `preempt` is false, so
+`preempted` is only a preemption inside the kernel.
 
 The required proof on the tested 7.1.5 kernel delivers the full 64-bit cookie,
 including bit 63, with `SI_KERNEL`, pidfd-backed process lifetime binding and

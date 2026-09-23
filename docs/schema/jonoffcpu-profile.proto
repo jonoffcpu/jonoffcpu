@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+//
+// The jonoffcpu stack profile: a derived analysis artifact the correlator writes next to its collapsed
+// stacks, from which any collapsed-stack slice (by switch-out reason, stack kind and weighting) can be
+// rendered again without re-reading the capture stream and the JFR. It is not a second definition of
+// the capture stream; this schema is the profile's own single definition.
+//
+// Layout: a 12-byte header ("JONOFFPRF" + a zero byte + a little-endian u16 format version, like the
+// capture stream's), then length-delimited `Record` messages. `profile_start` comes first and
+// `profile_end` last. Every string, frame and stack node is written before the first record that
+// references it, and ids are assigned densely from 1 in writing order, so 0 always means "absent".
+//
+// Stacks are a prefix-shared tree: a stack is named by the id of its leaf node, and walking `parent`
+// links up to 0 yields its frames leaf first. Stored stacks are root first when expanded.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.profile.v1;
+
+option java_package = "io.github.lhotari.jonoffcpu.profile";
+option java_outer_classname = "ProfileProto";
+option optimize_for = LITE_RUNTIME;
+
+message Record {
+  oneof record {
+    ProfileStart profile_start = 1;
+    StringRecord string = 2;
+    FrameRecord frame = 3;
+    StackNode stack_node = 4;
+    Entry entry = 5;
+    ProfileEnd profile_end = 6;
+  }
+}
+
+message ProfileStart {
+  uint32 schema_version = 1;
+  // The writing tool, for example "jonoffcpu-correlator".
+  string producer = 2;
+  // One per capture the profile was built from; a merged profile carries every input's.
+  repeated Provenance source = 3;
+  // The grouping key the entries carry, a subset of "reason", "kernel", "user", "thread". A dimension
+  // outside this list is 0 on every entry.
+  repeated string dimension = 4;
+  // The reason vocabulary: Entry.reason is an index into this list.
+  repeated string reason = 5;
+  // What observed_nanos is: "selected-observed-offcpu-nanoseconds".
+  string weight_semantics = 6;
+  // Whether estimated_nanos is an available inverse-probability estimate. When false it must not be
+  // used, although it is still written.
+  bool estimate_available = 7;
+  // Whether the phase-2 sleeping/run-queue split (Entry fields 20-23) is populated.
+  bool time_split_available = 8;
+  // The producing run's jonoffcpu-report.json, verbatim; empty for a merged profile.
+  string report_json = 9;
+  // Frames every rendered collapsed line starts with, joined by ';' and ending in ';', stating what was
+  // done to produce the numbers (a thinned subsample, a narrowed window). Empty when nothing was.
+  string label = 10;
+}
+
+message Provenance {
+  string session_id = 1;
+  uint64 capture_epoch = 2;
+  string source_sha256 = 3;
+  string original_jfr_sha256 = 4;
+  // The capture's resolved sampling object, verbatim JSON.
+  string sampling_json = 5;
+  // The correlation-time thinning applied to this capture: "1" when none.
+  string thinning_probability = 6;
+  uint64 thinning_seed = 7;
+  // The clip window in the source monotonic clock; 0 when unbounded on that side.
+  uint64 window_from_nanos = 8;
+  uint64 window_to_nanos = 9;
+}
+
+message StringRecord {
+  uint32 id = 1;
+  string value = 2;
+}
+
+message FrameRecord {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    JAVA = 1;
+    USER = 2;
+    KERNEL = 3;
+  }
+  uint32 id = 1;
+  Kind kind = 2;
+  // A Java frame's collapsed name ("class.method"), or a native frame's symbol as the collector resolved
+  // it, including any "+0x" offset.
+  uint32 name_string = 3;
+  // A native frame's module; 0 for Java frames and unresolved modules.
+  uint32 module_string = 4;
+}
+
+message StackNode {
+  uint32 id = 1;
+  uint32 parent = 2;
+  uint32 frame = 3;
+}
+
+message Entry {
+  // Leaf node ids; 0 when the stack is absent (not grouped, or the kernel produced none).
+  uint32 java_stack = 1;
+  uint32 kernel_stack = 2;
+  uint32 user_stack = 3;
+  // Index into ProfileStart.reason.
+  uint32 reason = 4;
+  // The raw task state sched_switch reported; 0 for runnable and preempted intervals and for captures
+  // without classification.
+  uint32 task_state = 5;
+  uint32 thread_name_string = 6;
+
+  uint64 intervals = 10;
+  // Selected observed off-CPU nanoseconds of the matched intervals, clipped to the analysis window and
+  // before any thinning reweight.
+  uint64 observed_nanos = 11;
+  // The same intervals weighted by the inverse of their admission probability, floored to whole
+  // nanoseconds. Meaningful only when ProfileStart.estimate_available.
+  uint64 estimated_nanos = 12;
+
+  // Reserved for the sleeping/run-queue split; ProfileStart.time_split_available says whether they are
+  // populated.
+  uint64 sleeping_nanos = 20;
+  uint64 runqueue_nanos = 21;
+  uint64 estimated_sleeping_nanos = 22;
+  uint64 estimated_runqueue_nanos = 23;
+}
+
+message ProfileEnd {
+  uint64 entries = 1;
+  uint64 total_intervals = 2;
+  uint64 total_observed_nanos = 3;
+  uint64 total_estimated_nanos = 4;
+  // Grouping dimensions dropped because the entry limit was reached, in the order they were dropped.
+  repeated string dimension_dropped = 5;
+}

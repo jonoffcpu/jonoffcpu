@@ -1,21 +1,56 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import java.math.BigDecimal;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Locale;
 import java.util.Set;
 
 /**
- * The resolved sampling policy: optional strict duration bounds and the admission policy applied to the
- * intervals inside them. {@link #json()} is the single representation sent to the native collector,
- * echoed by it, written into the capture stream and manifest, and compared structurally by the correlator.
+ * The resolved sampling policy: the switch-out reasons whose intervals are eligible, optional strict duration
+ * bounds, and the admission policy applied to the intervals inside them. {@link #json()} is the single
+ * representation sent to the native collector, echoed by it, written into the capture stream and manifest, and
+ * compared structurally by the correlator.
  */
-record SamplingConfig(Long minOffCpuMicros, Long maxOffCpuMicros, Admission admission) {
+record SamplingConfig(Set<OffCpuReason> reasons, Long minOffCpuMicros, Long maxOffCpuMicros, Admission admission) {
     static final long CERTAIN_ADMISSION = 1L << 32;
-    private static final Set<String> KEYS = Set.of("minOffCpuMicros", "maxOffCpuMicros", "admission");
+    private static final Set<String> KEYS = Set.of("reasons", "minOffCpuMicros", "maxOffCpuMicros", "admission");
     private static final long MAX_MICROS = Long.MAX_VALUE / 1000;
+    /** Blocked intervals only: preemptions are far more frequent, and recording one costs a signal and a stack walk. */
+    static final Set<OffCpuReason> DEFAULT_REASONS = EnumSet.of(OffCpuReason.BLOCKED);
+
+    /**
+     * Why the scheduler took a thread off the CPU, as the kernel classifies it at switch-out: {@code blocked}
+     * when it left in a waiting state, {@code runnable} when it left at an ordinary scheduling point while still
+     * running (how a user-space thread is preempted by the scheduler tick, and {@code sched_yield}), and
+     * {@code preempted} when the kernel preempted it inside the kernel. Declaration order is the canonical
+     * serialization order.
+     */
+    enum OffCpuReason {
+        BLOCKED,
+        RUNNABLE,
+        PREEMPTED;
+
+        String json() {
+            return name().toLowerCase(Locale.ROOT);
+        }
+
+        static OffCpuReason parse(String value) {
+            for (OffCpuReason reason : values()) {
+                if (reason.json().equals(value)) return reason;
+            }
+            throw new IllegalArgumentException("Unknown off-CPU reason: " + value);
+        }
+    }
+
+    SamplingConfig {
+        reasons = reasons == null ? null : Set.copyOf(EnumSet.copyOf(reasons));
+    }
 
     sealed interface Admission permits None, Uniform, Proportional {
         String policy();
@@ -111,7 +146,46 @@ record SamplingConfig(Long minOffCpuMicros, Long maxOffCpuMicros, Admission admi
         if (admission instanceof None && (minimum != null || maximum != null)) {
             throw new IllegalArgumentException("Duration bounds have no effect with admission policy none");
         }
-        return new SamplingConfig(minimum, maximum, admission);
+        JsonElement reasons = value.get("reasons");
+        if (admission instanceof None) {
+            if (reasons != null && !reasons.isJsonNull()) {
+                throw new IllegalArgumentException("Switch-out reasons have no effect with admission policy none");
+            }
+            return new SamplingConfig(null, null, null, admission);
+        }
+        return new SamplingConfig(parseReasons(reasons), minimum, maximum, admission);
+    }
+
+    /** Absent means the default; otherwise a non-empty list without duplicates, in any order. */
+    private static Set<OffCpuReason> parseReasons(JsonElement element) {
+        if (element == null || element.isJsonNull()) return DEFAULT_REASONS;
+        if (!element.isJsonArray()) throw new IllegalArgumentException("sampling.reasons must be a list");
+        EnumSet<OffCpuReason> reasons = EnumSet.noneOf(OffCpuReason.class);
+        for (JsonElement item : element.getAsJsonArray()) {
+            if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) {
+                throw new IllegalArgumentException("sampling.reasons must list reason names");
+            }
+            if (!reasons.add(OffCpuReason.parse(item.getAsString()))) {
+                throw new IllegalArgumentException("Duplicate off-CPU reason: " + item.getAsString());
+            }
+        }
+        if (reasons.isEmpty()) throw new IllegalArgumentException("sampling.reasons must not be empty");
+        return reasons;
+    }
+
+    /** The flat {@code sampling-reasons=blocked+runnable} option spelling. */
+    static JsonArray reasonsOption(String key, String value) {
+        JsonArray reasons = new JsonArray();
+        for (String reason : value.split("\\+", -1)) {
+            if (reason.isEmpty()) throw new IllegalArgumentException("Empty off-CPU reason in option: " + key);
+            reasons.add(reason);
+        }
+        return reasons;
+    }
+
+    /** The selected reasons in canonical order: blocked, runnable, preempted. */
+    List<OffCpuReason> orderedReasons() {
+        return reasons == null ? List.of() : List.copyOf(EnumSet.copyOf(reasons));
     }
 
     private static Admission parseAdmission(JsonObject value) {
@@ -184,6 +258,13 @@ record SamplingConfig(Long minOffCpuMicros, Long maxOffCpuMicros, Admission admi
 
     JsonObject json() {
         JsonObject value = new JsonObject();
+        if (reasons == null) {
+            value.add("reasons", JsonNull.INSTANCE);
+        } else {
+            JsonArray names = new JsonArray();
+            for (OffCpuReason reason : orderedReasons()) names.add(reason.json());
+            value.add("reasons", names);
+        }
         value.add("minOffCpuMicros", nullable(minOffCpuMicros));
         value.add("maxOffCpuMicros", nullable(maxOffCpuMicros));
         value.add("admission", admission.json());

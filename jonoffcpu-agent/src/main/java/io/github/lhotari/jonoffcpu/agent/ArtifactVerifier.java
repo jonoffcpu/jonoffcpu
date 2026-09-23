@@ -24,8 +24,11 @@ import jdk.jfr.consumer.RecordingFile;
 
 final class ArtifactVerifier {
     private static final int MAX_LINE_BYTES = 1024 * 1024;
-    /** Version 2 interns stacks: each distinct stack is one record that observations reference by id. */
-    static final int SCHEMA_VERSION = 2;
+    /**
+     * Version 2 interns stacks: each distinct stack is one record that observations reference by id. Version 3
+     * classifies every observation by its switch-out reason and adds {@code sampling.reasons}.
+     */
+    static final int SCHEMA_VERSION = 3;
 
     private static final int MAX_STACK_FRAMES = 4096;
     private static final BigInteger MAX_U64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
@@ -184,7 +187,12 @@ final class ArtifactVerifier {
             "kernelStackFailures",
             "userStackFailures",
             "signalFailures",
-            "ringReserveFailures"
+            "ringReserveFailures",
+            "switchOutsBlocked",
+            "switchOutsRunnable",
+            "switchOutsPreempted",
+            "reasonRejections",
+            "reasonRejectedDurationMicros"
         }) {
             requireU64(kernel, key);
         }
@@ -348,6 +356,16 @@ final class ArtifactVerifier {
                 "observation admissionThreshold",
                 sampling.admissionThreshold(end.subtract(start).longValueExact()),
                 JsonSupport.requireNumber(row, "admissionThreshold", 1, SamplingConfig.CERTAIN_ADMISSION));
+        // The kernel derives the reason from the two raw sched_switch arguments it records next to it, and only
+        // selected reasons pass its filter; recompute both.
+        String reason = JsonSupport.requireString(row, "offCpuReason");
+        String derived = CaptureStream.classifyOffCpu(
+                JsonSupport.requireBoolean(row, "preempted"),
+                JsonSupport.requireNumber(row, "prevTaskState", 0, 0xffffffffL));
+        JsonSupport.requireEqual("observation offCpuReason", derived, reason);
+        if (!sampling.reasons().contains(SamplingConfig.OffCpuReason.parse(reason))) {
+            throw new IOException("Observation reason was not selected by sampling.reasons: " + reason);
+        }
         // A stack is either announced by an earlier record or explained by an error on this row.
         for (String stack : new String[] {"kernelStack", "userStack"}) {
             long stackId = JsonSupport.requireSignedNumber(row, stack + "Id", Integer.MIN_VALUE, Integer.MAX_VALUE);

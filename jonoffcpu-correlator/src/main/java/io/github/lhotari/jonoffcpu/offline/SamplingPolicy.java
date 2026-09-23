@@ -10,20 +10,37 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * The capture's resolved sampling policy as the agent recorded it in {@code captureStart.sampling}: optional
- * strict duration bounds in microseconds and the admission policy the kernel applied to eligible intervals.
- * The per-row {@code admissionThreshold} is recomputed from this policy exactly as the collector computes it.
+ * The capture's resolved sampling policy as the agent recorded it in {@code captureStart.sampling}: the
+ * switch-out reasons the kernel kept, optional strict duration bounds in microseconds, and the admission policy
+ * the kernel applied to eligible intervals. The per-row {@code admissionThreshold} is recomputed from this policy
+ * exactly as the collector computes it.
+ *
+ * <p>{@code reasons} is null for a schemaVersion 2 capture, which predates the classification and kept every
+ * interval regardless of why it left the CPU.
  */
-record SamplingPolicy(BigInteger minOffCpuNanos, BigInteger maxOffCpuNanos, String policy, long parameter) {
+record SamplingPolicy(
+        List<OffCpuReason> reasons,
+        BigInteger minOffCpuNanos,
+        BigInteger maxOffCpuNanos,
+        String policy,
+        long parameter) {
     static final BigInteger CERTAIN_ADMISSION = BigInteger.ONE.shiftLeft(32);
     private static final BigInteger THOUSAND = BigInteger.valueOf(1000);
 
     static SamplingPolicy parse(JsonObject sampling) throws IOException {
+        boolean classified = sampling.has("reasons");
         require(
-                sampling.keySet().equals(java.util.Set.of("minOffCpuMicros", "maxOffCpuMicros", "admission")),
+                sampling.keySet()
+                        .equals(
+                                classified
+                                        ? java.util.Set.of("reasons", "minOffCpuMicros", "maxOffCpuMicros", "admission")
+                                        : java.util.Set.of("minOffCpuMicros", "maxOffCpuMicros", "admission")),
                 "Unexpected sampling policy shape");
+        List<OffCpuReason> reasons = classified ? reasons(sampling.get("reasons")) : null;
         BigInteger minimum = optionalBound(sampling, "minOffCpuMicros");
         BigInteger maximum = optionalBound(sampling, "maxOffCpuMicros");
         require(minimum == null || maximum == null || minimum.compareTo(maximum) < 0, "Invalid duration policy bounds");
@@ -51,7 +68,34 @@ record SamplingPolicy(BigInteger minOffCpuNanos, BigInteger maxOffCpuNanos, Stri
             }
             default -> throw new IOException("Unsupported admission policy: " + policy);
         }
-        return new SamplingPolicy(minimum, maximum, policy, parameter);
+        return new SamplingPolicy(reasons, minimum, maximum, policy, parameter);
+    }
+
+    /** A non-empty list of distinct reasons in the canonical order blocked, runnable, preempted. */
+    private static List<OffCpuReason> reasons(JsonElement value) throws IOException {
+        require(value != null && value.isJsonArray(), "Invalid sampling reasons");
+        List<OffCpuReason> reasons = new ArrayList<>();
+        for (JsonElement item : value.getAsJsonArray()) {
+            require(item.isJsonPrimitive() && item.getAsJsonPrimitive().isString(), "Invalid sampling reason");
+            OffCpuReason reason = OffCpuReason.parse(item.getAsString());
+            require(reason != OffCpuReason.UNSPECIFIED, "Invalid sampling reason");
+            require(
+                    reasons.isEmpty() || reasons.get(reasons.size() - 1).compareTo(reason) < 0,
+                    "Sampling reasons must be distinct and canonical");
+            reasons.add(reason);
+        }
+        require(!reasons.isEmpty(), "Sampling reasons must not be empty");
+        return List.copyOf(reasons);
+    }
+
+    /** Whether the capture classifies its intervals by switch-out reason. */
+    boolean classified() {
+        return reasons != null;
+    }
+
+    /** Whether the kernel's reason filter would have kept an interval of this reason. */
+    boolean selects(OffCpuReason reason) {
+        return reasons == null ? reason == OffCpuReason.UNSPECIFIED : reasons.contains(reason);
     }
 
     private static BigInteger optionalBound(JsonObject sampling, String key) throws IOException {

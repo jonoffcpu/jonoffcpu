@@ -33,7 +33,10 @@ import java.util.UUID;
 final class CaptureInput {
     static final BigInteger U64_MAX = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
     /** Version 2 interns stacks: each distinct stack is one record that observations reference by id. */
-    private static final int SCHEMA_VERSION = 2;
+    /** Version 2 interns stacks; version 3 also classifies every observation by its switch-out reason. */
+    private static final int OLDEST_SCHEMA_VERSION = 2;
+
+    private static final int SCHEMA_VERSION = 3;
 
     final JsonObject start;
     final JsonObject end;
@@ -106,6 +109,7 @@ final class CaptureInput {
         JsonObject end = null;
         JsonObject footer = null;
         int observations = 0;
+        long schemaVersion = 0;
         LongIntMap announcedStacks = new LongIntMap(1 << 12);
         List<String> reasons = new ArrayList<>();
         visitor.reading(budget, announcedStacks);
@@ -137,7 +141,11 @@ final class CaptureInput {
                         : null;
                 if (control) {
                     budget.charge(row);
-                    require(number(row, "schemaVersion") == SCHEMA_VERSION, "Unsupported source schema");
+                    long version = number(row, "schemaVersion");
+                    require(version >= OLDEST_SCHEMA_VERSION && version <= SCHEMA_VERSION, "Unsupported source schema");
+                    // One capture is written by one collector: every control record has the same version.
+                    require(schemaVersion == 0 || schemaVersion == version, "Mixed source schema versions");
+                    schemaVersion = version;
                 }
                 if (!type.equals("captureFinalized")) {
                     rawHash.update(bytes);
@@ -220,7 +228,10 @@ final class CaptureInput {
         require(number(inputs, "signal") > 0 && number(inputs, "signal") <= Integer.MAX_VALUE, "Invalid signal");
         require(number(inputs, "hostTgid") > 0 && number(inputs, "targetPid") > 0, "Invalid target PID");
         // The agent writes one resolved sampling object everywhere; the copies must agree exactly.
-        SamplingPolicy.parse(object(start, "sampling"));
+        // A classified (version 3) capture always names its reasons, and an older one never does.
+        require(
+                SamplingPolicy.parse(object(start, "sampling")).classified() == (schemaVersion >= 3),
+                "Source schema/sampling reasons mismatch");
         require(object(start, "sampling").equals(object(inputs, "sampling")), "Source/footer mismatch: sampling");
         for (String key : List.of("pidNamespaceDevice", "pidNamespaceInode")) {
             require(decimal(start, key).signum() > 0, "Invalid source namespace: " + key);

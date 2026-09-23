@@ -12,8 +12,10 @@ a 12-byte header, then length-delimited protobuf records. A capture holds a
 `captureStart`, a `stack` record for each distinct native stack, one
 `observation` per recorded off-CPU interval, a `captureEnd`, and the
 `captureFinalized` footer. The three control records carry the JSON object they
-have always carried, at `schemaVersion` 2, and that JSON is still read with the
-strict parser; observations and stacks are native protobuf. Read a capture with
+have always carried, at `schemaVersion` 3 (2 for captures recorded before
+switch-out reasons were classified, which are still read), and that JSON is
+still read with the strict parser; observations and stacks are native protobuf.
+All control records of one capture carry the same version. Read a capture with
 `java -jar jonoffcpu-correlator.jar --dump --source <file>`, which prints one
 JSON object per record with each observation's stacks expanded.
 
@@ -24,6 +26,34 @@ is no record and the observation carries `kernelStackError` or `userStackError`
 instead. An unannounced reference, a duplicate `stackId` and an unexplained
 negative id are all hard errors. The classified records re-expand both stacks,
 so an audit row remains self-contained.
+
+## Switch-out reasons
+
+A `schemaVersion` 3 capture records why the scheduler took each thread off the
+CPU. `captureStart.sampling.reasons` lists the reasons the kernel kept, in the
+canonical order `blocked`, `runnable`, `preempted`, and every observation carries
+its `reason` together with the two raw `sched_switch` arguments it was derived
+from, `prevTaskState` and `preempted`. The correlator recomputes the reason from
+those arguments — `preempted` wins, then a zero task state is `runnable`, and any
+other state is `blocked` — and marks a row whose reason disagrees, or is not one
+the capture selected, `source-policy-or-target-mismatch`, exactly as it treats a
+disagreeing admission threshold. A version 3 capture without `reasons`, a version
+2 capture with them, and a version 2 observation that carries any of the three
+fields are rejected the same way. Version 2 intervals read back as `unspecified`.
+
+The reason describes the switch-out. `runnable` is how a user-space thread
+preempted by the scheduler tick appears (it is switched out at an ordinary
+`schedule()` on its return to user mode), and `preempted` is a preemption inside
+the kernel; both are time spent waiting for a CPU. A `blocked` interval's duration
+includes its run-queue delay between wakeup and switch-in; the two are not split.
+
+The report's `offCpuReasons` object, present for classified captures, lists the
+selected reasons, the matched intervals and observed nanoseconds of each, the
+kernel's per-reason switch-out counts — taken before its reason filter, so a
+blocked-only capture still shows how often its threads were preempted — and the
+count and total duration of intervals the filter rejected. The population
+estimate covers the selected reasons only, since the kernel's eligibility counters
+are taken after the reason filter.
 
 A record's length prefix is checked against the record limit before any bytes
 are read, so a corrupt length cannot drive an allocation. A truncated final
@@ -62,7 +92,9 @@ recognisable wherever the directory ends up. A successful run writes:
 | `jonoffcpu-report.json` | Capture counters, classifications, handler-delay percentiles, interpretation notes, the degradation ladder and the opt-in population estimate | always |
 | `jonoffcpu-classified-records.jsonl` | Source and resolved JFR rows, including rejected and unmatched observations, with their classification | `--audit full` |
 | `jonoffcpu-matches.jsonl` | Cookies, clipped intervals, delivery delays and whether the target-to-JFR thread mapping could be verified | `--audit matches` (default) or `full` |
-| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling unless thinning applied (see **Degradation**) | `--format both` (default) or `collapsed` |
+| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling unless thinning applied (see **Degradation**). Every recorded interval, whatever its reason; when more than one reason contributes, each line starts with `[offcpu: <reason>]` (`--collapsed-reason-frame auto\|always\|never`) | `--format both` (default) or `collapsed` |
+| `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, restricted to one switch-out reason, without the reason frame | as above, and only when more than one reason contributes |
+| `jonoffcpu-offcpu-profile.pb` | The stack profile; see **Stack profile** | `--profile-output true` (default) |
 | `jonoffcpu-offcpu-synthetic.jfr` | An explicitly synthetic CPU-compatible view, using duration-quantized `jdk.ExecutionSample` events | `--format both` (default) or `jfr` |
 | `jonoffcpu-complete.json` | Completion marker | last; a directory without it is not a complete analysis, and it is never written for a narrowed run (see **Degradation**) |
 
@@ -140,6 +172,73 @@ random admission policy; it is not a confidence interval or an adjustment for
 missing Java stacks. Under `proportional`, a rare short interval that was admitted
 carries a weight of up to the full reference duration, so per-stack estimates for
 rare stacks are noisy even when the total is unbiased.
+
+## Stack profile
+
+`jonoffcpu-offcpu-profile.pb` is a derived artifact from which any collapsed-stack
+slice can be rendered again without re-reading the two inputs. Its format is
+defined by [`docs/schema/jonoffcpu-profile.proto`](../docs/schema/jonoffcpu-profile.proto):
+a 12-byte header, then length-delimited records — `profile_start`, a string
+constant pool, frames, a prefix-shared stack-node tree, one `entry` per distinct
+grouping key, and `profile_end` with the totals. Every string, frame and node is
+written before its first use and ids are dense from 1, so 0 always means absent.
+Entries are written in one canonical order, so the same analysis gives the same
+bytes whatever order its intervals matched in.
+
+An entry is keyed by the Java stack (at the collapsed file's class-and-method
+granularity) and the switch-out reason with its raw task state, and by default
+also by the kernel stack, the user stack and the thread name
+(`--profile-group-by`, any of `kernel`, `user`, `thread`, or `none`). It carries
+the matched interval count, the selected observed nanoseconds (clipped to the
+analysis window and before any thinning reweight), and the same intervals'
+inverse-probability weight, floored to whole nanoseconds; `estimate_available`
+repeats the population estimate's verdict on whether that weight may be used.
+Fields for the sleeping/run-queue split are reserved and marked unavailable.
+Past `--max-profile-entries` (default 2,000,000) the thread, then the user stack,
+then the kernel stack are dropped from the key; that merges entries without
+changing any total, and `profile_end` and the report's `stackProfile` object name
+what was dropped. The profile embeds the run's report and the label frames its
+collapsed lines start with. Partial mode writes no profile.
+
+The reader validates the header, the reference order and the end record's totals,
+and refuses a truncated or foreign file. Three subcommands use it:
+
+```sh
+java -jar jonoffcpu-correlator.jar stacks --profile P --output F
+    [--reason all|blocked,runnable,preempted,unspecified]
+    [--stack java|kernel|user|java+kernel|java+user+kernel]
+    [--weights observed|estimated] [--reason-frame auto|always|never] [--summary S]
+    [--include REGEX]... [--exclude REGEX]...
+java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
+java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
+```
+
+`stacks` with its defaults reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for
+byte, including the thinning label and reweighting. Native frames are rendered
+without their `+0x` offsets, kernel frames with an `_[k]` suffix, and a kernel
+stack stops before the tracing frames that captured it (`__traceiter_*`,
+`__bpf_trace_*`, `bpf_trace_run*`, `bpf_prog_*`); the profile keeps them.
+
+`--include`/`--exclude` filter whole profile entries before they are merged into
+lines, and before `--reason-frame auto` decides whether the slice mixes reasons.
+An entry is dropped when any frame of any stack the profile is grouped by
+matches an exclude pattern, and otherwise kept when there are no include
+patterns or a frame matches one; each option repeats, meaning any of its
+patterns. The frames matched are the ones a collapsed line would carry — Java
+names, offset-free native symbols, kernel symbols with `_[k]` and without the
+tracing frames, and the `[kernel stack unavailable]`/`[user stack unavailable]`
+placeholders — for every grouped stack, whichever `--stack` selects; patterns
+are searched for (`Matcher.find`), not matched whole. This is what
+`jfr-converter -I/-X` on a rendered file cannot do: it sees only the rendered
+frames, and a line merged from several entries can no longer be split. The
+`--summary` file records the slice's interval count and total, the patterns,
+`filterScope` (the stack kinds searched; a dropped dimension is not), and
+`filtered`, the intervals and nanoseconds removed. Kept plus filtered equals the
+unfiltered slice exactly, thinning included, because the unfiltered slice is
+rendered to compute it. `merge`
+sums identical entries and keeps every input's provenance; it refuses profiles
+with different grouping, and thinned profiles, whose weights have no common scale.
+`export` writes one row per entry with expanded stacks, for tools such as DuckDB.
 
 ## Degradation
 
@@ -249,22 +348,26 @@ columns, the cookie index, the interned JFR stacks and the few retained control
 objects. Retention is proportional to the number of *distinct stacks*, not to the
 number of recorded intervals — a capture of 1.12 million samples carrying 10,631
 distinct stacks holds one copy of each — so the guard is a usable steering signal
-rather than a proxy for input size. Roughly 80 bytes of retention per recorded
-interval, plus the interned stacks, is the figure to plan a capture against — it is
-the load-bearing number here. The scale fixture
+rather than a proxy for input size. Roughly 95 bytes of retention per recorded
+interval, plus the interned stacks and the stack profile's entries, is the figure
+to plan a capture against — it is the load-bearing number here. A source column
+slot is 51 bytes: the switch-out reason, the task state and both native stack ids
+are kept for the stack profile. The scale fixture
 (`StreamingCorrelatorTest.scale`, 2,000,000 observations and a matching 2,000,000
 JFR samples) asserts a bound of 400 MiB on peak retained bytes and has measured
 comfortably inside it; the exact figure moves with the engine's structures and is
 not a number to plan against.
 
 A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
-distinct Java stacks) measured 203 MiB (212,831,820 bytes) of peak retained
-bytes at `--audit full`, `--audit matches` and no `--audit` alike — about 190
-bytes per recorded interval, roughly 2.4x the 80-byte column-only figure above.
-Real JVM stacks are far deeper than the synthetic scale fixture's, so interned
-stacks account for the difference; treat 80 bytes/interval as a lower bound for
-the column storage alone, not the full per-interval budget, when planning
-against real captures.
+distinct Java stacks) measured 226 MiB (237,145,343 bytes) of peak retained
+bytes — about 211 bytes per recorded interval, roughly 2.2x the 95-byte
+column-only figure above, and 11 % above the 203 MiB it measured before the
+native stacks and the stack profile were retained. Real JVM stacks are far deeper
+than the synthetic scale fixture's, so interned stacks account for the
+difference; treat 95 bytes/interval as a lower bound for the column storage
+alone, not the full per-interval budget, when planning against real captures.
+Its stack profile is 913 KB for 12,914 entries, against a 6.3 MB collapsed file,
+and renders any slice in about a third of a second.
 
 Integrity failures still reject the analysis: a JFR whose size or digest differs from
 the footer, an observation referencing an unannounced stack, an async-profiler counter
