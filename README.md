@@ -56,7 +56,7 @@ wall-clock sampler notices at each tick that a thread is off-CPU, but neither
 how long the interval lasted nor whether the thread was sleeping or merely
 queued.
 
-![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)
+[![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/lhotari/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
 The kernel sees the *mechanism* of a wait, never its *reason*. A thread never
 blocks "on the database": with a synchronous JDBC driver it sleeps in a socket
@@ -140,7 +140,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 
 ## How it works
 
-![jonoffcpu architecture](docs/images/architecture.svg)
+[![jonoffcpu architecture](docs/images/architecture.svg)](https://raw.githubusercontent.com/lhotari/jonoffcpu/main/docs/images/architecture.svg)
 
 1. A [CO-RE eBPF program](jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c)
    hooks `sched_switch` and `sched_exit_tp`. When a
