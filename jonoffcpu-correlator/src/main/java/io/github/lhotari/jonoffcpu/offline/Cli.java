@@ -242,6 +242,16 @@ final class Cli {
         boolean estimatePopulation;
 
         @Option(
+                names = "--max-accounted-loss",
+                paramLabel = "F",
+                defaultValue = "0.01",
+                converter = FractionConverter.class,
+                description = "The largest fraction of selected intervals the collector may have dropped under counted"
+                        + " sequence contention for the population estimate to stay available, scaled up by the"
+                        + " loss (0 <= F < 1). Default: ${DEFAULT-VALUE}.")
+        BigDecimal maxAccountedLoss;
+
+        @Option(
                 names = "--audit",
                 paramLabel = "LEVEL",
                 defaultValue = "matches",
@@ -645,14 +655,20 @@ final class Cli {
 
     static int correlate(CorrelateOptions options) throws Exception {
         var defaults = OfflineCorrelator.Limits.defaults();
-        var limits = new OfflineCorrelator.Limits(
-                options.maxRows,
-                defaults.maxLineBytes(),
-                options.maxRetainedBytes == null ? defaults.maxRetainedBytes() : options.maxRetainedBytes,
-                defaults.maxFrames(),
-                options.maxHandlerDelayNs,
-                options.fromNs,
-                options.toNs);
+        OfflineCorrelator.Limits limits;
+        try {
+            limits = new OfflineCorrelator.Limits(
+                    options.maxRows,
+                    defaults.maxLineBytes(),
+                    options.maxRetainedBytes == null ? defaults.maxRetainedBytes() : options.maxRetainedBytes,
+                    defaults.maxFrames(),
+                    options.maxHandlerDelayNs,
+                    options.fromNs,
+                    options.toNs,
+                    options.maxAccountedLoss);
+        } catch (IllegalArgumentException invalid) {
+            throw options.usage(invalid.getMessage());
+        }
         boolean hasJfrRange = options.from != null || options.to != null;
         if (options.partial && (options.partialJfr || hasJfrRange)) {
             throw options.usage("Incomplete-capture mode cannot be combined with JFR selection");
@@ -675,7 +691,8 @@ final class Cli {
                     || options.given("--profile-output")
                     || options.given("--profile-group-by")
                     || options.given("--max-profile-entries")
-                    || options.given("--summary-output")) {
+                    || options.given("--summary-output")
+                    || options.given("--max-accounted-loss")) {
                 throw options.usage("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -1532,6 +1549,17 @@ final class Cli {
         @Override
         public String convert(String text) {
             return choice(text, new String[] {"csv", "jsonl"}, Function.identity());
+        }
+    }
+
+    /** A non-negative decimal fraction such as {@code 0.01}; the range is checked by the limits it goes into. */
+    static final class FractionConverter implements ITypeConverter<BigDecimal> {
+        @Override
+        public BigDecimal convert(String text) {
+            if (!text.matches("[0-9]{1,9}(\\.[0-9]{1,18})?")) {
+                throw new TypeConversionException("expected a decimal fraction such as 0.01 but was '" + text + "'");
+            }
+            return new BigDecimal(text);
         }
     }
 

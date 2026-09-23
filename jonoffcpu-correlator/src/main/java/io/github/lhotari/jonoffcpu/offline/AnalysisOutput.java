@@ -561,7 +561,7 @@ interface AnalysisOutput {
                         result.capture().sourceDigest,
                         result.capture().jfrDigest,
                         estimate != null
-                                && estimate.sourceCoverageComplete()
+                                && "available".equals(estimate.status())
                                 && !result.thinning().active());
             }
         };

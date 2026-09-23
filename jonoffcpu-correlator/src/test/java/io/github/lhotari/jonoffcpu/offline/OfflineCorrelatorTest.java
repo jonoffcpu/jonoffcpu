@@ -349,6 +349,168 @@ public final class OfflineCorrelatorTest {
     }
 
     /**
+     * Sequence contention drops a selected interval after the kernel counted it, and counts the drop. When that
+     * count alone explains the gap between selection and the rows, the estimate is scaled by selected / received
+     * and reports the loss; any other discrepancy keeps the reasons it always had, and a loss above the limit is
+     * refused.
+     */
+    private static void sequenceContentionEstimate(Path dir, Path jfr, JsonObject matched, long tid) throws Exception {
+        JsonObject unmatched = observation(tid);
+        unmatched.addProperty("correlationId", "8000000100000002");
+        List<JsonObject> rows = List.of(matched, unmatched);
+        var lenient = new OfflineCorrelator.Limits(
+                100_000_000, 1024 * 1024, 256L << 20, 4096, null, null, null, new java.math.BigDecimal("0.5"));
+        // One row's fixed-point weight: 3000 ns under the uniform threshold, 64 fraction bits below one.
+        BigInteger rowWeight = BigInteger.valueOf(3000).shiftLeft(32 + 64).divide(BigInteger.valueOf(42949673));
+
+        // No contention: exactly today's estimate, with nothing accounted and nothing assumed.
+        Path source = source(dir, jfr, rows);
+        var exact = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
+        check(
+                exact.status().equals("available")
+                        && exact.sourceCoverageComplete()
+                        && exact.accountedLoss() == null
+                        && exact.assumptions().isEmpty()
+                        && exact.estimatedDurationNanos()
+                                .equals(rowWeight.shiftLeft(1).shiftRight(64).toString()),
+                "Zero contention must keep the exact estimate: " + exact);
+
+        // One contended interval explains the gap exactly: available, scaled by 3 / 2, loss reported.
+        java.util.function.Consumer<JsonObject> contended = row -> {
+            JsonObject kernel = row.getAsJsonObject("counters").getAsJsonObject("kernel");
+            kernel.addProperty("selectedIntervals", "3");
+            kernel.addProperty("eligibleIntervals", "3");
+            kernel.addProperty("sequenceContentions", "1");
+        };
+        mutateSource(source, "captureEnd", contended);
+        var accounted = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
+        check(
+                accounted.status().equals("available")
+                        && accounted.unavailableReasons().isEmpty()
+                        && !accounted.sourceCoverageComplete()
+                        && accounted.sourceRowsUsed().equals("2")
+                        && accounted.accountedLoss() != null
+                        && accounted.accountedLoss().intervals().equals("1")
+                        && accounted.accountedLoss().reason().equals("sequence-contention")
+                        && accounted.accountedLoss().fraction().equals(new java.math.BigDecimal("0.333333"))
+                        && accounted.assumptions().equals(List.of(CorrelationEngine.CONTENTION_INDEPENDENCE))
+                        && accounted
+                                .estimatedDurationNanos()
+                                .equals(rowWeight
+                                        .shiftLeft(1)
+                                        .multiply(BigInteger.valueOf(3))
+                                        .divide(BigInteger.TWO)
+                                        .shiftRight(64)
+                                        .toString()),
+                "Counted contention must scale the estimate by selected / received: " + accounted);
+
+        // The same loss above the default 1 % limit is refused, and still reported.
+        var refused = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults())
+                .populationEstimate();
+        check(
+                refused.status().equals("unavailable")
+                        && refused.estimatedDurationNanos() == null
+                        && refused.unavailableReasons().equals(List.of("accounted-loss-above-limit"))
+                        && refused.accountedLoss() != null
+                        && refused.accountedLoss().intervals().equals("1"),
+                "Accounted loss above the limit must be refused: " + refused);
+
+        // A gap the contention count does not explain keeps both of today's reasons.
+        mutateSource(source, "captureEnd", row -> {
+            JsonObject kernel = row.getAsJsonObject("counters").getAsJsonObject("kernel");
+            kernel.addProperty("selectedIntervals", "4");
+            kernel.addProperty("eligibleIntervals", "4");
+        });
+        var unexplained = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
+        check(
+                unexplained.status().equals("unavailable")
+                        && unexplained.accountedLoss() == null
+                        && unexplained.assumptions().isEmpty()
+                        && unexplained
+                                .unavailableReasons()
+                                .equals(List.of("nonzero-sequenceContentions", "selected-source-row-count-mismatch")),
+                "Unexplained mismatch must stay unavailable with today's reasons: " + unexplained);
+
+        // An explained gap next to any other failure counter is not accounted for either.
+        source = source(dir, jfr, rows);
+        mutateSource(
+                source,
+                "captureEnd",
+                contended.andThen(row -> row.getAsJsonObject("counters")
+                        .getAsJsonObject("kernel")
+                        .addProperty("ringReserveFailures", "1")));
+        var otherLoss = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
+        check(
+                otherLoss.status().equals("unavailable")
+                        && otherLoss.accountedLoss() == null
+                        && otherLoss
+                                .unavailableReasons()
+                                .equals(List.of(
+                                        "nonzero-ringReserveFailures",
+                                        "nonzero-sequenceContentions",
+                                        "selected-source-row-count-mismatch")),
+                "Another nonzero failure counter must keep today's reasons: " + otherLoss);
+
+        // Through the CLI: the report carries the loss and the assumption, the profile's estimates are valid and
+        // scaled like the total, and the default limit refuses the same capture.
+        source = source(dir, jfr, rows);
+        mutateSource(source, "captureEnd", contended);
+        for (String limit : List.of("0.5", "")) {
+            Path output = dir.resolve("analysis-contention" + limit);
+            List<String> args = new ArrayList<>(List.of(
+                    "--source",
+                    source.toString(),
+                    "--jfr",
+                    jfr.toString(),
+                    "--output",
+                    output.toString(),
+                    "--format",
+                    "collapsed",
+                    "--estimate-population",
+                    "true"));
+            if (!limit.isEmpty()) args.addAll(List.of("--max-accounted-loss", limit));
+            check(OffCpuCorrelator.run(args.toArray(String[]::new)) == 0, "Contended capture did not complete");
+            JsonObject report = com.google.gson.JsonParser.parseString(
+                            Files.readString(output.resolve(OutputFiles.REPORT)))
+                    .getAsJsonObject();
+            JsonObject estimate = report.getAsJsonObject("populationEstimate");
+            JsonObject loss = estimate.getAsJsonObject("accountedLoss");
+            check(
+                    loss.get("intervals").getAsString().equals("1")
+                            && loss.get("fraction").getAsBigDecimal().equals(new java.math.BigDecimal("0.333333"))
+                            && loss.get("reason").getAsString().equals("sequence-contention")
+                            && estimate.getAsJsonArray("assumptions").size() == 1,
+                    "Report must carry the accounted loss and its assumption: " + estimate);
+            boolean available = !limit.isEmpty();
+            check(
+                    estimate.get("status").getAsString().equals(available ? "available" : "unavailable")
+                            && report.getAsJsonObject("stackProfile")
+                                            .get("estimateAvailable")
+                                            .getAsBoolean()
+                                    == available,
+                    "CLI limit " + (available ? limit : "default") + " gave the wrong verdict: " + estimate);
+            StackProfile profile = StackProfile.read(output.resolve(OutputFiles.PROFILE));
+            BigInteger expected =
+                    available ? rowWeight.multiply(BigInteger.valueOf(3)).divide(BigInteger.TWO) : rowWeight;
+            check(
+                    profile.header().estimateAvailable() == available
+                            && profile.totalEstimatedNanos()
+                                    == expected.shiftRight(64).longValueExact(),
+                    "Profile estimates must take the same scale as the total: " + profile.totalEstimatedNanos());
+        }
+        CommandLineTest.usageError(
+                "Accounted-loss limit",
+                "--source",
+                source.toString(),
+                "--jfr",
+                jfr.toString(),
+                "--output",
+                dir.resolve("analysis-contention-bad").toString(),
+                "--max-accounted-loss",
+                "1");
+    }
+
+    /**
      * Rewrite a source prefix and its digest, so validation cannot pass merely by rejecting a stale
      * hash.
      */
@@ -582,6 +744,7 @@ public final class OfflineCorrelatorTest {
                     "Population estimate is not the truncated exact inverse-probability sum");
             // Writes its own source.jsonl variants, so it runs before the two-row source below is created.
             proportionalEstimate(dir, jfr, observation, tid[0]);
+            sequenceContentionEstimate(dir, jfr, observation, tid[0]);
             JsonObject unmatched = observation(tid[0]);
             unmatched.addProperty("correlationId", "8000000100000002");
             Path twoSource = source(dir, jfr, List.of(observation, unmatched));

@@ -6,6 +6,7 @@ import static io.github.lhotari.jonoffcpu.offline.CaptureInput.*;
 import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.file.Path;
 import java.time.Instant;
@@ -41,7 +42,14 @@ final class OfflineCorrelator {
             int maxFrames,
             BigInteger maxHandlerDelayNanos,
             BigInteger fromNanos,
-            BigInteger toNanos) {
+            BigInteger toNanos,
+            BigDecimal maxAccountedLoss) {
+        /**
+         * The largest fraction of kernel-selected intervals that an exactly counted loss (sequence
+         * contention) may remove before the population estimate is refused.
+         */
+        public static final BigDecimal DEFAULT_MAX_ACCOUNTED_LOSS = new BigDecimal("0.01");
+
         public Limits {
             if (maxRows <= 0 || maxLineBytes <= 0 || maxRetainedBytes <= 0 || maxFrames <= 0) {
                 throw new IllegalArgumentException("Resource limits must be positive");
@@ -55,6 +63,32 @@ final class OfflineCorrelator {
             if (fromNanos != null && toNanos != null && fromNanos.compareTo(toNanos) >= 0) {
                 throw new IllegalArgumentException("Measurement window must be nonempty");
             }
+            if (maxAccountedLoss == null) {
+                maxAccountedLoss = DEFAULT_MAX_ACCOUNTED_LOSS;
+            }
+            // A loss of every selected interval leaves nothing to scale, so the limit stays below one.
+            if (maxAccountedLoss.signum() < 0 || maxAccountedLoss.compareTo(BigDecimal.ONE) >= 0) {
+                throw new IllegalArgumentException("Accounted-loss limit must be at least 0 and below 1");
+            }
+        }
+
+        public Limits(
+                int maxRows,
+                int maxLineBytes,
+                long maxRetainedBytes,
+                int maxFrames,
+                BigInteger maxHandlerDelayNanos,
+                BigInteger fromNanos,
+                BigInteger toNanos) {
+            this(
+                    maxRows,
+                    maxLineBytes,
+                    maxRetainedBytes,
+                    maxFrames,
+                    maxHandlerDelayNanos,
+                    fromNanos,
+                    toNanos,
+                    DEFAULT_MAX_ACCOUNTED_LOSS);
         }
 
         public static Limits defaults() {
@@ -99,6 +133,8 @@ final class OfflineCorrelator {
      * Inverse-probability source-duration estimate, kept separate from matched stack weights. Each valid source
      * row is weighted by {@code duration * 2^32 / admissionThreshold} using the exact per-row threshold the kernel
      * drew against; the sum is accumulated in exact fixed-point arithmetic and truncated to whole nanoseconds.
+     * When the only gap in coverage is an {@link AccountedLoss}, the sum is scaled by {@code selected / received}
+     * under the independence assumption {@code assumptions} names, and {@code sourceCoverageComplete} is false.
      */
     public record PopulationEstimate(
             String method,
@@ -111,7 +147,17 @@ final class OfflineCorrelator {
             String estimatedDurationNanos,
             boolean sourceCoverageComplete,
             boolean stackDeliveryCorrectionApplied,
-            List<String> unavailableReasons) {}
+            List<String> unavailableReasons,
+            AccountedLoss accountedLoss,
+            List<String> assumptions) {}
+
+    /**
+     * Kernel-selected intervals that never reached the capture, but whose number the kernel counted exactly:
+     * {@code selectedIntervals - receivedObservations == sequenceContentions}. {@code fraction} is
+     * {@code intervals / selectedIntervals}, rounded to six significant digits for display; the limit check and the
+     * scaling of the estimate use the exact counters.
+     */
+    public record AccountedLoss(String intervals, BigDecimal fraction, String reason) {}
 
     public record Analysis(
             int schemaVersion,

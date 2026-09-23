@@ -119,25 +119,36 @@ static __always_inline __u64 run_delay(struct task_struct *task)
     return BPF_CORE_READ(flavour, sched_info.run_delay);
 }
 
+/* Each lost compare-and-swap means another CPU allocated a sequence in the
+ * meantime, so the loop always makes global progress; the constant bound keeps
+ * the hook's cost fixed. Only an allocation that loses every attempt is dropped
+ * and counted as a contention. */
+#define JONOFFCPU_SEQUENCE_ATTEMPTS 16
+
 static __always_inline __u32 allocate_sequence(struct jonoffcpu_stats *s)
 {
     __u64 old = next_sequence;
     __u64 next;
     __u64 observed;
+    int attempt;
 
-    if (!old) {
-        if (s)
-            __sync_fetch_and_add(&s->sequence_exhaustions, 1);
-        return 0;
+    for (attempt = 0; attempt < JONOFFCPU_SEQUENCE_ATTEMPTS; attempt++) {
+        /* Zero is the exhaustion sentinel: the last valid sequence was taken. */
+        if (!old) {
+            if (s)
+                __sync_fetch_and_add(&s->sequence_exhaustions, 1);
+            return 0;
+        }
+        next = old == 0xffffffffULL ? 0 : old + 1;
+        observed = __sync_val_compare_and_swap(&next_sequence, old, next);
+        if (observed == old)
+            return (__u32)old;
+        /* Retry from the value the winner left behind. */
+        old = observed;
     }
-    next = old == 0xffffffffULL ? 0 : old + 1;
-    observed = __sync_val_compare_and_swap(&next_sequence, old, next);
-    if (observed != old) {
-        if (s)
-            __sync_fetch_and_add(&s->sequence_contentions, 1);
-        return 0;
-    }
-    return (__u32)old;
+    if (s)
+        __sync_fetch_and_add(&s->sequence_contentions, 1);
+    return 0;
 }
 
 /* The raw tracepoint, not the trace event: `preempt` is the scheduler's own
