@@ -30,7 +30,8 @@ import picocli.CommandLine.Model.OptionSpec;
  */
 public final class CommandLineTest {
     /** Every command with its own help, the top-level one as the empty name. */
-    static final List<String> COMMANDS = List.of("", "correlate", "stacks", "merge", "export", "dump");
+    static final List<String> COMMANDS =
+            List.of("", "correlate", "stacks", "top", "summarize", "merge", "export", "dump");
 
     private CommandLineTest() {}
 
@@ -182,12 +183,41 @@ public final class CommandLineTest {
         explicit.addAll(List.of("--output", second.toString()));
         check(OffCpuCorrelator.run(implicit.toArray(String[]::new)) == 0, "The default command must correlate");
         check(OffCpuCorrelator.run(explicit.toArray(String[]::new)) == 0, "correlate must correlate");
-        for (String file : List.of(OutputFiles.COLLAPSED, OutputFiles.PROFILE, OutputFiles.COMPLETE)) {
+        check(
+                Files.exists(first.resolve(OutputFiles.SUMMARY_MD)),
+                "No digest: " + Files.readString(first.resolve(OutputFiles.REPORT)));
+        for (String file : List.of(
+                OutputFiles.COLLAPSED,
+                OutputFiles.PROFILE,
+                OutputFiles.SUMMARY_JSON,
+                OutputFiles.SUMMARY_MD,
+                OutputFiles.COMPLETE)) {
             check(
                     java.util.Arrays.equals(
                             Files.readAllBytes(first.resolve(file)), Files.readAllBytes(second.resolve(file))),
                     file + " must not depend on how correlate is named");
         }
+        // Correlation writes the digest by default and names it in the report; --summary-output false does not.
+        com.google.gson.JsonObject digest = com.google.gson.JsonParser.parseString(
+                        Files.readString(first.resolve(OutputFiles.REPORT)))
+                .getAsJsonObject()
+                .getAsJsonObject("digest");
+        check(
+                digest.get("path").getAsString().equals(OutputFiles.SUMMARY_MD)
+                        && digest.get("json").getAsString().equals(OutputFiles.SUMMARY_JSON)
+                        && Files.readString(first.resolve(OutputFiles.SUMMARY_MD))
+                                .startsWith("# jonoffcpu analysis digest"),
+                "The report must name the digest: " + digest);
+        Path withoutDigest = dir.resolve("without-digest");
+        List<String> noDigest = new ArrayList<>(common);
+        noDigest.addAll(List.of("--output", withoutDigest.toString(), "--summary-output", "false"));
+        check(OffCpuCorrelator.run(noDigest.toArray(String[]::new)) == 0, "Correlation without a digest");
+        check(
+                !Files.exists(withoutDigest.resolve(OutputFiles.SUMMARY_MD))
+                        && !Files.exists(withoutDigest.resolve(OutputFiles.SUMMARY_JSON))
+                        && !Files.readString(withoutDigest.resolve(OutputFiles.REPORT))
+                                .contains("\"digest\""),
+                "--summary-output false must write no digest");
         Path slice = dir.resolve("slice.collapsed");
         Path patterns = Files.writeString(dir.resolve("idle.txt"), "epollWait\n");
         check(
@@ -294,7 +324,8 @@ public final class CommandLineTest {
             check(correlate.findOption(name) != null, "README mentions unknown correlate option " + name);
         }
         // The slicing section's commands: every option it names belongs to one of them.
-        List<CommandSpec> profileCommands = List.of(spec("stacks"), spec("merge"), spec("export"));
+        List<CommandSpec> profileCommands =
+                List.of(spec("stacks"), spec("top"), spec("summarize"), spec("merge"), spec("export"));
         for (String name :
                 options(String.join("\n", section(readme, "### 5. Slice and filter with the stack profile")))) {
             check(

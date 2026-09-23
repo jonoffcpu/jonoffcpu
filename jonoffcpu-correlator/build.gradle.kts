@@ -297,6 +297,7 @@ val fixtureMains = mapOf(
     "CommandLine" to "io.github.lhotari.jonoffcpu.offline.CommandLineTest",
     "StackTransforms" to "io.github.lhotari.jonoffcpu.offline.StackTransformsTest",
     "Export" to "io.github.lhotari.jonoffcpu.offline.ExportTest",
+    "Top" to "io.github.lhotari.jonoffcpu.offline.TopTest",
     "FixtureAcceptance" to "io.github.lhotari.jonoffcpu.offline.FixtureAcceptanceTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->

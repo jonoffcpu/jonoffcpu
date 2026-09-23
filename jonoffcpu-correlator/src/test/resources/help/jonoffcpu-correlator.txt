@@ -7,8 +7,9 @@ Usage: java -jar jonoffcpu-correlator.jar [-hV] [--audit=LEVEL] [--collapsed-rea
                                           [--output=DIR] [--partial=true|false]
                                           [--partial-jfr=true|false] [--profile-group-by=LIST]
                                           [--profile-output=true|false] [--quantum-ns=N]
-                                          [--source=FILE] [--thinning=Q] [--thinning-seed=N]
-                                          [--to=TIME] [--to-ns=N] [COMMAND]
+                                          [--source=FILE] [--summary-output=true|false]
+                                          [--thinning=Q] [--thinning-seed=N] [--to=TIME]
+                                          [--to-ns=N] [COMMAND]
 Correlates a jonoffcpu capture with its JFR, and renders, merges and exports the stack profile it
 produces. Without a subcommand it correlates, with the options below.
       --source=FILE          The finalized capture stream the agent wrote (jonoffcpu-capture.pb).
@@ -63,6 +64,11 @@ produces. Without a subcommand it correlates, with the options below.
                              The profile's optional dimensions besides the Java stack and the
                                reason: any of kernel, user, thread, or none. Default: kernel,user,
                                thread.
+      --summary-output=true|false
+                             Whether to write the analysis digest, jonoffcpu-summary.md and
+                               jonoffcpu-summary.json, from the profile and the report. A failure
+                               to write it is reported in the report and never fails the
+                               correlation. Default: true.
       --max-profile-entries=N
                              Entry limit for the profile; past it the thread, then the user and the
                                kernel stack are dropped from the grouping. Default: 2000000.
@@ -73,6 +79,12 @@ Commands:
   stacks     Renders one collapsed slice of a stack profile: by switch-out reason, stack kinds,
                weights and time part, keeping or dropping whole intervals by their frames and
                transforming the frames of the ones it keeps.
+  top        Ranks where off-CPU time went. Each selected interval is idle when a frame of any of
+               its stacks matches --idle, and busy otherwise; busy time is attributed by --by to a
+               row, and idle time is listed in its own table.
+  summarize  Writes the analysis digest, jonoffcpu-summary.md and jonoffcpu-summary.json: the
+               capture's coverage and losses, where the time went, the ranked busy and idle tables,
+               the heaviest transformed stacks, and the command that reproduces each table.
   merge      Sums the counters of several stack profiles into one. Thinned profiles cannot be
                merged.
   export     Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.
@@ -80,9 +92,9 @@ Commands:
   help       Display help information about the specified command.
 
 Writes into the output directory: jonoffcpu-report.json, jonoffcpu-offcpu-stacks.collapsed,
-jonoffcpu-offcpu-profile.pb, jonoffcpu-offcpu-synthetic.jfr and, last, jonoffcpu-complete.json;
-jonoffcpu-classified-records.jsonl is written only for --audit full and jonoffcpu-matches.jsonl for
---audit full or matches; --partial true writes INCOMPLETE-jonoffcpu-* files and jonoffcpu-partial.
-json instead.
+jonoffcpu-offcpu-profile.pb, the digest jonoffcpu-summary.md and jonoffcpu-summary.json,
+jonoffcpu-offcpu-synthetic.jfr and, last, jonoffcpu-complete.json; jonoffcpu-classified-records.
+jsonl is written only for --audit full and jonoffcpu-matches.jsonl for --audit full or matches;
+--partial true writes INCOMPLETE-jonoffcpu-* files and jonoffcpu-partial.json instead.
 
 Exit status: 0 complete, 2 narrowed or partial output, 64 invalid command line.

@@ -162,6 +162,11 @@ def main():
     profile_path = output / "analysis/jonoffcpu-offcpu-profile.pb"
     if not profile_path.is_file() or profile_path.stat().st_size == 0:
         raise RuntimeError(f"Stack profile is missing or empty: {profile_path}")
+    # The digest is written by default, and the report names it rather than an error.
+    digest = report.get("digest") or {}
+    digest_path = output / "analysis/jonoffcpu-summary.md"
+    if digest.get("path") != "jonoffcpu-summary.md" or not digest_path.is_file():
+        raise RuntimeError(f"Analysis digest is missing ({digest}): {digest_path}")
     # The profile renders back to the collapsed stacks the correlator wrote.
     run(
         [

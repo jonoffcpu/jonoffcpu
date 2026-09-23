@@ -29,7 +29,8 @@ public final class OffCpuCorrelator {
             String prefix,
             Degradation ladder,
             boolean stackProfile,
-            StackProfileRenderer.ReasonFrame reasonFrame) {
+            StackProfileRenderer.ReasonFrame reasonFrame,
+            boolean digest) {
         public OutputOptions {
             if (reasonFrame == null) throw new IllegalArgumentException("Missing reason frame mode");
             if (!collapsed && !compatibilityJfr)
@@ -55,7 +56,8 @@ public final class OffCpuCorrelator {
                     OutputFiles.PREFIX,
                     Degradation.none(),
                     true,
-                    StackProfileRenderer.ReasonFrame.AUTO);
+                    StackProfileRenderer.ReasonFrame.AUTO,
+                    true);
         }
     }
 
@@ -185,7 +187,8 @@ public final class OffCpuCorrelator {
             Degradation.Policy onLimit,
             StackProfileRenderer.ReasonFrame reasonFrame,
             boolean stackProfile,
-            ProfileAccumulator.Options profileOptions)
+            ProfileAccumulator.Options profileOptions,
+            boolean digest)
             throws IOException {
         boolean hasJfrRange = from != null || to != null;
         OfflineCorrelator.JfrSelection selection = null;
@@ -223,7 +226,8 @@ public final class OffCpuCorrelator {
                         prefix,
                         ladder,
                         stackProfile,
-                        reasonFrame),
+                        reasonFrame,
+                        digest),
                 () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
         System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + output
@@ -413,6 +417,7 @@ public final class OffCpuCorrelator {
             view.addProperty("estimateAvailable", profile.header().estimateAvailable());
             view.addProperty("timeSplitAvailable", profile.header().timeSplitAvailable());
             report.add("stackProfile", view);
+            if (options.digest()) report.add("digest", digest(directory, prefix, profile, report));
         }
         // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
         String reportJson =
@@ -459,6 +464,34 @@ public final class OffCpuCorrelator {
                 writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
             }
         }
+    }
+
+    /**
+     * Writes the analysis digest beside the report and returns the report's {@code digest} object. The digest is a
+     * convenience: a failure to produce it is reported there, its files are removed, and the correlation goes on.
+     */
+    private static JsonObject digest(Path directory, String prefix, StackProfile profile, JsonObject report) {
+        JsonObject view = new JsonObject();
+        Path json = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_JSON_SUFFIX));
+        Path markdown = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_MD_SUFFIX));
+        try {
+            Digest.write(
+                    Digest.of(profile, OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX), report, Digest.defaults()),
+                    json,
+                    markdown);
+            view.addProperty("path", markdown.getFileName().toString());
+            view.addProperty("json", json.getFileName().toString());
+            view.addProperty("schemaVersion", Digest.SCHEMA_VERSION);
+        } catch (IOException | RuntimeException failure) {
+            try {
+                Files.deleteIfExists(json);
+                Files.deleteIfExists(markdown);
+            } catch (IOException ignored) {
+                // The error below is what the reader needs; a leftover file is named by it too.
+            }
+            view.addProperty("error", String.valueOf(failure));
+        }
+        return view;
     }
 
     /** A digest recheck run after every other artifact is written but before the completion marker. */
