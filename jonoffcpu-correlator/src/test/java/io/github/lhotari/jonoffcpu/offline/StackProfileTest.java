@@ -456,12 +456,184 @@ public final class StackProfileTest {
         rejects(IOException.class, "canonical", () -> correlate(uncanonical, jfr, dir.resolve("a5")));
     }
 
+    private static List<StackProfile.Frame> frames(StackProfile.Kind kind, String... names) {
+        return Arrays.stream(names)
+                .map(name -> new StackProfile.Frame(kind, name, kind == StackProfile.Kind.USER ? "libc.so.6" : ""))
+                .toList();
+    }
+
+    private static JsonObject summaryOf(Path file) throws IOException {
+        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+    }
+
+    /**
+     * Filters drop whole entries before they merge into lines, match stacks the slice does not render, and account
+     * for what they remove — which {@code jfr-converter -X} on a rendered file can do none of.
+     */
+    private static void filters(Path dir) throws Exception {
+        var java = StackProfile.Kind.JAVA;
+        var kernel = StackProfile.Kind.KERNEL;
+        var user = StackProfile.Kind.USER;
+        List<StackProfile.Entry> entries = List.of(
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "io.netty.channel.epoll.Native.epollWait0"),
+                        frames(
+                                kernel,
+                                "do_syscall_64+0x10",
+                                "ep_poll+0x20",
+                                "schedule+0x2a",
+                                "__traceiter_sched_exit_tp+0x40"),
+                        frames(user, "epoll_wait+0x5"),
+                        OffCpuReason.BLOCKED,
+                        1,
+                        "loop-1",
+                        3,
+                        3000,
+                        0),
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "app.Worker.park"),
+                        frames(kernel, "do_syscall_64+0x10", "futex_wait+0x8"),
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        "worker",
+                        2,
+                        2000,
+                        0),
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "app.Worker.spin"),
+                        frames(kernel, "schedule+0x2a"),
+                        frames(user, "sched_yield+0x3"),
+                        OffCpuReason.RUNNABLE,
+                        0,
+                        "worker",
+                        1,
+                        500,
+                        0));
+        List<String> grouped = List.of("reason", ProfileAccumulator.KERNEL, ProfileAccumulator.USER, "thread");
+        Path profile = dir.resolve("filters.pb");
+        new StackProfile(new StackProfile.Header(List.of(), grouped, false, "{}", "", List.of()), entries)
+                .write(profile);
+
+        String all = stacks(profile, dir.resolve("all.collapsed"));
+        check(all.lines().count() == 3 && all.startsWith("[offcpu: "), "Unfiltered slice: " + all);
+
+        // The literal frame name works as given, and the whole interval goes, not just the frame.
+        Path summary = dir.resolve("netty.json");
+        String netty = stacks(
+                profile,
+                dir.resolve("netty.collapsed"),
+                "--exclude",
+                "io.netty.channel.epoll.Native.epollWait0",
+                "--summary",
+                summary.toString());
+        check(!netty.contains("epollWait0") && netty.lines().count() == 2, "Netty wait not dropped: " + netty);
+        JsonObject counts = summaryOf(summary);
+        check(counts.get("intervals").getAsString().equals("3"), "Kept intervals: " + counts);
+        check(counts.get("totalNanos").getAsString().equals("2500"), "Kept nanos: " + counts);
+        JsonObject filtered = counts.getAsJsonObject("filtered");
+        check(filtered.get("intervals").getAsString().equals("3"), "Filtered intervals: " + counts);
+        check(filtered.get("totalNanos").getAsString().equals("3000"), "Filtered nanos: " + counts);
+        check(counts.getAsJsonArray("exclude").size() == 1, "Patterns must be reported: " + counts);
+        check(counts.getAsJsonArray("filterScope").size() == 3, "Every grouped stack is searched: " + counts);
+
+        // A kernel frame drops its entry from a Java-only slice, where the frame never reaches a line.
+        check(
+                stacks(profile, dir.resolve("ep.collapsed"), "--stack", "java", "--exclude", "^ep_poll_\\[k\\]$")
+                        .equals(netty),
+                "Unrendered kernel frames must be matched");
+        // The profiler's own tracing frames are not the thread's and match nothing.
+        check(
+                stacks(profile, dir.resolve("trace.collapsed"), "--exclude", "__traceiter")
+                        .equals(all),
+                "Tracing frames must not be matched");
+        // An unavailable stack matches as its placeholder frame.
+        check(
+                !stacks(profile, dir.resolve("nouser.collapsed"), "--exclude", "user stack unavailable")
+                        .contains("app.Worker.park"),
+                "Unavailable stacks match their placeholder");
+
+        // Repeated includes are a union, and an exclusion wins over an inclusion.
+        String union =
+                stacks(profile, dir.resolve("union.collapsed"), "--include", "futex_wait", "--include", "sched_yield");
+        check(union.lines().count() == 2 && !union.contains("epollWait0"), "Includes are a union: " + union);
+        Path none = dir.resolve("none.json");
+        check(
+                stacks(
+                                profile,
+                                dir.resolve("none.collapsed"),
+                                "--include",
+                                "Thread.run",
+                                "--exclude",
+                                "Thread.run",
+                                "--summary",
+                                none.toString())
+                        .isEmpty(),
+                "Exclusion must win");
+        check(
+                summaryOf(none)
+                        .getAsJsonObject("filtered")
+                        .get("totalNanos")
+                        .getAsString()
+                        .equals("5500"),
+                "An empty slice still accounts for the time: " + summaryOf(none));
+
+        // Only kept entries decide whether the slice mixes reasons.
+        String parked = stacks(profile, dir.resolve("parked.collapsed"), "--include", "Worker\\.(park|spin)$");
+        check(parked.lines().allMatch(line -> line.startsWith("[offcpu: ")), "Two reasons remain: " + parked);
+        String blockedOnly = stacks(profile, dir.resolve("park.collapsed"), "--include", "Worker\\.park$");
+        check(
+                blockedOnly.lines().count() == 1 && blockedOnly.startsWith("java.lang.Thread.run;app.Worker.park "),
+                "A filter leaving one reason needs no reason frame: " + blockedOnly);
+
+        rejects(
+                java.util.regex.PatternSyntaxException.class,
+                "Unclosed group",
+                () -> stacks(profile, dir.resolve("bad.collapsed"), "--include", "("));
+        rejects(
+                IllegalArgumentException.class,
+                "--exclude",
+                () -> stacks(profile, dir.resolve("missing.collapsed"), "--exclude"));
+
+        // A profile not grouped by kernel stacks cannot be filtered by them, and the summary says so.
+        Path narrow = dir.resolve("narrow.pb");
+        new StackProfile(
+                        new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of()),
+                        entries.stream()
+                                .map(entry -> new StackProfile.Entry(
+                                        entry.javaStack(),
+                                        null,
+                                        null,
+                                        entry.reason(),
+                                        entry.taskState(),
+                                        null,
+                                        entry.intervals(),
+                                        entry.observedNanos(),
+                                        entry.estimatedNanos()))
+                                .toList())
+                .write(narrow);
+        Path narrowSummary = dir.resolve("narrow.json");
+        stacks(narrow, dir.resolve("narrow.collapsed"), "--exclude", "ep_poll", "--summary", narrowSummary.toString());
+        JsonObject narrowCounts = summaryOf(narrowSummary);
+        check(
+                narrowCounts
+                        .getAsJsonObject("filtered")
+                        .get("intervals")
+                        .getAsString()
+                        .equals("0"),
+                "Nothing to match: " + narrowCounts);
+        check(
+                narrowCounts.getAsJsonArray("filterScope").toString().equals("[\"java\"]"),
+                "Scope must show what was searched: " + narrowCounts);
+    }
+
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-profile-test-");
         try {
             unclassifiedGolden(Files.createDirectories(dir.resolve("golden")));
             mixedReasons(Files.createDirectories(dir.resolve("mixed")));
             classificationIsVerified(Files.createDirectories(dir.resolve("verified")));
+            filters(Files.createDirectories(dir.resolve("filters")));
             System.out.println("Stack profile fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

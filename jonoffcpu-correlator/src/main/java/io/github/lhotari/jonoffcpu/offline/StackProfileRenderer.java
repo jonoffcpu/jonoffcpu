@@ -7,17 +7,22 @@ import com.google.gson.JsonObject;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.math.BigInteger;
+import java.util.ArrayList;
 import java.util.EnumSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 /**
  * Projects a {@link StackProfile} onto collapsed stacks: one slice by switch-out reason, stack kind and weighting.
  * Rendered with the profile's own defaults — every reason, Java stacks, observed weights — a profile reproduces
- * the correlator's {@code jonoffcpu-offcpu-stacks.collapsed} byte for byte.
+ * the correlator's {@code jonoffcpu-offcpu-stacks.collapsed} byte for byte. A {@link Filter} keeps or drops whole
+ * entries by their frames before they are merged into lines, so it sees stacks the slice does not render, and the
+ * time it removes stays accountable.
  */
 final class StackProfileRenderer {
     /** Which stacks a collapsed line is made of, root first, in this order. */
@@ -82,8 +87,96 @@ final class StackProfileRenderer {
         }
     }
 
-    /** The collapsed lines of one slice and the totals behind them, for a summary a reader can reconcile. */
-    record Slice(Map<String, BigInteger> nanos, long intervals, BigInteger totalNanos) {}
+    /**
+     * Keeps or drops whole profile entries by their frames. An entry is dropped when any frame of any of its stacks
+     * matches an {@code exclude} pattern, and otherwise kept when {@code include} is empty or any frame matches one
+     * of its patterns. Patterns are searched for ({@link java.util.regex.Matcher#find()}) in each frame's rendered
+     * text: a Java frame's name, a native frame's offset-free symbol, a kernel frame's with its {@code _[k]} suffix
+     * and without the tracing frames, and an unavailable native stack's placeholder frame. Every stack the profile
+     * is grouped by is searched, whichever the slice renders.
+     */
+    record Filter(List<Pattern> include, List<Pattern> exclude) {
+        static final Filter NONE = new Filter(List.of(), List.of());
+
+        private static final int INCLUDED = 1;
+        private static final int EXCLUDED = 2;
+
+        Filter {
+            include = List.copyOf(include);
+            exclude = List.copyOf(exclude);
+        }
+
+        static Filter of(List<String> include, List<String> exclude) {
+            return new Filter(
+                    include.stream().map(Pattern::compile).toList(),
+                    exclude.stream().map(Pattern::compile).toList());
+        }
+
+        boolean active() {
+            return !include.isEmpty() || !exclude.isEmpty();
+        }
+
+        /** The stack kinds a filter over this profile searches: Java always, native ones when grouped by. */
+        static List<String> scope(StackProfile profile) {
+            List<String> scope = new ArrayList<>(List.of("java"));
+            if (profile.header().dimensions().contains(ProfileAccumulator.USER)) scope.add(ProfileAccumulator.USER);
+            if (profile.header().dimensions().contains(ProfileAccumulator.KERNEL)) {
+                scope.add(ProfileAccumulator.KERNEL);
+            }
+            return scope;
+        }
+
+        /** Whether an entry survives; each distinct stack is matched once per render. */
+        private Predicate<StackProfile.Entry> predicate(StackProfile profile) {
+            if (!active()) return entry -> true;
+            List<String> scope = scope(profile);
+            boolean user = scope.contains(ProfileAccumulator.USER);
+            boolean kernel = scope.contains(ProfileAccumulator.KERNEL);
+            Map<List<StackProfile.Frame>, Integer> javaFlags = new IdentityHashMap<>();
+            Map<List<StackProfile.Frame>, Integer> userFlags = new IdentityHashMap<>();
+            Map<List<StackProfile.Frame>, Integer> kernelFlags = new IdentityHashMap<>();
+            return entry -> {
+                int flags = javaFlags.computeIfAbsent(entry.javaStack(), stack -> match(javaNames(stack)));
+                if (user && (flags & EXCLUDED) == 0) {
+                    flags |= userFlags.computeIfAbsent(entry.userStack(), stack -> match(userNames(stack)));
+                }
+                if (kernel && (flags & EXCLUDED) == 0) {
+                    flags |= kernelFlags.computeIfAbsent(entry.kernelStack(), stack -> match(kernelNames(stack)));
+                }
+                if ((flags & EXCLUDED) != 0) return false;
+                return include.isEmpty() || (flags & INCLUDED) != 0;
+            };
+        }
+
+        private int match(List<String> names) {
+            int flags = 0;
+            for (String name : names) {
+                for (Pattern pattern : exclude) {
+                    if (pattern.matcher(name).find()) return EXCLUDED;
+                }
+                if ((flags & INCLUDED) == 0) {
+                    for (Pattern pattern : include) {
+                        if (pattern.matcher(name).find()) {
+                            flags |= INCLUDED;
+                            break;
+                        }
+                    }
+                }
+            }
+            return flags;
+        }
+    }
+
+    /**
+     * The collapsed lines of one slice and the totals behind them, for a summary a reader can reconcile. The
+     * filtered totals are what the slice's filter removed: an unfiltered slice's totals less the kept ones.
+     */
+    record Slice(
+            Map<String, BigInteger> nanos,
+            long intervals,
+            BigInteger totalNanos,
+            long filteredIntervals,
+            BigInteger filteredNanos) {}
 
     private static final Pattern OFFSET = Pattern.compile("\\+0x[0-9a-fA-F]+$");
     /**
@@ -92,6 +185,9 @@ final class StackProfileRenderer {
      * leaf is the profiler, not the wait.
      */
     private static final Pattern TRACING = Pattern.compile("^(__traceiter_|__bpf_trace_|bpf_trace_run|bpf_prog_)");
+
+    private static final String USER_UNAVAILABLE = "[user stack unavailable]";
+    private static final String KERNEL_UNAVAILABLE = "[kernel stack unavailable]";
 
     private StackProfileRenderer() {}
 
@@ -103,10 +199,36 @@ final class StackProfileRenderer {
     /**
      * Renders one slice. {@code reasons} null selects every reason. Observed weights are rescaled by the source's
      * correlation-time thinning, as the correlator's own collapsed file is; estimated weights require the
-     * profile's estimate to be available.
+     * profile's estimate to be available. The filter applies to entries before anything else, including the
+     * {@link ReasonFrame#AUTO} decision, so a filtered slice reads as if the dropped entries were never recorded.
      */
     static Slice render(
-            StackProfile profile, Set<OffCpuReason> reasons, StackKinds kinds, Weights weights, ReasonFrame frame)
+            StackProfile profile,
+            Set<OffCpuReason> reasons,
+            StackKinds kinds,
+            Weights weights,
+            ReasonFrame frame,
+            Filter filter)
+            throws IOException {
+        Slice kept = project(profile, reasons, kinds, weights, frame, filter.predicate(profile));
+        if (!filter.active()) return kept;
+        // Rendered unfiltered as well, so the removed time is exact even where thinning rounds line by line.
+        Slice all = project(profile, reasons, kinds, weights, frame, entry -> true);
+        return new Slice(
+                kept.nanos(),
+                kept.intervals(),
+                kept.totalNanos(),
+                Math.subtractExact(all.intervals(), kept.intervals()),
+                all.totalNanos().subtract(kept.totalNanos()));
+    }
+
+    private static Slice project(
+            StackProfile profile,
+            Set<OffCpuReason> reasons,
+            StackKinds kinds,
+            Weights weights,
+            ReasonFrame frame,
+            Predicate<StackProfile.Entry> keeps)
             throws IOException {
         if (weights == Weights.ESTIMATED) {
             CaptureInput.require(
@@ -116,17 +238,19 @@ final class StackProfileRenderer {
         if (kinds.kernel) requireDimension(profile, ProfileAccumulator.KERNEL);
         if (kinds.user) requireDimension(profile, ProfileAccumulator.USER);
         Set<OffCpuReason> selected = reasons == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(reasons);
+        List<StackProfile.Entry> entries = new ArrayList<>();
         Set<OffCpuReason> present = EnumSet.noneOf(OffCpuReason.class);
         for (StackProfile.Entry entry : profile.entries()) {
+            if (!selected.contains(entry.reason()) || !keeps.test(entry)) continue;
+            entries.add(entry);
             // Only reasons that contribute a line count, as in the correlator's own collapsed file.
-            if (selected.contains(entry.reason()) && entry.observedNanos() > 0) present.add(entry.reason());
+            if (entry.observedNanos() > 0) present.add(entry.reason());
         }
         boolean withReason = frame.applies(present.size());
         String label = profile.header().label();
         Map<String, BigInteger> raw = new TreeMap<>();
         long intervals = 0;
-        for (StackProfile.Entry entry : profile.entries()) {
-            if (!selected.contains(entry.reason())) continue;
+        for (StackProfile.Entry entry : entries) {
             intervals = Math.addExact(intervals, entry.intervals());
             long nanos = weights == Weights.OBSERVED ? entry.observedNanos() : entry.estimatedNanos();
             if (nanos == 0) continue;
@@ -134,8 +258,8 @@ final class StackProfileRenderer {
             if (withReason) line.append(reasonFrame(entry.reason())).append(';');
             int start = line.length();
             if (kinds.java) appendJava(line, entry.javaStack());
-            if (kinds.user) appendNative(line, start, entry.userStack(), "", "[user stack unavailable]");
-            if (kinds.kernel) appendNative(line, start, entry.kernelStack(), "_[k]", "[kernel stack unavailable]");
+            if (kinds.user) appendNative(line, start, userNames(entry.userStack()));
+            if (kinds.kernel) appendNative(line, start, kernelNames(entry.kernelStack()));
             raw.merge(line.toString(), BigInteger.valueOf(nanos), BigInteger::add);
         }
         Thinning thinning = weights == Weights.OBSERVED ? profile.header().thinning() : Thinning.NONE;
@@ -147,7 +271,7 @@ final class StackProfileRenderer {
             scaled.put(line.getKey(), value);
             total = total.add(value);
         }
-        return new Slice(scaled, intervals, total);
+        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO);
     }
 
     private static void requireDimension(StackProfile profile, String dimension) throws IOException {
@@ -163,18 +287,33 @@ final class StackProfileRenderer {
         }
     }
 
-    private static void appendNative(
-            StringBuilder line, int start, List<StackProfile.Frame> stack, String suffix, String unavailable) {
+    private static void appendNative(StringBuilder line, int start, List<String> names) {
         if (line.length() > start) line.append(';');
-        if (stack == null) {
-            line.append(unavailable);
-            return;
-        }
-        int end = suffix.isEmpty() ? stack.size() : kernelEnd(stack);
+        line.append(String.join(";", names));
+    }
+
+    /** Each kind of stack's frames, root first, as they read in a collapsed line; what a {@link Filter} matches. */
+    private static List<String> javaNames(List<StackProfile.Frame> stack) {
+        if (stack == null) return List.of();
+        return stack.stream().map(StackProfile.Frame::name).toList();
+    }
+
+    private static List<String> userNames(List<StackProfile.Frame> stack) {
+        return nativeNames(stack, stack == null ? 0 : stack.size(), "", USER_UNAVAILABLE);
+    }
+
+    private static List<String> kernelNames(List<StackProfile.Frame> stack) {
+        return nativeNames(stack, stack == null ? 0 : kernelEnd(stack), "_[k]", KERNEL_UNAVAILABLE);
+    }
+
+    private static List<String> nativeNames(
+            List<StackProfile.Frame> stack, int end, String suffix, String unavailable) {
+        if (stack == null) return List.of(unavailable);
+        List<String> names = new ArrayList<>(end);
         for (int index = 0; index < end; index++) {
-            if (index > 0) line.append(';');
-            line.append(escape(nativeName(stack.get(index)))).append(suffix);
+            names.add(escape(nativeName(stack.get(index))) + suffix);
         }
+        return names;
     }
 
     /** Where a root-first kernel stack stops being the thread's own: at the first tracing frame, if any. */
@@ -208,7 +347,12 @@ final class StackProfileRenderer {
     }
 
     static JsonObject summary(
-            Slice slice, StackProfile profile, Set<OffCpuReason> reasons, StackKinds kinds, Weights weights) {
+            Slice slice,
+            StackProfile profile,
+            Set<OffCpuReason> reasons,
+            StackKinds kinds,
+            Weights weights,
+            Filter filter) {
         JsonObject summary = new JsonObject();
         summary.addProperty("schemaVersion", 1);
         JsonArray selected = new JsonArray();
@@ -224,9 +368,25 @@ final class StackProfileRenderer {
         summary.addProperty("intervals", Long.toString(slice.intervals()));
         summary.addProperty("lines", slice.nanos().size());
         summary.addProperty("totalNanos", slice.totalNanos().toString());
+        summary.add("include", patterns(filter.include()));
+        summary.add("exclude", patterns(filter.exclude()));
+        JsonArray scope = new JsonArray();
+        if (filter.active()) Filter.scope(profile).forEach(scope::add);
+        summary.add("filterScope", scope);
+        // What the filter removed from the selected reasons: add it back to reconcile with an unfiltered slice.
+        JsonObject filtered = new JsonObject();
+        filtered.addProperty("intervals", Long.toString(slice.filteredIntervals()));
+        filtered.addProperty("totalNanos", slice.filteredNanos().toString());
+        summary.add("filtered", filtered);
         summary.addProperty("label", profile.header().label());
         summary.addProperty("sources", profile.header().sources().size());
         return summary;
+    }
+
+    private static JsonArray patterns(List<Pattern> patterns) {
+        JsonArray array = new JsonArray();
+        for (Pattern pattern : patterns) array.add(pattern.pattern());
+        return array;
     }
 
     /** One row per entry with its stacks expanded, for tools such as DuckDB. */

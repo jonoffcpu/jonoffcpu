@@ -208,6 +208,7 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--reason all|blocked,runnable,preempted,unspecified]
     [--stack java|kernel|user|java+kernel|java+user+kernel]
     [--weights observed|estimated] [--reason-frame auto|always|never] [--summary S]
+    [--include REGEX]... [--exclude REGEX]...
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
 ```
@@ -216,9 +217,25 @@ java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --outpu
 byte, including the thinning label and reweighting. Native frames are rendered
 without their `+0x` offsets, kernel frames with an `_[k]` suffix, and a kernel
 stack stops before the tracing frames that captured it (`__traceiter_*`,
-`__bpf_trace_*`, `bpf_trace_run*`, `bpf_prog_*`); the profile keeps them. Pattern
-filtering is left to `jfr-converter -I/-X`; `--summary` records the slice's
-interval count and total so that what `-X` drops can be accounted for. `merge`
+`__bpf_trace_*`, `bpf_trace_run*`, `bpf_prog_*`); the profile keeps them.
+
+`--include`/`--exclude` filter whole profile entries before they are merged into
+lines, and before `--reason-frame auto` decides whether the slice mixes reasons.
+An entry is dropped when any frame of any stack the profile is grouped by
+matches an exclude pattern, and otherwise kept when there are no include
+patterns or a frame matches one; each option repeats, meaning any of its
+patterns. The frames matched are the ones a collapsed line would carry — Java
+names, offset-free native symbols, kernel symbols with `_[k]` and without the
+tracing frames, and the `[kernel stack unavailable]`/`[user stack unavailable]`
+placeholders — for every grouped stack, whichever `--stack` selects; patterns
+are searched for (`Matcher.find`), not matched whole. This is what
+`jfr-converter -I/-X` on a rendered file cannot do: it sees only the rendered
+frames, and a line merged from several entries can no longer be split. The
+`--summary` file records the slice's interval count and total, the patterns,
+`filterScope` (the stack kinds searched; a dropped dimension is not), and
+`filtered`, the intervals and nanoseconds removed. Kept plus filtered equals the
+unfiltered slice exactly, thinning included, because the unfiltered slice is
+rendered to compute it. `merge`
 sums identical entries and keeps every input's provenance; it refuses profiles
 with different grouping, and thinned profiles, whose weights have no common scale.
 `export` writes one row per entry with expanded stacks, for tools such as DuckDB.

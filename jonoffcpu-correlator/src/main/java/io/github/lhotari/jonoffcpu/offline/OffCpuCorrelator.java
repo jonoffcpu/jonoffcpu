@@ -173,7 +173,8 @@ public final class OffCpuCorrelator {
             System.out.println("       java -jar jonoffcpu-correlator.jar stacks --profile " + OutputFiles.PROFILE
                     + " --output out.collapsed [--reason all|blocked,runnable,preempted,unspecified]"
                     + " [--stack java|kernel|user|java+kernel|java+user+kernel] [--weights observed|estimated]"
-                    + " [--reason-frame auto|always|never] [--summary summary.json]");
+                    + " [--reason-frame auto|always|never] [--summary summary.json]"
+                    + " [--include REGEX]... [--exclude REGEX]...");
             System.out.println(
                     "       java -jar jonoffcpu-correlator.jar merge --profiles a.pb,b.pb --output merged.pb");
             System.out.println("       java -jar jonoffcpu-correlator.jar export --profile " + OutputFiles.PROFILE
@@ -696,6 +697,8 @@ public final class OffCpuCorrelator {
     /** Renders one collapsed slice of a stack profile. */
     private static int stacks(String[] args) throws IOException {
         Map<String, String> options = new HashMap<>();
+        Map<String, List<String>> repeated = new HashMap<>();
+        args = takeRepeated(args, Set.of("--include", "--exclude"), repeated);
         parseOptions(
                 args,
                 Set.of("--profile", "--output", "--reason", "--stack", "--weights", "--reason-frame", "--summary"),
@@ -707,16 +710,19 @@ public final class OffCpuCorrelator {
                 StackProfileRenderer.StackKinds.parse(options.getOrDefault("--stack", "java"));
         StackProfileRenderer.Weights weights =
                 StackProfileRenderer.Weights.parse(options.getOrDefault("--weights", "observed"));
+        StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
+                repeated.getOrDefault("--include", List.of()), repeated.getOrDefault("--exclude", List.of()));
         StackProfileRenderer.Slice slice = StackProfileRenderer.render(
                 profile,
                 reasons,
                 kinds,
                 weights,
-                StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--reason-frame", "auto")));
+                StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--reason-frame", "auto")),
+                filter);
         try (BufferedWriter writer = newFile(Path.of(options.get("--output")))) {
             StackProfileRenderer.writeCollapsed(slice, writer);
         }
-        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights);
+        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, filter);
         if (options.containsKey("--summary")) {
             try (BufferedWriter writer = newFile(Path.of(options.get("--summary")))) {
                 new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(summary, writer);
@@ -724,8 +730,30 @@ public final class OffCpuCorrelator {
             }
         }
         System.out.println("Wrote " + slice.nanos().size() + " collapsed stacks to " + options.get("--output") + ": "
-                + slice.intervals() + " intervals, " + slice.totalNanos() + " ns");
+                + slice.intervals() + " intervals, " + slice.totalNanos() + " ns"
+                + (filter.active()
+                        ? "; filtered out " + slice.filteredIntervals() + " intervals, " + slice.filteredNanos()
+                                + " ns, matching " + String.join(",", StackProfileRenderer.Filter.scope(profile))
+                                + " stacks"
+                        : ""));
         return 0;
+    }
+
+    /** Moves each occurrence of a repeatable option's value into {@code repeated}; returns the other arguments. */
+    private static String[] takeRepeated(String[] args, Set<String> names, Map<String, List<String>> repeated) {
+        List<String> rest = new java.util.ArrayList<>();
+        for (int i = 0; i < args.length; i++) {
+            if (names.contains(args[i])) {
+                if (i + 1 == args.length) throw new IllegalArgumentException("Missing value for option: " + args[i]);
+                repeated.computeIfAbsent(args[i], name -> new java.util.ArrayList<>())
+                        .add(args[++i]);
+            } else {
+                rest.add(args[i]);
+                // An ordinary option's value is not an option name, even when it looks like one.
+                if (i + 1 < args.length) rest.add(args[++i]);
+            }
+        }
+        return rest.toArray(String[]::new);
     }
 
     /** Sums the counters of several stack profiles into one. */

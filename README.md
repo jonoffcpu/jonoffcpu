@@ -561,8 +561,9 @@ off-CPU time observed under that Java stack. The collapsed weights are
 microseconds of off-CPU time, and `--units µs` makes the flame graph say so
 instead of counting "samples"; that option is a fork addition, so use the
 provided `jfr-converter.jar` rather than a stock `jfrconv`. Add `--reverse` to see which
-blocking calls dominate regardless of caller, or `-I`/`-X` regular expressions
-to keep or drop stacks by frame. Any tool that reads the collapsed-stack
+blocking calls dominate regardless of caller. To keep or drop stacks by frame,
+render the slice from the stack profile with `--include`/`--exclude` (step 5),
+which also matches frames the graph does not show. Any tool that reads the collapsed-stack
 format, such as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph)
 with `--countname=µs`, works on the same file.
 
@@ -587,9 +588,16 @@ java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
   --stack java+kernel --summary blocked.json --output blocked.collapsed
 
-# ... and without idle waits on a socket or an epoll loop
-java -jar jfr-converter.jar --title "Off-CPU time, busy waits" --units µs \
-  -X '.*(ep_poll|sock_recvmsg|tcp_recvmsg)_\[k\].*' blocked.collapsed blocked.html
+# ... without idle waits on a socket or an epoll loop
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --stack java+kernel --exclude '(ep_poll|sock_recvmsg|tcp_recvmsg)_\[k\]' \
+  --summary busy.json --output busy.collapsed
+
+# Java stacks only, without the Netty event loops' idle epoll waits
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude 'io\.netty\.channel\.epoll\.Native\.epollWait0' --output app.collapsed
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
@@ -604,9 +612,21 @@ estimate instead of the observed durations, when the capture's population
 estimate is available. Rendered with its defaults, a profile reproduces
 `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 
-Filtering stays with the converter's `-I`/`-X` regular expressions. The
-`--summary` file records the slice's interval count and total nanoseconds, so
-time dropped with `-X` can be accounted for.
+`--exclude REGEX` drops every interval with a frame matching the pattern, and
+`--include REGEX` keeps only intervals with one; both can be repeated (any
+pattern matches), and an exclusion wins. Filtering happens on the profile's
+entries, before they are merged into collapsed lines, so it removes whole
+intervals and matches every stack the profile holds, whichever `--stack`
+renders: `--stack java --exclude 'ep_poll_\[k\]'` drops the epoll waits from a
+Java-only graph. Patterns are searched for in each frame as it would be
+rendered (Java names, offset-free native symbols, kernel symbols with `_[k]`,
+and `[kernel stack unavailable]`/`[user stack unavailable]` for a missing
+stack); anchor them with `^…$` for an exact frame. The `--summary` file
+records the slice's interval count and total nanoseconds, the patterns, the
+stacks they were matched against (`filterScope`), and under `filtered` what
+the filters removed, so the kept and removed time add up to the unfiltered
+slice. The converter's own `-I`/`-X` still work on a rendered file, but see
+only the frames in its lines and cannot account for what they drop.
 
 Profiles merge and export as well:
 
