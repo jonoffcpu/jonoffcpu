@@ -1,0 +1,21 @@
+# Every library and plugin version of the build, declared once. The embedded libraries' SHA-256 digests are pinned
+# next to their use in the module build scripts, which verify them before shading.
+[versions]
+protobuf = "4.33.1"
+jmc-writer = "9.1.2"
+
+[libraries]
+gson = "com.google.code.gson:gson:2.14.0"
+jmc-flightrecorder-writer = { module = "org.openjdk.jmc:flightrecorder.writer", version.ref = "jmc-writer" }
+picocli = "info.picocli:picocli:4.7.7"
+protobuf-javalite = { module = "com.google.protobuf:protobuf-javalite", version.ref = "protobuf" }
+protoc = { module = "com.google.protobuf:protoc", version.ref = "protobuf" }
+snakeyaml = "org.yaml:snakeyaml:2.7"
+
+# Gradle plugins, as dependencies of the build-logic convention plugins that apply them.
+maven-publish-plugin = "com.vanniktech:gradle-maven-publish-plugin:0.37.0"
+protobuf-plugin = "com.google.protobuf:protobuf-gradle-plugin:0.10.0"
+shadow-plugin = "com.gradleup.shadow:shadow-gradle-plugin:9.6.1"
+
+[plugins]
+spotless = { id = "com.diffplug.spotless", version = "8.10.2" }

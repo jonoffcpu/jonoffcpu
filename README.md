@@ -1211,7 +1211,10 @@ Releases embed all four bundles. The agent JAR lands in
 `jonoffcpu-agent/build/libs/` and the runnable correlator JAR in
 `jonoffcpu-correlator/build/libs/`.
 
-The build uses Gradle's build cache, and the native bundle's Dockerfiles
+The build runs with Gradle's configuration cache, build cache,
+configure-on-demand and parallel execution; the modules share their build
+logic through the convention plugins in `build-logic/`, and every library and
+plugin version is in `gradle/libs.versions.toml`. The native bundle's Dockerfiles
 compile the collector's Cargo dependencies in a layer of their own, so a
 collector change rebuilds only the collector. The tests are main-based
 fixtures; each reports its class and every scenario with `STARTED`, `PASSED`
@@ -1248,6 +1251,8 @@ are in [AGENTS.md](AGENTS.md).
 | [`jonoffcpu-agent/`](jonoffcpu-agent/) | Java agent: capture controller, JNI bridge, and native integration tests ([README](jonoffcpu-agent/README.md)) |
 | [`jonoffcpu-native/`](jonoffcpu-native/) | Rust/[libbpf-rs](https://github.com/libbpf/libbpf-rs) collector, CO-RE eBPF programs, and privileged kernel proof tools ([README](jonoffcpu-native/README.md)) |
 | [`jonoffcpu-correlator/`](jonoffcpu-correlator/) | Offline correlator: JFR reader and derived-output writers ([OFFLINE.md](jonoffcpu-correlator/OFFLINE.md)) |
+| [`jonoffcpu-jfr-converter/`](jonoffcpu-jfr-converter/) | async-profiler's jfr-converter, built from the submodule's sources |
+| [`build-logic/`](build-logic/) | Gradle convention plugins and task types the modules share |
 | [`async-profiler/`](async-profiler/) | Submodule tracking the [`jonoffcpu-dev`](https://github.com/lhotari/async-profiler/tree/jonoffcpu-dev) branch of [`lhotari/async-profiler`](https://github.com/lhotari/async-profiler) |
 
 ## License
