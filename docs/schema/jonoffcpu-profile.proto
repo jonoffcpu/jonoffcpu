@@ -33,6 +33,8 @@ message Record {
 }
 
 message ProfileStart {
+  // 2 since FrameRecord.Kind JFR_NATIVE; a schema 1 profile tags every frame of its Java stacks JAVA. A
+  // reader refuses a schema it does not know rather than render frame kinds it cannot tell apart.
   uint32 schema_version = 1;
   // The writing tool, for example "jonoffcpu-correlator".
   string producer = 2;
@@ -87,13 +89,17 @@ message FrameRecord {
     JAVA = 1;
     USER = 2;
     KERNEL = 3;
+    // A frame of the Java stack that async-profiler did not record as Java code: frame type Native, C++
+    // or Kernel, or no type. Its name is collapsed like a Java frame's ("libjvm.so.Unsafe_Park": the
+    // library, then the symbol) but is not a package-qualified Class.method. Since schema 2.
+    JFR_NATIVE = 4;
   }
   uint32 id = 1;
   Kind kind = 2;
-  // A Java frame's collapsed name ("class.method"), or a native frame's symbol as the collector resolved
-  // it, including any "+0x" offset.
+  // A Java-stack frame's collapsed name ("class.method", or "library.symbol" for JFR_NATIVE), or a native
+  // frame's symbol as the collector resolved it, including any "+0x" offset.
   uint32 name_string = 3;
-  // A native frame's module; 0 for Java frames and unresolved modules.
+  // A native frame's module; 0 for JAVA and JFR_NATIVE frames and unresolved modules.
   uint32 module_string = 4;
 }
 

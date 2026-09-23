@@ -34,7 +34,10 @@ record StackProfile(Header header, List<Entry> entries) {
     static final byte[] MAGIC = "JONOFFPRF\0".getBytes(StandardCharsets.US_ASCII);
     static final int FORMAT_VERSION = 1;
     static final int HEADER_BYTES = MAGIC.length + 2;
-    static final int SCHEMA_VERSION = 1;
+    /** Schema 2 added {@link Kind#JFR_NATIVE}; a schema 1 profile tags every frame of its Java stacks JAVA. */
+    static final int SCHEMA_VERSION = 2;
+
+    static final int OLDEST_SCHEMA_VERSION = 1;
     static final String PRODUCER = "jonoffcpu-correlator";
     static final String WEIGHT_SEMANTICS = "selected-observed-offcpu-nanoseconds";
     /** The reason vocabulary written into every profile; {@code Entry.reason} indexes it. */
@@ -43,10 +46,16 @@ record StackProfile(Header header, List<Entry> entries) {
 
     private static final int MAX_RECORD_BYTES = 1 << 20;
 
+    /** A frame's kind; its ordinal plus one is the wire value. */
     enum Kind {
         JAVA,
         USER,
-        KERNEL
+        KERNEL,
+        /**
+         * A frame of the Java stack that async-profiler did not record as Java code ({@code Native}, {@code C++},
+         * {@code Kernel}, or no type): rendered like a Java frame, but its name is never read as a package.
+         */
+        JFR_NATIVE
     }
 
     /** One frame: a Java frame's collapsed name, or a native frame's symbol and module. */
@@ -243,9 +252,11 @@ record StackProfile(Header header, List<Entry> entries) {
             ProfileAccumulator.Counters counters = item.getValue();
             List<Frame> java = javaStacks.computeIfAbsent(key.collapsed(), id -> {
                 List<Frame> frames = new ArrayList<>();
+                boolean[] javaFrames = dictionaries.collapsedJava(id);
                 // A collapsed key's frames never contain ';', so splitting it is lossless.
-                for (String name : dictionaries.collapsedKey(id).split(";", -1)) {
-                    frames.add(new Frame(Kind.JAVA, name, ""));
+                String[] names = dictionaries.collapsedKey(id).split(";", -1);
+                for (int index = 0; index < names.length; index++) {
+                    frames.add(new Frame(javaFrames[index] ? Kind.JAVA : Kind.JFR_NATIVE, names[index], ""));
                 }
                 return List.copyOf(frames);
             });
@@ -314,6 +325,7 @@ record StackProfile(Header header, List<Entry> entries) {
         boolean timeSplitAvailable = false;
         Map<Key, long[]> merged = new LinkedHashMap<>();
         Map<Key, Split> splits = new HashMap<>();
+        Map<List<String>, List<Frame>> javaStacks = javaStacksByName(profiles);
         for (StackProfile profile : profiles) {
             Header header = profile.header();
             CaptureInput.require(header.dimensions().equals(dimensions), "Profiles with different grouping dimensions");
@@ -329,12 +341,21 @@ record StackProfile(Header header, List<Entry> entries) {
             // An input without the split contributes its time as unsplit, which its entries already say.
             timeSplitAvailable |= header.timeSplitAvailable();
             for (Entry entry : profile.entries()) {
-                long[] counters = merged.computeIfAbsent(entry.key(), ignored -> new long[3]);
+                Key key = entry.javaStack() == null
+                        ? entry.key()
+                        : new Key(
+                                javaStacks.get(names(entry.javaStack())),
+                                entry.kernelStack(),
+                                entry.userStack(),
+                                entry.reason(),
+                                entry.taskState(),
+                                entry.thread());
+                long[] counters = merged.computeIfAbsent(key, ignored -> new long[3]);
                 counters[0] = Math.addExact(counters[0], entry.intervals());
                 counters[1] = U64.add(counters[1], entry.observedNanos(), "Profile duration");
                 counters[2] = U64.add(counters[2], entry.estimatedNanos(), "Profile estimate");
-                Split split = splits.get(entry.key());
-                splits.put(entry.key(), split == null ? entry.split() : split.plus(entry.split()));
+                Split split = splits.get(key);
+                splits.put(key, split == null ? entry.split() : split.plus(entry.split()));
             }
         }
         List<Entry> entries = new ArrayList<>(merged.size());
@@ -356,6 +377,36 @@ record StackProfile(Header header, List<Entry> entries) {
         return new StackProfile(
                 new Header(sources, dimensions, estimateAvailable, "", label, List.copyOf(dropped), timeSplitAvailable),
                 entries);
+    }
+
+    /**
+     * One Java stack per distinct list of frame names across the inputs, so a stack merges whatever kinds its inputs
+     * gave it: a frame is JAVA only when every input says so. A schema 1 input calls every frame JAVA, which a newer
+     * input's JFR_NATIVE therefore overrules.
+     */
+    private static Map<List<String>, List<Frame>> javaStacksByName(List<StackProfile> profiles) {
+        Map<List<String>, List<Frame>> stacks = new HashMap<>();
+        for (StackProfile profile : profiles) {
+            for (Entry entry : profile.entries()) {
+                if (entry.javaStack() == null) continue;
+                stacks.merge(names(entry.javaStack()), entry.javaStack(), StackProfile::agreedKinds);
+            }
+        }
+        return stacks;
+    }
+
+    private static List<Frame> agreedKinds(List<Frame> left, List<Frame> right) {
+        if (left.equals(right)) return left;
+        List<Frame> agreed = new ArrayList<>(left.size());
+        for (int index = 0; index < left.size(); index++) {
+            Frame frame = left.get(index);
+            agreed.add(frame.kind() == Kind.JAVA ? right.get(index) : frame);
+        }
+        return List.copyOf(agreed);
+    }
+
+    private static List<String> names(List<Frame> stack) {
+        return stack.stream().map(Frame::name).toList();
     }
 
     // ---- canonical order -----------------------------------------------------------------------
@@ -563,7 +614,12 @@ record StackProfile(Header header, List<Entry> entries) {
                 first != null && first.getRecordCase() == ProfileProto.Record.RecordCase.PROFILE_START,
                 "Stack profile does not start with profile_start");
         ProfileProto.ProfileStart start = first.getProfileStart();
-        CaptureInput.require(start.getSchemaVersion() == SCHEMA_VERSION, "Unsupported stack profile schema");
+        int schema = start.getSchemaVersion();
+        CaptureInput.require(
+                schema >= OLDEST_SCHEMA_VERSION && schema <= SCHEMA_VERSION,
+                "Unsupported stack profile schema " + schema);
+        // Kinds a profile's schema does not define are refused rather than guessed.
+        int kinds = schema == 1 ? Kind.KERNEL.ordinal() + 1 : Kind.values().length;
         CaptureInput.require(start.getReasonList().equals(REASONS), "Unsupported stack profile reason vocabulary");
         CaptureInput.require(
                 start.getWeightSemantics().equals(WEIGHT_SEMANTICS), "Unsupported stack profile weight semantics");
@@ -603,7 +659,7 @@ record StackProfile(Header header, List<Entry> entries) {
                     ProfileProto.FrameRecord frame = record.getFrame();
                     CaptureInput.require(frame.getId() == frames.size(), "Out-of-order frame id");
                     int kind = frame.getKindValue();
-                    CaptureInput.require(kind >= 1 && kind <= Kind.values().length, "Invalid frame kind");
+                    CaptureInput.require(kind >= 1 && kind <= kinds, "Invalid frame kind");
                     frames.add(new Frame(
                             Kind.values()[kind - 1],
                             reference(strings, frame.getNameString(), false),

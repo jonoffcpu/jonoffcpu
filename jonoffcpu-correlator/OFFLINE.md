@@ -227,6 +227,19 @@ written before its first use and ids are dense from 1, so 0 always means absent.
 Entries are written in one canonical order, so the same analysis gives the same
 bytes whatever order its intervals matched in.
 
+Each frame has a kind. Native stacks' frames are `USER` or `KERNEL`. A Java
+stack's frame is `JAVA` when async-profiler recorded it as Java code (frame type
+`Interpreted`, `JIT compiled`, `C1 compiled` or `Inlined`), and `JFR_NATIVE`
+otherwise (`Native`, `C++`, `Kernel`, or no type): a frame such as
+`libjvm.so.Unsafe_Park`, the library then the symbol, which only looks like a
+package-qualified Java name. Stacks that differ only in a frame's type share a
+collapsed key, so a frame position is `JAVA` only when every such stack agrees.
+The kind changes no name, so the collapsed key and every rendered line stay the
+same. `JFR_NATIVE` arrived with `schema_version` 2; a schema 1 profile tags every
+Java-stack frame `JAVA` and still reads, and a reader that predates schema 2
+refuses a newer profile with `Unsupported stack profile schema` rather than
+render it.
+
 An entry is keyed by the Java stack (at the collapsed file's class-and-method
 granularity) and the switch-out reason with its raw task state, and by default
 also by the kernel stack, the user stack and the thread name
@@ -278,8 +291,14 @@ a `sleeping` or `runqueue` slice leaves out.
 
 `--package-names abbreviate` cuts each package segment of a Java frame to its
 first letter (`io.netty.channel.epoll.Native.epollWait0` becomes
-`i.n.c.e.Native.epollWait0`), and `drop` shows `Class.method`; a frame that is
-not a package-qualified `Class.method` is left unchanged. It only changes the
+`i.n.c.e.Native.epollWait0`), and `drop` shows `Class.method`; a hidden class's
+`.0x…` suffix (`Cursor$$Lambda.0x0000000081a16ff8`) stays part of the class. Only
+`JAVA` frames change: a `JFR_NATIVE` frame keeps its library and symbol
+(`libjvm.so.Unsafe_Park`). As a fallback for schema 1 profiles, and as a second
+line of defence, a name that reads as native is also left alone: one with a C++
+`::`, a shared-library segment (`.so.`, `.so.6.`), a leading `/` or `[`, or a
+space. That rule can only prevent a rewrite, and a frame that is not a
+package-qualified `Class.method` is left unchanged too. It only changes the
 rendered text: lines that become identical are summed, filters match the full
 names, and `--summary` records the mode as `packageNames`.
 
@@ -303,9 +322,14 @@ rendered to compute it. `merge`
 sums identical entries and keeps every input's provenance; it refuses profiles
 with different grouping, and thinned profiles, whose weights have no common scale.
 It sums the split parts too, so an input without the split contributes its time
-as unsplit and the merged profile has the split when any input has it.
-`export` writes one row per entry with expanded stacks and the six split columns,
-for tools such as DuckDB.
+as unsplit and the merged profile has the split when any input has it. Java
+stacks with the same frame names merge whatever kinds their inputs gave them, and
+a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`, so a schema 1 input
+cannot make a native frame rewritable.
+`export` writes one row per entry with expanded stacks, the six split columns and,
+last, `java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack
+frame's kind, `java` or `native`, joined with `;` like `java_stack`. It is for
+tools such as DuckDB.
 
 ## Degradation
 

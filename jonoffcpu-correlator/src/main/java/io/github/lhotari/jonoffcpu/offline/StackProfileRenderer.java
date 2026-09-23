@@ -98,16 +98,23 @@ final class StackProfileRenderer {
     /**
      * How a Java frame's package is shown: in full, abbreviated to the first letter of each package segment
      * ({@code i.n.c.e.Native.epollWait0}), or dropped ({@code Native.epollWait0}). Only the display changes: filters
-     * still match the full names, and frames that become equal merge into one line.
+     * still match the full names, and frames that become equal merge into one line. Native frames of the Java stack
+     * ({@code libjvm.so.Unsafe_Park}) are left as they are: by their {@link StackProfile.Kind#JFR_NATIVE} kind, and,
+     * for a profile that predates the kind, by a name that is recognisably native.
      */
     enum PackageNames {
         FULL,
         ABBREVIATE,
         DROP;
 
-        /** A qualified Java frame: package segments, then a class and a method, all without further dots. */
-        private static final Pattern QUALIFIED =
-                Pattern.compile("^((?:[\\p{L}_$][\\p{L}\\p{N}_$]*\\.)+)([\\p{L}_$][^.]*\\.[\\p{L}_$<][^.]*)$");
+        /**
+         * A qualified Java frame: package segments, then a class and a method, all without further dots except a
+         * hidden class's {@code .0x} suffix ({@code Foo$$Lambda.0x0000000801234567}).
+         */
+        private static final Pattern QUALIFIED = Pattern.compile(
+                "^((?:[\\p{L}_$][\\p{L}\\p{N}_$]*\\.)+)([\\p{L}_$][^.]*(?:\\.0x\\p{XDigit}+)?\\.[\\p{L}_$<][^.]*)$");
+        /** A shared-library segment such as {@code libjvm.so.} or {@code libc.so.6.}: a native frame's library. */
+        private static final Pattern SHARED_LIBRARY = Pattern.compile("\\.so(\\.\\d+)*\\.");
 
         String label() {
             return name().toLowerCase(java.util.Locale.ROOT);
@@ -120,9 +127,19 @@ final class StackProfileRenderer {
             throw new IllegalArgumentException("Invalid package names mode: " + text);
         }
 
-        /** The frame as shown; a name that is not a package-qualified {@code Class.method} is left unchanged. */
+        /** The frame as shown; only a {@link StackProfile.Kind#JAVA JAVA} frame's package is ever changed. */
+        String apply(StackProfile.Frame frame) {
+            return frame.kind() == StackProfile.Kind.JAVA ? apply(frame.name()) : frame.name();
+        }
+
+        /**
+         * A Java frame's name as shown. A name that is not a package-qualified {@code Class.method}, or that reads
+         * as native — a C++ {@code ::}, a shared library, a path, a bracketed placeholder, or a space — is left
+         * unchanged. The name rule is what protects a profile written before frames had kinds; with kinds it can only
+         * ever prevent a rewrite.
+         */
         String apply(String frame) {
-            if (this == FULL) return frame;
+            if (this == FULL || looksNative(frame)) return frame;
             java.util.regex.Matcher matcher = QUALIFIED.matcher(frame);
             if (!matcher.matches()) return frame;
             if (this == DROP) return matcher.group(2);
@@ -131,6 +148,14 @@ final class StackProfileRenderer {
                 shown.appendCodePoint(segment.codePointAt(0)).append('.');
             }
             return shown.append(matcher.group(2)).toString();
+        }
+
+        private static boolean looksNative(String frame) {
+            return frame.contains("::")
+                    || frame.indexOf(' ') >= 0
+                    || frame.startsWith("/")
+                    || frame.startsWith("[")
+                    || SHARED_LIBRARY.matcher(frame).find();
         }
     }
 
@@ -306,8 +331,8 @@ final class StackProfileRenderer {
             PackageNames packages,
             Predicate<StackProfile.Entry> keeps)
             throws IOException {
-        // Each distinct Java frame name is shortened once per render.
-        Map<String, String> shown = new java.util.HashMap<>();
+        // Each distinct Java frame is shortened once per render.
+        Map<StackProfile.Frame, String> shown = new java.util.HashMap<>();
         if (weights == Weights.ESTIMATED) {
             CaptureInput.require(
                     profile.header().estimateAvailable(),
@@ -386,11 +411,14 @@ final class StackProfileRenderer {
     }
 
     private static void appendJava(
-            StringBuilder line, List<StackProfile.Frame> stack, PackageNames packages, Map<String, String> shown) {
+            StringBuilder line,
+            List<StackProfile.Frame> stack,
+            PackageNames packages,
+            Map<StackProfile.Frame, String> shown) {
         for (int index = 0; index < stack.size(); index++) {
             if (index > 0) line.append(';');
-            String name = stack.get(index).name();
-            line.append(packages == PackageNames.FULL ? name : shown.computeIfAbsent(name, packages::apply));
+            StackProfile.Frame frame = stack.get(index);
+            line.append(packages == PackageNames.FULL ? frame.name() : shown.computeIfAbsent(frame, packages::apply));
         }
     }
 
@@ -510,7 +538,7 @@ final class StackProfileRenderer {
             case "csv" -> {
                 writer.write("reason,task_state,thread,java_stack,kernel_stack,user_stack,"
                         + "intervals,observed_nanos,estimated_nanos,sleeping_nanos,runqueue_nanos,unsplit_nanos,"
-                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos");
+                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,java_stack_kinds");
                 writer.newLine();
                 for (StackProfile.Entry entry : profile.entries()) {
                     writer.write(String.join(
@@ -529,7 +557,8 @@ final class StackProfileRenderer {
                             Long.toUnsignedString(entry.split().unsplit()),
                             Long.toUnsignedString(entry.split().estimatedSleeping()),
                             Long.toUnsignedString(entry.split().estimatedRunqueue()),
-                            Long.toUnsignedString(entry.split().estimatedUnsplit())));
+                            Long.toUnsignedString(entry.split().estimatedUnsplit()),
+                            csv(javaKinds(entry.javaStack()))));
                     writer.newLine();
                 }
             }
@@ -553,6 +582,7 @@ final class StackProfileRenderer {
                     row.addProperty("estimatedSleepingNanos", Long.toUnsignedString(split.estimatedSleeping()));
                     row.addProperty("estimatedRunqueueNanos", Long.toUnsignedString(split.estimatedRunqueue()));
                     row.addProperty("estimatedUnsplitNanos", Long.toUnsignedString(split.estimatedUnsplit()));
+                    row.addProperty("javaStackKinds", javaKinds(entry.javaStack()));
                     gson.toJson(row, writer);
                     writer.newLine();
                 }
@@ -569,6 +599,17 @@ final class StackProfileRenderer {
             StackProfile.Frame frame = stack.get(index);
             if (text.length() > 0) text.append(';');
             text.append(nativeFrames ? escape(nativeName(frame)) : frame.name());
+        }
+        return text.toString();
+    }
+
+    /** Each Java-stack frame's kind, {@code java} or {@code native}, joined like the stack's names. */
+    private static String javaKinds(List<StackProfile.Frame> stack) {
+        if (stack == null) return null;
+        StringBuilder text = new StringBuilder();
+        for (StackProfile.Frame frame : stack) {
+            if (text.length() > 0) text.append(';');
+            text.append(frame.kind() == StackProfile.Kind.JAVA ? "java" : "native");
         }
         return text.toString();
     }

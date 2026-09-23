@@ -5,6 +5,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.profile.ProfileProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -199,6 +200,12 @@ public final class StackProfileTest {
                 read.entries().stream().allMatch(entry -> entry.reason() == OffCpuReason.UNSPECIFIED),
                 "Unclassified intervals must read back as unspecified");
         check(read.entries().stream().allMatch(entry -> "main".equals(entry.thread())), "Thread names are grouped");
+        // A JDK recording's frames are all Java code, so every frame of its Java stacks is JAVA.
+        check(
+                read.entries().stream()
+                        .flatMap(entry -> entry.javaStack().stream())
+                        .allMatch(frame -> frame.kind() == StackProfile.Kind.JAVA),
+                "Frames recorded as Java code must be JAVA");
 
         // Kernel stacks reach a collapsed line; the offset-free symbol keeps one function one frame.
         String mixed = stacks(profile, dir.resolve("java-kernel.collapsed"), "--stack", "java+kernel");
@@ -295,6 +302,12 @@ public final class StackProfileTest {
         check(rows.get(0).startsWith("reason,task_state,thread,java_stack"), "CSV header changed: " + rows.get(0));
         check(rows.size() == read.entries().size() + 1, "One CSV row per entry");
         check(rows.get(1).startsWith("unspecified,0,main,"), "Unexpected CSV row: " + rows.get(1));
+        // The last column names each Java-stack frame's kind, parallel to java_stack.
+        check(rows.get(0).endsWith(",java_stack_kinds"), "CSV header lacks the kinds: " + rows.get(0));
+        String firstStack = String.join(
+                ";",
+                read.entries().get(0).javaStack().stream().map(frame -> "java").toList());
+        check(rows.get(1).endsWith("," + firstStack), "Unexpected CSV kinds: " + rows.get(1));
 
         // A damaged file is refused rather than half read.
         byte[] bytes = Files.readAllBytes(profile);
@@ -627,7 +640,8 @@ public final class StackProfileTest {
         check(
                 csv.get(0)
                         .endsWith(",sleeping_nanos,runqueue_nanos,unsplit_nanos,"
-                                + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos"),
+                                + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,"
+                                + "java_stack_kinds"),
                 "CSV header: " + csv.get(0));
 
         // A profile without the split refuses the parts, and merging it with one that has them keeps it unsplit.
@@ -704,6 +718,10 @@ public final class StackProfileTest {
                 "java.lang.invoke.LambdaForm$MH/0x0000000800c01000.invoke",
                 List.of("j.l.i.LambdaForm$MH/0x0000000800c01000.invoke", "LambdaForm$MH/0x0000000800c01000.invoke"));
         // Frames that are not package-qualified Class.method names are left as they are.
+        // A JDK 21+ hidden class carries a ".0x" suffix, which is still part of the class name.
+        expected.put(
+                "org.apache.Cursor$$Lambda.0x00000000819d7660.run",
+                List.of("o.a.Cursor$$Lambda.0x00000000819d7660.run", "Cursor$$Lambda.0x00000000819d7660.run"));
         for (String unchanged : List.of("Worker.run", "[stack unavailable]", "epoll_wait", "libc.so.6", "")) {
             expected.put(unchanged, List.of(unchanged, unchanged));
         }
@@ -789,6 +807,188 @@ public final class StackProfileTest {
                 IllegalArgumentException.class,
                 "Invalid package names mode",
                 () -> stacks(profile, dir.resolve("bad.collapsed"), "--package-names", "short"));
+    }
+
+    /**
+     * Native frames that async-profiler records inside the Java stack keep their library whatever the package-names
+     * mode: by their JFR_NATIVE kind, and, in a profile written before frames had kinds, by a native-looking name.
+     */
+    private static void nativeFrames(Path dir) throws Exception {
+        var java = StackProfile.Kind.JAVA;
+        var jfrNative = StackProfile.Kind.JFR_NATIVE;
+        Map<String, List<String>> javaCases = new java.util.LinkedHashMap<>();
+        javaCases.put(
+                "io.netty.channel.epoll.Native.epollWait0", List.of("i.n.c.e.Native.epollWait0", "Native.epollWait0"));
+        javaCases.put("a.Outer$Inner.<init>", List.of("a.Outer$Inner.<init>", "Outer$Inner.<init>"));
+        for (var entry : javaCases.entrySet()) {
+            StackProfile.Frame frame = new StackProfile.Frame(java, entry.getKey(), "");
+            check(
+                    StackProfileRenderer.PackageNames.ABBREVIATE
+                                    .apply(frame)
+                                    .equals(entry.getValue().get(0))
+                            && StackProfileRenderer.PackageNames.DROP
+                                    .apply(frame)
+                                    .equals(entry.getValue().get(1)),
+                    "A Java frame's package must still be shortened: " + entry.getKey());
+        }
+        List<String> nativeNames = List.of(
+                "libjvm.so.Unsafe_Park",
+                "libjvm.so.ZWorkers::run",
+                "libasyncProfiler.so.PerfEvents::signalHandler",
+                "libnio.so.Java_sun_nio_ch_EPoll_wait",
+                "libnetty_transport_native_epoll_x86_64.so.netty_epoll_native_epollWait0",
+                "libc.so.6.__GI___clone3",
+                "/lib/ld-musl-x86_64.so.1",
+                "C2 Runtime complete_monitor_locking",
+                "SafepointBlob");
+        for (String name : nativeNames) {
+            for (var kind : List.of(java, jfrNative)) {
+                for (var mode : StackProfileRenderer.PackageNames.values()) {
+                    String shown = mode.apply(new StackProfile.Frame(kind, name, ""));
+                    check(
+                            shown.equals(name),
+                            "A native frame was rewritten: " + name + " (" + kind + ", " + mode + ") -> " + shown);
+                }
+            }
+        }
+        // The kind alone decides: a JFR_NATIVE frame is never read as a package, however Java-like its name.
+        check(
+                StackProfileRenderer.PackageNames.DROP
+                        .apply(new StackProfile.Frame(jfrNative, "a.b.Class.method", ""))
+                        .equals("a.b.Class.method"),
+                "A JFR_NATIVE frame must keep its name");
+
+        // A rendered profile: the same name as JAVA in one stack and JFR_NATIVE in another is shortened only as JAVA.
+        List<StackProfile.Entry> entries = List.of(
+                new StackProfile.Entry(
+                        List.of(
+                                new StackProfile.Frame(java, "java.lang.Thread.run", ""),
+                                new StackProfile.Frame(jfrNative, "libjvm.so.Unsafe_Park", "")),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        3,
+                        3000,
+                        0),
+                new StackProfile.Entry(
+                        List.of(
+                                new StackProfile.Frame(java, "java.lang.Thread.run", ""),
+                                new StackProfile.Frame(jfrNative, "a.b.Class.method", "")),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        2,
+                        2000,
+                        0),
+                new StackProfile.Entry(
+                        List.of(
+                                new StackProfile.Frame(java, "java.lang.Thread.run", ""),
+                                new StackProfile.Frame(java, "a.b.Class.method", "")),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        1,
+                        1000,
+                        0));
+        StackProfile.Header header = new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of());
+        StackProfile written = new StackProfile(header, entries);
+        Path profile = dir.resolve("native.pb");
+        written.write(profile);
+        StackProfile read = StackProfile.read(profile);
+        check(read.entries().equals(written.entries()), "Frame kinds must survive a round trip");
+        String dropped = stacks(profile, dir.resolve("drop.collapsed"), "--package-names", "drop");
+        check(
+                dropped.equals("Thread.run;Class.method 1\n"
+                        + "Thread.run;a.b.Class.method 2\n"
+                        + "Thread.run;libjvm.so.Unsafe_Park 3\n"),
+                "Only JAVA frames may be shortened: " + dropped);
+        List<String> csv = exportCsv(profile, dir.resolve("native.csv"));
+        check(
+                csv.stream().filter(row -> row.contains("libjvm.so")).allMatch(row -> row.endsWith(",java;native")),
+                "Kinds not exported: " + csv);
+
+        // Filters match the full names in every mode, so they select the same entries with the same totals.
+        for (String mode : List.of("full", "abbreviate", "drop")) {
+            Path summary = dir.resolve(mode + "-filtered.json");
+            stacks(
+                    profile,
+                    dir.resolve(mode + "-filtered.collapsed"),
+                    "--package-names",
+                    mode,
+                    "--exclude",
+                    "^libjvm\\.so\\.",
+                    "--summary",
+                    summary.toString());
+            check(
+                    summaryOf(summary).get("totalNanos").getAsString().equals("3000")
+                            && summaryOf(summary).get("intervals").getAsString().equals("3"),
+                    "Filtered totals changed with " + mode + ": " + summaryOf(summary));
+        }
+
+        // A schema 1 profile tags every frame JAVA; it still reads, and the name rule protects its native frames.
+        List<StackProfile.Entry> legacyEntries = entries.stream()
+                .map(entry -> new StackProfile.Entry(
+                        entry.javaStack().stream()
+                                .map(frame -> new StackProfile.Frame(java, frame.name(), ""))
+                                .toList(),
+                        null,
+                        null,
+                        entry.reason(),
+                        entry.taskState(),
+                        null,
+                        entry.intervals(),
+                        entry.observedNanos(),
+                        entry.estimatedNanos()))
+                .toList();
+        Path legacy = dir.resolve("legacy.pb");
+        schemaVersion(new StackProfile(header, legacyEntries), 1, legacy);
+        String legacyDropped = stacks(legacy, dir.resolve("legacy.collapsed"), "--package-names", "drop");
+        check(
+                legacyDropped.equals("Thread.run;Class.method 3\nThread.run;libjvm.so.Unsafe_Park 3\n"),
+                "A schema 1 profile's native frames must keep their names: " + legacyDropped);
+        // Merged with a newer profile, a frame either input calls JFR_NATIVE is JFR_NATIVE.
+        StackProfile merged = StackProfile.merge(List.of(StackProfile.read(legacy), read));
+        check(merged.entries().size() == 2, "Stacks that differ only in kinds must merge: " + merged.entries());
+        for (StackProfile.Entry entry : merged.entries()) {
+            check(entry.javaStack().get(1).kind() == jfrNative, "A sometimes native frame must be JFR_NATIVE");
+        }
+        check(merged.totalObservedNanos() == 12_000, "Merging must keep every nanosecond");
+        // A schema 1 profile cannot carry the kind schema 2 introduced, and an unknown schema is refused by name.
+        Path forged = dir.resolve("forged.pb");
+        schemaVersion(written, 1, forged);
+        rejects(IOException.class, "Invalid frame kind", () -> StackProfile.read(forged));
+        Path future = dir.resolve("future.pb");
+        schemaVersion(written, StackProfile.SCHEMA_VERSION + 1, future);
+        rejects(
+                IOException.class,
+                "Unsupported stack profile schema " + (StackProfile.SCHEMA_VERSION + 1),
+                () -> StackProfile.read(future));
+    }
+
+    /** Writes a profile with its profile_start's schema version replaced, as an older or newer writer would. */
+    private static void schemaVersion(StackProfile profile, int version, Path file) throws IOException {
+        var bytes = new java.io.ByteArrayOutputStream();
+        profile.write(bytes);
+        var input = new java.io.ByteArrayInputStream(bytes.toByteArray());
+        try (var output = Files.newOutputStream(file)) {
+            output.write(input.readNBytes(StackProfile.HEADER_BYTES));
+            ProfileProto.Record record;
+            while ((record = ProfileProto.Record.parseDelimitedFrom(input)) != null) {
+                if (record.hasProfileStart()) {
+                    record = record.toBuilder()
+                            .setProfileStart(
+                                    record.getProfileStart().toBuilder().setSchemaVersion(version))
+                            .build();
+                }
+                record.writeDelimitedTo(output);
+            }
+        }
     }
 
     private static List<StackProfile.Frame> frames(StackProfile.Kind kind, String... names) {
@@ -970,6 +1170,7 @@ public final class StackProfileTest {
             classificationIsVerified(Files.createDirectories(dir.resolve("verified")));
             filters(Files.createDirectories(dir.resolve("filters")));
             packageNames(Files.createDirectories(dir.resolve("packages")));
+            nativeFrames(Files.createDirectories(dir.resolve("native")));
             timeSplitRule();
             sleepingAndRunqueue(Files.createDirectories(dir.resolve("split")));
             System.out.println("Stack profile fixtures passed");

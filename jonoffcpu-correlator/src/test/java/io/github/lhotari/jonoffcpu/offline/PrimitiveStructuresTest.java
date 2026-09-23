@@ -62,8 +62,12 @@ public final class PrimitiveStructuresTest {
     }
 
     private static java.util.Map<String, Object> frame(String className, String methodName, int line) {
+        return frame("Interpreted", className, methodName, line);
+    }
+
+    private static java.util.Map<String, Object> frame(String type, String className, String methodName, int line) {
         java.util.Map<String, Object> frame = new java.util.LinkedHashMap<>();
-        frame.put("type", "Interpreted");
+        frame.put("type", type);
         frame.put("className", className);
         frame.put("methodName", methodName);
         frame.put("descriptor", "()V");
@@ -113,6 +117,43 @@ public final class PrimitiveStructuresTest {
         rejects(() -> dictionaries.internStack(leafFirst, false, 1), "Stack frame count limit exceeded");
         check(dictionaries.frames(first).length == 2, "Interner lost the retained frames");
         check(dictionaries.frames(first)[0].className().equals("a.Leaf"), "Frames must stay leaf-first");
+
+        // Which frames of a collapsed key are Java comes from async-profiler's frame type, root first like the key.
+        int typed = dictionaries.internStack(
+                java.util.List.of(
+                        frame("Kernel", null, "futex_wait", 0),
+                        frame("C++", "libjvm.so", "Unsafe_Park", 0),
+                        frame("Native", "libc.so.6", "__futex_abstimed_wait_cancelable64", 0),
+                        frame(null, "b.Untyped", "run", 0),
+                        frame("Inlined", "b.Inlined", "run", 0),
+                        frame("C1 compiled", "b.C1", "run", 0),
+                        frame("JIT compiled", "b.Jit", "run", 0),
+                        frame("Interpreted", "b.Root", "main", 0)),
+                false,
+                4096);
+        check(
+                java.util.Arrays.equals(
+                        dictionaries.collapsedJava(dictionaries.collapsedOf(typed)),
+                        new boolean[] {true, true, true, true, false, false, false, false}),
+                "Java frames must follow the frame type");
+        check(
+                java.util.Arrays.equals(
+                        dictionaries.collapsedJava(dictionaries.collapsedOf(first)), new boolean[] {true, true}),
+                "Interpreted frames are Java");
+        // A stack that collapses to the same key with a native type at one frame makes that frame native.
+        int sometimesNative = dictionaries.internStack(
+                java.util.List.of(frame("Native", "a.Leaf", "run", 3), frame("a.Root", "main", 1)), false, 4096);
+        check(
+                dictionaries.collapsedOf(sometimesNative) == dictionaries.collapsedOf(first),
+                "A frame type does not belong in a collapsed key");
+        check(
+                java.util.Arrays.equals(
+                        dictionaries.collapsedJava(dictionaries.collapsedOf(first)), new boolean[] {true, false}),
+                "A frame that is sometimes native must be native");
+        check(
+                java.util.Arrays.equals(
+                        dictionaries.collapsedJava(dictionaries.collapsedOf(empty)), new boolean[] {false}),
+                "The unavailable marker is not a Java frame");
 
         int thread = dictionaries.internThread(41L, 401L, "worker");
         check(dictionaries.internThread(41L, 401L, "worker") == thread, "Equal threads were not interned");

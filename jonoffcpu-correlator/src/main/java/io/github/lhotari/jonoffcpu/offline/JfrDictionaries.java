@@ -8,6 +8,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * The interned JFR side of a correlation: one entry per distinct resolved stack and per distinct
@@ -37,10 +38,17 @@ import java.util.Objects;
  * <p>Interning is done without materializing a key per sample: a 64-bit hash is folded over the raw
  * frame list, and a hash hit is confirmed by comparing the raw list against the stored frames. Only
  * a genuinely new stack allocates.
+ *
+ * <p>Each collapsed key also records which of its frames are Java frames, by async-profiler's frame type, since the
+ * key alone cannot tell {@code libjvm.so.Unsafe_Park} from {@code a.b.Class.method}. A frame position is Java only
+ * when every stack that collapses to the key has a Java type there: a frame that is sometimes native counts as
+ * native.
  */
 final class JfrDictionaries {
     private static final String UNAVAILABLE = "[stack unavailable]";
     private static final String UNRESOLVED = "[unresolved]";
+    /** async-profiler's frame types for Java code; {@code Native}, {@code C++} and {@code Kernel} are not. */
+    private static final Set<String> JAVA_TYPES = Set.of("Interpreted", "JIT compiled", "C1 compiled", "Inlined");
 
     record Frame(
             String type, String className, String methodName, String descriptor, int lineNumber, int bytecodeIndex) {}
@@ -54,10 +62,12 @@ final class JfrDictionaries {
     private final List<Integer> stackCollapsed = new ArrayList<>();
     private final Map<String, Integer> collapsedIds = new HashMap<>();
     private final List<String> collapsedKeys = new ArrayList<>();
+    private final List<boolean[]> collapsedJava = new ArrayList<>();
     private final Map<Thread, Integer> threadIds = new HashMap<>();
     private final List<Thread> threads = new ArrayList<>();
     private long stringBytes;
     private long frameBytes;
+    private long javaFlagBytes;
 
     /** Interns the frame list of one sample and returns its stack id. */
     int internStack(List<?> rawFrames, boolean truncated, int maxFrames) throws IOException {
@@ -86,7 +96,7 @@ final class JfrDictionaries {
         int id = stackFrames.size();
         stackFrames.add(frames);
         stackTruncated.add(truncated);
-        stackCollapsed.add(internCollapsed(collapsed(frames)));
+        stackCollapsed.add(internCollapsed(collapsed(frames), javaFrames(frames)));
         stacksByHash.merge(hash, new int[] {id}, (existing, added) -> {
             int[] grown = Arrays.copyOf(existing, existing.length + 1);
             grown[existing.length] = added[0];
@@ -116,6 +126,16 @@ final class JfrDictionaries {
         return collapsedKeys.get(collapsedId);
     }
 
+    /** Which frames of a collapsed key, root first like the key, are Java frames. */
+    boolean[] collapsedJava(int collapsedId) {
+        return collapsedJava.get(collapsedId);
+    }
+
+    /** Whether async-profiler's frame type names Java code; a missing or unknown type does not. */
+    static boolean isJavaType(String type) {
+        return type != null && JAVA_TYPES.contains(type);
+    }
+
     int collapsedCount() {
         return collapsedKeys.size();
     }
@@ -136,7 +156,12 @@ final class JfrDictionaries {
     }
 
     long retainedBytes() {
-        return stringBytes + frameBytes + stacksByHash.size() * 64L + collapsedKeys.size() * 64L + threads.size() * 96L;
+        return stringBytes
+                + frameBytes
+                + stacksByHash.size() * 64L
+                + collapsedKeys.size() * 64L
+                + threads.size() * 96L
+                + javaFlagBytes;
     }
 
     /**
@@ -164,13 +189,30 @@ final class JfrDictionaries {
         return key.toString();
     }
 
-    private int internCollapsed(String key) {
+    /** The Java flags of a stack, root first; the empty stack's single placeholder frame is not Java. */
+    private static boolean[] javaFrames(Frame[] frames) {
+        if (frames.length == 0) return new boolean[1];
+        boolean[] java = new boolean[frames.length];
+        for (int index = 0; index < frames.length; index++) {
+            java[frames.length - 1 - index] = isJavaType(frames[index].type());
+        }
+        return java;
+    }
+
+    private int internCollapsed(String key, boolean[] java) {
         Integer existing = collapsedIds.get(key);
-        if (existing != null) return existing;
+        if (existing != null) {
+            // Stacks that differ only in a frame's type share the key; they must agree for the frame to be Java.
+            boolean[] agreed = collapsedJava.get(existing);
+            for (int index = 0; index < agreed.length; index++) agreed[index] &= java[index];
+            return existing;
+        }
         int id = collapsedKeys.size();
         collapsedKeys.add(key);
+        collapsedJava.add(java);
         collapsedIds.put(key, id);
         stringBytes += 48L + 2L * key.length();
+        javaFlagBytes += 16L + java.length;
         return id;
     }
 
