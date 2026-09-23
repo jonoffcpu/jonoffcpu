@@ -57,7 +57,11 @@ RUN mkdir -p async-profiler/build/lib \
     && make -C async-profiler -j"$(nproc)" build/lib/libasyncProfiler.so \
     && check-musl-needed async-profiler/build/lib/libasyncProfiler.so
 
+# As in the glibc build: the dependencies compile in a layer of their own, with
+# a placeholder crate whose empty build script still pulls in the build
+# dependencies, so a collector change reuses them.
 FROM toolchain AS collector-dependencies
+ARG TARGETARCH
 WORKDIR /work
 COPY jonoffcpu-native/Cargo.toml jonoffcpu-native/Cargo.lock jonoffcpu-native/
 RUN mkdir -p jonoffcpu-native/src/bin \
@@ -73,31 +77,45 @@ RUN mkdir -p jonoffcpu-native/src/bin \
        jonoffcpu-native/src/bin/time_namespace_negative.rs \
        jonoffcpu-native/src/bin/signal_latency.rs \
        jonoffcpu-native/src/bin/target_exit_proof.rs \
-       jonoffcpu-native/src/bin/offcpu_reason_proof.rs
+       jonoffcpu-native/src/bin/offcpu_reason_proof.rs \
+    && echo 'fn main() {}' > jonoffcpu-native/build.rs
 RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \
     cargo fetch --locked --manifest-path jonoffcpu-native/Cargo.toml
+# The Alpine Rust target defaults to a static CRT, which cannot produce a
+# loadable cdylib. With a dynamic CRT, Rust's unwinder links -lgcc_s, but
+# Alpine JVM images do not ship libgcc_s.so.1, so that name is resolved to a
+# linker script over GCC's static libgcc_eh and libgcc archives instead.
+# AArch64 keeps the explicit libgcc link for GCC's outlined atomics, as in the
+# glibc build. The collector build below uses the same RUSTFLAGS; any
+# difference would rebuild every dependency.
+RUN gcc_lib_dir=$(dirname "$(gcc -print-libgcc-file-name)") \
+    && mkdir -p /work/static-gcc \
+    && printf 'GROUP(%s/libgcc_eh.a %s/libgcc.a)\n' "$gcc_lib_dir" "$gcc_lib_dir" \
+      > /work/static-gcc/libgcc_s.a \
+    && { echo "-C target-feature=-crt-static -C link-arg=-Wl,-z,defs -L/work/static-gcc"; \
+         if [ "$TARGETARCH" = arm64 ]; then echo "-C link-arg=-lgcc"; fi; } \
+      | tr '\n' ' ' > /work/rustflags
+RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \
+    set -eux; \
+    export RUSTFLAGS="$(cat /work/rustflags)"; \
+    cargo build --locked --release --lib \
+      --manifest-path jonoffcpu-native/Cargo.toml \
+      --target-dir jonoffcpu-native/target; \
+    rm -rf jonoffcpu-native/target/release/.fingerprint/jonoffcpu-native-* \
+      jonoffcpu-native/target/release/build/jonoffcpu-native-* \
+      jonoffcpu-native/target/release/deps/*jonoffcpu_native* \
+      jonoffcpu-native/target/release/libjonoffcpu_native.*
 
 FROM collector-dependencies AS collector-build
 ARG TARGETARCH
 COPY jonoffcpu-native jonoffcpu-native
 # The capture stream schema: build.rs compiles it into the collector's codec.
 COPY docs/schema docs/schema
-# The Alpine Rust target defaults to a static CRT, which cannot produce a
-# loadable cdylib. With a dynamic CRT, Rust's unwinder links -lgcc_s, but
-# Alpine JVM images do not ship libgcc_s.so.1, so that name is resolved to a
-# linker script over GCC's static libgcc_eh and libgcc archives instead.
-# AArch64 keeps the explicit libgcc link for GCC's outlined atomics, as in the
-# glibc build.
+# The static CRT, libgcc_s and AArch64 atomics flags are set up with the
+# dependencies above.
 RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \
     set -eux; \
-    gcc_lib_dir=$(dirname "$(gcc -print-libgcc-file-name)"); \
-    mkdir -p /work/static-gcc; \
-    printf 'GROUP(%s/libgcc_eh.a %s/libgcc.a)\n' "$gcc_lib_dir" "$gcc_lib_dir" \
-      > /work/static-gcc/libgcc_s.a; \
-    export RUSTFLAGS="-C target-feature=-crt-static -C link-arg=-Wl,-z,defs -L/work/static-gcc"; \
-    if [ "$TARGETARCH" = arm64 ]; then \
-      export RUSTFLAGS="$RUSTFLAGS -C link-arg=-lgcc"; \
-    fi; \
+    export RUSTFLAGS="$(cat /work/rustflags)"; \
     cargo build --locked --release --lib \
       --manifest-path jonoffcpu-native/Cargo.toml \
       --target-dir jonoffcpu-native/target; \

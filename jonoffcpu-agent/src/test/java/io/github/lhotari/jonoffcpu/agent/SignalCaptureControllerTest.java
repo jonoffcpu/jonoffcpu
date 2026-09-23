@@ -3,6 +3,7 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Files;
@@ -48,29 +49,50 @@ public final class SignalCaptureControllerTest {
     public static void main(String[] args) throws Exception {
         Path root = Files.createTempDirectory("jonoffcpu-agent-controller-");
         try {
-            successfulCapture(root.resolve("success"));
-            profilerOnlyCapture(root.resolve("profiler-only"));
-            profilerOnlyExternalStopIsFinalized(root.resolve("profiler-only-external-stop"));
-            coalescingCapture(root.resolve("coalescing"));
-            nativeStackFailureIsRetained(root.resolve("missing-native-stack"));
-            stopTimeoutRetainsOwnership(root.resolve("timeout"));
-            closeTimeoutRetainsOwnership(root.resolve("close-timeout"));
-            nativeStopErrorStillCleansUp(root.resolve("stop-error"));
-            incompleteSourceStillFinalizesProfiler(root.resolve("incomplete-source"));
-            profilerTerminationTriggersPollCleanup(root.resolve("poll"));
-            lostStopResponseUsesIdentityQuery(root.resolve("receipt"));
-            unfinalizedApNeverPublishesFooter(root.resolve("unfinalized"));
-            ownershipMismatchNeverUsesOrdinaryStop(root.resolve("ownership"));
-            busyProfilerIsNeverTakenOver(root.resolve("busy"));
-            malformedStartUsesUuidGuard(root.resolve("malformed"));
-            concurrentLifecycleHasOneOwner(root.resolve("concurrent"));
-            nativeOptionParsing(root.resolve("options"));
-            yamlConfigParsing(root.resolve("yaml"));
-            samplingProbabilityParsing(root.resolve("sampling-probability"));
-            samplingConfigParsing(root.resolve("sampling-config"));
-            proportionalAdmissionThreshold();
-            siblingCaptureFileNames();
-            unsignedStopCountersParse();
+            FixtureSteps.step("successfulCapture", () -> successfulCapture(root.resolve("success")));
+            FixtureSteps.step("profilerOnlyCapture", () -> profilerOnlyCapture(root.resolve("profiler-only")));
+            FixtureSteps.step(
+                    "profilerOnlyExternalStopIsFinalized",
+                    () -> profilerOnlyExternalStopIsFinalized(root.resolve("profiler-only-external-stop")));
+            FixtureSteps.step("coalescingCapture", () -> coalescingCapture(root.resolve("coalescing")));
+            FixtureSteps.step(
+                    "nativeStackFailureIsRetained",
+                    () -> nativeStackFailureIsRetained(root.resolve("missing-native-stack")));
+            FixtureSteps.step(
+                    "stopTimeoutRetainsOwnership", () -> stopTimeoutRetainsOwnership(root.resolve("timeout")));
+            FixtureSteps.step(
+                    "closeTimeoutRetainsOwnership", () -> closeTimeoutRetainsOwnership(root.resolve("close-timeout")));
+            FixtureSteps.step(
+                    "nativeStopErrorStillCleansUp", () -> nativeStopErrorStillCleansUp(root.resolve("stop-error")));
+            FixtureSteps.step(
+                    "incompleteSourceStillFinalizesProfiler",
+                    () -> incompleteSourceStillFinalizesProfiler(root.resolve("incomplete-source")));
+            FixtureSteps.step(
+                    "profilerTerminationTriggersPollCleanup",
+                    () -> profilerTerminationTriggersPollCleanup(root.resolve("poll")));
+            FixtureSteps.step(
+                    "lostStopResponseUsesIdentityQuery",
+                    () -> lostStopResponseUsesIdentityQuery(root.resolve("receipt")));
+            FixtureSteps.step(
+                    "unfinalizedApNeverPublishesFooter",
+                    () -> unfinalizedApNeverPublishesFooter(root.resolve("unfinalized")));
+            FixtureSteps.step(
+                    "ownershipMismatchNeverUsesOrdinaryStop",
+                    () -> ownershipMismatchNeverUsesOrdinaryStop(root.resolve("ownership")));
+            FixtureSteps.step("busyProfilerIsNeverTakenOver", () -> busyProfilerIsNeverTakenOver(root.resolve("busy")));
+            FixtureSteps.step(
+                    "malformedStartUsesUuidGuard", () -> malformedStartUsesUuidGuard(root.resolve("malformed")));
+            FixtureSteps.step(
+                    "concurrentLifecycleHasOneOwner", () -> concurrentLifecycleHasOneOwner(root.resolve("concurrent")));
+            FixtureSteps.step("nativeOptionParsing", () -> nativeOptionParsing(root.resolve("options")));
+            FixtureSteps.step("yamlConfigParsing", () -> yamlConfigParsing(root.resolve("yaml")));
+            FixtureSteps.step(
+                    "samplingProbabilityParsing",
+                    () -> samplingProbabilityParsing(root.resolve("sampling-probability")));
+            FixtureSteps.step("samplingConfigParsing", () -> samplingConfigParsing(root.resolve("sampling-config")));
+            FixtureSteps.step("proportionalAdmissionThreshold", () -> proportionalAdmissionThreshold());
+            FixtureSteps.step("siblingCaptureFileNames", () -> siblingCaptureFileNames());
+            FixtureSteps.step("unsignedStopCountersParse", () -> unsignedStopCountersParse());
             System.out.println("SignalCaptureController fixtures passed");
         } finally {
             try (var paths = Files.walk(root)) {

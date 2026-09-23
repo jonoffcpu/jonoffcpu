@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  # The reusable workflow's setup-gradle comments on a pull request whose build fails.
+  pull-requests: write
 
 concurrency:
   group: ci-${{ github.ref }}

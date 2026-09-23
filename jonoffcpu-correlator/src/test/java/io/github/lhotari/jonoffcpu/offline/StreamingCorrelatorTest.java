@@ -5,6 +5,7 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
@@ -990,21 +991,21 @@ public final class StreamingCorrelatorTest {
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-streaming-test-");
         try {
-            goldenEquivalence(dir);
-            auditLevels(dir);
-            syntheticFromColumns(dir);
-            syntheticOrderTiesBreakOnCookie(dir);
-            scale(dir);
-            thinningAccuracy(dir);
-            thinningDeterminism(dir);
-            ladder(dir);
+            FixtureSteps.step("goldenEquivalence", () -> goldenEquivalence(dir));
+            FixtureSteps.step("auditLevels", () -> auditLevels(dir));
+            FixtureSteps.step("syntheticFromColumns", () -> syntheticFromColumns(dir));
+            FixtureSteps.step("syntheticOrderTiesBreakOnCookie", () -> syntheticOrderTiesBreakOnCookie(dir));
+            FixtureSteps.step("scale", () -> scale(dir));
+            FixtureSteps.step("thinningAccuracy", () -> thinningAccuracy(dir));
+            FixtureSteps.step("thinningDeterminism", () -> thinningDeterminism(dir));
+            FixtureSteps.step("ladder", () -> ladder(dir));
             // Runs after scale(), not next to auditLevels() where it belongs by subject. scale()'s
             // distinct-stack floor depends on how far the JVM has inlined ScaleFixture's recursive
             // commitAtDepth by the time it runs: another 200,000-event fixture ahead of it warms that
             // recursion enough to collapse the captured stacks below the floor (66 observed against a
             // floor of 100). Every other large fixture is already downstream of scale() for the same
             // reason; this one joins them.
-            auditUnderDegradation(dir);
+            FixtureSteps.step("auditUnderDegradation", () -> auditUnderDegradation(dir));
             System.out.println("Streaming correlator fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {
