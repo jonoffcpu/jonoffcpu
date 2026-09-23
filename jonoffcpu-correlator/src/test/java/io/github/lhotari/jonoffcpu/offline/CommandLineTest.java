@@ -3,6 +3,7 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -345,10 +346,10 @@ public final class CommandLineTest {
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-cli-test-");
         try {
-            helpSnapshots();
-            usageErrors();
-            dumpAlias(dir);
-            readmeMatchesParser();
+            FixtureSteps.step("helpSnapshots", () -> helpSnapshots());
+            FixtureSteps.step("usageErrors", () -> usageErrors());
+            FixtureSteps.step("dumpAlias", () -> dumpAlias(dir));
+            FixtureSteps.step("readmeMatchesParser", () -> readmeMatchesParser());
             System.out.println("Command line fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

@@ -1,0 +1,37 @@
+name: Dependency submission
+
+# Submits the Gradle build's resolved dependencies to GitHub's dependency graph, which Dependabot alerts and
+# security updates for Gradle dependencies are based on.
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dependency-submission-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dependency-submission:
+    name: Submit Gradle dependencies
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The converter module builds from the async-profiler submodule's sources.
+          submodules: recursive
+      - uses: actions/setup-java@v6
+        with:
+          distribution: corretto
+          java-version: 25
+      - name: Generate and submit the dependency graph
+        uses: gradle/actions/dependency-submission@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          build-scan-publish: true
+          build-scan-terms-of-use-url: https://gradle.com/terms-of-service
+          build-scan-terms-of-use-agree: "yes"

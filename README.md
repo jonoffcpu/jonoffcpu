@@ -1209,6 +1209,16 @@ Releases embed all four bundles. The agent JAR lands in
 `jonoffcpu-agent/build/libs/` and the runnable correlator JAR in
 `jonoffcpu-correlator/build/libs/`.
 
+The build uses Gradle's build cache, and the native bundle's Dockerfiles
+compile the collector's Cargo dependencies in a layer of their own, so a
+collector change rebuilds only the collector. The tests are main-based
+fixtures; each reports its class and every scenario with `STARTED`, `PASSED`
+or `FAILED` and the time it took. CI publishes a
+[Build Scan](https://scans.gradle.com) for every Gradle build, and restores
+the native bundle's Docker layers from the GitHub Actions cache with
+`-PdockerCache=gha` (`-PdockerCacheWrite=true` also exports them, which CI
+does only on `main`).
+
 The converter is built from the same fork's `src/converter` sources by the
 `jonoffcpu-jfr-converter` module:
 

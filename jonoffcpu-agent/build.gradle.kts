@@ -203,6 +203,26 @@ val nativeFileNames = listOf("libjonoffcpu.so", "libjonoffcpu_native.so", "libas
 val nativeRoot = layout.buildDirectory.dir("native")
 val prebuiltNative = providers.gradleProperty("prebuiltNative").map(String::toBoolean).orElse(false)
 
+// Layer caching for the native bundle builds in GitHub Actions: -PdockerCache=gha restores every stage, the
+// toolchains and the compiled dependencies included, from the Actions cache, and -PdockerCacheWrite=true also
+// exports them (mode=max). CI writes only on the default branch, whose entries every branch can read. The cache
+// needs a buildx builder with the docker-container driver (BUILDX_BUILDER) and the Actions runtime environment.
+val dockerCache = providers.gradleProperty("dockerCache").orElse("none")
+val dockerCacheWrite = providers.gradleProperty("dockerCacheWrite").map(String::toBoolean).orElse(false)
+
+fun dockerCacheArguments(scope: String): List<String> =
+    when (val cache = dockerCache.get()) {
+        "none" -> emptyList()
+        "gha" ->
+            listOf("--cache-from", "type=gha,scope=$scope") +
+                if (dockerCacheWrite.get()) {
+                    listOf("--cache-to", "type=gha,scope=$scope,mode=max,ignore-error=true")
+                } else {
+                    emptyList()
+                }
+        else -> throw GradleException("Unsupported dockerCache value '$cache'; expected none or gha")
+    }
+
 val nativeTasks = allNativePlatforms.mapValues { (platform, spec) ->
     val dockerfile = layout.projectDirectory.file("tools/${spec.dockerfile}")
     val output = nativeRoot.map { it.dir(platform) }
@@ -211,11 +231,13 @@ val nativeTasks = allNativePlatforms.mapValues { (platform, spec) ->
         description = "Builds the agent, collector, and async-profiler libraries for $platform in Docker buildx."
         workingDir(rootProject.layout.projectDirectory)
         commandLine(
-            "docker", "buildx", "build", "--progress=plain",
-            "--platform", spec.dockerPlatform,
-            "--file", dockerfile.asFile.absolutePath,
-            "--output", output.map { "type=local,dest=${it.asFile.absolutePath}" }.get(),
-            rootProject.layout.projectDirectory.asFile.absolutePath
+            listOf(
+                "docker", "buildx", "build", "--progress=plain",
+                "--platform", spec.dockerPlatform,
+                "--file", dockerfile.asFile.absolutePath,
+                "--output", output.map { "type=local,dest=${it.asFile.absolutePath}" }.get()
+            ) + dockerCacheArguments("native-bundle-$platform") +
+                rootProject.layout.projectDirectory.asFile.absolutePath
         )
         inputs.file(dockerfile)
         inputs.file(layout.projectDirectory.file("tools/check-musl-needed.sh"))

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -411,9 +412,9 @@ public final class FixtureAcceptanceTest {
         }
         Path dir = Files.createTempDirectory("jonoffcpu-fixture-acceptance-");
         try {
-            transforms(Path.of(fixtures), dir);
-            export(Path.of(fixtures), dir);
-            top(Path.of(fixtures), dir);
+            FixtureSteps.step("transforms", () -> transforms(Path.of(fixtures), dir));
+            FixtureSteps.step("export", () -> export(Path.of(fixtures), dir));
+            FixtureSteps.step("top", () -> top(Path.of(fixtures), dir));
             System.out.println("Fixture acceptance checks passed");
         } finally {
             try (var files = Files.walk(dir)) {

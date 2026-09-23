@@ -5,6 +5,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -490,10 +491,11 @@ public final class PartialCorrelatorTest {
                                     .toString()
                                     .contains("explicit-partial-mode"),
                     "Explicit partial mode promoted complete inputs");
-            sourcePrefixFixtures(dir, source, jfr, observation, complete);
-            jfrPrefixFixtures(dir, source, observation);
-            hardFailures(dir, source, jfr, complete);
-            outputFixtures(dir, source, jfr);
+            FixtureSteps.step(
+                    "sourcePrefixFixtures", () -> sourcePrefixFixtures(dir, source, jfr, observation, complete));
+            FixtureSteps.step("jfrPrefixFixtures", () -> jfrPrefixFixtures(dir, source, observation));
+            FixtureSteps.step("hardFailures", () -> hardFailures(dir, source, jfr, complete));
+            FixtureSteps.step("outputFixtures", () -> outputFixtures(dir, source, jfr));
             System.out.println("Partial correlator fixtures passed on " + Runtime.version());
         } finally {
             try (var files = Files.walk(dir)) {

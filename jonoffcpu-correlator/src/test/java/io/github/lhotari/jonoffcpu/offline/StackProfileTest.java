@@ -6,6 +6,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import io.github.lhotari.jonoffcpu.profile.ProfileProto;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -1233,14 +1234,18 @@ public final class StackProfileTest {
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-profile-test-");
         try {
-            unclassifiedGolden(Files.createDirectories(dir.resolve("golden")));
-            mixedReasons(Files.createDirectories(dir.resolve("mixed")));
-            classificationIsVerified(Files.createDirectories(dir.resolve("verified")));
-            filters(Files.createDirectories(dir.resolve("filters")));
-            packageNames(Files.createDirectories(dir.resolve("packages")));
-            nativeFrames(Files.createDirectories(dir.resolve("native")));
-            timeSplitRule();
-            sleepingAndRunqueue(Files.createDirectories(dir.resolve("split")));
+            FixtureSteps.step(
+                    "unclassifiedGolden", () -> unclassifiedGolden(Files.createDirectories(dir.resolve("golden"))));
+            FixtureSteps.step("mixedReasons", () -> mixedReasons(Files.createDirectories(dir.resolve("mixed"))));
+            FixtureSteps.step(
+                    "classificationIsVerified",
+                    () -> classificationIsVerified(Files.createDirectories(dir.resolve("verified"))));
+            FixtureSteps.step("filters", () -> filters(Files.createDirectories(dir.resolve("filters"))));
+            FixtureSteps.step("packageNames", () -> packageNames(Files.createDirectories(dir.resolve("packages"))));
+            FixtureSteps.step("nativeFrames", () -> nativeFrames(Files.createDirectories(dir.resolve("native"))));
+            FixtureSteps.step("timeSplitRule", () -> timeSplitRule());
+            FixtureSteps.step(
+                    "sleepingAndRunqueue", () -> sleepingAndRunqueue(Files.createDirectories(dir.resolve("split"))));
             System.out.println("Stack profile fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

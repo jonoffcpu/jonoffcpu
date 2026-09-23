@@ -38,6 +38,10 @@ jobs:
   build-and-verify:
     name: Native build and verification
     needs: version
+    # The reusable workflow declares what setup-gradle may need; a tag build has no pull request to comment on.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/build-and-verify.yml
     with:
       version: ${{ needs.version.outputs.version }}

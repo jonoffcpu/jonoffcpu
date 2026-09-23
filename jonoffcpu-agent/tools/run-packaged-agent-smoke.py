@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import os
 import platform
 import subprocess
 from pathlib import Path
@@ -78,8 +79,16 @@ def main():
     module = Path(__file__).resolve().parents[1]
     dockerfile = "tools/Dockerfile.runtime" if args.libc == "glibc" else "tools/Dockerfile.runtime-musl"
     image = f"jonoffcpu-agent-runtime-{args.libc}:{platform.machine()}"
+    build = ["docker", "build"]
+    # In GitHub Actions the runtime image's layers come from the Actions cache, as the native bundle's do: the
+    # buildx builder named by BUILDX_BUILDER restores them, exports them only when asked, and loads the image.
+    if os.environ.get("JONOFFCPU_DOCKER_CACHE") == "gha":
+        scope = f"runtime-{args.libc}-{platform.machine()}"
+        build = ["docker", "buildx", "build", "--load", "--cache-from", f"type=gha,scope={scope}"]
+        if os.environ.get("JONOFFCPU_DOCKER_CACHE_WRITE") == "true":
+            build += ["--cache-to", f"type=gha,scope={scope},mode=max,ignore-error=true"]
     run(
-        ["docker", "build", "-t", image, "-f", module / dockerfile, module / "tools"],
+        [*build, "-t", image, "-f", module / dockerfile, module / "tools"],
         output / "runtime-build.log",
     )
     mounts = [

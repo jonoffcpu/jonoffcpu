@@ -3,6 +3,7 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -374,9 +375,9 @@ public final class StackTransformsTest {
     public static void main(String[] args) throws Exception {
         Path dir = Files.createTempDirectory("jonoffcpu-transforms-test-");
         try {
-            transformsInIsolation();
-            commandLine(dir);
-            collapsedInput(dir);
+            FixtureSteps.step("transformsInIsolation", () -> transformsInIsolation());
+            FixtureSteps.step("commandLine", () -> commandLine(dir));
+            FixtureSteps.step("collapsedInput", () -> collapsedInput(dir));
             System.out.println("Stack transform fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

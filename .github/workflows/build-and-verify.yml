@@ -20,6 +20,8 @@ on:
 
 permissions:
   contents: read
+  # setup-gradle comments on the pull request when its build fails.
+  pull-requests: write
 
 jobs:
   native-build-and-verify:
@@ -65,9 +67,15 @@ jobs:
         if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
         with:
           components: rustfmt
+      # The default (enhanced) cache provider is free for public repositories. It saves the Gradle User
+      # Home, the local build cache included, only from the default branch; other runs restore it read-only.
+      # Every build publishes a Build Scan, and a failed one is summarized on the pull request.
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
-          cache-provider: basic
+          build-scan-publish: true
+          build-scan-terms-of-use-url: https://gradle.com/terms-of-service
+          build-scan-terms-of-use-agree: "yes"
+          add-job-summary-as-pr-comment: on-failure
       - name: Check native collector formatting
         if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
         run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
@@ -85,6 +93,17 @@ jobs:
           fi
           duckdb --version
           echo "JONOFFCPU_REQUIRE_DUCKDB=true" >> "$GITHUB_ENV"
+      # Docker layer caching in the GitHub Actions cache: a docker-container buildx
+      # builder, which the native bundle and runtime image builds select through
+      # BUILDX_BUILDER, and the Actions runtime environment that its gha cache
+      # needs. The default builder stays in use for everything else. Layers are
+      # restored on every run and exported only from the default branch, whose
+      # cache every branch can read.
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        id: buildx
+        with:
+          use: false
+      - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
       # The glibc runner JDK exercises the host-native JNI fixtures in check; the
       # musl bundle cannot load into the glibc build JVM, so its evidence is the
       # packaged smoke in an Alpine container of the same architecture.
@@ -92,14 +111,21 @@ jobs:
         env:
           NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
           NATIVE_LIBC: ${{ matrix.libc }}
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          DOCKER_CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
         run: >-
           ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
           -PnativeArchitectures="$NATIVE_ARCHITECTURE"
           -PnativeLibcs="$NATIVE_LIBC"
+          -PdockerCache=gha
+          -PdockerCacheWrite="$DOCKER_CACHE_WRITE"
           --no-daemon
       - name: Run packaged agent end-to-end smoke test
         env:
           NATIVE_LIBC: ${{ matrix.libc }}
+          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
+          JONOFFCPU_DOCKER_CACHE: gha
+          JONOFFCPU_DOCKER_CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
         run: |
           java_home_option=()
           if [ "$NATIVE_LIBC" = glibc ]; then
@@ -133,9 +159,15 @@ jobs:
         with:
           distribution: corretto
           java-version: 25
+      # The default (enhanced) cache provider is free for public repositories. It saves the Gradle User
+      # Home, the local build cache included, only from the default branch; other runs restore it read-only.
+      # Every build publishes a Build Scan, and a failed one is summarized on the pull request.
       - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
-          cache-provider: basic
+          build-scan-publish: true
+          build-scan-terms-of-use-url: https://gradle.com/terms-of-service
+          build-scan-terms-of-use-agree: "yes"
+          add-job-summary-as-pr-comment: on-failure
       - uses: actions/download-artifact@v8
         with:
           name: ${{ inputs.native_artifact_prefix }}-linux-x86_64

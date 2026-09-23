@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -285,16 +286,16 @@ public final class PrimitiveStructuresTest {
     }
 
     public static void main(String[] args) throws Exception {
-        unsigned();
-        cookieIndex();
-        dictionaries();
-        columns();
-        budget();
-        quantum();
-        thinning();
+        FixtureSteps.step("unsigned", () -> unsigned());
+        FixtureSteps.step("cookieIndex", () -> cookieIndex());
+        FixtureSteps.step("dictionaries", () -> dictionaries());
+        FixtureSteps.step("columns", () -> columns());
+        FixtureSteps.step("budget", () -> budget());
+        FixtureSteps.step("quantum", () -> quantum());
+        FixtureSteps.step("thinning", () -> thinning());
         Path dir = Files.createTempDirectory("jonoffcpu-primitive-structures-test-");
         try {
-            estimate(dir);
+            FixtureSteps.step("estimate", () -> estimate(dir));
         } finally {
             try (var files = Files.walk(dir)) {
                 for (Path path : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
