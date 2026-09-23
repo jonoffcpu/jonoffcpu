@@ -423,6 +423,84 @@ into its own table and join to the rows on `run`:
 
 Its counters follow the same number rule.
 
+## Ranked tables and the digest
+
+`top` ranks where a profile's (or, with `--collapsed-input`, any collapsed
+file's) time went, with the selection, filter and transform options of
+`stacks`:
+
+```sh
+java -jar jonoffcpu-correlator.jar top (--profile P | --collapsed-input F)
+    [--by boundary|self|method|class|package|pool] [--app REGEX]... [--app-from FILE]...
+    [--idle REGEX]... [--idle-from FILE]... [--machinery-from FILE]...
+    [--weights observed|estimated] [--limit N] [--format md|json|csv] [--output FILE]
+    [--baseline P2 [--units X --baseline-units Y]]
+java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REGEX]...
+    [--idle-from FILE]... [--limit N] [--output-dir D]
+```
+
+- **Idle or busy.** An entry is idle when any frame of any of its stacks
+  matches an idle pattern, matched as `--exclude` matches. Idle entries are not
+  dropped: they get their own table. `--exclude` still removes entries.
+- **Attribution** is computed on the Java stack after `--canonical-names` and
+  `--hide`. `boundary` (the default, which needs `--app`) keys a row by the
+  deepest application frame and its **blocker**: the entry frame of the longest
+  leaf-side run below the boundary that matches the wait machinery
+  (`--machinery-from`, default `preset:jvm-wait-machinery`), or the leaf when
+  there is none. Busy entries without an application frame go to a table by
+  thread pool (the name with digit runs as `#`). `self` is the leaf after the
+  transforms, `method`, `class` and `package` count every distinct one in the
+  stack once per entry (inclusive), and `pool` is the thread's pool.
+- **Columns**: rank, key (and blocker), seconds to three decimals, share of the
+  busy total (of the idle total in the idle table), intervals, estimated
+  seconds when the profile's estimate is available, sleeping and run-queue
+  seconds when it has the split, the dominant reason, and for boundary rows the
+  heaviest root-most application frame (the caller, after `--trim-root` and
+  `--root-at`). Rows sort by weight, then key.
+- **Totals** add up: busy and idle make the selection, and application rows and
+  the pool table make the busy total. The over-exclusion check counts idle
+  entries with a `java.util.concurrent.locks.*.lock*`/`acquire*` or
+  `complete_monitor_locking` frame, the waits an idle list may hide by mistake.
+- **Weights.** `observed` by default; `estimated` needs the profile's
+  estimate. Under proportional or uniform admission observed time
+  under-weights short waits, and the output warns.
+- **`--baseline`** keys both runs by application boundary and gives each row's
+  seconds, or seconds per unit of work with `--units`/`--baseline-units`, and
+  its share of that run's busy application time. Rows present in one run only
+  have the other side empty; rows sort by the larger value, then by the
+  absolute delta. It refuses observed weights when both runs have estimates and
+  either was sampled, warns when neither has estimates, and warns when the runs'
+  unresolved native frames (`/lib/…` paths) differ by more than 10 points of
+  busy time, since their time without an application frame is then not
+  comparable.
+- **Formats.** `json` is the source: `schemaVersion` 1, `command` (the
+  reproduce command), `by`, `unit`, `selection` (every option, with the
+  patterns and their sources), `totals`, `rows`, `noApplicationFrame`, `idle`
+  (or `comparison`), and `warnings`. `md` and `csv` (one row per table row,
+  with a `table` column) are rendered from it.
+
+Correlation writes the **digest**, `jonoffcpu-summary.json` and
+`jonoffcpu-summary.md`, next to the report unless `--summary-output false` is
+given, with `preset:jvm-idle`, `preset:jvm-wait-machinery`, canonical names and
+no application pattern; `summarize` rewrites it with `--app`. The report's
+`digest` object names the files, or holds the `error` when the digest could not
+be written, which never fails the correlation. The JSON, `schemaVersion` 1:
+
+| Field | Contents |
+| --- | --- |
+| `profile`, `run`, `estimateAvailable`, `timeSplitAvailable` | What was summarised |
+| `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
+| `selection` | As in `top --format json` |
+| `whereTheTimeWent` | `top`'s totals: selected, idle, busy, busy with and without an application frame, over-exclusion |
+| `busy`, `idle` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, and the `rows` |
+| `busyNoApplicationFrameByPool` | The pool table (with `--app`), or busy time by pool (without) |
+| `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines, and the `command` |
+| `warnings` | As in `top` |
+
+Every table is limited to `--limit` rows (default 20), which keeps the Markdown
+of an Apache Pulsar broker's digest under 16 KB. The Markdown is rendered from
+the JSON, so the two cannot disagree, and the same inputs give the same bytes.
+
 ## Degradation
 
 A profile is not an audit log. When a capture does not fit the retained-bytes budget,

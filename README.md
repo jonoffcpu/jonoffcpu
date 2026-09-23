@@ -213,6 +213,7 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`docs/schema/jonoffcpu-profile.proto`](docs/schema/jonoffcpu-profile.proto) |
+| `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: coverage and losses, where the time went, ranked busy and idle tables, the heaviest transformed stacks, and the command that reproduces each table. The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
 | `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
 | `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
@@ -744,6 +745,20 @@ duckdb -c "SELECT reason, java_stack, sum(observed_nanos) / 1e9 AS seconds
            FROM read_csv('entries.csv') GROUP BY ALL ORDER BY seconds DESC LIMIT 20"
 ```
 
+`top` ranks the same profile instead of drawing it: each interval is idle when
+a frame matches `--idle`/`--idle-from` (for example `preset:jvm-idle`) and busy
+otherwise, and busy time is attributed to the deepest frame of your code
+(`--app`) and the lock, monitor or park below it, with idle time in a table of
+its own. `summarize` writes the same tables into the digest that correlation
+writes by default:
+
+```sh
+java -jar jonoffcpu-correlator.jar top --profile runs.pb \
+  --app '^com\.example\.' --idle-from preset:jvm-idle --format md
+java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
+  --units 5 --baseline-units 5 --app '^com\.example\.' --idle-from preset:jvm-idle
+```
+
 A merged profile sums durations across its inputs: it shows what dominates
 across the runs, not what fraction of any one run's time it took. Thinned
 profiles cannot be merged, because each is rescaled by its own probability.
@@ -930,6 +945,7 @@ The agent can also be started programmatically with
 | `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
 | `--collapsed-reason-frame auto\|always\|never` | Whether each line of `jonoffcpu-offcpu-stacks.collapsed` starts with its `[offcpu: <reason>]` frame. Default `auto`: only when the capture mixes reasons. |
 | `--profile-output true\|false` | Whether to write `jonoffcpu-offcpu-profile.pb`. Default `true`. |
+| `--summary-output true\|false` | Whether to write the digest, `jonoffcpu-summary.md` and `.json`. Default `true`. |
 | `--profile-group-by <list>` | Which optional dimensions the profile keeps besides the Java stack and the reason: any of `kernel`, `user`, `thread`, or `none`. Default all three. |
 | `--max-profile-entries <n>` | Entry limit for the profile. Past it the thread, then the user stack, then the kernel stack are dropped from the grouping, which merges entries and changes no total; the report names what was dropped. Default 2,000,000. |
 

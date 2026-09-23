@@ -7,6 +7,7 @@ import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintWriter;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
@@ -99,6 +100,8 @@ final class Cli {
             List.of("--profiles", "--output"),
             "export",
             List.of("--profile", "--output"),
+            "summarize",
+            List.of("--profile"),
             "dump",
             List.of("--source"));
 
@@ -307,6 +310,16 @@ final class Cli {
                 description = "The profile's optional dimensions besides the Java stack and the reason: any of"
                         + " kernel, user, thread, or none. Default: ${DEFAULT-VALUE}.")
         String profileGroupBy;
+
+        @Option(
+                names = "--summary-output",
+                arity = "1",
+                paramLabel = "true|false",
+                defaultValue = "true",
+                description = "Whether to write the analysis digest, " + OutputFiles.SUMMARY_MD + " and "
+                        + OutputFiles.SUMMARY_JSON + ", from the profile and the report. A failure to write it is"
+                        + " reported in the report and never fails the correlation. Default: ${DEFAULT-VALUE}.")
+        boolean summaryOutput;
 
         @Option(
                 names = "--max-profile-entries",
@@ -574,11 +587,21 @@ final class Cli {
             showDefaultValues = false,
             description = "Correlates a jonoffcpu capture with its JFR, and renders, merges and exports the stack"
                     + " profile it produces. Without a subcommand it correlates, with the options below.",
-            subcommands = {Correlate.class, Stacks.class, Merge.class, Export.class, Dump.class, HelpCommand.class},
+            subcommands = {
+                Correlate.class,
+                Stacks.class,
+                TopCommand.class,
+                Summarize.class,
+                Merge.class,
+                Export.class,
+                Dump.class,
+                HelpCommand.class
+            },
             footer = {
                 "",
                 "Writes into the output directory: " + OutputFiles.REPORT + ", " + OutputFiles.COLLAPSED + ", "
-                        + OutputFiles.PROFILE + ", " + OutputFiles.SYNTHETIC_JFR + " and, last, "
+                        + OutputFiles.PROFILE + ", the digest " + OutputFiles.SUMMARY_MD + " and "
+                        + OutputFiles.SUMMARY_JSON + ", " + OutputFiles.SYNTHETIC_JFR + " and, last, "
                         + OutputFiles.COMPLETE + "; " + OutputFiles.CLASSIFIED_RECORDS + " is written only for"
                         + " --audit full and " + OutputFiles.MATCHES + " for --audit full or matches; --partial"
                         + " true writes " + OutputFiles.INCOMPLETE_PREFIX + "* files and " + OutputFiles.PARTIAL
@@ -651,7 +674,8 @@ final class Cli {
                     || options.given("--collapsed-reason-frame")
                     || options.given("--profile-output")
                     || options.given("--profile-group-by")
-                    || options.given("--max-profile-entries")) {
+                    || options.given("--max-profile-entries")
+                    || options.given("--summary-output")) {
                 throw options.usage("Partial mode supports diagnostics or labelled collapsed output;"
                         + " synthetic JFR and population estimates require complete analysis");
             }
@@ -692,7 +716,8 @@ final class Cli {
                 options.onLimit,
                 options.collapsedReasonFrame,
                 options.profileOutput,
-                profileOptions);
+                profileOptions,
+                options.summaryOutput);
     }
 
     @Command(
@@ -931,6 +956,306 @@ final class Cli {
         return weight.signum() == 0
                 ? java.math.BigDecimal.ZERO
                 : frames.divide(weight, 1, java.math.RoundingMode.HALF_EVEN);
+    }
+
+    /** The options {@code top} and {@code summarize} share: what is application code, idle and wait machinery. */
+    static final class RankingOptions {
+        @Option(
+                names = "--app",
+                paramLabel = "REGEX",
+                description = "A frame of your application; the deepest one is a stack's boundary. Repeatable.")
+        List<String> app = new ArrayList<>();
+
+        @Option(
+                names = "--app-from",
+                paramLabel = "FILE",
+                description = "Read --app patterns from a file or preset:NAME; repeatable.")
+        List<String> appFrom = new ArrayList<>();
+
+        @Option(
+                names = "--idle",
+                paramLabel = "REGEX",
+                description = "An interval with a frame matching this is idle, a wait for work: it is listed in its"
+                        + " own table, not dropped. Repeatable.")
+        List<String> idle = new ArrayList<>();
+
+        @Option(
+                names = "--idle-from",
+                paramLabel = "FILE",
+                description = "Read --idle patterns from a file or preset:NAME, such as preset:jvm-idle; repeatable."
+                        + " Default for summarize, when no idle pattern is given: preset:jvm-idle.")
+        List<String> idleFrom = new ArrayList<>();
+
+        @Option(
+                names = "--machinery-from",
+                paramLabel = "FILE",
+                description = "The wait machinery below a boundary whose entry frame is the blocker, from a file or"
+                        + " preset:NAME; repeatable. Default: preset:jvm-wait-machinery.")
+        List<String> machineryFrom = new ArrayList<>();
+
+        @Option(
+                names = "--limit",
+                paramLabel = "N",
+                defaultValue = "20",
+                description = "Rows per table. Default: ${DEFAULT-VALUE}.")
+        int limit;
+
+        List<StackTransforms.Sourced> app() throws IOException {
+            return sourced(app, "--app-from", appFrom);
+        }
+
+        List<StackTransforms.Sourced> idle(boolean defaultPreset) throws IOException {
+            if (defaultPreset && idle.isEmpty() && idleFrom.isEmpty()) {
+                return sourced(List.of(), "--idle-from", List.of("preset:jvm-idle"));
+            }
+            return sourced(idle, "--idle-from", idleFrom);
+        }
+
+        List<StackTransforms.Sourced> machinery() throws IOException {
+            return sourced(
+                    List.of(),
+                    "--machinery-from",
+                    machineryFrom.isEmpty() ? List.of("preset:jvm-wait-machinery") : machineryFrom);
+        }
+    }
+
+    @Command(
+            name = "top",
+            mixinStandardHelpOptions = true,
+            versionProvider = Version.class,
+            sortOptions = false,
+            description = {
+                "Ranks where off-CPU time went. Each selected interval is idle when a frame of any of its stacks"
+                        + " matches --idle, and busy otherwise; busy time is attributed by --by to a row, and idle"
+                        + " time is listed in its own table.",
+                "--by boundary (the default) keys a row by the deepest --app frame and the blocker below it, and"
+                        + " breaks busy time without an application frame down by thread pool."
+            },
+            footer = {
+                "",
+                "With --baseline, compares the application boundaries of two profiles, per unit of work when"
+                        + " --units and --baseline-units are given. Selection, filter and transform options are"
+                        + " those of stacks."
+            })
+    static final class TopCommand implements Callable<Integer> {
+        @Spec
+        CommandSpec spec;
+
+        @Mixin
+        SliceOptions slice;
+
+        @Option(
+                names = "--collapsed-input",
+                paramLabel = "FILE",
+                description = "Rank any collapsed file instead of --profile; values keep the file's unit.")
+        Path collapsedInput;
+
+        @Option(
+                names = "--by",
+                paramLabel = "KEY",
+                defaultValue = "boundary",
+                converter = ByConverter.class,
+                description = "What a row is: boundary (deepest --app frame and its blocker), self (the leaf, after"
+                        + " --collapse-leaf), method, class or package (every distinct one in the stack, inclusive),"
+                        + " or pool (the thread name with digit runs as #). Default: ${DEFAULT-VALUE}.")
+        Top.By by;
+
+        @Mixin
+        RankingOptions ranking;
+
+        @Option(
+                names = "--format",
+                paramLabel = "FORMAT",
+                defaultValue = "md",
+                converter = TopFormatConverter.class,
+                description = "md, json or csv. Default: ${DEFAULT-VALUE}.")
+        String format;
+
+        @Option(names = "--output", paramLabel = "FILE", description = "Write to this file instead of stdout.")
+        Path output;
+
+        @Option(
+                names = "--baseline",
+                paramLabel = "FILE",
+                description = "Compare with this profile, keyed by application boundary.")
+        Path baseline;
+
+        @Option(
+                names = "--units",
+                paramLabel = "N",
+                description = "This run's units of work, such as millions of messages, for time per unit.")
+        BigDecimal units;
+
+        @Option(names = "--baseline-units", paramLabel = "N", description = "The baseline's units of work.")
+        BigDecimal baselineUnits;
+
+        @Mixin
+        FilterOptions filters;
+
+        @Mixin
+        TransformOptions transformOptions;
+
+        @Override
+        public Integer call() throws Exception {
+            ParseResult parsed = spec.commandLine().getParseResult();
+            if ((slice.profile == null) == (collapsedInput == null)) {
+                throw new ParameterException(spec.commandLine(), "Give exactly one of --profile and --collapsed-input");
+            }
+            for (String option : List.of("--stack", "--time", "--thread-frame")) {
+                if (parsed.hasMatchedOption(option)) {
+                    throw new ParameterException(spec.commandLine(), option + " does not apply to top");
+                }
+            }
+            if (collapsedInput != null) {
+                for (String option : List.of("--reason", "--weights", "--baseline", "--by")) {
+                    boolean pool = option.equals("--by") && by == Top.By.POOL;
+                    if (option.equals("--by") ? pool : parsed.hasMatchedOption(option)) {
+                        throw new ParameterException(
+                                spec.commandLine(),
+                                (pool ? "--by pool" : option) + " needs a stack profile, not --collapsed-input");
+                    }
+                }
+            }
+            if ((units == null) != (baselineUnits == null) || units != null && baseline == null) {
+                throw new ParameterException(
+                        spec.commandLine(), "--units and --baseline-units go together, with --baseline");
+            }
+            if (baseline != null && by != Top.By.BOUNDARY) {
+                throw new ParameterException(spec.commandLine(), "--baseline compares boundaries; use --by boundary");
+            }
+            if (by == Top.By.BOUNDARY && ranking.app.isEmpty() && ranking.appFrom.isEmpty()) {
+                throw new ParameterException(
+                        spec.commandLine(), "--by boundary needs --app or --app-from; or rank with --by self");
+            }
+            Top.Options options = new Top.Options(
+                    by,
+                    ranking.app(),
+                    ranking.idle(false),
+                    ranking.machinery(),
+                    ranking.limit,
+                    transformOptions.transforms(),
+                    slice.packageNames,
+                    slice.weights,
+                    slice.reasons.selected(),
+                    filters.filter());
+            String command = Top.shell(reproduce(parsed));
+            JsonObject result;
+            if (collapsedInput != null) {
+                result = Top.tables(Top.fromCollapsed(collapsedInput, options), options, command);
+            } else {
+                Top.Input input = Top.fromProfile(slice.profile, StackProfile.read(slice.profile), options);
+                if (baseline == null) {
+                    result = Top.tables(input, options, command);
+                } else {
+                    Top.Input before = Top.fromProfile(baseline, StackProfile.read(baseline), options);
+                    boolean exhaustive = input.exhaustiveSampling() && before.exhaustiveSampling();
+                    if (!exhaustive
+                            && slice.weights == StackProfileRenderer.Weights.OBSERVED
+                            && input.estimateAvailable()
+                            && before.estimateAvailable()) {
+                        throw new ParameterException(
+                                spec.commandLine(),
+                                "Observed time is length-biased under proportional or uniform sampling, and both"
+                                        + " runs have population estimates: compare with --weights estimated");
+                    }
+                    result = Top.compare(input, before, options, units, baselineUnits, command);
+                }
+            }
+            String text =
+                    switch (format) {
+                        case "json" ->
+                            new GsonBuilder()
+                                            .serializeNulls()
+                                            .setPrettyPrinting()
+                                            .create()
+                                            .toJson(result)
+                                    + "\n";
+                        case "csv" -> Top.csv(result);
+                        default -> Top.markdown(result);
+                    };
+            if (output == null) {
+                spec.commandLine().getOut().print(text);
+            } else {
+                try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
+                    writer.write(text);
+                }
+            }
+            for (var warning : result.getAsJsonArray("warnings")) {
+                spec.commandLine().getErr().println("Warning: " + warning.getAsString());
+            }
+            return OK;
+        }
+
+        /** The command as given, minus where it wrote, so a reader can run it again. */
+        private static List<String> reproduce(ParseResult parsed) {
+            List<String> words = new ArrayList<>(List.of(NAME, "top"));
+            List<String> args = parsed.originalArgs();
+            for (int index = args.indexOf("top") + 1; index < args.size(); index++) {
+                String word = args.get(index);
+                if (word.equals("--output")) {
+                    index++;
+                } else if (!word.startsWith("--output=")) {
+                    words.add(word);
+                }
+            }
+            return words;
+        }
+    }
+
+    @Command(
+            name = "summarize",
+            mixinStandardHelpOptions = true,
+            versionProvider = Version.class,
+            sortOptions = false,
+            description = {
+                "Writes the analysis digest, " + OutputFiles.SUMMARY_MD + " and " + OutputFiles.SUMMARY_JSON
+                        + ": the capture's coverage and losses, where the time went, the ranked busy and idle"
+                        + " tables, the heaviest transformed stacks, and the command that reproduces each table.",
+                "Correlation writes it by default; this command rewrites it with an application pattern."
+            })
+    static final class Summarize implements Callable<Integer> {
+        @Option(names = "--profile", paramLabel = "FILE", description = "The stack profile. Required.")
+        Path profile;
+
+        @Option(
+                names = "--report",
+                paramLabel = "FILE",
+                description = "The correlation report beside it, for the capture section. Default: "
+                        + OutputFiles.REPORT + " next to the profile, when it exists.")
+        Path report;
+
+        @Option(
+                names = "--output-dir",
+                paramLabel = "DIR",
+                description =
+                        "Where to write the digest; its files must not exist. Default: the current" + " directory.")
+        Path outputDirectory;
+
+        @Mixin
+        RankingOptions ranking;
+
+        @Override
+        public Integer call() throws Exception {
+            Path reportPath = report;
+            if (reportPath == null) {
+                Path sibling = profile.toAbsolutePath().resolveSibling(OutputFiles.REPORT);
+                if (java.nio.file.Files.isRegularFile(sibling)) reportPath = sibling;
+            }
+            JsonObject reportJson = reportPath == null
+                    ? null
+                    : com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(reportPath))
+                            .getAsJsonObject();
+            Digest.Options options =
+                    new Digest.Options(ranking.app(), ranking.idle(true), ranking.machinery(), ranking.limit);
+            JsonObject digest = Digest.of(StackProfile.read(profile), profile.toString(), reportJson, options);
+            Path directory = outputDirectory == null ? Path.of("") : outputDirectory;
+            java.nio.file.Files.createDirectories(directory.toAbsolutePath());
+            Path json = directory.resolve(OutputFiles.SUMMARY_JSON);
+            Path markdown = directory.resolve(OutputFiles.SUMMARY_MD);
+            Digest.write(digest, json, markdown);
+            System.out.println("Wrote " + markdown + " and " + json);
+            return OK;
+        }
     }
 
     @Command(
@@ -1179,6 +1504,20 @@ final class Cli {
         @Override
         public String convert(String text) {
             return choice(text, new String[] {"number", "string"}, Function.identity());
+        }
+    }
+
+    static final class ByConverter implements ITypeConverter<Top.By> {
+        @Override
+        public Top.By convert(String text) {
+            return choice(text, Top.By.values(), Top.By::label);
+        }
+    }
+
+    static final class TopFormatConverter implements ITypeConverter<String> {
+        @Override
+        public String convert(String text) {
+            return choice(text, new String[] {"md", "json", "csv"}, Function.identity());
         }
     }
 

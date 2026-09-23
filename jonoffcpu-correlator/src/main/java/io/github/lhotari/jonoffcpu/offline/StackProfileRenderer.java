@@ -222,7 +222,7 @@ final class StackProfileRenderer {
         }
 
         /** Whether an entry survives; each distinct stack is matched once per render. */
-        private Predicate<StackProfile.Entry> predicate(StackProfile profile) {
+        Predicate<StackProfile.Entry> predicate(StackProfile profile) {
             if (!active()) return entry -> true;
             List<String> scope = scope(profile);
             boolean user = scope.contains(ProfileAccumulator.USER);

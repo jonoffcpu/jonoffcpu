@@ -16,6 +16,8 @@ final class OutputFiles {
     static final String CLASSIFIED_RECORDS_SUFFIX = "classified-records.jsonl";
     static final String MATCHES_SUFFIX = "matches.jsonl";
     static final String PROFILE_SUFFIX = "offcpu-profile.pb";
+    static final String SUMMARY_JSON_SUFFIX = "summary.json";
+    static final String SUMMARY_MD_SUFFIX = "summary.md";
 
     static final String REPORT = PREFIX + REPORT_SUFFIX;
     static final String COLLAPSED = PREFIX + COLLAPSED_SUFFIX;
@@ -23,6 +25,10 @@ final class OutputFiles {
     static final String CLASSIFIED_RECORDS = PREFIX + CLASSIFIED_RECORDS_SUFFIX;
     static final String MATCHES = PREFIX + MATCHES_SUFFIX;
     static final String PROFILE = PREFIX + PROFILE_SUFFIX;
+    /** The analysis digest, for people and AI agents; the Markdown is rendered from the JSON. */
+    static final String SUMMARY_JSON = PREFIX + SUMMARY_JSON_SUFFIX;
+
+    static final String SUMMARY_MD = PREFIX + SUMMARY_MD_SUFFIX;
     /** Written last; a directory without it is not a complete analysis. */
     static final String COMPLETE = PREFIX + "complete.json";
 

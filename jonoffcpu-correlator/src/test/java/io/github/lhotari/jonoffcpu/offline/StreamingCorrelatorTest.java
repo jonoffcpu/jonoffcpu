@@ -91,6 +91,8 @@ public final class StreamingCorrelatorTest {
                 .getAsJsonObject();
         // Only the streamed path has the columns a stack profile is built from.
         check(streamedReport.remove("stackProfile") != null, "The streamed report must describe its stack profile");
+        // The digest is made from the stack profile, so only the streamed run has one.
+        check(streamedReport.remove("digest") != null, "The streamed report must name its digest");
         check(
                 Files.isRegularFile(streamed.resolve(OutputFiles.PROFILE)),
                 "The streamed run must write a stack profile");

@@ -184,6 +184,225 @@ public final class FixtureAcceptanceTest {
         System.out.println("DuckDB recipes reproduce the reference rows");
     }
 
+    /** The worked example of the top-and-digest spec: rows as boundary, blocker, seconds, intervals. */
+    static final List<String> BOUNDARY_ROWS = List.of(
+            "org.apache.pulsar.broker.service.persistent.PersistentDispatcherMultipleConsumers.internalConsumerFlow|C2 Runtime complete_monitor_locking|11.982|4245",
+            "org.apache.bookkeeper.common.collections.GrowableBatchedArrayBlockingQueue.offer|java.util.concurrent.locks.ReentrantLock.lock|4.946|1565",
+            "org.apache.pulsar.broker.service.persistent.MessageDeduplication.isDuplicateNormal|C2 Runtime complete_monitor_locking|0.801|187",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.isMessageDeleted|java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.lock|0.621|268",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.asyncDelete|java.util.concurrent.locks.ReentrantReadWriteLock$WriteLock.lock|0.499|153",
+            "org.apache.pulsar.broker.service.PendingAcksMap.addPendingAckIfAllowed|java.util.concurrent.locks.ReentrantReadWriteLock$WriteLock.lock|0.277|95",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.filterReadEntries|java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.lock|0.222|112",
+            "org.apache.pulsar.broker.service.InMemoryRedeliveryTracker.getRedeliveryCount|java.util.concurrent.locks.StampedLock.readLock|0.217|104",
+            "org.apache.pulsar.broker.service.PendingAcksMap.getRemainingUnacked|java.util.concurrent.locks.ReentrantReadWriteLock$ReadLock.lock|0.141|68",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.updateLastMarkDeleteEntryToLatest|C2 Runtime complete_monitor_locking|0.127|28");
+
+    /** The comparison example: boundary, Alpine s/M, Wolfi s/M, Alpine share, Wolfi share. */
+    static final List<String> COMPARISON_ROWS = List.of(
+            "org.apache.pulsar.broker.service.persistent.PersistentDispatcherMultipleConsumers.internalConsumerFlow|2.034|2.396|61.4 %|58.2 %",
+            "org.apache.bookkeeper.common.collections.GrowableBatchedArrayBlockingQueue.offer|0.735|0.989|22.2 %|24.0 %",
+            "org.apache.pulsar.broker.service.persistent.MessageDeduplication.isDuplicateNormal|0.091|0.161|2.8 %|3.9 %",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.isMessageDeleted|0.116|0.124|3.5 %|3.0 %",
+            "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.asyncDelete|0.064|0.101|1.9 %|2.4 %");
+
+    private static com.google.gson.JsonObject top(List<String> args) throws Exception {
+        List<String> command = new ArrayList<>(List.of("top", "--format", "json"));
+        command.addAll(args);
+        CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
+        check(invocation.code() == 0, "top failed: " + invocation);
+        return com.google.gson.JsonParser.parseString(invocation.out()).getAsJsonObject();
+    }
+
+    private static String totals(com.google.gson.JsonObject totals, String slice) {
+        var sum = totals.getAsJsonObject(slice);
+        return sum.get("entries").getAsLong() + "/" + sum.get("intervals").getAsLong() + "/"
+                + sum.get("value").getAsBigDecimal().toPlainString();
+    }
+
+    /** The top-and-digest worked example, its comparison, the digest bound, and top agreeing with stacks. */
+    private static void top(Path fixtures, Path dir) throws Exception {
+        Path wolfi = fixtures.resolve("pulsar-broker-2026-09-23-wolfi/jonoffcpu-offcpu-profile.pb");
+        Path alpine = fixtures.resolve("pulsar-broker-2026-09-23-alpine/jonoffcpu-offcpu-profile.pb");
+        List<String> options =
+                List.of("--app", APP, "--idle-from", "preset:jvm-idle", "--idle", IDLE_BOOKKEEPER, "--limit", "10");
+        List<String> args = new ArrayList<>(List.of("--profile", wolfi.toString()));
+        args.addAll(options);
+        var result = top(args);
+        var totals = result.getAsJsonObject("totals");
+        check(totals(totals, "selected").equals("2791/308777/8519.334"), "All: " + totals);
+        check(totals(totals, "idle").equals("660/301389/8470.366"), "Idle: " + totals);
+        check(totals(totals, "busy").equals("2131/7388/48.968"), "Busy: " + totals);
+        check(totals(totals, "busyNoApplicationFrame").equals("132/237/28.374"), "No application frame: " + totals);
+        check(totals(totals, "overExclusion").equals("18/18/0.047"), "Over-exclusion: " + totals);
+        List<String> rows = new ArrayList<>();
+        for (var element : result.getAsJsonArray("rows")) {
+            var row = element.getAsJsonObject();
+            rows.add(
+                    row.get("boundary").getAsString() + "|" + row.get("blocker").getAsString() + "|"
+                            + row.get("value").getAsBigDecimal().toPlainString() + "|"
+                            + row.get("intervals").getAsLong());
+        }
+        check(rows.equals(BOUNDARY_ROWS), "Busy by boundary:\n" + String.join("\n", rows));
+        var pools = result.getAsJsonArray("noApplicationFrame");
+        check(
+                pools.get(0).getAsJsonObject().get("pool").getAsString().equals("ZDriverMinor")
+                        && pools.get(0)
+                                .getAsJsonObject()
+                                .get("value")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("22.517")
+                        && pools.get(0).getAsJsonObject().get("intervals").getAsLong() == 88
+                        && pools.get(1)
+                                .getAsJsonObject()
+                                .get("pool")
+                                .getAsString()
+                                .equals("ZDriverMajor")
+                        && pools.get(1)
+                                .getAsJsonObject()
+                                .get("value")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("5.527")
+                        && pools.get(1).getAsJsonObject().get("intervals").getAsLong() == 27,
+                "Pools: " + pools);
+        List<String> idle = new ArrayList<>();
+        for (var element : result.getAsJsonArray("idle")) {
+            var row = element.getAsJsonObject();
+            idle.add(row.get("boundary").getAsString() + " "
+                    + row.get("value").getAsBigDecimal().setScale(1, java.math.RoundingMode.HALF_EVEN));
+        }
+        check(
+                idle.subList(0, 5)
+                        .equals(List.of(
+                                "[no application frame] 7687.8",
+                                "org.apache.bookkeeper.common.collections.GrowableBatchedArrayBlockingQueue.internalTakeAll 231.2",
+                                "org.apache.pulsar.common.util.collections.GrowableArrayBlockingQueue.take 225.0",
+                                "org.apache.zookeeper.ClientCnxnSocketNIO.doTransport 218.2",
+                                "org.apache.zookeeper.ClientCnxn$EventThread.run 108.2")),
+                "Idle by boundary: " + idle);
+        System.out.println("top: the worked example's tables");
+
+        List<String> compare = new ArrayList<>(List.of(
+                "--profile",
+                wolfi.toString(),
+                "--baseline",
+                alpine.toString(),
+                "--units",
+                "5",
+                "--baseline-units",
+                "5"));
+        compare.addAll(options.subList(0, 6));
+        compare.addAll(List.of("--limit", "5"));
+        var comparison = top(compare);
+        List<String> compared = new ArrayList<>();
+        for (var element : comparison.getAsJsonArray("comparison")) {
+            var row = element.getAsJsonObject();
+            compared.add(row.get("boundary").getAsString() + "|"
+                    + row.get("baseline").getAsBigDecimal().toPlainString() + "|"
+                    + row.get("value").getAsBigDecimal().toPlainString() + "|"
+                    + Top.percent(row.get("baselineShare").getAsBigDecimal()) + "|"
+                    + Top.percent(row.get("share").getAsBigDecimal()));
+        }
+        check(compared.equals(COMPARISON_ROWS), "Comparison:\n" + String.join("\n", compared));
+        var compareTotals = comparison.getAsJsonObject("totals");
+        check(
+                compareTotals
+                                .get("baselineBusyApplication")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("16.574")
+                        && compareTotals
+                                .get("busyApplication")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("20.593")
+                        && compareTotals
+                                .get("baselineBusy")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("2019.121")
+                        && compareTotals
+                                .get("busy")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("48.968"),
+                "Comparison totals: " + compareTotals);
+        check(comparison.getAsJsonArray("warnings").size() == 2, "Both warnings: " + comparison.get("warnings"));
+        System.out.println("top --baseline: the comparison example");
+
+        // top and stacks agree: a boundary's rows add up to the stacks lines that end in it after --leaf-at.
+        Path leafAt = run(
+                dir.resolve("leaf-at.collapsed"),
+                List.of(
+                        "stacks",
+                        "--profile",
+                        wolfi.toString(),
+                        "--exclude-from",
+                        "preset:jvm-idle",
+                        "--exclude",
+                        IDLE_BOOKKEEPER,
+                        "--leaf-at",
+                        APP));
+        java.util.Map<String, BigDecimal> leaves = new java.util.HashMap<>();
+        for (String line : Files.readAllLines(leafAt)) {
+            int space = line.lastIndexOf(' ');
+            String stack = line.substring(0, space);
+            leaves.merge(
+                    stack.substring(stack.lastIndexOf(';') + 1),
+                    new BigDecimal(line.substring(space + 1)).movePointLeft(6),
+                    BigDecimal::add);
+        }
+        java.util.Map<String, BigDecimal> boundaries = new java.util.HashMap<>();
+        List<String> all = new ArrayList<>(List.of("--profile", wolfi.toString()));
+        all.addAll(options.subList(0, 6));
+        all.addAll(List.of("--limit", "100000"));
+        for (var element : top(all).getAsJsonArray("rows")) {
+            var row = element.getAsJsonObject();
+            boundaries.merge(row.get("boundary").getAsString(), row.get("value").getAsBigDecimal(), BigDecimal::add);
+        }
+        for (var boundary : boundaries.entrySet()) {
+            BigDecimal difference =
+                    boundary.getValue().subtract(leaves.getOrDefault(boundary.getKey(), BigDecimal.ZERO));
+            check(
+                    difference.abs().compareTo(new BigDecimal("0.002")) <= 0,
+                    "top and stacks disagree on " + boundary.getKey() + ": " + boundary.getValue() + " vs "
+                            + leaves.get(boundary.getKey()));
+        }
+        System.out.println("top agrees with stacks --leaf-at on " + boundaries.size() + " boundaries");
+
+        Path digest = dir.resolve("digest");
+        CommandLineTest.Invocation summarize = CommandLineTest.invoke(
+                "summarize",
+                "--profile",
+                wolfi.toString(),
+                "--report",
+                wolfi.resolveSibling(OutputFiles.REPORT).toString(),
+                "--app",
+                APP,
+                "--idle-from",
+                "preset:jvm-idle",
+                "--idle",
+                IDLE_BOOKKEEPER,
+                "--output-dir",
+                digest.toString());
+        check(summarize.code() == 0, "summarize failed: " + summarize);
+        long size = Files.size(digest.resolve(OutputFiles.SUMMARY_MD));
+        check(size < 16 * 1024, "The digest's Markdown must stay under 16 KB, is " + size);
+        var heaviest = com.google.gson.JsonParser.parseString(
+                        Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)))
+                .getAsJsonObject()
+                .getAsJsonObject("heaviestStacks");
+        check(
+                heaviest.get("lines").getAsInt() == 78
+                        && heaviest.get("meanDepth")
+                                .getAsBigDecimal()
+                                .toPlainString()
+                                .equals("4.1"),
+                "Heaviest transformed stacks: " + heaviest);
+        System.out.println("summarize: " + size + " bytes of Markdown");
+    }
+
     public static void main(String[] args) throws Exception {
         String fixtures = System.getProperty("jonoffcpu.fixtures", "");
         if (fixtures.isEmpty()) {
@@ -194,6 +413,7 @@ public final class FixtureAcceptanceTest {
         try {
             transforms(Path.of(fixtures), dir);
             export(Path.of(fixtures), dir);
+            top(Path.of(fixtures), dir);
             System.out.println("Fixture acceptance checks passed");
         } finally {
             try (var files = Files.walk(dir)) {

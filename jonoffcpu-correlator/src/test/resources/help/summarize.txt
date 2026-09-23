@@ -1,0 +1,26 @@
+Usage: java -jar jonoffcpu-correlator.jar summarize [-hV] [--limit=N] [--output-dir=DIR]
+       [--profile=FILE] [--report=FILE] [--app=REGEX]... [--app-from=FILE]... [--idle=REGEX]...
+       [--idle-from=FILE]... [--machinery-from=FILE]...
+Writes the analysis digest, jonoffcpu-summary.md and jonoffcpu-summary.json: the capture's coverage
+and losses, where the time went, the ranked busy and idle tables, the heaviest transformed stacks,
+and the command that reproduces each table.
+Correlation writes it by default; this command rewrites it with an application pattern.
+      --profile=FILE     The stack profile. Required.
+      --report=FILE      The correlation report beside it, for the capture section. Default:
+                           jonoffcpu-report.json next to the profile, when it exists.
+      --output-dir=DIR   Where to write the digest; its files must not exist. Default: the current
+                           directory.
+      --app=REGEX        A frame of your application; the deepest one is a stack's boundary.
+                           Repeatable.
+      --app-from=FILE    Read --app patterns from a file or preset:NAME; repeatable.
+      --idle=REGEX       An interval with a frame matching this is idle, a wait for work: it is
+                           listed in its own table, not dropped. Repeatable.
+      --idle-from=FILE   Read --idle patterns from a file or preset:NAME, such as preset:jvm-idle;
+                           repeatable. Default for summarize, when no idle pattern is given: preset:
+                           jvm-idle.
+      --machinery-from=FILE
+                         The wait machinery below a boundary whose entry frame is the blocker, from
+                           a file or preset:NAME; repeatable. Default: preset:jvm-wait-machinery.
+      --limit=N          Rows per table. Default: 20.
+  -h, --help             Show this help message and exit.
+  -V, --version          Print version information and exit.
