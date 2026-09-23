@@ -748,6 +748,14 @@ A merged profile sums durations across its inputs: it shows what dominates
 across the runs, not what fraction of any one run's time it took. Thinned
 profiles cannot be merged, because each is rescaled by its own probability.
 
+`export --format jsonl` also carries each stack as an array (`javaFrames`,
+`kernelFrames`, `userFrames`), the stack without generated-class addresses
+(`canonicalJavaStack`), the thread's pool (`threadPool`), a `run` column
+(`--run-label`), and on every row whether the estimated columns are valid
+(`estimateAvailable`); its counters are JSON numbers. `--run-metadata FILE`
+writes the profile's provenance and totals as one JSON object. The columns
+are listed in [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#stack-profile).
+
 ## Configuration
 
 ### Agent options

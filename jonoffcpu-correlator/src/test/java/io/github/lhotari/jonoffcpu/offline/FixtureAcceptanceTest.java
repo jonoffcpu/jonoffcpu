@@ -112,6 +112,78 @@ public final class FixtureAcceptanceTest {
         }
     }
 
+    /** The boundary ranking recipe of the README's "Analyzing with SQL", on the 0.5.0 export. */
+    static final String BOUNDARY_SQL = """
+            CREATE TEMP TABLE entries AS
+            SELECT javaFrames AS frames, observedNanos AS nanos, intervals
+            FROM read_json('%s', format = 'newline_delimited');
+
+            SELECT coalesce(list_filter(frames, lambda f: regexp_matches(f, '^org\\.apache\\.'))[-1],
+                            '[no application frame]') AS boundary,
+                   round(sum(nanos) / 1e9, 3) AS seconds, sum(intervals) AS intervals
+            FROM entries
+            WHERE NOT list_bool_or(list_transform(frames, lambda f: regexp_matches(f,
+                  '^(io\\.netty\\.channel\\.epoll\\.Native\\.epollWait0?|java\\.util\\.concurrent\\.ThreadPoolExecutor\\.getTask|sun\\.nio\\.ch\\.SelectorImpl\\.select|java\\.util\\.concurrent\\.ForkJoinPool\\.awaitWork)$|BlockingQueue\\.take(All)?$|^java\\.lang\\.ref\\.|^libasyncProfiler\\.so\\.')))
+            GROUP BY 1 ORDER BY 2 DESC LIMIT 3;
+            """;
+
+    /** The export's reference numbers, and the SQL recipe when DuckDB is on the path. */
+    private static void export(Path fixtures, Path dir) throws Exception {
+        Path profile = fixtures.resolve("pulsar-broker-2026-09-23-wolfi/jonoffcpu-offcpu-profile.pb");
+        Path jsonl = dir.resolve("wolfi.jsonl");
+        Path metadata = dir.resolve("wolfi-run.json");
+        CommandLineTest.Invocation invocation = CommandLineTest.invoke(
+                "export",
+                "--profile",
+                profile.toString(),
+                "--format",
+                "jsonl",
+                "--output",
+                jsonl.toString(),
+                "--run-metadata",
+                metadata.toString());
+        check(invocation.code() == 0, "Export failed: " + invocation);
+        List<String> rows = Files.readAllLines(jsonl, StandardCharsets.UTF_8);
+        check(rows.size() == 2_791, "2,791 rows, got " + rows.size());
+        long observed = 0;
+        java.util.regex.Pattern address = java.util.regex.Pattern.compile("(Lambda|LambdaForm\\$D?MH)[./]0x");
+        for (String line : rows) {
+            var row = com.google.gson.JsonParser.parseString(line).getAsJsonObject();
+            List<String> frames = new ArrayList<>();
+            row.getAsJsonArray("javaFrames").forEach(frame -> frames.add(frame.getAsString()));
+            check(String.join(";", frames).equals(row.get("javaStack").getAsString()), "javaFrames must join: " + line);
+            check(row.getAsJsonArray("javaFrameKinds").size() == frames.size(), "One kind per frame: " + line);
+            check(!address.matcher(row.get("canonicalJavaStack").getAsString()).find(), "Canonical: " + line);
+            observed += row.get("observedNanos").getAsLong();
+        }
+        check(observed == 8_519_334_220_784L, "Observed nanoseconds " + observed);
+        var run = com.google.gson.JsonParser.parseString(Files.readString(metadata))
+                .getAsJsonObject();
+        check(run.get("observedNanos").getAsLong() == observed, "Run metadata total: " + run);
+        System.out.println("export: 2791 rows, " + observed + " observed ns");
+
+        Path duckdb = ExportTest.duckdb();
+        if (duckdb == null) {
+            System.out.println("Skipping the DuckDB recipes: duckdb is not on the path");
+            return;
+        }
+        String types = ExportTest.duckdb(
+                duckdb,
+                "DESCRIBE SELECT javaFrames, observedNanos FROM read_json('" + jsonl
+                        + "', format = 'newline_delimited');");
+        check(
+                types.contains("javaFrames,VARCHAR[]") && types.contains("observedNanos,BIGINT"),
+                "DuckDB must infer the frame arrays and numeric counters: " + types);
+        String boundaries = ExportTest.duckdb(duckdb, BOUNDARY_SQL.formatted(jsonl));
+        check(
+                boundaries.contains(
+                                "org.apache.pulsar.broker.service.persistent.PersistentDispatcherMultipleConsumers.internalConsumerFlow,11.982,4245")
+                        && boundaries.contains(
+                                "org.apache.bookkeeper.common.collections.GrowableBatchedArrayBlockingQueue.offer,4.946,1565"),
+                "The boundary recipe: " + boundaries);
+        System.out.println("DuckDB recipes reproduce the reference rows");
+    }
+
     public static void main(String[] args) throws Exception {
         String fixtures = System.getProperty("jonoffcpu.fixtures", "");
         if (fixtures.isEmpty()) {
@@ -121,6 +193,7 @@ public final class FixtureAcceptanceTest {
         Path dir = Files.createTempDirectory("jonoffcpu-fixture-acceptance-");
         try {
             transforms(Path.of(fixtures), dir);
+            export(Path.of(fixtures), dir);
             System.out.println("Fixture acceptance checks passed");
         } finally {
             try (var files = Files.walk(dir)) {

@@ -71,6 +71,20 @@ jobs:
       - name: Check native collector formatting
         if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
         run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
+      # The export's DuckDB checks run where DuckDB is on the path; one job is
+      # enough, and only the x86-64 runner image ships Homebrew. They fail rather
+      # than skip once JONOFFCPU_REQUIRE_DUCKDB is set.
+      - name: Install DuckDB
+        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
+        run: |
+          if ! command -v duckdb >/dev/null; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            brew install duckdb
+            echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+            export PATH="$(brew --prefix)/bin:$PATH"
+          fi
+          duckdb --version
+          echo "JONOFFCPU_REQUIRE_DUCKDB=true" >> "$GITHUB_ENV"
       # The glibc runner JDK exercises the host-native JNI fixtures in check; the
       # musl bundle cannot load into the glibc build JVM, so its evidence is the
       # packaged smoke in an Alpine container of the same architecture.

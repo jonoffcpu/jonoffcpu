@@ -974,7 +974,11 @@ final class Cli {
             mixinStandardHelpOptions = true,
             versionProvider = Version.class,
             sortOptions = false,
-            description = "Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.")
+            description = {
+                "Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.",
+                "JSON Lines rows carry the stacks as arrays too, counters as numbers, and every row names its run and"
+                        + " whether its estimated columns may be used."
+            })
     static final class Export implements Callable<Integer> {
         @Option(names = "--profile", paramLabel = "FILE", description = "The stack profile to export. Required.")
         Path profile;
@@ -990,11 +994,46 @@ final class Cli {
         @Option(names = "--output", paramLabel = "FILE", description = "The file to write. Required.")
         Path output;
 
+        @Option(
+                names = "--run-label",
+                paramLabel = "TEXT",
+                description = "The run column of every row, for loading several runs into one table. Default: the"
+                        + " profile's label, else its first source's session id.")
+        String runLabel;
+
+        @Option(
+                names = "--run-metadata",
+                paramLabel = "FILE",
+                description = "Also write one JSON object describing the profile: its run, sources, sampling,"
+                        + " dimensions, estimate validity and totals.")
+        Path runMetadata;
+
+        @Option(
+                names = "--numbers",
+                paramLabel = "FORM",
+                defaultValue = "number",
+                converter = NumbersConverter.class,
+                description = "How JSON Lines counters are written: number (a string only past 2^53-1) or string,"
+                        + " as before 0.5.0. Default: ${DEFAULT-VALUE}.")
+        String numbers;
+
         @Override
         public Integer call() throws Exception {
             StackProfile read = StackProfile.read(profile);
+            String run = runLabel != null ? runLabel : StackProfileRenderer.defaultRun(read);
             try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
-                StackProfileRenderer.export(read, format, writer);
+                StackProfileRenderer.export(
+                        read, new StackProfileRenderer.Export(format, run, numbers.equals("string")), writer);
+            }
+            if (runMetadata != null) {
+                try (BufferedWriter writer = OffCpuCorrelator.newFile(runMetadata)) {
+                    new GsonBuilder()
+                            .serializeNulls()
+                            .setPrettyPrinting()
+                            .create()
+                            .toJson(StackProfileRenderer.runMetadata(read, run), writer);
+                    writer.newLine();
+                }
             }
             return OK;
         }
@@ -1133,6 +1172,13 @@ final class Cli {
         @Override
         public StackTransforms.ThreadFrame convert(String text) {
             return choice(text, StackTransforms.ThreadFrame.values(), StackTransforms.ThreadFrame::label);
+        }
+    }
+
+    static final class NumbersConverter implements ITypeConverter<String> {
+        @Override
+        public String convert(String text) {
+            return choice(text, new String[] {"number", "string"}, Function.identity());
         }
     }
 

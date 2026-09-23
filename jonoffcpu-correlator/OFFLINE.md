@@ -281,6 +281,7 @@ java -jar jonoffcpu-correlator.jar stacks --collapsed-input C --output F [filter
 java -jar jonoffcpu-correlator.jar stacks --list-presets
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
+    [--run-label TEXT] [--run-metadata R] [--numbers number|string]
 ```
 
 `stacks` with its defaults reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for
@@ -391,10 +392,36 @@ as unsplit and the merged profile has the split when any input has it. Java
 stacks with the same frame names merge whatever kinds their inputs gave them, and
 a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`, so a schema 1 input
 cannot make a native frame rewritable.
-`export` writes one row per entry with expanded stacks, the six split columns and,
-last, `java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack
-frame's kind, `java` or `native`, joined with `;` like `java_stack`. It is for
-tools such as DuckDB.
+`export` writes one row per entry with expanded stacks, the six split columns and
+`java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack frame's
+kind, `java` or `native`, joined with `;` like `java_stack`. It is for tools such
+as DuckDB. Since 0.5.0 these columns are followed, in this order, by:
+
+| JSON Lines | CSV | Contents |
+| --- | --- | --- |
+| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first, as the joined columns render them; `null` for an absent stack. CSV stays flat. |
+| `canonicalJavaStack` | `canonical_java_stack` | `javaStack` without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
+| `threadPool` | `thread_pool` | The thread name with every digit run replaced by `#` |
+| `run` | `run` | `--run-label`, by default the profile's label, else its first source's session id |
+| `estimateAvailable` | `estimate_available` | Whether the estimated columns may be used, from the profile header |
+
+In JSON Lines the counters are numbers while they are at most 2^53-1, so that
+a double holds them exactly and DuckDB infers `BIGINT`, and decimal strings
+beyond that; `--numbers string` writes them all as strings, as before 0.5.0.
+CSV counters are unsigned decimals, as before.
+
+`--run-metadata FILE` also writes one JSON object describing the profile, to load
+into its own table and join to the rows on `run`:
+
+```json
+{"schemaVersion": 1, "run": "...", "label": "...",
+ "sources": [{"sessionId": "...", "captureEpoch": 1, "windowFromNanos": 0, "windowToNanos": 0,
+              "samplingJson": "{...}", "thinningProbability": "1", "timeSplitJson": "{...}"}],
+ "dimensions": ["reason", "kernel", "user", "thread"], "estimateAvailable": false,
+ "timeSplitAvailable": false, "entries": 2791, "intervals": 308777, "observedNanos": 8519334220784}
+```
+
+Its counters follow the same number rule.
 
 ## Degradation
 
