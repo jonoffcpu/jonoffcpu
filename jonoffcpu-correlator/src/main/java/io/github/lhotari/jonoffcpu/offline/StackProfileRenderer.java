@@ -95,6 +95,45 @@ final class StackProfileRenderer {
         }
     }
 
+    /**
+     * How a Java frame's package is shown: in full, abbreviated to the first letter of each package segment
+     * ({@code i.n.c.e.Native.epollWait0}), or dropped ({@code Native.epollWait0}). Only the display changes: filters
+     * still match the full names, and frames that become equal merge into one line.
+     */
+    enum PackageNames {
+        FULL,
+        ABBREVIATE,
+        DROP;
+
+        /** A qualified Java frame: package segments, then a class and a method, all without further dots. */
+        private static final Pattern QUALIFIED =
+                Pattern.compile("^((?:[\\p{L}_$][\\p{L}\\p{N}_$]*\\.)+)([\\p{L}_$][^.]*\\.[\\p{L}_$<][^.]*)$");
+
+        String label() {
+            return name().toLowerCase(java.util.Locale.ROOT);
+        }
+
+        static PackageNames parse(String text) {
+            for (PackageNames mode : values()) {
+                if (mode.label().equals(text)) return mode;
+            }
+            throw new IllegalArgumentException("Invalid package names mode: " + text);
+        }
+
+        /** The frame as shown; a name that is not a package-qualified {@code Class.method} is left unchanged. */
+        String apply(String frame) {
+            if (this == FULL) return frame;
+            java.util.regex.Matcher matcher = QUALIFIED.matcher(frame);
+            if (!matcher.matches()) return frame;
+            if (this == DROP) return matcher.group(2);
+            StringBuilder shown = new StringBuilder(frame.length());
+            for (String segment : matcher.group(1).split("\\.")) {
+                shown.appendCodePoint(segment.codePointAt(0)).append('.');
+            }
+            return shown.append(matcher.group(2)).toString();
+        }
+    }
+
     /** Whether each line starts with an {@code [offcpu: reason]} frame. */
     enum ReasonFrame {
         /** Only when the slice mixes more than one reason, which is when an unlabelled graph misleads. */
@@ -241,12 +280,13 @@ final class StackProfileRenderer {
             Weights weights,
             ReasonFrame frame,
             Time time,
-            Filter filter)
+            Filter filter,
+            PackageNames packages)
             throws IOException {
-        Slice kept = project(profile, reasons, kinds, weights, frame, time, filter.predicate(profile));
+        Slice kept = project(profile, reasons, kinds, weights, frame, time, packages, filter.predicate(profile));
         if (!filter.active()) return kept;
         // Rendered unfiltered as well, so the removed time is exact even where thinning rounds line by line.
-        Slice all = project(profile, reasons, kinds, weights, frame, time, entry -> true);
+        Slice all = project(profile, reasons, kinds, weights, frame, time, packages, entry -> true);
         return new Slice(
                 kept.nanos(),
                 kept.intervals(),
@@ -263,8 +303,11 @@ final class StackProfileRenderer {
             Weights weights,
             ReasonFrame frame,
             Time time,
+            PackageNames packages,
             Predicate<StackProfile.Entry> keeps)
             throws IOException {
+        // Each distinct Java frame name is shortened once per render.
+        Map<String, String> shown = new java.util.HashMap<>();
         if (weights == Weights.ESTIMATED) {
             CaptureInput.require(
                     profile.header().estimateAvailable(),
@@ -305,7 +348,7 @@ final class StackProfileRenderer {
             StringBuilder line = new StringBuilder(label);
             if (withReason) line.append(reasonFrame(entry.reason())).append(';');
             int start = line.length();
-            if (kinds.java) appendJava(line, entry.javaStack());
+            if (kinds.java) appendJava(line, entry.javaStack(), packages, shown);
             if (kinds.user) appendNative(line, start, userNames(entry.userStack()));
             if (kinds.kernel) appendNative(line, start, kernelNames(entry.kernelStack()));
             if (time != Time.SPLIT) {
@@ -342,10 +385,12 @@ final class StackProfileRenderer {
                 "This profile is not grouped by its " + dimension + " stacks");
     }
 
-    private static void appendJava(StringBuilder line, List<StackProfile.Frame> stack) {
+    private static void appendJava(
+            StringBuilder line, List<StackProfile.Frame> stack, PackageNames packages, Map<String, String> shown) {
         for (int index = 0; index < stack.size(); index++) {
             if (index > 0) line.append(';');
-            line.append(stack.get(index).name());
+            String name = stack.get(index).name();
+            line.append(packages == PackageNames.FULL ? name : shown.computeIfAbsent(name, packages::apply));
         }
     }
 
@@ -415,7 +460,8 @@ final class StackProfileRenderer {
             StackKinds kinds,
             Weights weights,
             Time time,
-            Filter filter) {
+            Filter filter,
+            PackageNames packages) {
         JsonObject summary = new JsonObject();
         summary.addProperty("schemaVersion", 1);
         JsonArray selected = new JsonArray();
@@ -426,6 +472,7 @@ final class StackProfileRenderer {
         summary.addProperty("stack", kinds.text);
         summary.addProperty("weights", weights.name().toLowerCase(java.util.Locale.ROOT));
         summary.addProperty("time", time.label());
+        summary.addProperty("packageNames", packages.label());
         summary.addProperty(
                 "reasonSemantics",
                 "switch-out reason; a blocked interval's time is split into sleeping before its wakeup and runqueue"

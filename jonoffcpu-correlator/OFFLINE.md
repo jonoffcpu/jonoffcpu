@@ -255,7 +255,8 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--reason all|blocked,runnable,preempted,unspecified]
     [--stack java|kernel|user|java+kernel|java+user+kernel]
     [--weights observed|estimated] [--reason-frame auto|always|never]
-    [--time total|sleeping|runqueue|split] [--summary S]
+    [--time total|sleeping|runqueue|split] [--package-names full|abbreviate|drop]
+    [--summary S]
     [--include REGEX]... [--exclude REGEX]...
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
@@ -274,6 +275,13 @@ each line in a `[sleeping]`, `[runqueue]` or `[unsplit]` frame. Every mode but
 reason only when it contributes to the selected part. The `--summary` file names
 the `time` part and carries `unsplitNanos`, the kept entries' unsplit time, which
 a `sleeping` or `runqueue` slice leaves out.
+
+`--package-names abbreviate` cuts each package segment of a Java frame to its
+first letter (`io.netty.channel.epoll.Native.epollWait0` becomes
+`i.n.c.e.Native.epollWait0`), and `drop` shows `Class.method`; a frame that is
+not a package-qualified `Class.method` is left unchanged. It only changes the
+rendered text: lines that become identical are summed, filters match the full
+names, and `--summary` records the mode as `packageNames`.
 
 `--include`/`--exclude` filter whole profile entries before they are merged into
 lines, and before `--reason-frame auto` decides whether the slice mixes reasons.

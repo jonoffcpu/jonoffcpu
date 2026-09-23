@@ -689,6 +689,108 @@ public final class StackProfileTest {
         return Files.readAllLines(csv);
     }
 
+    /**
+     * Java package names can be abbreviated to their initials or dropped. Only the display changes: filters still
+     * match the full names, and frames that become equal merge into one line.
+     */
+    private static void packageNames(Path dir) throws Exception {
+        var abbreviate = StackProfileRenderer.PackageNames.ABBREVIATE;
+        var drop = StackProfileRenderer.PackageNames.DROP;
+        Map<String, List<String>> expected = new java.util.LinkedHashMap<>();
+        expected.put(
+                "io.netty.channel.epoll.Native.epollWait0", List.of("i.n.c.e.Native.epollWait0", "Native.epollWait0"));
+        expected.put("app.Outer$Inner.<init>", List.of("a.Outer$Inner.<init>", "Outer$Inner.<init>"));
+        expected.put(
+                "java.lang.invoke.LambdaForm$MH/0x0000000800c01000.invoke",
+                List.of("j.l.i.LambdaForm$MH/0x0000000800c01000.invoke", "LambdaForm$MH/0x0000000800c01000.invoke"));
+        // Frames that are not package-qualified Class.method names are left as they are.
+        for (String unchanged : List.of("Worker.run", "[stack unavailable]", "epoll_wait", "libc.so.6", "")) {
+            expected.put(unchanged, List.of(unchanged, unchanged));
+        }
+        for (var entry : expected.entrySet()) {
+            check(
+                    abbreviate.apply(entry.getKey()).equals(entry.getValue().get(0))
+                            && drop.apply(entry.getKey())
+                                    .equals(entry.getValue().get(1))
+                            && StackProfileRenderer.PackageNames.FULL
+                                    .apply(entry.getKey())
+                                    .equals(entry.getKey()),
+                    "Package names of " + entry.getKey() + ": " + abbreviate.apply(entry.getKey()) + ", "
+                            + drop.apply(entry.getKey()));
+        }
+
+        var java = StackProfile.Kind.JAVA;
+        List<StackProfile.Entry> entries = List.of(
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "io.netty.channel.epoll.Native.epollWait0"),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        3,
+                        3000,
+                        0),
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "app.one.Worker.park"),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        2,
+                        2000,
+                        0),
+                new StackProfile.Entry(
+                        frames(java, "java.lang.Thread.run", "app.two.Worker.park"),
+                        null,
+                        null,
+                        OffCpuReason.BLOCKED,
+                        1,
+                        null,
+                        1,
+                        500,
+                        0));
+        Path profile = dir.resolve("packages.pb");
+        new StackProfile(new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of()), entries)
+                .write(profile);
+
+        check(
+                stacks(profile, dir.resolve("full.collapsed"), "--package-names", "full")
+                        .equals(stacks(profile, dir.resolve("default.collapsed"))),
+                "full must be the default");
+        String abbreviated = stacks(profile, dir.resolve("abbreviate.collapsed"), "--package-names", "abbreviate");
+        check(
+                abbreviated.equals("j.l.Thread.run;a.o.Worker.park 2\n"
+                        + "j.l.Thread.run;a.t.Worker.park 1\n"
+                        + "j.l.Thread.run;i.n.c.e.Native.epollWait0 3\n"),
+                "Abbreviated packages: " + abbreviated);
+        // Dropping the packages merges the two Worker.park stacks into one line.
+        Path summary = dir.resolve("drop.json");
+        String dropped = stacks(
+                profile, dir.resolve("drop.collapsed"), "--package-names", "drop", "--summary", summary.toString());
+        check(
+                dropped.equals("Thread.run;Native.epollWait0 3\nThread.run;Worker.park 3\n"),
+                "Dropped packages: " + dropped);
+        check(summaryOf(summary).get("packageNames").getAsString().equals("drop"), "Summary must name the mode");
+        check(summaryOf(summary).get("totalNanos").getAsString().equals("5500"), "Dropping packages keeps the time");
+        // Filters match the full names, whatever is shown.
+        String filtered = stacks(
+                profile,
+                dir.resolve("drop-filtered.collapsed"),
+                "--package-names",
+                "drop",
+                "--exclude",
+                "^io\\.netty\\.",
+                "--include",
+                "app\\.one\\.");
+        check(filtered.equals("Thread.run;Worker.park 2\n"), "Filters must see full names: " + filtered);
+        rejects(
+                IllegalArgumentException.class,
+                "Invalid package names mode",
+                () -> stacks(profile, dir.resolve("bad.collapsed"), "--package-names", "short"));
+    }
+
     private static List<StackProfile.Frame> frames(StackProfile.Kind kind, String... names) {
         return Arrays.stream(names)
                 .map(name -> new StackProfile.Frame(kind, name, kind == StackProfile.Kind.USER ? "libc.so.6" : ""))
@@ -867,6 +969,7 @@ public final class StackProfileTest {
             mixedReasons(Files.createDirectories(dir.resolve("mixed")));
             classificationIsVerified(Files.createDirectories(dir.resolve("verified")));
             filters(Files.createDirectories(dir.resolve("filters")));
+            packageNames(Files.createDirectories(dir.resolve("packages")));
             timeSplitRule();
             sleepingAndRunqueue(Files.createDirectories(dir.resolve("split")));
             System.out.println("Stack profile fixtures passed");
