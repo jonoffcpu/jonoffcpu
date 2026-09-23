@@ -663,7 +663,17 @@ the whole time and ends each line in a `[sleeping]`, `[runqueue]` or
 needs a profile whose capture recorded the split. `--package-names abbreviate`
 shortens each Java frame's package to its initials (`i.n.c.e.Native.epollWait0`)
 and `--package-names drop` removes it (`Native.epollWait0`); `full` is the
-default. Stacks that become identical merge into one line, and
+default. Only Java frames change: the native frames async-profiler records in
+the Java stack (HotSpot, JNI libraries, libc, runtime stubs) keep their library
+and symbol as written.
+
+| Frame | `abbreviate` | `drop` |
+| --- | --- | --- |
+| `io.netty.channel.epoll.Native.epollWait0` | `i.n.c.e.Native.epollWait0` | `Native.epollWait0` |
+| `org.example.Cursor$$Lambda.0x0000000081a16ff8.run` | `o.e.Cursor$$Lambda.0x0000000081a16ff8.run` | `Cursor$$Lambda.0x0000000081a16ff8.run` |
+| `libjvm.so.Unsafe_Park` | unchanged | unchanged |
+
+Stacks that become identical merge into one line, and
 `--include`/`--exclude` still match the full names. Rendered with its defaults, a
 profile reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 
