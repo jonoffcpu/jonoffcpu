@@ -241,6 +241,14 @@ final class StackProfileRenderer {
             };
         }
 
+        /** Whether a line of plain frame names survives, by the same rules as a profile entry. */
+        boolean keeps(List<String> names) {
+            if (!active()) return true;
+            int flags = match(names);
+            if ((flags & EXCLUDED) != 0) return false;
+            return include.isEmpty() || (flags & INCLUDED) != 0;
+        }
+
         private int match(List<String> names) {
             int flags = 0;
             for (String name : names) {
@@ -308,10 +316,29 @@ final class StackProfileRenderer {
             Filter filter,
             PackageNames packages)
             throws IOException {
-        Slice kept = project(profile, reasons, kinds, weights, frame, time, packages, filter.predicate(profile));
+        return render(profile, reasons, kinds, weights, frame, time, filter, packages, StackTransforms.NONE);
+    }
+
+    /**
+     * As above, with each kept entry's Java stack {@link StackTransforms transformed} before it becomes a line. The
+     * filter still sees the untransformed stacks, and transformed lines that read the same merge.
+     */
+    static Slice render(
+            StackProfile profile,
+            Set<OffCpuReason> reasons,
+            StackKinds kinds,
+            Weights weights,
+            ReasonFrame frame,
+            Time time,
+            Filter filter,
+            PackageNames packages,
+            StackTransforms transforms)
+            throws IOException {
+        Slice kept =
+                project(profile, reasons, kinds, weights, frame, time, packages, transforms, filter.predicate(profile));
         if (!filter.active()) return kept;
         // Rendered unfiltered as well, so the removed time is exact even where thinning rounds line by line.
-        Slice all = project(profile, reasons, kinds, weights, frame, time, packages, entry -> true);
+        Slice all = project(profile, reasons, kinds, weights, frame, time, packages, transforms, entry -> true);
         return new Slice(
                 kept.nanos(),
                 kept.intervals(),
@@ -329,10 +356,13 @@ final class StackProfileRenderer {
             ReasonFrame frame,
             Time time,
             PackageNames packages,
+            StackTransforms transforms,
             Predicate<StackProfile.Entry> keeps)
             throws IOException {
-        // Each distinct Java frame is shortened once per render.
+        // Each distinct Java frame is shortened once per render, and each distinct Java stack transformed once.
         Map<StackProfile.Frame, String> shown = new java.util.HashMap<>();
+        StackTransforms.Compiled transform = transforms.compile();
+        Map<List<StackProfile.Frame>, List<StackProfile.Frame>> transformed = new IdentityHashMap<>();
         if (weights == Weights.ESTIMATED) {
             CaptureInput.require(
                     profile.header().estimateAvailable(),
@@ -347,6 +377,9 @@ final class StackProfileRenderer {
         boolean estimated = weights == Weights.ESTIMATED;
         if (kinds.kernel) requireDimension(profile, ProfileAccumulator.KERNEL);
         if (kinds.user) requireDimension(profile, ProfileAccumulator.USER);
+        if (transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
+            requireDimension(profile, ProfileAccumulator.THREAD);
+        }
         Set<OffCpuReason> selected = reasons == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(reasons);
         List<StackProfile.Entry> entries = new ArrayList<>();
         Set<OffCpuReason> present = EnumSet.noneOf(OffCpuReason.class);
@@ -372,8 +405,21 @@ final class StackProfileRenderer {
             if (nanos == 0) continue;
             StringBuilder line = new StringBuilder(label);
             if (withReason) line.append(reasonFrame(entry.reason())).append(';');
+            if (transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
+                String thread = entry.thread() == null ? "[unknown thread]" : escape(entry.thread());
+                line.append(
+                                transforms.threadFrame() == StackTransforms.ThreadFrame.POOL
+                                        ? StackTransforms.poolName(thread)
+                                        : thread)
+                        .append(';');
+            }
             int start = line.length();
-            if (kinds.java) appendJava(line, entry.javaStack(), packages, shown);
+            if (kinds.java) {
+                List<StackProfile.Frame> stack = transforms.active()
+                        ? transformed.computeIfAbsent(entry.javaStack(), transform::apply)
+                        : entry.javaStack();
+                appendJava(line, stack, packages, shown);
+            }
             if (kinds.user) appendNative(line, start, userNames(entry.userStack()));
             if (kinds.kernel) appendNative(line, start, kernelNames(entry.kernelStack()));
             if (time != Time.SPLIT) {
@@ -410,7 +456,7 @@ final class StackProfileRenderer {
                 "This profile is not grouped by its " + dimension + " stacks");
     }
 
-    private static void appendJava(
+    static void appendJava(
             StringBuilder line,
             List<StackProfile.Frame> stack,
             PackageNames packages,
@@ -467,7 +513,7 @@ final class StackProfileRenderer {
         return "[unknown]";
     }
 
-    private static String escape(String name) {
+    static String escape(String name) {
         return name.replace(';', ':').replace('\n', ' ').replace('\r', ' ');
     }
 
@@ -526,7 +572,7 @@ final class StackProfileRenderer {
         return summary;
     }
 
-    private static JsonArray patterns(List<Pattern> patterns) {
+    static JsonArray patterns(List<Pattern> patterns) {
         JsonArray array = new JsonArray();
         for (Pattern pattern : patterns) array.add(pattern.pattern());
         return array;

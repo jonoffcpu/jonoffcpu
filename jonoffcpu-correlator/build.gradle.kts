@@ -294,7 +294,9 @@ val fixtureMains = mapOf(
     "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest",
     "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest",
     "StackProfile" to "io.github.lhotari.jonoffcpu.offline.StackProfileTest",
-    "CommandLine" to "io.github.lhotari.jonoffcpu.offline.CommandLineTest"
+    "CommandLine" to "io.github.lhotari.jonoffcpu.offline.CommandLineTest",
+    "StackTransforms" to "io.github.lhotari.jonoffcpu.offline.StackTransformsTest",
+    "FixtureAcceptance" to "io.github.lhotari.jonoffcpu.offline.FixtureAcceptanceTest"
 )
 val fixtureTasks = fixtureMains.map { (taskName, className) ->
     tasks.register<JavaExec>("test$taskName") {
@@ -313,6 +315,13 @@ val fixtureTasks = fixtureMains.map { (taskName, className) ->
 tasks.named<JavaExec>("testCommandLine") {
     inputs.file(rootProject.file("README.md"))
     systemProperty("jonoffcpu.readme", rootProject.file("README.md").absolutePath)
+}
+
+// The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
+tasks.named<JavaExec>("testFixtureAcceptance") {
+    val fixtures = providers.gradleProperty("jonoffcpuFixtures").orElse("")
+    inputs.property("fixtures", fixtures)
+    systemProperty("jonoffcpu.fixtures", fixtures.get())
 }
 
 tasks.named<JavaExec>("testStreamingCorrelator") {

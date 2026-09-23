@@ -575,10 +575,13 @@ public final class OffCpuCorrelator {
      * Blank lines and lines starting with {@code #} are skipped; a pattern starting with {@code #} is written
      * {@code \#}. A line is otherwise taken verbatim, spaces included, since frame names can contain them. A file
      * without any pattern is refused rather than read as no filter, which for an include would keep everything.
+     * {@code preset:NAME} names a pattern list bundled with the correlator instead of a file; see {@link Presets}.
      */
     static List<String> patternFile(String option, String file) throws IOException {
         List<String> patterns = new java.util.ArrayList<>();
-        List<String> lines = Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);
+        List<String> lines = file.startsWith(Presets.PREFIX)
+                ? Presets.lines(file.substring(Presets.PREFIX.length()))
+                : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);
         for (int index = 0; index < lines.size(); index++) {
             String line = lines.get(index);
             if (line.isBlank() || line.startsWith("#")) continue;

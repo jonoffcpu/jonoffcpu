@@ -14,6 +14,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -93,7 +94,7 @@ final class Cli {
             "correlate",
             List.of("--source", "--jfr", "--output"),
             "stacks",
-            List.of("--profile", "--output"),
+            List.of("--output"),
             "merge",
             List.of("--profiles", "--output"),
             "export",
@@ -102,8 +103,9 @@ final class Cli {
             List.of("--source"));
 
     private static void requireOptions(CommandLine command) {
-        // The top-level command with no arguments at all asks for help instead.
+        // The top-level command with no arguments at all asks for help instead, and a listing needs no input.
         if (command.getParseResult().originalArgs().isEmpty()) return;
+        if (command.getParseResult().hasMatchedOption("--list-presets")) return;
         List<String> missing = new ArrayList<>();
         for (String name : REQUIRED.getOrDefault(command.getCommandName(), List.of())) {
             if (!command.getParseResult().hasMatchedOption(name)) {
@@ -328,7 +330,8 @@ final class Cli {
         @Option(
                 names = "--profile",
                 paramLabel = "FILE",
-                description = "The stack profile, such as " + OutputFiles.PROFILE + ". Required.")
+                description = "The stack profile, such as " + OutputFiles.PROFILE + "."
+                        + " Required unless --collapsed-input is given.")
         Path profile;
 
         @Option(
@@ -395,19 +398,163 @@ final class Cli {
         @Option(
                 names = "--include-from",
                 paramLabel = "FILE",
-                description = "Read --include patterns from a file, one per line; repeatable.")
+                description =
+                        "Read --include patterns from a file, one per line, or a bundled preset:NAME;" + " repeatable.")
         List<String> includeFrom = new ArrayList<>();
 
         @Option(
                 names = "--exclude-from",
                 paramLabel = "FILE",
-                description = "Read --exclude patterns from a file, one per line; repeatable.")
+                description = "Read --exclude patterns from a file, one per line, or a bundled preset:NAME such"
+                        + " as preset:jvm-idle; repeatable.")
         List<String> excludeFrom = new ArrayList<>();
 
         StackProfileRenderer.Filter filter() throws IOException {
             return StackProfileRenderer.Filter.of(
                     patterns(include, "--include-from", includeFrom), patterns(exclude, "--exclude-from", excludeFrom));
         }
+    }
+
+    /**
+     * The frame-level transforms of a line's Java stack. They change what a kept interval's stack looks like, never
+     * which intervals are kept; the filters see the untransformed stack.
+     */
+    static final class TransformOptions {
+        @Option(
+                names = "--canonical-names",
+                description = "Remove generated-class addresses ($$Lambda.0x..., LambdaForm$MH/0x...), so two runs'"
+                        + " stacks compare.")
+        boolean canonicalNames;
+
+        @Option(
+                names = "--hide",
+                paramLabel = "REGEX",
+                description = "Remove every frame that matches, anywhere in the stack; a stack of nothing else keeps"
+                        + " its leaf. Repeatable.")
+        List<String> hide = new ArrayList<>();
+
+        @Option(
+                names = "--hide-from",
+                paramLabel = "FILE",
+                description = "Read --hide patterns from a file or preset:NAME; repeatable.")
+        List<String> hideFrom = new ArrayList<>();
+
+        @Option(
+                names = "--trim-root",
+                paramLabel = "REGEX",
+                description = "Remove the longest root-side run of matching frames, such as thread and event-loop"
+                        + " entry points; deeper frames stay even if they match. Repeatable.")
+        List<String> trimRoot = new ArrayList<>();
+
+        @Option(
+                names = "--trim-root-from",
+                paramLabel = "FILE",
+                description = "Read --trim-root patterns from a file or preset:NAME, such as preset:jvm-infra;"
+                        + " repeatable.")
+        List<String> trimRootFrom = new ArrayList<>();
+
+        @Option(
+                names = "--root-at",
+                paramLabel = "REGEX",
+                description = "Start the stack at the root-most matching frame, such as your application's first"
+                        + " frame. Repeatable.")
+        List<String> rootAt = new ArrayList<>();
+
+        @Option(
+                names = "--root-at-from",
+                paramLabel = "FILE",
+                description = "Read --root-at patterns from a file or preset:NAME; repeatable.")
+        List<String> rootAtFrom = new ArrayList<>();
+
+        @Option(
+                names = "--root-at-unmatched",
+                paramLabel = "MODE",
+                defaultValue = "bucket",
+                converter = UnmatchedConverter.class,
+                description = "A stack without a --root-at match: bucket (becomes the single frame"
+                        + " " + StackTransforms.NO_APPLICATION_FRAME + ") or keep (unchanged)."
+                        + " Default: ${DEFAULT-VALUE}.")
+        String rootAtUnmatched;
+
+        @Option(
+                names = "--leaf-at",
+                paramLabel = "REGEX",
+                description = "Cut the callees of the leaf-most matching frame, keeping the match. Repeatable.")
+        List<String> leafAt = new ArrayList<>();
+
+        @Option(
+                names = "--leaf-at-from",
+                paramLabel = "FILE",
+                description = "Read --leaf-at patterns from a file or preset:NAME; repeatable.")
+        List<String> leafAtFrom = new ArrayList<>();
+
+        @Option(
+                names = "--collapse-leaf",
+                paramLabel = "REGEX",
+                description = "Replace the longest leaf-side run of matching frames, the wait machinery, by its"
+                        + " root-most frame, such as ReentrantLock.lock. Repeatable.")
+        List<String> collapseLeaf = new ArrayList<>();
+
+        @Option(
+                names = "--collapse-leaf-from",
+                paramLabel = "FILE",
+                description = "Read --collapse-leaf patterns from a file or preset:NAME, such as"
+                        + " preset:jvm-wait-machinery; repeatable.")
+        List<String> collapseLeafFrom = new ArrayList<>();
+
+        @Option(
+                names = "--collapse-leaf-label",
+                paramLabel = "LABEL",
+                defaultValue = "frame",
+                converter = LeafLabelConverter.class,
+                description = "What replaces a collapsed run: frame (its root-most frame) or category ([monitor],"
+                        + " [lock], [park], [wait], [sleep], [native] or [kernel]). Default: ${DEFAULT-VALUE}.")
+        String collapseLeafLabel;
+
+        @Option(
+                names = "--thread-frame",
+                paramLabel = "MODE",
+                defaultValue = "none",
+                converter = ThreadFrameConverter.class,
+                description = "Start each line with the thread's name, or its pool (digit runs replaced by #:"
+                        + " pulsar-io-3-25 is pulsar-io-#-#); needs the profile's thread dimension. none, name or"
+                        + " pool. Default: ${DEFAULT-VALUE}.")
+        StackTransforms.ThreadFrame threadFrame;
+
+        StackTransforms transforms() throws IOException {
+            return new StackTransforms(
+                    canonicalNames,
+                    sourced(hide, "--hide-from", hideFrom),
+                    sourced(trimRoot, "--trim-root-from", trimRootFrom),
+                    sourced(rootAt, "--root-at-from", rootAtFrom),
+                    rootAtUnmatched.equals("keep"),
+                    sourced(leafAt, "--leaf-at-from", leafAtFrom),
+                    sourced(collapseLeaf, "--collapse-leaf-from", collapseLeafFrom),
+                    collapseLeafLabel.equals("category"),
+                    threadFrame);
+        }
+    }
+
+    /** A transform option's patterns with their sources: inline ones first, then each file or preset in order. */
+    static List<StackTransforms.Sourced> sourced(List<String> inline, String fromOption, List<String> files)
+            throws IOException {
+        List<StackTransforms.Sourced> patterns = new ArrayList<>();
+        for (String pattern : inline) {
+            try {
+                java.util.regex.Pattern.compile(pattern);
+            } catch (java.util.regex.PatternSyntaxException invalid) {
+                throw new IllegalArgumentException(
+                        "Invalid pattern for " + fromOption.replace("-from", "") + ": " + invalid.getMessage(),
+                        invalid);
+            }
+            patterns.add(new StackTransforms.Sourced(pattern, "inline"));
+        }
+        for (String file : files) {
+            for (String pattern : OffCpuCorrelator.patternFile(fromOption, file)) {
+                patterns.add(new StackTransforms.Sourced(pattern, file));
+            }
+        }
+        return patterns;
     }
 
     /** A filter option's patterns: those given inline, then those of each pattern file in order. */
@@ -553,11 +700,33 @@ final class Cli {
             mixinStandardHelpOptions = true,
             versionProvider = Version.class,
             sortOptions = false,
-            description = "Renders one collapsed slice of a stack profile: by switch-out reason, stack kinds,"
-                    + " weights and time part, keeping or dropping whole intervals by their frames.")
+            description = {
+                "Renders one collapsed slice of a stack profile: by switch-out reason, stack kinds, weights and time"
+                        + " part, keeping or dropping whole intervals by their frames and transforming the frames"
+                        + " of the ones it keeps.",
+                "With --collapsed-input, filters and transforms any collapsed file instead, such as a CPU view the"
+                        + " converter wrote."
+            },
+            footer = {
+                "",
+                "Per kept entry, in this order: --canonical-names, --hide, --trim-root, --root-at, --leaf-at,"
+                        + " --collapse-leaf, then --package-names and --thread-frame as display. Filters see the"
+                        + " untransformed stacks, and lines that transform alike merge, so totals never change."
+                        + " Every -from option also takes preset:NAME; --list-presets prints them."
+            })
     static final class Stacks implements Callable<Integer> {
+        @Spec
+        CommandSpec spec;
+
         @Mixin
         SliceOptions slice;
+
+        @Option(
+                names = "--collapsed-input",
+                paramLabel = "FILE",
+                description = "Read any collapsed file instead of --profile. Weights keep the file's unit; the"
+                        + " converter's Java frames lose their _[j]-style markers and '/' in class names.")
+        Path collapsedInput;
 
         @Option(
                 names = "--output",
@@ -577,26 +746,43 @@ final class Cli {
         @Option(
                 names = "--summary",
                 paramLabel = "FILE",
-                description = "Also write a JSON summary of the slice: its totals, patterns and what the filters"
-                        + " removed.")
+                description = "Also write a JSON summary of the slice: its totals, patterns, transforms and what"
+                        + " the filters removed.")
         Path summary;
+
+        @Option(names = "--list-presets", description = "Print the bundled pattern presets and exit.")
+        boolean listPresets;
 
         @Mixin
         FilterOptions filters;
 
+        @Mixin
+        TransformOptions transformOptions;
+
         @Override
         public Integer call() throws Exception {
-            StackProfile profile = StackProfile.read(slice.profile);
+            if (listPresets) {
+                spec.commandLine().getOut().print(Presets.listing());
+                return OK;
+            }
+            ParseResult parsed = spec.commandLine().getParseResult();
+            if ((slice.profile == null) == (collapsedInput == null)) {
+                throw new ParameterException(spec.commandLine(), "Give exactly one of --profile and --collapsed-input");
+            }
             StackProfileRenderer.Filter filter = filters.filter();
-            StackProfileRenderer.Slice rendered = StackProfileRenderer.render(
-                    profile,
-                    slice.reasons.selected(),
-                    slice.stack,
-                    slice.weights,
-                    reasonFrame,
-                    slice.time,
-                    filter,
-                    slice.packageNames);
+            StackTransforms transforms = transformOptions.transforms();
+            if (collapsedInput != null) {
+                for (String option :
+                        List.of("--reason", "--stack", "--weights", "--time", "--reason-frame", "--thread-frame")) {
+                    if (parsed.hasMatchedOption(option)) {
+                        throw new ParameterException(
+                                spec.commandLine(), option + " needs a stack profile, not --collapsed-input");
+                    }
+                }
+                return collapsed(filter, transforms);
+            }
+            StackProfile profile = StackProfile.read(slice.profile);
+            StackProfileRenderer.Slice rendered = render(profile, filter, transforms);
             try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
                 StackProfileRenderer.writeCollapsed(rendered, writer);
             }
@@ -609,16 +795,18 @@ final class Cli {
                     slice.time,
                     filter,
                     slice.packageNames);
-            if (summary != null) {
-                try (BufferedWriter writer = OffCpuCorrelator.newFile(summary)) {
-                    new GsonBuilder()
-                            .serializeNulls()
-                            .setPrettyPrinting()
-                            .create()
-                            .toJson(json, writer);
-                    writer.newLine();
-                }
+            if (transforms.active() || transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
+                StackProfileRenderer.Slice before = render(profile, filter, StackTransforms.NONE);
+                json.add(
+                        "transforms",
+                        transformsReport(
+                                transforms,
+                                profile.header().label().length(),
+                                before.nanos(),
+                                rendered.nanos(),
+                                rendered.totalNanos()));
             }
+            writeSummary(json);
             System.out.println("Wrote " + rendered.nanos().size() + " collapsed stacks to " + output + ": "
                     + rendered.intervals() + " intervals, " + rendered.totalNanos() + " ns"
                     + (slice.time == StackProfileRenderer.Time.TOTAL ? "" : " of " + slice.time.label() + " time")
@@ -629,6 +817,120 @@ final class Cli {
                             : ""));
             return OK;
         }
+
+        private StackProfileRenderer.Slice render(
+                StackProfile profile, StackProfileRenderer.Filter filter, StackTransforms transforms)
+                throws IOException {
+            return StackProfileRenderer.render(
+                    profile,
+                    slice.reasons.selected(),
+                    slice.stack,
+                    slice.weights,
+                    reasonFrame,
+                    slice.time,
+                    filter,
+                    slice.packageNames,
+                    transforms);
+        }
+
+        private int collapsed(StackProfileRenderer.Filter filter, StackTransforms transforms) throws IOException {
+            List<CollapsedStacks.Line> lines = CollapsedStacks.read(collapsedInput);
+            CollapsedStacks.Slice rendered = CollapsedStacks.render(lines, filter, transforms, slice.packageNames);
+            try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
+                CollapsedStacks.write(rendered, writer);
+            }
+            JsonObject json = new JsonObject();
+            json.addProperty("schemaVersion", 1);
+            json.addProperty("input", "collapsed");
+            json.addProperty("packageNames", slice.packageNames.label());
+            json.addProperty("inputLines", lines.size());
+            json.addProperty("lines", rendered.weights().size());
+            json.addProperty("totalWeight", rendered.total().toPlainString());
+            json.add("include", StackProfileRenderer.patterns(filter.include()));
+            json.add("exclude", StackProfileRenderer.patterns(filter.exclude()));
+            JsonObject filtered = new JsonObject();
+            filtered.addProperty("inputLines", rendered.filteredLines());
+            filtered.addProperty("totalWeight", rendered.filteredWeight().toPlainString());
+            json.add("filtered", filtered);
+            if (transforms.active()) {
+                CollapsedStacks.Slice before =
+                        CollapsedStacks.render(lines, filter, StackTransforms.NONE, slice.packageNames);
+                json.add(
+                        "transforms",
+                        transformsReport(transforms, 0, before.weights(), rendered.weights(), rendered.total()));
+            }
+            writeSummary(json);
+            System.out.println("Wrote " + rendered.weights().size() + " collapsed stacks to " + output + ": weight "
+                    + rendered.total().toPlainString()
+                    + (filter.active()
+                            ? "; filtered out " + rendered.filteredLines() + " input lines, weight "
+                                    + rendered.filteredWeight().toPlainString()
+                            : ""));
+            return OK;
+        }
+
+        private void writeSummary(JsonObject json) throws IOException {
+            if (summary == null) return;
+            try (BufferedWriter writer = OffCpuCorrelator.newFile(summary)) {
+                new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(json, writer);
+                writer.newLine();
+            }
+        }
+    }
+
+    /**
+     * The transforms in effect with what they did: lines and weight-averaged depth before and after, and for
+     * {@code --root-at} the weight and share of {@link StackTransforms#NO_APPLICATION_FRAME}. {@code prefix} is the
+     * length of the label every line starts with, which is not a frame.
+     */
+    static JsonObject transformsReport(
+            StackTransforms transforms,
+            int prefix,
+            Map<String, ? extends Number> before,
+            Map<String, ? extends Number> after,
+            Number total) {
+        JsonObject report = transforms.report();
+        report.addProperty("linesBefore", before.size());
+        report.addProperty("linesAfter", after.size());
+        report.addProperty("framesBefore", meanDepth(before, prefix));
+        report.addProperty("framesAfter", meanDepth(after, prefix));
+        if (!transforms.rootAt().isEmpty()) {
+            java.math.BigDecimal bucket = java.math.BigDecimal.ZERO;
+            for (var line : after.entrySet()) {
+                String frames = line.getKey().substring(prefix);
+                if (frames.equals(StackTransforms.NO_APPLICATION_FRAME)
+                        || frames.endsWith(";" + StackTransforms.NO_APPLICATION_FRAME)) {
+                    bucket = bucket.add(new java.math.BigDecimal(line.getValue().toString()));
+                }
+            }
+            java.math.BigDecimal all = new java.math.BigDecimal(total.toString());
+            JsonObject unmatched = new JsonObject();
+            unmatched.addProperty("weight", bucket.toPlainString());
+            unmatched.addProperty(
+                    "share",
+                    all.signum() == 0
+                            ? java.math.BigDecimal.ZERO
+                            : bucket.divide(all, 6, java.math.RoundingMode.HALF_EVEN));
+            report.add("noApplicationFrame", unmatched);
+        }
+        return report;
+    }
+
+    /** The weight-averaged number of frames per line, to one decimal place. */
+    static java.math.BigDecimal meanDepth(Map<String, ? extends Number> lines, int prefix) {
+        java.math.BigDecimal weight = java.math.BigDecimal.ZERO;
+        java.math.BigDecimal frames = java.math.BigDecimal.ZERO;
+        for (var line : lines.entrySet()) {
+            java.math.BigDecimal value =
+                    new java.math.BigDecimal(line.getValue().toString());
+            String text = line.getKey().substring(prefix);
+            long depth = text.isEmpty() ? 0 : text.chars().filter(c -> c == ';').count() + 1;
+            weight = weight.add(value);
+            frames = frames.add(value.multiply(java.math.BigDecimal.valueOf(depth)));
+        }
+        return weight.signum() == 0
+                ? java.math.BigDecimal.ZERO
+                : frames.divide(weight, 1, java.math.RoundingMode.HALF_EVEN);
     }
 
     @Command(
@@ -810,6 +1112,27 @@ final class Cli {
         @Override
         public Degradation.Policy convert(String text) {
             return choice(text, Degradation.Policy.values(), Degradation.Policy::text);
+        }
+    }
+
+    static final class UnmatchedConverter implements ITypeConverter<String> {
+        @Override
+        public String convert(String text) {
+            return choice(text, new String[] {"bucket", "keep"}, Function.identity());
+        }
+    }
+
+    static final class LeafLabelConverter implements ITypeConverter<String> {
+        @Override
+        public String convert(String text) {
+            return choice(text, new String[] {"frame", "category"}, Function.identity());
+        }
+    }
+
+    static final class ThreadFrameConverter implements ITypeConverter<StackTransforms.ThreadFrame> {
+        @Override
+        public StackTransforms.ThreadFrame convert(String text) {
+            return choice(text, StackTransforms.ThreadFrame.values(), StackTransforms.ThreadFrame::label);
         }
     }
 
