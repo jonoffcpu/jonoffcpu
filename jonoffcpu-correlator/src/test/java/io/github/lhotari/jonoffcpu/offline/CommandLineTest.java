@@ -326,11 +326,16 @@ public final class CommandLineTest {
         // The slicing section's commands: every option it names belongs to one of them.
         List<CommandSpec> profileCommands =
                 List.of(spec("stacks"), spec("top"), spec("summarize"), spec("merge"), spec("export"));
-        for (String name :
-                options(String.join("\n", section(readme, "### 5. Slice and filter with the stack profile")))) {
-            check(
-                    profileCommands.stream().anyMatch(command -> command.findOption(name) != null),
-                    "README slicing section mentions unknown option " + name);
+        for (String heading : List.of(
+                "### 5. Slice and filter with the stack profile",
+                "### 6. Find what to optimize",
+                "## Analyzing with AI agents",
+                "## Analyzing with SQL")) {
+            for (String name : options(String.join("\n", section(readme, heading)))) {
+                check(
+                        profileCommands.stream().anyMatch(command -> command.findOption(name) != null),
+                        "README section " + heading + " mentions unknown option " + name);
+            }
         }
         for (String name : options(String.join("\n", section(readme, "### 3. Correlate")))) {
             check(correlate.findOption(name) != null, "README correlate step mentions unknown option " + name);
