@@ -1,558 +1,240 @@
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-import java.util.HexFormat
-import java.util.zip.ZipFile
-import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
-import org.gradle.api.tasks.bundling.Jar
-import org.gradle.api.tasks.compile.JavaCompile
-import org.gradle.api.tasks.javadoc.Javadoc
-import org.gradle.external.javadoc.StandardJavadocDocletOptions
-import org.gradle.jvm.toolchain.JvmVendorSpec
-
 plugins {
-    `java-library`
-    // The base plugin: the full plugin would publish components["java"], but only the shaded JAR is published.
-    id("com.vanniktech.maven.publish.base")
-    id("com.gradleup.shadow")
-    id("com.google.protobuf")
+    id("jonoffcpu.shaded-jar-conventions")
+    id("jonoffcpu.protobuf-conventions")
 }
 
-group = "io.github.lhotari"
-
-base {
-    archivesName = "jonoffcpu-agent"
+jonoffcpu {
+    javaRelease = 17
 }
 
-repositories {
-    mavenCentral()
+jonoffcpuPublication {
+    displayName = "jonoffcpu agent"
+    description = "Self-contained Linux off-CPU profiling agent for the JVM."
 }
-
-java {
-    toolchain {
-        languageVersion = JavaLanguageVersion.of(25)
-        vendor = JvmVendorSpec.AMAZON
-    }
-    targetCompatibility = JavaVersion.VERSION_17
-    // Maven Central requires sources and javadoc JARs next to the shaded JAR.
-    withSourcesJar()
-    withJavadocJar()
-}
-
-val embeddedRuntime = configurations.create("embeddedRuntime") {
-    isTransitive = false
-}
-configurations.compileOnly {
-    extendsFrom(embeddedRuntime)
-}
-configurations.testImplementation {
-    extendsFrom(embeddedRuntime)
-}
-
-val asyncProfilerDir = rootProject.layout.projectDirectory.dir("async-profiler")
-val asyncProfilerConverter = asyncProfilerDir.file("build/bin/jfrconv")
 
 dependencies {
-    // The capture stream codec, generated from docs/schema/jonoffcpu-capture.proto.
-    embeddedRuntime("com.google.protobuf:protobuf-javalite:4.33.1")
-    embeddedRuntime("com.google.code.gson:gson:2.14.0")
-    embeddedRuntime("org.yaml:snakeyaml:2.7")
+    embeddedRuntime(libs.protobuf.javalite)
+    embeddedRuntime(libs.gson)
+    embeddedRuntime(libs.snakeyaml)
+}
+
+tasks.verifyDependencyDigests {
+    digests =
+        mapOf(
+            "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
+            "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
+            "snakeyaml-2.7.jar" to "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e",
+        )
 }
 
 sourceSets {
     main {
-        proto.setSrcDirs(listOf(rootProject.layout.projectDirectory.dir("docs/schema")))
         // The stack profile is the correlator's derived artifact; the agent never reads or writes one.
         proto.exclude("jonoffcpu-profile.proto")
     }
 }
 
-protobuf {
-    protoc {
-        artifact = "com.google.protobuf:protoc:4.33.1"
-    }
-    generateProtoTasks {
-        all().configureEach {
-            builtins {
-                named("java") {
-                    // The lite runtime has no descriptors or reflection, which is all the stream needs.
-                    option("lite")
-                }
-            }
-        }
-    }
-}
+val rootDirectory = isolated.rootProject.projectDirectory
+val asyncProfilerDir = rootDirectory.dir("async-profiler")
 
-tasks.withType<JavaCompile>().configureEach {
-    options.release = 17
-    options.encoding = "UTF-8"
-}
-
-tasks.withType<Javadoc>().configureEach {
-    options.encoding = "UTF-8"
-    (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:none", "-quiet")
-}
-
-val expectedDependencyDigests = mapOf(
-    "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
-    "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
-    "snakeyaml-2.7.jar" to "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e"
-)
-
-fun sha256(bytes: ByteArray): String =
-    HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))
-
-fun sha256File(input: File): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    input.inputStream().buffered().use { stream ->
-        val buffer = ByteArray(64 * 1024)
-        while (true) {
-            val read = stream.read(buffer)
-            if (read < 0) break
-            if (read > 0) digest.update(buffer, 0, read)
-        }
-    }
-    return HexFormat.of().formatHex(digest.digest())
-}
-
-val verifyDependencyDigests = tasks.register("verifyDependencyDigests") {
-    group = "verification"
-    description = "Checks the exact protobuf, Gson and SnakeYAML artifacts before embedding them."
-    inputs.files(embeddedRuntime)
-    doLast {
-        embeddedRuntime.files.forEach { artifact ->
-            val expected = expectedDependencyDigests[artifact.name]
-                ?: throw GradleException("No pinned digest for ${artifact.name}")
-            val actual = sha256File(artifact)
-            if (actual != expected) {
-                throw GradleException("SHA-256 mismatch for ${artifact.name}: $actual")
-            }
-        }
-    }
-}
-
-/** One embedded native bundle: a Linux architecture linked against one C library. */
-data class NativePlatform(
-    val name: String,
-    val architecture: String,
-    val libc: String,
-    val elfMachine: Int,
-    val dockerPlatform: String,
-    val dockerfile: String,
-    val taskSuffix: String
-)
-
-val allNativePlatforms = listOf(
-    NativePlatform("linux-x86_64", "x86_64", "glibc", 62, "linux/amd64", "Dockerfile.native-bundle", "LinuxX86_64"),
-    NativePlatform("linux-aarch64", "aarch64", "glibc", 183, "linux/arm64", "Dockerfile.native-bundle", "LinuxAarch64"),
-    NativePlatform(
-        "linux-musl-x86_64", "x86_64", "musl", 62, "linux/amd64", "Dockerfile.native-bundle-musl", "LinuxMuslX86_64"
-    ),
-    NativePlatform(
-        "linux-musl-aarch64", "aarch64", "musl", 183, "linux/arm64", "Dockerfile.native-bundle-musl", "LinuxMuslAarch64"
+// Which native bundles the agent JAR embeds: -PnativeArchitectures (current, all, x86_64 or aarch64) and
+// -PnativeLibcs (musl, glibc, all or current). -PprebuiltNative=true takes them from build/native instead of
+// building them, as the release packaging does with the bundles the native runners built.
+val hostArchitecture = NativePlatform.architecture(providers.systemProperty("os.arch").get())
+val hostLibc = providers.of(HostLibcValueSource::class) {}.get()
+val hostPlatform = NativePlatform.hostPlatform(hostArchitecture, hostLibc)
+val nativePlatforms =
+    NativePlatform.select(
+        providers.gradleProperty("nativeArchitectures").getOrElse("current"),
+        providers.gradleProperty("nativeLibcs").getOrElse("musl"),
+        hostArchitecture,
+        hostLibc,
     )
-).associateBy { it.name }
-val hostArchitecture = providers.systemProperty("os.arch").map { architecture ->
-    when (architecture.lowercase()) {
-        "amd64", "x86_64" -> "x86_64"
-        "aarch64", "arm64" -> "aarch64"
-        else -> throw GradleException("Unsupported build host architecture: $architecture")
-    }
-}
-
-/** Detects the C library of the JVM running this build from its own mapped loader, as the agent does. */
-fun hostLibc(): String {
-    val maps = File("/proc/self/maps")
-    if (!maps.isFile) return "glibc"
-    val muslLoaderMapped = maps.readLines()
-        .map { line -> line.substringAfter(" /", "").substringAfterLast('/') }
-        .any { name -> name.startsWith("ld-musl-") || name.startsWith("libc.musl-") }
-    return if (muslLoaderMapped) "musl" else "glibc"
-}
-val hostPlatform = hostArchitecture.map { architecture ->
-    val libc = hostLibc()
-    if (libc == "musl") "linux-musl-$architecture" else "linux-$architecture"
-}
-val nativeArchitectureSelection = providers.gradleProperty("nativeArchitectures")
-    .map { it.trim().lowercase() }
-    .orElse("current")
-val selectedArchitectures = when (val selection = nativeArchitectureSelection.get()) {
-    "current" -> setOf(hostArchitecture.get())
-    "all", "both" -> setOf("x86_64", "aarch64")
-    "x86_64", "amd64", "linux-x86_64" -> setOf("x86_64")
-    "aarch64", "arm64", "linux-aarch64" -> setOf("aarch64")
-    else -> throw GradleException(
-        "Unsupported nativeArchitectures value '$selection'; expected current, all, x86_64, or aarch64"
-    )
-}
-val nativeLibcSelection = providers.gradleProperty("nativeLibcs")
-    .map { it.trim().lowercase() }
-    .orElse("musl")
-val selectedLibcs = when (val selection = nativeLibcSelection.get()) {
-    "all", "both" -> setOf("glibc", "musl")
-    "glibc", "gnu" -> setOf("glibc")
-    "musl" -> setOf("musl")
-    "current", "host" -> setOf(hostLibc())
-    else -> throw GradleException(
-        "Unsupported nativeLibcs value '$selection'; expected musl, glibc, all, or current"
-    )
-}
-val nativePlatforms = allNativePlatforms.filterValues {
-    it.architecture in selectedArchitectures && it.libc in selectedLibcs
-}
-val nativeFileNames = listOf("libjonoffcpu.so", "libjonoffcpu_native.so", "libasyncProfiler.so")
+val hostPlatformSelected = hostPlatform in nativePlatforms
+val prebuiltNative = providers.gradleProperty("prebuiltNative").map(String::toBoolean).getOrElse(false)
 val nativeRoot = layout.buildDirectory.dir("native")
-val prebuiltNative = providers.gradleProperty("prebuiltNative").map(String::toBoolean).orElse(false)
+val nativeLibraries =
+    files(nativePlatforms.flatMap { platform -> NativePlatform.FILE_NAMES.map { nativeRoot.map { it.file("$platform/$it") } } })
 
 // Layer caching for the native bundle builds in GitHub Actions: -PdockerCache=gha restores every stage, the
 // toolchains and the compiled dependencies included, from the Actions cache, and -PdockerCacheWrite=true also
 // exports them (mode=max). CI writes only on the default branch, whose entries every branch can read. The cache
 // needs a buildx builder with the docker-container driver (BUILDX_BUILDER) and the Actions runtime environment.
-val dockerCache = providers.gradleProperty("dockerCache").orElse("none")
-val dockerCacheWrite = providers.gradleProperty("dockerCacheWrite").map(String::toBoolean).orElse(false)
+val dockerCache = providers.gradleProperty("dockerCache").getOrElse("none")
+val dockerCacheWrite = providers.gradleProperty("dockerCacheWrite").map(String::toBoolean).getOrElse(false)
 
 fun dockerCacheArguments(scope: String): List<String> =
-    when (val cache = dockerCache.get()) {
-        "none" -> emptyList()
-        "gha" ->
+    when (dockerCache) {
+        "none" -> {
+            emptyList()
+        }
+
+        "gha" -> {
             listOf("--cache-from", "type=gha,scope=$scope") +
-                if (dockerCacheWrite.get()) {
-                    listOf("--cache-to", "type=gha,scope=$scope,mode=max,ignore-error=true")
-                } else {
-                    emptyList()
-                }
-        else -> throw GradleException("Unsupported dockerCache value '$cache'; expected none or gha")
-    }
+                if (dockerCacheWrite) listOf("--cache-to", "type=gha,scope=$scope,mode=max,ignore-error=true") else emptyList()
+        }
 
-val nativeTasks = allNativePlatforms.mapValues { (platform, spec) ->
-    val dockerfile = layout.projectDirectory.file("tools/${spec.dockerfile}")
-    val output = nativeRoot.map { it.dir(platform) }
-    tasks.register<Exec>("build${spec.taskSuffix}Native") {
-        group = "native build"
-        description = "Builds the agent, collector, and async-profiler libraries for $platform in Docker buildx."
-        workingDir(rootProject.layout.projectDirectory)
-        commandLine(
-            listOf(
-                "docker", "buildx", "build", "--progress=plain",
-                "--platform", spec.dockerPlatform,
-                "--file", dockerfile.asFile.absolutePath,
-                "--output", output.map { "type=local,dest=${it.asFile.absolutePath}" }.get()
-            ) + dockerCacheArguments("native-bundle-$platform") +
-                rootProject.layout.projectDirectory.asFile.absolutePath
-        )
-        inputs.file(dockerfile)
-        inputs.file(layout.projectDirectory.file("tools/check-musl-needed.sh"))
-        inputs.files(
-            fileTree(rootProject.file("jonoffcpu-agent/src/main/c")),
-            fileTree(rootProject.file("jonoffcpu-native/src")),
-            rootProject.file("jonoffcpu-native/Cargo.toml"),
-            rootProject.file("jonoffcpu-native/Cargo.lock"),
-            fileTree(rootProject.file("async-profiler/src")),
-            rootProject.file("async-profiler/Makefile")
-        )
-        outputs.files(nativeFileNames.map { name -> output.map { it.file(name) } })
-        val asyncProfilerHeader = rootProject.file("async-profiler/src/asprof.h")
-        doFirst {
-            // An uninitialized submodule otherwise surfaces as an opaque Docker COPY failure.
-            if (!asyncProfilerHeader.isFile) {
-                throw GradleException(
-                    "The async-profiler submodule is not checked out; run 'git submodule update --init'"
-                )
-            }
-            delete(output)
+        else -> {
+            throw GradleException("Unsupported dockerCache value '$dockerCache'; expected none or gha")
         }
     }
-}
 
-fun elfMachine(bytes: ByteArray): Int {
-    if (bytes.size < 20 || bytes[0] != 0x7f.toByte() || bytes[1] != 'E'.code.toByte()
-        || bytes[2] != 'L'.code.toByte() || bytes[3] != 'F'.code.toByte()
-    ) {
-        throw GradleException("Native artifact is not an ELF file")
-    }
-    if (bytes[4] != 2.toByte() || bytes[5] != 1.toByte()) {
-        throw GradleException("Native artifact must be a little-endian ELF64 file")
-    }
-    return bytes[18].toUByte().toInt() or (bytes[19].toUByte().toInt() shl 8)
-}
-
-/**
- * Checks that a native library is linked against the expected C library. glibc-linked
- * libraries carry GLIBC_2.x symbol version needs; musl-linked libraries carry none.
- */
-fun verifyLibc(bytes: ByteArray, expectedLibc: String, label: String) {
-    val glibcVersioned = String(bytes, StandardCharsets.ISO_8859_1).contains("GLIBC_2.")
-    if (expectedLibc == "glibc" && !glibcVersioned) {
-        throw GradleException("$label is labeled glibc but carries no glibc symbol versions")
-    }
-    if (expectedLibc == "musl" && glibcVersioned) {
-        throw GradleException("$label is labeled musl but carries glibc symbol versions")
-    }
-}
-
-val verifyNativeArchitectures = tasks.register("verifyNativeArchitectures") {
-    group = "verification"
-    description = "Rejects missing, malformed, or mislabeled native libraries for the selected Linux platforms."
-    if (!prebuiltNative.get()) {
-        dependsOn(nativePlatforms.keys.map(nativeTasks::getValue))
-    }
-    inputs.files(nativePlatforms.keys.map { platform -> nativeRoot.map { it.dir(platform) } })
-    doLast {
-        nativePlatforms.forEach { (platform, spec) ->
-            nativeFileNames.forEach { name ->
-                val artifact = nativeRoot.get().dir(platform).file(name).asFile
-                if (!artifact.isFile) {
-                    throw GradleException("Missing $platform/$name")
+val nativeTasks =
+    NativePlatform.ALL.mapValues { (platform, spec) ->
+        tasks.register<Exec>("build${spec.taskSuffix}Native") {
+            group = "native build"
+            description = "Builds the agent, collector, and async-profiler libraries for $platform in Docker buildx."
+            val output = nativeRoot.map { it.dir(platform) }
+            val dockerfile = layout.projectDirectory.file("tools/${spec.dockerfile}")
+            workingDir(rootDirectory)
+            commandLine(
+                listOf(
+                    "docker",
+                    "buildx",
+                    "build",
+                    "--progress=plain",
+                    "--platform",
+                    spec.dockerPlatform,
+                    "--file",
+                    dockerfile.asFile.absolutePath,
+                    "--output",
+                    "type=local,dest=${output.get().asFile.absolutePath}",
+                ) + dockerCacheArguments("native-bundle-$platform") + rootDirectory.asFile.absolutePath,
+            )
+            inputs.file(dockerfile)
+            inputs.file(layout.projectDirectory.file("tools/check-musl-needed.sh"))
+            inputs.files(
+                fileTree(layout.projectDirectory.dir("src/main/c")),
+                fileTree(rootDirectory.dir("jonoffcpu-native/src")),
+                rootDirectory.file("jonoffcpu-native/Cargo.toml"),
+                rootDirectory.file("jonoffcpu-native/Cargo.lock"),
+                fileTree(asyncProfilerDir.dir("src")),
+                asyncProfilerDir.file("Makefile"),
+            )
+            outputs.files(NativePlatform.FILE_NAMES.map { name -> output.map { it.file(name) } })
+            val asyncProfilerHeader = asyncProfilerDir.file("src/asprof.h").asFile
+            doFirst {
+                // An uninitialized submodule otherwise surfaces as an opaque Docker COPY failure.
+                if (!asyncProfilerHeader.isFile) {
+                    throw GradleException("The async-profiler submodule is not checked out; run 'git submodule update --init'")
                 }
-                val bytes = artifact.readBytes()
-                val actual = elfMachine(bytes)
-                if (actual != spec.elfMachine) {
-                    throw GradleException("$platform/$name has ELF e_machine $actual, expected ${spec.elfMachine}")
-                }
-                verifyLibc(bytes, spec.libc, "$platform/$name")
+                output.get().asFile.deleteRecursively()
             }
         }
     }
-}
 
-val nativeChecksums = nativeRoot.map { it.file("SHA256SUMS") }
-val generateNativeChecksums = tasks.register("generateNativeChecksums") {
-    dependsOn(verifyNativeArchitectures)
-    inputs.files(nativePlatforms.keys.map { platform -> nativeRoot.map { it.dir(platform) } })
-    outputs.file(nativeChecksums)
-    doLast {
-        val lines = nativePlatforms.keys.sorted().flatMap { platform ->
-            nativeFileNames.sorted().map { name ->
-                val artifact = nativeRoot.get().dir(platform).file(name).asFile
-                "${sha256File(artifact)}  $platform/$name"
-            }
-        }
-        val output = nativeChecksums.get().asFile
-        output.parentFile.mkdirs()
-        output.writeText(lines.joinToString("\n", postfix = "\n"), StandardCharsets.UTF_8)
+val verifyNativeArchitectures =
+    tasks.register<VerifyNativeLibraries>("verifyNativeArchitectures") {
+        group = "verification"
+        description = "Rejects missing, malformed, or mislabeled native libraries for the selected Linux platforms."
+        if (!prebuiltNative) dependsOn(nativePlatforms.map(nativeTasks::getValue))
+        nativeRoot = layout.buildDirectory.dir("native")
+        libraries.from(nativeLibraries)
+        platforms = nativePlatforms
     }
-}
 
-// The plain JAR is never published or consumed; the shaded JAR below is the only artifact.
-tasks.named<Jar>("jar") {
-    enabled = false
-}
+val generateNativeChecksums =
+    tasks.register<GenerateNativeChecksums>("generateNativeChecksums") {
+        dependsOn(verifyNativeArchitectures)
+        nativeRoot = layout.buildDirectory.dir("native")
+        libraries.from(nativeLibraries)
+        platforms = nativePlatforms
+        checksums = layout.buildDirectory.file("native/SHA256SUMS")
+    }
 
-val jar = tasks.named<ShadowJar>("shadowJar") {
-    dependsOn(verifyDependencyDigests, generateNativeChecksums)
-    archiveClassifier = ""
-    configurations = listOf(embeddedRuntime)
+tasks.shadowJar {
+    dependsOn(generateNativeChecksums)
     relocate("com.google.protobuf", "io.github.lhotari.jonoffcpu.internal.shaded.protobuf")
     relocate("com.google.gson", "io.github.lhotari.jonoffcpu.internal.shaded.gson")
     relocate("org.yaml.snakeyaml", "io.github.lhotari.jonoffcpu.internal.shaded.snakeyaml")
-    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
-    isPreserveFileTimestamps = false
-    isReproducibleFileOrder = true
-    // The bundled libraries' Maven descriptors and ProGuard rules describe their original,
-    // unrelocated coordinates and packages, so they are misleading inside the shaded JAR.
-    exclude("META-INF/maven/**", "META-INF/proguard/**")
     manifest {
         attributes(
             "Premain-Class" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent",
             "Agent-Class" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent",
             "Can-Redefine-Classes" to "false",
             "Can-Retransform-Classes" to "false",
-            "Implementation-Title" to "jonoffcpu-agent",
-            "Implementation-Version" to project.version
         )
     }
     from(nativeRoot) {
         into("META-INF/native")
         include("SHA256SUMS")
-        nativePlatforms.keys.forEach { include("$it/**") }
+        nativePlatforms.forEach { include("$it/**") }
     }
     from(asyncProfilerDir.file("LICENSE")) {
         into("META-INF/licenses")
         rename { "async-profiler-LICENSE" }
     }
-    from(rootProject.file("LICENSE")) {
-        into("META-INF")
-    }
 }
+val agentJar = tasks.shadowJar.flatMap { it.archiveFile }
 
-// The plain JAR neither embeds nor declares its relocated dependencies, so the shaded JAR is the only
-// usable artifact. Publishing the Shadow plugin's component makes it the module's sole runtime
-// variant: a consumer that asks for nothing in particular gets it, since Gradle accepts a shadowed
-// variant when no external one exists. The agent has no separate API, so no apiElements is published.
-publishing {
-    publications.register<MavenPublication>("maven") {
-        from(components["shadow"])
-        artifact(tasks.named("sourcesJar"))
-        artifact(tasks.named("javadocJar"))
-    }
-}
-
-val verifyRuntimeJar = tasks.register("verifyRuntimeJar") {
-    group = "verification"
-    description = "Checks bundled native entries, ELF architectures, C libraries, licenses, and recorded SHA-256 digests."
-    dependsOn(jar)
-    inputs.file(jar.flatMap { it.archiveFile })
-    doLast {
-        val archive = jar.get().archiveFile.get().asFile
-        ZipFile(archive).use { zip ->
-            val checksumEntry = zip.getEntry("META-INF/native/SHA256SUMS")
-                ?: throw GradleException("Runtime JAR has no native checksum manifest")
-            if (zip.entries().asSequence().any { it.name.startsWith("one/profiler/") }) {
-                throw GradleException("Runtime JAR must not embed the async-profiler Java API")
-            }
-            if (zip.entries().asSequence().any {
-                    it.name.startsWith("com/google/gson/")
-                            || it.name.startsWith("org/yaml/snakeyaml/")
-                            || it.name.startsWith("com/google/protobuf/")
-                }) {
-                throw GradleException("Agent JAR contains unrelocated dependency packages")
-            }
-            for (name in listOf(
-                "io/github/lhotari/jonoffcpu/internal/shaded/gson/Gson.class",
-                "io/github/lhotari/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
-                "io/github/lhotari/jonoffcpu/internal/shaded/snakeyaml/Yaml.class"
-            )) {
-                if (zip.getEntry(name) == null) throw GradleException("Agent JAR is missing relocated class $name")
-            }
-            if (zip.entries().asSequence().any {
-                    it.name.startsWith("io/github/lhotari/jonoffcpu/offline/")
-                        || it.name.startsWith("io/github/lhotari/jonoffcpu/jfr/")
-                        || it.name.startsWith("org/openjdk/jmc/")
-                }) {
-                throw GradleException("Agent JAR must not embed offline correlator or JMC writer classes")
-            }
-            val recorded = mutableMapOf<String, String>()
-            zip.getInputStream(checksumEntry).bufferedReader(StandardCharsets.UTF_8).useLines { lines ->
-                lines.filter { it.isNotBlank() }.forEach { line ->
-                    val match = Regex("^([0-9a-f]{64})  (linux-(?:musl-)?(?:x86_64|aarch64)/[^/]+)\$").matchEntire(line)
-                        ?: throw GradleException("Malformed native checksum line: $line")
-                    recorded[match.groupValues[2]] = match.groupValues[1]
-                }
-            }
-            nativePlatforms.forEach { (platform, spec) ->
-                nativeFileNames.forEach { name ->
-                    val relative = "$platform/$name"
-                    val entry = zip.getEntry("META-INF/native/$relative")
-                        ?: throw GradleException("Runtime JAR is missing $relative")
-                    val bytes = zip.getInputStream(entry).use { it.readAllBytes() }
-                    if (elfMachine(bytes) != spec.elfMachine) {
-                        throw GradleException("Runtime JAR contains the wrong architecture at $relative")
-                    }
-                    verifyLibc(bytes, spec.libc, "Runtime JAR entry $relative")
-                    if (recorded[relative] != sha256(bytes)) {
-                        throw GradleException("Runtime JAR checksum mismatch for $relative")
-                    }
-                }
-            }
-            val expectedEntries = nativePlatforms.keys.flatMap { platform ->
-                nativeFileNames.map { "$platform/$it" }
-            }.toSet()
-            if (recorded.keys != expectedEntries) {
-                throw GradleException("Native checksum manifest has missing or unexpected entries")
-            }
+val verifyRuntimeJar =
+    tasks.register<VerifyAgentJar>("verifyRuntimeJar") {
+        description = "Checks bundled native entries, ELF architectures, C libraries, licenses, and recorded SHA-256 digests."
+        jar = agentJar
+        label = "Agent JAR"
+        platforms = nativePlatforms
+        requiredEntries =
             listOf(
                 "META-INF/LICENSE",
-                "META-INF/licenses/async-profiler-LICENSE"
-            ).forEach { name ->
-                if (zip.getEntry(name) == null) {
-                    throw GradleException("Runtime JAR is missing $name")
-                }
-            }
-        }
+                "META-INF/licenses/async-profiler-LICENSE",
+                "io/github/lhotari/jonoffcpu/internal/shaded/gson/Gson.class",
+                "io/github/lhotari/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
+                "io/github/lhotari/jonoffcpu/internal/shaded/snakeyaml/Yaml.class",
+            )
+        forbiddenPrefixes =
+            listOf(
+                // Unrelocated dependencies, the async-profiler Java API, and the offline correlator's classes.
+                "com/google/gson/",
+                "org/yaml/snakeyaml/",
+                "com/google/protobuf/",
+                "one/profiler/",
+                "io/github/lhotari/jonoffcpu/offline/",
+                "io/github/lhotari/jonoffcpu/jfr/",
+                "org/openjdk/jmc/",
+            )
     }
+tasks.check {
+    dependsOn(verifyRuntimeJar)
 }
 
-val fixtureMains = mapOf(
-    "SignalCaptureController" to "io.github.lhotari.jonoffcpu.agent.SignalCaptureControllerTest",
-    "NativeLibc" to "io.github.lhotari.jonoffcpu.agent.NativeLibcTest"
-)
-val fixtureTasks = fixtureMains.map { (taskName, className) ->
-    tasks.register<JavaExec>("test$taskName") {
-        group = "verification"
-        dependsOn(jar, tasks.named("testClasses"))
-        classpath = files(sourceSets.test.get().runtimeClasspath, jar.flatMap { it.archiveFile })
-        mainClass = className
-        jvmArgs("-ea")
-    }
+val fixtureClasspath = files(sourceSets.test.map { it.runtimeClasspath }, agentJar)
+
+tasks.register<FixtureExec>("testSignalCaptureController") {
+    classpath = fixtureClasspath
+    mainClass = "io.github.lhotari.jonoffcpu.agent.SignalCaptureControllerTest"
 }
 
-val testShadedAgentJar = tasks.register<JavaExec>("testShadedAgentJar") {
-    group = "verification"
+tasks.register<FixtureExec>("testNativeLibc") {
+    classpath = fixtureClasspath
+    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeLibcTest"
+}
+
+tasks.register<FixtureExec>("testShadedAgentJar") {
     description = "Exercises relocated YAML parsing from the published agent JAR."
-    dependsOn(jar, tasks.named("testClasses"))
-    classpath = files(sourceSets.test.get().output, jar.flatMap { it.archiveFile })
+    classpath = files(sourceSets.test.map { it.output }, agentJar)
     mainClass = "io.github.lhotari.jonoffcpu.agent.ShadedAgentJarTest"
-    jvmArgs("-ea")
 }
 
-val testNativeCollectorJni = tasks.register<JavaExec>("testNativeCollectorJni") {
-    group = "verification"
-    dependsOn(jar, tasks.named("testClasses"), verifyNativeArchitectures)
-    classpath = files(sourceSets.test.get().runtimeClasspath, jar.flatMap { it.archiveFile })
+tasks.register<FixtureExec>("testNativeCollectorJni") {
+    dependsOn(verifyNativeArchitectures)
+    classpath = fixtureClasspath
     mainClass = "io.github.lhotari.jonoffcpu.agent.NativeCollectorJniTest"
-    jvmArgs("-ea")
-    onlyIf("selected native platforms include the current host") {
-        nativePlatforms.containsKey(hostPlatform.get())
-    }
-    doFirst {
-        setArgs(listOf(nativeRoot.get().dir(hostPlatform.get()).file("libjonoffcpu.so").asFile.absolutePath))
-    }
-}
-
-val testNativeBundleLoader = tasks.register<JavaExec>("testNativeBundleLoader") {
-    group = "verification"
-    description = "Extracts the host bundle from the JAR and exercises async-profiler through the native C API."
-    dependsOn(jar, tasks.named("testClasses"))
-    classpath = files(sourceSets.test.get().runtimeClasspath, jar.flatMap { it.archiveFile })
-    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeBundleLoaderTest"
-    jvmArgs("-ea")
-    onlyIf("selected native platforms include the current host") {
-        nativePlatforms.containsKey(hostPlatform.get())
-    }
-}
-
-tasks.named("test") {
-    enabled = false
-}
-tasks.named("check") {
-    dependsOn(
-        fixtureTasks,
-        testShadedAgentJar,
-        testNativeCollectorJni,
-        testNativeBundleLoader,
-        verifyRuntimeJar
+    args(
+        nativeRoot
+            .get()
+            .file("$hostPlatform/libjonoffcpu.so")
+            .asFile.absolutePath,
     )
+    // A local copy: a task action must not capture the build script itself.
+    val selected = hostPlatformSelected
+    onlyIf("selected native platforms include the current host") { selected }
 }
 
-mavenPublishing {
-    publishToMavenCentral()
-    // The base plugin leaves this property switch, which the release workflow sets, to the build script.
-    if (providers.gradleProperty("signAllPublications").map(String::toBoolean).getOrElse(false)) {
-        signAllPublications()
-    }
-    coordinates(project.group.toString(), "jonoffcpu-agent", project.version.toString())
-    pom {
-        name.set("jonoffcpu agent")
-        description.set("Self-contained Linux off-CPU profiling agent for the JVM.")
-        url.set("https://github.com/lhotari/jonoffcpu")
-        licenses {
-            license {
-                name.set("MIT License")
-                url.set("https://opensource.org/license/mit")
-                distribution.set("repo")
-            }
-        }
-        developers {
-            developer {
-                id.set("lhotari")
-                name.set("Lari Hotari")
-                email.set("lari+jonoffcpu@hotari.net")
-                url.set("https://github.com/lhotari")
-            }
-        }
-        scm {
-            connection.set("scm:git:https://github.com/lhotari/jonoffcpu.git")
-            developerConnection.set("scm:git:ssh://git@github.com/lhotari/jonoffcpu.git")
-            url.set("https://github.com/lhotari/jonoffcpu")
-        }
-    }
+tasks.register<FixtureExec>("testNativeBundleLoader") {
+    description = "Extracts the host bundle from the JAR and exercises async-profiler through the native C API."
+    classpath = fixtureClasspath
+    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeBundleLoaderTest"
+    // A local copy: a task action must not capture the build script itself.
+    val selected = hostPlatformSelected
+    onlyIf("selected native platforms include the current host") { selected }
 }

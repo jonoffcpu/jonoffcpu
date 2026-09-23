@@ -137,7 +137,8 @@ the build directory. The musl bundle is built in
 `jonoffcpu-agent/tools/Dockerfile.native-bundle-musl` and must keep depending
 only on musl itself.
 
-Java uses Palantir Java Format and Gradle Kotlin scripts use ktlint through Spotless. Run
+Java uses Palantir Java Format, and Gradle Kotlin scripts and the build-logic
+Kotlin sources use ktlint, through Spotless. Run
 `./gradlew spotlessApply` after editing Java and `./gradlew spotlessCheck` to
 verify formatting; the Java modules' `check` tasks already depend on this
 check.
@@ -186,10 +187,21 @@ and exact-cookie matches rather than only checking process exit status.
   correlator's names are the `OutputFiles` constants, and the agent derives
   its manifest and default JFR from the stem of `correlationOutput` via
   `ManifestStore.sibling`. Never spell an output name inline.
-- Declare every plugin version once, in the root build script, with
-  `apply false` for the ones the subprojects apply. Gradle gives a subproject
-  whose plugin set differs from its siblings' its own class loader, and the
-  publish plugin's shared build service then cannot cross that boundary.
+- Declare every library and plugin version once, in
+  `gradle/libs.versions.toml`. Modules apply the convention plugins in
+  `build-logic/` (`jonoffcpu.java-conventions`, `publish-conventions`,
+  `shaded-jar-conventions`, `protobuf-conventions`), which bring the
+  third-party plugins as dependencies, so every module loads them from one
+  class loader; the publish plugin's shared build service cannot cross class
+  loaders. Put logic shared by modules there, and task logic in typed tasks
+  under `build-logic/conventions/src/main/kotlin`.
+- The build runs with the configuration cache, configure-on-demand, the build
+  cache and parallel execution (`gradle.properties`). No project configures
+  another (depend on another project's task by path), task actions capture
+  only providers and plain values, never the build script, and configuration
+  reads inputs through providers or value sources. Check a build change with
+  `--configuration-cache-problems=warn` and by running it twice: the second run
+  must say `Reusing configuration cache`.
 - Keep public configuration, manifest, capture stream, report, and CLI changes backward
   compatible unless a format/version migration is designed and documented.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on

@@ -1,10 +1,20 @@
+pluginManagement {
+    // The convention plugins every module applies; see build-logic/.
+    includeBuild("build-logic")
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+dependencyResolutionManagement {
+    // Repositories are declared here, once; a module that declares its own is an error.
+    repositoriesMode = RepositoriesMode.FAIL_ON_PROJECT_REPOS
+    repositories {
+        mavenCentral()
+    }
+}
+
 rootProject.name = "jonoffcpu"
 
-include("jonoffcpu-agent")
-project(":jonoffcpu-agent").projectDir = file("jonoffcpu-agent")
-
-include("jonoffcpu-correlator")
-project(":jonoffcpu-correlator").projectDir = file("jonoffcpu-correlator")
-
-include("jonoffcpu-jfr-converter")
-project(":jonoffcpu-jfr-converter").projectDir = file("jonoffcpu-jfr-converter")
+include("jonoffcpu-agent", "jonoffcpu-correlator", "jonoffcpu-jfr-converter")

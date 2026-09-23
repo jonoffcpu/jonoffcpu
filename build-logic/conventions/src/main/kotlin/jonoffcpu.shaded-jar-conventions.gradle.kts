@@ -1,0 +1,67 @@
+import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
+
+// A self-contained module: its runtime libraries, declared in `embeddedRuntime`, are verified against pinned
+// SHA-256 digests (`verifyDependencyDigests.digests`), relocated into the module's own package by the module's
+// shadowJar configuration, and embedded in the one JAR that is built and published. The module adds its relocations,
+// manifest entries and any further contents.
+plugins {
+    id("jonoffcpu.publish-conventions")
+    id("com.gradleup.shadow")
+}
+
+val embeddedRuntime =
+    configurations.create("embeddedRuntime") {
+        isTransitive = false
+        isCanBeConsumed = false
+    }
+configurations.compileOnly {
+    extendsFrom(embeddedRuntime)
+}
+configurations.testImplementation {
+    extendsFrom(embeddedRuntime)
+}
+
+val verifyDependencyDigests =
+    tasks.register<VerifyDependencyDigests>("verifyDependencyDigests") {
+        group = "verification"
+        description = "Checks the exact embedded artifacts against their pinned SHA-256 digests before embedding them."
+        artifacts.from(embeddedRuntime)
+    }
+
+// The plain JAR is never published or consumed; the shaded JAR is the only artifact.
+tasks.named<Jar>("jar") {
+    enabled = false
+}
+
+tasks.named<ShadowJar>("shadowJar") {
+    dependsOn(verifyDependencyDigests)
+    archiveClassifier = ""
+    configurations = listOf(embeddedRuntime)
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    isPreserveFileTimestamps = false
+    isReproducibleFileOrder = true
+    // The bundled libraries' Maven descriptors and ProGuard rules describe their original,
+    // unrelocated coordinates and packages, so they are misleading inside the shaded JAR.
+    exclude("META-INF/maven/**", "META-INF/proguard/**")
+    manifest {
+        attributes(
+            "Implementation-Title" to project.name,
+            "Implementation-Version" to project.version.toString(),
+        )
+    }
+    from(isolated.rootProject.projectDirectory.file("LICENSE")) {
+        into("META-INF")
+    }
+}
+
+// The plain JAR neither embeds nor declares its relocated dependencies, so the shaded JAR is the only usable
+// artifact. Publishing the Shadow plugin's component makes it the module's sole runtime variant: a consumer that
+// asks for nothing in particular gets it, since Gradle accepts a shadowed variant when no external one exists.
+// The module has no separate API, so no apiElements is published.
+publishing {
+    publications.register<MavenPublication>("maven") {
+        from(components["shadow"])
+        artifact(tasks.named("sourcesJar"))
+        artifact(tasks.named("javadocJar"))
+    }
+}
