@@ -71,7 +71,8 @@ produces. Without a subcommand it correlates, with the options below.
 Commands:
   correlate  Correlates a capture with its JFR into a new output directory (the default command).
   stacks     Renders one collapsed slice of a stack profile: by switch-out reason, stack kinds,
-               weights and time part, keeping or dropping whole intervals by their frames.
+               weights and time part, keeping or dropping whole intervals by their frames and
+               transforming the frames of the ones it keeps.
   merge      Sums the counters of several stack profiles into one. Thinned profiles cannot be
                merged.
   export     Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.

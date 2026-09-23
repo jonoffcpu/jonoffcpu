@@ -113,7 +113,7 @@ public final class CommandLineTest {
                 "o.collapsed",
                 "--package-names",
                 "short");
-        usageError("Missing required option: '--profile=FILE'", "stacks", "--output", "o.collapsed");
+        usageError("Give exactly one of --profile and --collapsed-input", "stacks", "--output", "o.collapsed");
         usageError("Missing required option: '--source=FILE'", "--jfr", "x.jfr", "--output", "out");
         usageError("Missing required option: '--jfr=FILE'", "correlate", "--source", "x.pb", "--output", "out");
         usageError("should be specified only once", "--source", "a", "--source", "b");

@@ -650,6 +650,16 @@ java -jar jonoffcpu-correlator.jar stacks \
 java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
   --package-names abbreviate --output short.collapsed
+
+# Busy waits only, each stack from your first frame to the lock or monitor it waited on
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude-from preset:jvm-idle --root-at '^com\.example\.' \
+  --collapse-leaf-from preset:jvm-wait-machinery --output busy-app.collapsed
+
+# The same transforms on any collapsed file, such as the recording's CPU view
+java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
+  --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
@@ -703,6 +713,27 @@ per line, and add them to any given with `--include`/`--exclude`; both repeat.
 Blank lines and lines starting with `#` are skipped (write `\#` for a pattern
 that starts with `#`), and every other line is taken verbatim, spaces included.
 A file with no patterns, or with an invalid one, is refused, naming the line.
+
+Filters keep or drop whole intervals; transforms change the frames of the
+intervals kept, and never a total. `--trim-root` strips the longest root-side
+run of matching frames (thread, executor and event-loop entry points),
+`--root-at` starts each stack at its root-most matching frame and puts stacks
+without one under `[no application frame]`, `--leaf-at` cuts below the
+leaf-most match, `--collapse-leaf` replaces the lock, park and monitor
+internals under a wait with the frame that entered them (or a category such as
+`[lock]` with `--collapse-leaf-label category`), `--hide` removes matching
+frames anywhere, `--canonical-names` removes generated-class addresses so two
+runs compare, and `--thread-frame name|pool` starts each line with the thread
+or its pool. Each has a `-from FILE` form, and every `-from` option, the
+filters' included, also takes a bundled `preset:jvm-infra`,
+`preset:jvm-wait-machinery` or `preset:jvm-idle` (`stacks --list-presets`).
+Filters always see the untransformed stack. On an Apache Pulsar broker's busy
+waits, `--root-at` with `--collapse-leaf` turns 164 lines at a mean depth of 23
+frames into 78 lines of about 4. `--collapsed-input FILE` applies the same
+filters and transforms to any collapsed file, such as the converter's CPU or
+allocation view, whose `_[j]`-style markers and `/`-separated class names it
+normalizes; the order and every rule are in
+[OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#transforms).
 
 Profiles merge and export as well:
 

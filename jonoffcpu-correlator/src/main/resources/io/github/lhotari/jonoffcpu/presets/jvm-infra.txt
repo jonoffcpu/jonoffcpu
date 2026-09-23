@@ -1,0 +1,12 @@
+# jvm-infra: how a thread got to the application code - thread entry points, JDK executors and
+# fork/join workers, and Netty's event-loop and inbound-pipeline plumbing (epoll and NIO).
+# For --trim-root (strip this prefix) or --hide (remove these frames anywhere).
+#
+# Only the root-side run is removed by --trim-root, so an application call into one of these
+# classes keeps its frames. Other transports (io_uring, KQueue) are not covered yet.
+^java\.lang\.Thread\.(run|runWith)$
+^java\.util\.concurrent\.(ThreadPoolExecutor\$Worker\.run|ThreadPoolExecutor\.runWorker|FutureTask\.run|ScheduledThreadPoolExecutor\$ScheduledFutureTask\.run|Executors\$RunnableAdapter\.call|ForkJoinWorkerThread\.run|ForkJoinPool\.(runWorker|scan)|ForkJoinPool\$WorkQueue\.topLevelExec|ForkJoinTask\.doExec|CompletableFuture\$(AsyncRun|AsyncSupply)\.(run|exec))$
+^io\.netty\.util\.concurrent\.(FastThreadLocalRunnable\.run|SingleThreadEventExecutor(\$\d+)?\.(run|runAllTasks\w*)|AbstractEventExecutor\.(safeExecute|runTask)|DefaultThreadFactory\$DefaultRunnableDecorator\.run)$
+^io\.netty\.util\.internal\.ThreadExecutorMap\$\d+\.run$
+^io\.netty\.channel\.(SingleThreadIoEventLoop(\$\d+)?\.(run|runIo)|epoll\.EpollIoHandler(\$DefaultEpollIoRegistration)?\.(run|processReady|handle)|epoll\.AbstractEpollChannel\$AbstractEpollUnsafe\.handle|epoll\.AbstractEpollStreamChannel\$EpollStreamUnsafe\.epollInReady|nio\.NioEventLoop\.(run|processSelectedKeys\w*)|DefaultChannelPipeline(\$HeadContext)?\.(fireChannelRead|channelRead|fireChannelReadComplete)|AbstractChannelHandlerContext\.(fireChannelRead|invokeChannelRead|fireChannelReadComplete|invokeChannelReadComplete))$
+^io\.netty\.handler\.codec\.ByteToMessageDecoder\.(channelRead|callDecode|fireChannelRead|decodeRemovalReentryProtection)$

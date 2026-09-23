@@ -1,0 +1,19 @@
+# jvm-wait-machinery: the frames underneath a wait that are the same for every wait of its kind -
+# JDK locks and parking, Object.wait, Thread.sleep, HotSpot's monitor entry, and the JVM, libc
+# and kernel frames below them. For --collapse-leaf, which replaces the longest leaf-side run of
+# these frames with the run's entry frame (ReentrantLock.lock, C2 Runtime complete_monitor_locking).
+#
+# The libjvm.so and libc.so.6 lines match only symbolized native frames (glibc images). On musl
+# every native frame is /lib/ld-musl-<arch>.so.1, which the ld-musl line matches instead.
+^java\.util\.concurrent\.locks\.
+^java\.util\.concurrent\.ForkJoinPool\.(managedBlock|unmanagedBlock)$
+^java\.util\.concurrent\.CompletableFuture\$Signaller\.block$
+^jdk\.internal\.misc\.Unsafe\.park$
+^java\.lang\.Object\.wait0?$
+^java\.lang\.Thread\.(sleep|sleepNanos0?|onSpinWait)$
+^C[12] Runtime (complete_monitor_locking|monitorenter)
+^libjvm\.so\.
+^libc\.so\.6\.
+^/lib/ld-musl-
+^\[vdso\]$
+_\[k\]$

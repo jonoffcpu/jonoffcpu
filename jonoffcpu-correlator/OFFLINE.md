@@ -273,6 +273,12 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--summary S]
     [--include REGEX]... [--exclude REGEX]...
     [--include-from FILE]... [--exclude-from FILE]...
+    [--canonical-names] [--hide REGEX]... [--trim-root REGEX]...
+    [--root-at REGEX]... [--root-at-unmatched bucket|keep] [--leaf-at REGEX]...
+    [--collapse-leaf REGEX]... [--collapse-leaf-label frame|category]
+    [--thread-frame none|name|pool]    (each REGEX option also has a -from FILE form)
+java -jar jonoffcpu-correlator.jar stacks --collapsed-input C --output F [filters and transforms]
+java -jar jonoffcpu-correlator.jar stacks --list-presets
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
 ```
@@ -290,6 +296,59 @@ each line in a `[sleeping]`, `[runqueue]` or `[unsplit]` frame. Every mode but
 reason only when it contributes to the selected part. The `--summary` file names
 the `time` part and carries `unsplitNanos`, the kept entries' unsplit time, which
 a `sleeping` or `runqueue` slice leaves out.
+
+### Transforms
+
+Filters decide which entries a slice keeps; transforms change what a kept
+entry's Java stack looks like. They run per entry after the filters, which
+therefore always match the full, untransformed stacks, in this order:
+
+1. `--canonical-names` removes generated-class addresses (`$$Lambda.0x…`,
+   `$$Lambda$14/0x…`, `LambdaForm$MH/0x…`, `LambdaForm$DMH/0x…`), so runs compare.
+2. `--hide` removes every matching frame anywhere; a stack of nothing else
+   keeps its leaf.
+3. `--trim-root` removes the longest root-side run of matching frames; the
+   run stops at the first frame that does not match, so deeper matches stay,
+   and a stack that matches throughout keeps its leaf.
+4. `--root-at` starts the stack at its root-most matching frame. A stack
+   without one becomes the single frame `[no application frame]`, or stays as
+   it is with `--root-at-unmatched keep`.
+5. `--leaf-at` cuts the callees of the leaf-most matching frame and keeps the
+   match; a stack without one is unchanged.
+6. `--collapse-leaf` replaces the longest leaf-side run of matching frames by
+   the run's root-most frame, or with `--collapse-leaf-label category` by the
+   category of that frame: `[kernel]`, `[monitor]`, `[park]`, `[wait]`,
+   `[sleep]`, `[lock]` or `[native]`, and the frame itself when none applies.
+
+`--package-names` and `--thread-frame` (the thread's name, or its pool with
+every digit run replaced by `#`, as a frame after any reason frame) are then
+applied as display. With `--stack java+kernel` or `java+user+kernel` the native
+stacks are appended unchanged after the transformed Java stack. Lines that read
+the same after transforming merge, adding their intervals and nanoseconds, so
+no transform changes a total. Each `REGEX` option repeats, and has a
+`-from FILE` form that reads patterns as `--exclude-from` does. Every `-from`
+option, the filters' included, also accepts `preset:NAME`, a list bundled with
+the correlator: `jvm-infra` (thread, executor and Netty entry points, for
+`--trim-root` or `--hide`), `jvm-wait-machinery` (lock, park and monitor
+internals down to libc and the kernel, for `--collapse-leaf`) and `jvm-idle`
+(waits for work, for `--exclude-from`); `stacks --list-presets` prints them with
+their caveats. When any transform is in effect the `--summary` file gains a
+`transforms` object: each option with its patterns and their source (`inline`, a
+file, or `preset:NAME`), `linesBefore`/`linesAfter`, the weight-averaged depth
+`framesBefore`/`framesAfter`, and for `--root-at` the `noApplicationFrame`
+weight and share.
+
+`--collapsed-input FILE` takes any collapsed file instead of a profile — a CPU,
+wall, allocation or lock view the converter wrote, or a jonoffcpu collapsed
+file — through the same filters, transforms and `--package-names`. The
+converter's Java frames lose their compilation marker (`_[j]`, `_[i]`, `_[0]`,
+`_[1]`) and the `/` of their class names; every other frame is kept verbatim.
+In a file with such markers every unmarked frame is native; in one without them
+a frame is native when its name contains `::`, `.so.` or a space, starts with
+`/` or `[`, or ends with `_[k]`. Weights keep the file's unit, integer or
+decimal, and the summary says `input: collapsed`. `--reason`, `--stack`,
+`--weights`, `--time`, `--reason-frame` and `--thread-frame` need a profile and
+are refused.
 
 `--package-names abbreviate` cuts each package segment of a Java frame to its
 first letter (`io.netty.channel.epoll.Native.epollWait0` becomes
