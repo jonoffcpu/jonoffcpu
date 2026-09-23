@@ -19,6 +19,10 @@
 #define JONOFFCPU_REASON_RUNNABLE 2
 #define JONOFFCPU_REASON_PREEMPTED 3
 
+/* Where the run-queue part of an interval comes from. Off reads nothing. */
+#define JONOFFCPU_TIME_SPLIT_OFF 0
+#define JONOFFCPU_TIME_SPLIT_SCHED_INFO 1
+
 struct jonoffcpu_target_binding {
     __u64 registration_token;
     __u64 process_generation_ns;
@@ -29,6 +33,8 @@ struct jonoffcpu_thread_state {
     __u64 start_monotonic_ns;
     __u64 thread_generation_ns;
     /* The raw task state sched_switch reported; 0 is TASK_RUNNING. */
+    /* The scheduler's cumulative sched_info.run_delay at switch-out. */
+    __u64 run_delay_at_switch_out;
     __u32 prev_task_state;
     __u8 reason;
     __u8 preempted;
@@ -55,7 +61,11 @@ struct jonoffcpu_observation {
     __u32 prev_task_state;
     __u8 reason;
     __u8 preempted;
-    __u8 reserved[2];
+    /* Whether runqueue_ns carries the interval's run-queue time. */
+    __u8 has_runqueue;
+    __u8 reserved;
+    /* The growth of sched_info.run_delay across the interval. */
+    __u64 runqueue_ns;
 };
 
 struct jonoffcpu_stats {
@@ -83,6 +93,9 @@ struct jonoffcpu_stats {
     __u64 switch_outs_preempted;
     __u64 reason_rejections;
     __u64 reason_rejected_duration_us;
+    /* Run-queue readings dropped because sched_info.run_delay went backwards
+     * across the interval; the interval is then recorded unsplit. */
+    __u64 runqueue_inversions;
 };
 
 #endif

@@ -126,4 +126,26 @@ record CorrelationResult(
     BigInteger selectedObservedDuration() {
         return BigInteger.valueOf(selectedObservedDurationNanos);
     }
+
+    /** The capture's run-queue source; {@code captureStart} was validated when it was read. */
+    TimeSplit.Source timeSplit() {
+        try {
+            return TimeSplit.source(capture.start);
+        } catch (java.io.IOException impossible) {
+            throw new IllegalStateException(impossible);
+        }
+    }
+
+    /** Splits a source slot's clipped interval into {@code parts}: sleeping, run queue, unsplit. */
+    TimeSplit.Outcome split(int sourceSlot, long[] parts) {
+        return TimeSplit.split(
+                sources.offCpuReason(sourceSlot),
+                sources.start(sourceSlot),
+                sources.end(sourceSlot),
+                sources.hasRunqueue(sourceSlot),
+                sources.runqueue(sourceSlot),
+                fromNanos(sourceSlot),
+                toNanos(sourceSlot),
+                parts);
+    }
 }

@@ -326,6 +326,7 @@ final class SignalCaptureController {
                         capture.signal(),
                         capture.delivery(),
                         config.sampling(),
+                        config.timeSplit(),
                         JsonSupport.requireNumber(prepared, "hostTgid", 1, 0xffffffffL),
                         config.targetPid(),
                         JsonSupport.requireObject(prepared, "verifiedIdentity"));
@@ -490,6 +491,7 @@ final class SignalCaptureController {
             analysisInputs.addProperty("sessionId", sessionId);
             analysisInputs.addProperty("targetPid", config.targetPid());
             analysisInputs.add("sampling", config.sampling().json());
+            analysisInputs.add("timeSplit", config.timeSplit().json());
             analysisInputs.add("jfrArtifact", jfrArtifact.json());
             JsonObject footer = new JsonObject();
             footer.addProperty("schemaVersion", ArtifactVerifier.SCHEMA_VERSION);
@@ -536,6 +538,7 @@ final class SignalCaptureController {
         value.addProperty("targetPid", config.targetPid());
         value.addProperty("outputPath", manifest.sourcePath().toString());
         value.add("sampling", config.sampling().json());
+        value.add("timeSplit", config.timeSplit().json());
         // prepare runs on the controller thread, whose profiler polls must not appear in its own capture.
         value.addProperty("excludeCallingThread", true);
         return value;
@@ -549,6 +552,7 @@ final class SignalCaptureController {
         value.addProperty("signal", capture.signal());
         value.addProperty("signalDelivery", capture.delivery());
         value.add("sampling", config.sampling().json());
+        value.add("timeSplit", config.timeSplit().json());
         return value;
     }
 
@@ -629,9 +633,12 @@ final class SignalCaptureController {
         }
     }
 
-    // The native collector echoes the sampling object it was prepared with; any drift is a protocol error.
+    // The native collector echoes the sampling and timeSplit objects it was prepared with; any drift is a protocol
+    // error.
     private void validateEffectivePolicy(JsonObject result) {
         JsonSupport.requireEqual("sampling", config.sampling().json(), JsonSupport.requireObject(result, "sampling"));
+        JsonSupport.requireEqual(
+                "timeSplit", config.timeSplit().json(), JsonSupport.requireObject(result, "timeSplit"));
     }
 
     private void requireCapture(CaptureProtocol.Active found) {
@@ -659,6 +666,7 @@ final class SignalCaptureController {
         value.addProperty("hostTgid", JsonSupport.requireNumber(prepared, "hostTgid", 1, 0xffffffffL));
         value.addProperty("targetPid", config.targetPid());
         value.add("sampling", config.sampling().json());
+        value.add("timeSplit", config.timeSplit().json());
         value.addProperty("monotonicOffsetNanos", JsonSupport.requireDecimal(identity, "monotonicOffsetNanos"));
         value.addProperty("clockVerified", JsonSupport.requireBoolean(identity, "clockVerified"));
         value.add("verifiedIdentity", identity.deepCopy());

@@ -121,6 +121,9 @@ def main():
     # The configuration names no reasons, so the resolved policy records blocked intervals only.
     if manifest.get("sampling", {}).get("reasons") != ["blocked"]:
         raise RuntimeError(f"Capture did not resolve the default switch-out reasons: {manifest_path}")
+    # Nor does it name a time-split source, so each interval's run-queue part is read from sched_info.
+    if manifest.get("timeSplit") != {"source": "schedInfo"}:
+        raise RuntimeError(f"Capture did not resolve the default time-split source: {manifest_path}")
 
     run(
         [
@@ -171,6 +174,37 @@ def main():
     )
     if (output / "rendered.collapsed").read_bytes() != (output / "analysis/jonoffcpu-offcpu-stacks.collapsed").read_bytes():
         raise RuntimeError("The stack profile does not reproduce the collapsed stacks")
+
+    # Every matched interval carries its run-queue part, so its time splits into sleeping and run-queue time.
+    time_split = reasons.get("timeSplit", {})
+    if time_split.get("source") != "schedInfo" or time_split.get("available") is not True:
+        raise RuntimeError(f"The report does not announce the time split: {report_path}")
+    unsplit = time_split.get("unsplitIntervals", {})
+    if int(unsplit.get("withoutReading", -1)) != 0 or int(unsplit.get("readingExceedsInterval", -1)) != 0:
+        raise RuntimeError(f"Matched intervals were left unsplit: {report_path}")
+    blocked = matched_by_reason["blocked"]
+    if int(blocked["sleepingNanos"]) + int(blocked["runqueueNanos"]) != int(blocked["observedNanos"]):
+        raise RuntimeError(f"Blocked sleeping and run-queue time do not add up: {report_path}")
+    # The split slice renders the same total, one [sleeping] or [runqueue] leaf per part.
+    totals = {}
+    for time in ("total", "split"):
+        run(
+            [
+                *common,
+                java, "-jar", "/artifacts/jonoffcpu-correlator.jar", "stacks",
+                "--profile", "/out/analysis/jonoffcpu-offcpu-profile.pb",
+                "--time", time,
+                "--output", f"/out/{time}.collapsed",
+                "--summary", f"/out/{time}.summary.json",
+            ],
+            output / f"stacks-{time}.log",
+        )
+        totals[time] = json.loads((output / f"{time}.summary.json").read_text())["totalNanos"]
+    if totals["split"] != totals["total"]:
+        raise RuntimeError(f"The split slice does not add up to the total: {totals}")
+    split_lines = (output / "split.collapsed").read_text().splitlines()
+    if not split_lines or not all(";[sleeping] " in line or ";[runqueue] " in line for line in split_lines):
+        raise RuntimeError("The split slice has lines without a sleeping or run-queue leaf")
 
     print(
         f"Packaged agent and correlator smoke passed on {platform.machine()} ({args.libc}): "

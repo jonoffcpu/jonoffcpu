@@ -117,6 +117,7 @@ fn main() -> Result<()> {
                     "probabilityThreshold": 4_294_967_296_u64,
                 },
             },
+            "timeSplit": {"source": "schedInfo"},
         })
         .to_string();
         jonoffcpu_collector_prepare(request.as_ptr().cast(), request.len(), out)

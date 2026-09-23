@@ -177,6 +177,19 @@ public final class OfflineCorrelatorTest {
             int schemaVersion,
             JsonObject extraKernelCounters)
             throws IOException {
+        return source(dir, jfr, observations, sampling, schemaVersion, extraKernelCounters, null);
+    }
+
+    /** As above, with a version 4 capture's {@code timeSplit} block when it is non-null. */
+    static Path source(
+            Path dir,
+            Path jfr,
+            List<JsonObject> observations,
+            JsonObject sampling,
+            int schemaVersion,
+            JsonObject extraKernelCounters,
+            JsonObject timeSplit)
+            throws IOException {
         List<JsonObject> samples = new ArrayList<>();
         List<JsonObject> statsRows = new ArrayList<>();
         SignalJfrExporter.visit(jfr, raw -> {
@@ -192,6 +205,7 @@ public final class OfflineCorrelatorTest {
         start.addProperty("hostTgid", 123);
         start.addProperty("targetPid", ProcessHandle.current().pid());
         start.add("sampling", sampling);
+        if (timeSplit != null) start.add("timeSplit", timeSplit);
         start.addProperty("processGenerationNs", "100");
         start.addProperty("timeNamespaceInode", "42");
         start.addProperty("pidNamespaceDevice", "4");

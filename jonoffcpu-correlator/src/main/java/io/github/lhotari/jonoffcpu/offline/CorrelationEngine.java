@@ -26,7 +26,7 @@ import java.util.Map;
  * Streams a finalized capture and its combined JFR into primitive columns, joins them on the exact
  * 64-bit cookie, and accumulates duration-weighted stacks per interned stack id.
  *
- * <p>Nothing per-row survives the pass: an observation becomes 51 bytes of columns, a sample 38
+ * <p>Nothing per-row survives the pass: an observation becomes 59 bytes of columns, a sample 38
  * plus a dictionary id, and the two audit files are written by re-reading the files afterwards.
  * Validation is unchanged, only relocated: every constant an observation is checked against comes
  * from {@code captureStart}, which the reader delivers before the first observation, and the one
@@ -69,6 +69,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private long registrationToken;
     private long startedMonotonicNanos;
     private SamplingPolicy sampling;
+    private TimeSplit.Source timeSplit;
 
     private CorrelationEngine(
             OfflineCorrelator.Limits limits,
@@ -165,6 +166,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         registrationToken = Long.parseUnsignedLong(text(captureStart, "registrationToken"), 16);
         startedMonotonicNanos = U64.requireSigned(decimal(captureStart, "startedMonotonicNanos"), "captureStart");
         sampling = SamplingPolicy.parse(object(captureStart, "sampling"));
+        timeSplit = TimeSplit.source(captureStart);
     }
 
     @Override
@@ -210,6 +212,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
         if (switchOut == null) switchOut = OffCpuReason.UNSPECIFIED;
         boolean policyMismatch = classificationMismatch
+                // Only a capture that reads the scheduler's run delay may carry a run-queue part.
+                || observation.hasRunqueueNanos() && !timeSplit.available()
                 || targetTgid != targetPid
                 || Integer.toUnsignedLong(observation.getHostTgid()) != hostTgid
                 // The kernel recorded the threshold it drew against; it must be the policy's for this length.
@@ -250,7 +254,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 switchOut,
                 observation.getPrevTaskState(),
                 stackColumn(observation.getKernelStackId(), observation.getKernelStackError()),
-                stackColumn(observation.getUserStackId(), observation.getUserStackError()));
+                stackColumn(observation.getUserStackId(), observation.getUserStackError()),
+                observation.hasRunqueueNanos(),
+                observation.getRunqueueNanos());
         if (sources.size() % WATERMARK_ROWS == 0) {
             try {
                 budget.structures(retainedBytes());
@@ -458,6 +464,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         long[][] collapsedNanosByReason = new long[OffCpuReason.values().length][];
         long[] stackNanos = new long[dictionaries.stackCount()];
         ProfileAccumulator profile = new ProfileAccumulator(profileOptions);
+        long[] parts = new long[3];
         long total = 0;
         int matched = 0;
         int unverified = 0;
@@ -527,6 +534,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             stackNanos[stackId] = U64.add(stackNanos[stackId], duration, "Selected duration");
             int collapsed = dictionaries.collapsedOf(stackId);
             OffCpuReason switchOut = sources.offCpuReason(slot);
+            TimeSplit.split(switchOut, start, end, sources.hasRunqueue(slot), sources.runqueue(slot), from, to, parts);
             if (duration > 0) {
                 collapsedNanos[collapsed] = U64.add(collapsedNanos[collapsed], duration, "Selected duration");
                 long[] byReason = collapsedNanosByReason[switchOut.ordinal()];
@@ -542,7 +550,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                     switchOut,
                     sources.taskState(slot),
                     dictionaries.thread(samples.threadId(sample)).name(),
-                    duration,
+                    parts,
                     sources.threshold(slot));
         }
         capture.budget.structures(retainedBytes() + profile.retainedBytes());

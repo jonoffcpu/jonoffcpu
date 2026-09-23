@@ -83,6 +83,7 @@ final class ManifestStore {
         profiler.addProperty("protocol", "signal-capture-v1");
         root.add("asyncProfiler", profiler);
         root.add("sampling", config.sampling().json());
+        root.add("timeSplit", config.timeSplit().json());
 
         JsonObject threads = new JsonObject();
         threads.addProperty("schemaVersion", 1);

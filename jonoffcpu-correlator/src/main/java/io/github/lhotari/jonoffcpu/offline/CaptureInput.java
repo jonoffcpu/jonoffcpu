@@ -32,11 +32,13 @@ import java.util.UUID;
 /** Validates a finalized source stream and its self-contained receipt before correlation. */
 final class CaptureInput {
     static final BigInteger U64_MAX = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
-    /** Version 2 interns stacks: each distinct stack is one record that observations reference by id. */
-    /** Version 2 interns stacks; version 3 also classifies every observation by its switch-out reason. */
+    /**
+     * Version 2 interns stacks; version 3 also classifies every observation by its switch-out reason; version 4 adds
+     * {@code timeSplit} and each observation's run-queue part.
+     */
     private static final int OLDEST_SCHEMA_VERSION = 2;
 
-    private static final int SCHEMA_VERSION = 3;
+    private static final int SCHEMA_VERSION = 4;
 
     final JsonObject start;
     final JsonObject end;
@@ -233,6 +235,12 @@ final class CaptureInput {
                 SamplingPolicy.parse(object(start, "sampling")).classified() == (schemaVersion >= 3),
                 "Source schema/sampling reasons mismatch");
         require(object(start, "sampling").equals(object(inputs, "sampling")), "Source/footer mismatch: sampling");
+        // Version 4 always names its time-split source, an older capture never does, and the copies agree.
+        require(start.has("timeSplit") == (schemaVersion >= 4), "Source schema/timeSplit mismatch");
+        TimeSplit.source(start);
+        require(
+                java.util.Objects.equals(start.get("timeSplit"), inputs.get("timeSplit")),
+                "Source/footer mismatch: timeSplit");
         for (String key : List.of("pidNamespaceDevice", "pidNamespaceInode")) {
             require(decimal(start, key).signum() > 0, "Invalid source namespace: " + key);
         }

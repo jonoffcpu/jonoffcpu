@@ -43,7 +43,9 @@ struct Observation {
     prev_task_state: u32,
     reason: u8,
     preempted: u8,
-    reserved: [u8; 2],
+    has_runqueue: u8,
+    reserved: u8,
+    runqueue_ns: u64,
 }
 
 #[derive(Serialize)]

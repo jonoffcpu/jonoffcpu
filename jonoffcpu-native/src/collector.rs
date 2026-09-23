@@ -27,7 +27,8 @@ use std::time::{Duration, Instant};
 const SOURCE_ID: &str = "jonoffcpu.offcpu.v1";
 /// Version 2 interns stacks: each distinct stack is one `stack` record and observations reference it.
 /// Version 3 classifies every observation by its switch-out reason and adds `sampling.reasons`.
-const SCHEMA_VERSION: u32 = 3;
+/// Version 4 adds `timeSplit` and each observation's run-queue part.
+const SCHEMA_VERSION: u32 = 4;
 const MAX_CONTROL_JSON: usize = 64 * 1024;
 const DRAIN_QUIET_POLLS: usize = 2;
 const MAX_RING_BATCH: usize = 1024;
@@ -46,6 +47,7 @@ pub(crate) struct PrepareConfig {
     target_pid: u32,
     output_path: PathBuf,
     sampling: SamplingConfig,
+    time_split: TimeSplitConfig,
     /// The agent's controller thread calls prepare and later only polls the profiler; when set, that
     /// thread's own waits are left out of the capture like the collector's, so the profiler does not
     /// observe itself.
@@ -65,6 +67,65 @@ pub(crate) struct EnableConfig {
     signal_delivery: Option<String>,
     #[serde(default)]
     sampling: Option<SamplingConfig>,
+    #[serde(default)]
+    time_split: Option<TimeSplitConfig>,
+}
+
+/// Where each interval's run-queue part comes from. Echoed like `sampling`: it changes what is
+/// measured, not which intervals are kept, so it is a block of its own.
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TimeSplitConfig {
+    source: TimeSplitSource,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeSplitSource {
+    /// Nothing is read; observations carry no run-queue part.
+    #[serde(rename = "off")]
+    Off,
+    /// The growth of the scheduler's `task_struct.sched_info.run_delay` across the interval.
+    #[serde(rename = "schedInfo")]
+    SchedInfo,
+}
+
+impl TimeSplitConfig {
+    /// The kernel's `JONOFFCPU_TIME_SPLIT_*` value.
+    fn kernel_value(&self) -> u32 {
+        match self.source {
+            TimeSplitSource::Off => 0,
+            TimeSplitSource::SchedInfo => 1,
+        }
+    }
+
+    fn json(&self) -> Value {
+        serde_json::to_value(self).expect("time split config serializes")
+    }
+}
+
+/// Whether the running kernel keeps `task_struct.sched_info.run_delay` (`CONFIG_SCHED_INFO`).
+fn run_delay_available() -> Result<bool> {
+    use libbpf_rs::btf::types::Struct;
+    let btf = libbpf_rs::btf::Btf::from_vmlinux().context("load vmlinux BTF")?;
+    let Some(task) = btf.type_by_name::<Struct<'_>>("task_struct") else {
+        return Ok(false);
+    };
+    let Some(member) = task
+        .iter()
+        .find(|member| member.name.is_some_and(|name| name == "sched_info"))
+    else {
+        return Ok(false);
+    };
+    let Some(sched_info) = btf
+        .type_by_id::<libbpf_rs::btf::BtfType<'_>>(member.ty)
+        .map(|ty| ty.skip_mods_and_typedefs())
+        .and_then(|ty| Struct::try_from(ty).ok())
+    else {
+        return Ok(false);
+    };
+    Ok(sched_info
+        .iter()
+        .any(|member| member.name.is_some_and(|name| name == "run_delay")))
 }
 
 /// The resolved sampling policy. The same object is echoed verbatim in every control reply and
@@ -271,7 +332,9 @@ struct Observation {
     prev_task_state: u32,
     reason: u8,
     preempted: u8,
-    reserved: [u8; 2],
+    has_runqueue: u8,
+    reserved: u8,
+    runqueue_ns: u64,
 }
 
 #[repr(C)]
@@ -298,6 +361,7 @@ struct KernelStats {
     switch_outs_preempted: u64,
     reason_rejections: u64,
     reason_rejected_duration_us: u64,
+    runqueue_inversions: u64,
 }
 
 impl KernelStats {
@@ -342,6 +406,7 @@ impl KernelStats {
             "switchOutsPreempted": self.switch_outs_preempted.to_string(),
             "reasonRejections": self.reason_rejections.to_string(),
             "reasonRejectedDurationMicros": self.reason_rejected_duration_us.to_string(),
+            "runqueueInversions": self.runqueue_inversions.to_string(),
         })
     }
 }
@@ -1032,6 +1097,7 @@ fn prepare_internal(
         "targetPid": prepared.target_pid,
         "hostTgid": prepared.host_tgid,
         "sampling": prepared.sampling.json(),
+        "timeSplit": prepared.time_split.json(),
         "verifiedIdentity": {
             "registrationToken": format!("{:016x}", prepared.registration_token),
             "processGenerationNs": prepared.process_generation_ns.to_string(),
@@ -1050,6 +1116,7 @@ struct PreparedReply {
     target_pid: u32,
     host_tgid: u32,
     sampling: SamplingConfig,
+    time_split: TimeSplitConfig,
     registration_token: u64,
     pid_namespace_device: u64,
     pid_namespace_inode: u64,
@@ -1277,6 +1344,13 @@ fn worker(
         .write_all(&capture::header())
         .context("write source artifact header")?;
 
+    // No silent fallback: a kernel without the accounting needs an explicit `off`.
+    if config.time_split.source == TimeSplitSource::SchedInfo && !run_delay_available()? {
+        bail!(
+            "timeSplit.source schedInfo needs task_struct.sched_info.run_delay (CONFIG_SCHED_INFO), \
+             which this kernel lacks; set timeSplit.source to off"
+        );
+    }
     let mut object = MaybeUninit::uninit();
     let open = JonoffcpuCookieSkelBuilder::default()
         .open(&mut object)
@@ -1400,6 +1474,7 @@ fn worker(
         target_pid: identity.target_pid,
         host_tgid: identity.host_tgid,
         sampling: config.sampling.clone(),
+        time_split: config.time_split.clone(),
         registration_token: identity.registration_token,
         pid_namespace_device: identity.pid_namespace_device,
         pid_namespace_inode: identity.pid_namespace_inode,
@@ -1920,6 +1995,14 @@ fn enable_capture(
         bail!("sampling differs from prepared policy");
     }
     enable.sampling = Some(prepare.sampling.clone());
+    if enable
+        .time_split
+        .as_ref()
+        .is_some_and(|value| *value != prepare.time_split)
+    {
+        bail!("timeSplit differs from prepared configuration");
+    }
+    enable.time_split = Some(prepare.time_split.clone());
     reset_stats(&skel.maps.stats)?;
     let wall_clock_calibration = capture_wall_clock_calibration()?;
     let started_ns = monotonic_ns()?;
@@ -1941,6 +2024,7 @@ fn enable_capture(
         bss.has_min_off_cpu = u32::from(prepare.sampling.min_off_cpu_micros.is_some());
         bss.has_max_off_cpu = u32::from(prepare.sampling.max_off_cpu_micros.is_some());
         bss.reason_mask = prepare.sampling.reason_mask();
+        bss.time_split_source = prepare.time_split.kernel_value();
         match prepare.sampling.admission {
             Admission::Uniform {
                 probability_threshold,
@@ -1984,6 +2068,7 @@ fn enable_capture(
         "pidNamespaceInode": identity.pid_namespace_inode.to_string(),
         "startedMonotonicNanos": started_ns.to_string(),
         "sampling": prepare.sampling.json(),
+        "timeSplit": prepare.time_split.json(),
         "loader": "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
         "hook": "tp_btf/sched_exit_tp",
         "switchOutHook": "tp_btf/sched_switch",
@@ -2017,6 +2102,7 @@ fn enable_capture(
         "targetPid": reply.target_pid,
         "hostTgid": reply.host_tgid,
         "sampling": reply.sampling.json(),
+        "timeSplit": reply.time_split.json(),
         "signalEnvironment": signal_environment,
         "verifiedIdentity": {
             "registrationToken": format!("{:016x}", reply.registration_token),
@@ -2313,6 +2399,7 @@ fn observation_record(
                 .map_or(0, |reason| i32::from(reason.kernel_value())),
             prev_task_state: Some(event.prev_task_state),
             preempted: Some(event.preempted != 0),
+            runqueue_nanos: (event.has_runqueue != 0).then_some(event.runqueue_ns),
         })),
     }
 }
@@ -2659,7 +2746,60 @@ mod tests {
             .unwrap()
             .extend(bounds.as_object().unwrap().clone());
         sampling["admission"] = admission;
-        json!({"targetPid":1,"outputPath":"/tmp/source.ndjson","sampling":sampling})
+        json!({
+            "targetPid":1,
+            "outputPath":"/tmp/source.ndjson",
+            "sampling":sampling,
+            "timeSplit":{"source":"schedInfo"}
+        })
+    }
+
+    /// The block is required, names one source, and round-trips to the object the agent sent.
+    #[test]
+    fn time_split_is_an_explicit_required_block() {
+        let uniform_one =
+            json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64});
+        let mut value = sampling_json(json!({}), uniform_one);
+        let parsed = parse_prepare(&value.to_string()).unwrap();
+        assert_eq!(parsed.time_split.source, TimeSplitSource::SchedInfo);
+        assert_eq!(parsed.time_split.kernel_value(), 1);
+        assert_eq!(parsed.time_split.json(), json!({"source":"schedInfo"}));
+        value["timeSplit"] = json!({"source":"off"});
+        let off = parse_prepare(&value.to_string()).unwrap();
+        assert_eq!(off.time_split.kernel_value(), 0);
+        assert_eq!(off.time_split.json(), json!({"source":"off"}));
+        for rejected in [
+            json!({"source":"wakeup"}),
+            json!({"source":"schedinfo"}),
+            json!({}),
+            json!({"source":"off","extra":1}),
+            json!("off"),
+        ] {
+            value["timeSplit"] = rejected.clone();
+            assert!(parse_prepare(&value.to_string()).is_err(), "{rejected}");
+        }
+        value.as_object_mut().unwrap().remove("timeSplit");
+        assert!(parse_prepare(&value.to_string()).is_err());
+    }
+
+    /// The ring record keeps the C layout, and the run-queue part reaches field 21 only when the
+    /// kernel marked it present.
+    #[test]
+    fn observation_carries_the_run_queue_part_only_when_present() {
+        assert_eq!(size_of::<Observation>(), 136);
+        let mut event: Observation = unsafe { std::mem::zeroed() };
+        event.reason = OffCpuReason::Blocked.kernel_value();
+        event.prev_task_state = 1;
+        event.runqueue_ns = 1234;
+        let runqueue = |event: &Observation| match observation_record(event, None, None).record {
+            Some(capture::record::Record::Observation(row)) => row.runqueue_nanos,
+            _ => panic!("not an observation"),
+        };
+        assert_eq!(runqueue(&event), None);
+        event.has_runqueue = 1;
+        assert_eq!(runqueue(&event), Some(1234));
+        event.runqueue_ns = 0;
+        assert_eq!(runqueue(&event), Some(0));
     }
 
     #[test]
@@ -3204,6 +3344,9 @@ mod tests {
             target_pid: dead_pid as u32,
             output_path: dead_path.clone(),
             sampling: privileged_sampling(),
+            time_split: TimeSplitConfig {
+                source: TimeSplitSource::SchedInfo,
+            },
             exclude_calling_thread: false,
             calling_tid: 0,
         })
@@ -3433,6 +3576,9 @@ mod tests {
             target_pid: unsafe { libc::getpid() as u32 },
             output_path: path,
             sampling: privileged_sampling(),
+            time_split: TimeSplitConfig {
+                source: TimeSplitSource::SchedInfo,
+            },
             exclude_calling_thread: false,
             calling_tid: 0,
         }
@@ -3458,6 +3604,7 @@ mod tests {
             signal: libc::SIGRTMIN() + 5,
             signal_delivery: Some("queued".to_string()),
             sampling: None,
+            time_split: None,
         }
     }
 

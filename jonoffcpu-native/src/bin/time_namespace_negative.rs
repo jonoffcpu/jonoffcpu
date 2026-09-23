@@ -20,6 +20,7 @@ fn main() -> Result<()> {
                 "probabilityThreshold": 1,
             },
         },
+        "timeSplit": {"source": "schedInfo"},
     })
     .to_string();
     let mut result = JonoffcpuResult::default();

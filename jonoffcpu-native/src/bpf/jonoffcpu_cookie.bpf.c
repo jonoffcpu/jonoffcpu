@@ -64,6 +64,20 @@ volatile __u32 target_namespace_tgid;
  * would otherwise be captured, signalled, and written back by itself. */
 volatile __u32 collector_tid;
 volatile __u32 agent_tid;
+/* JONOFFCPU_TIME_SPLIT_*: whether each interval also records its run-queue
+ * part, read from the scheduler's own per-task accounting. */
+volatile __u32 time_split_source;
+
+/* Local CO-RE flavours, so the object neither depends on the build host's
+ * vmlinux.h carrying sched_info nor fails to load on a kernel without
+ * CONFIG_SCHED_INFO; the collector refuses schedInfo there before loading. */
+struct sched_info___jonoffcpu {
+    unsigned long long run_delay;
+} __attribute__((preserve_access_index));
+
+struct task_struct___jonoffcpu {
+    struct sched_info___jonoffcpu sched_info;
+} __attribute__((preserve_access_index));
 
 static __always_inline struct jonoffcpu_stats *current_stats(void)
 {
@@ -91,6 +105,18 @@ static __always_inline struct jonoffcpu_target_binding *target_binding(
         __sync_val_compare_and_swap(&binding->host_tgid, 0, host_tgid);
     }
     return binding;
+}
+
+/* The scheduler adds each wait on a run queue to sched_info.run_delay when
+ * the task gets a CPU, before the switch-in hook runs; the difference across
+ * an interval is that interval's run-queue time, in rq_clock nanoseconds. */
+static __always_inline __u64 run_delay(struct task_struct *task)
+{
+    struct task_struct___jonoffcpu *flavour = (void *)task;
+
+    if (!bpf_core_field_exists(flavour->sched_info.run_delay))
+        return 0;
+    return BPF_CORE_READ(flavour, sched_info.run_delay);
 }
 
 static __always_inline __u32 allocate_sequence(struct jonoffcpu_stats *s)
@@ -175,6 +201,8 @@ int BPF_PROG(record_switch_out, bool preempt, struct task_struct *prev,
     initial.prev_task_state = prev_state;
     initial.reason = reason;
     initial.preempted = preempt ? 1 : 0;
+    initial.run_delay_at_switch_out =
+        time_split_source == JONOFFCPU_TIME_SPLIT_SCHED_INFO ? run_delay(task) : 0;
     /* The state is stored for every reason and filtered at switch-in: skipping
      * the store would leave an older start time behind for the next interval. */
     state = bpf_task_storage_get(&thread_states, task, &initial,
@@ -185,6 +213,7 @@ int BPF_PROG(record_switch_out, bool preempt, struct task_struct *prev,
         state->prev_task_state = initial.prev_task_state;
         state->reason = initial.reason;
         state->preempted = initial.preempted;
+        state->run_delay_at_switch_out = initial.run_delay_at_switch_out;
         if (s)
             __sync_fetch_and_add(&s->switch_outs, 1);
     } else {
@@ -222,6 +251,8 @@ int BPF_KPROBE(capture_switch_in)
     __u64 admission_threshold;
     __u64 cookie;
     __u64 registration_token;
+    __u64 runqueue_ns = 0;
+    __u8 has_runqueue = 0;
     __u32 sequence;
     struct bpf_pidns_info target_ids = {};
     long namespace_result;
@@ -256,6 +287,22 @@ int BPF_KPROBE(capture_switch_in)
     duration_us = duration_ns / 1000;
     if (!enabled)
         goto cleanup;
+    /* The run-queue part, taken before any filter so that every interval is
+     * read alike. It is the raw growth of run_delay, in rq_clock nanoseconds:
+     * rq_clock can be a little stale when a runnable task departs, so the value
+     * may exceed a runnable or preempted interval's bpf_ktime_get_ns duration by
+     * microseconds. The consumers apply the split rule; only a counter that went
+     * backwards is dropped here, and counted. */
+    if (time_split_source == JONOFFCPU_TIME_SPLIT_SCHED_INFO) {
+        __u64 delay = run_delay(task);
+
+        if (delay >= state->run_delay_at_switch_out) {
+            runqueue_ns = delay - state->run_delay_at_switch_out;
+            has_runqueue = 1;
+        } else if (s) {
+            __sync_fetch_and_add(&s->runqueue_inversions, 1);
+        }
+    }
     /* Reason filter, then duration bounds, then admission. */
     if (state->reason > JONOFFCPU_REASON_PREEMPTED ||
         !(reason_mask & (1U << state->reason))) {
@@ -324,6 +371,8 @@ int BPF_KPROBE(capture_switch_in)
     event->prev_task_state = state->prev_task_state;
     event->reason = state->reason;
     event->preempted = state->preempted;
+    event->has_runqueue = has_runqueue;
+    event->runqueue_ns = runqueue_ns;
     bpf_get_current_comm(event->comm, sizeof(event->comm));
     stack_id = bpf_get_stackid(ctx, &stack_traces, 0);
     event->kernel_stack_id = stack_id;

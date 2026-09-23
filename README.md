@@ -98,7 +98,8 @@ real duration and the flame graph's widths are microseconds of off-CPU time.
 `jonoffcpu` measures the whole interval, from switch-out to switch-in, so
 run-queue delay under CPU contention is included alongside sleeping. It also
 records *why* the thread left the CPU — it blocked, or it was still runnable —
-and by default records only the blocked intervals; see
+and by default records only the blocked intervals, and it splits each
+interval's time into the two states, sleeping and runnable on a run queue; see
 [Why the thread left the CPU](#why-the-thread-left-the-cpu).
 
 Further reading:
@@ -261,10 +262,41 @@ throttling, thread-pool sizing or IRQ load rather than to that code. Measured
 on a 16-CPU 7.1 kernel, more spinning threads than CPUs came back 2,861
 `runnable` against 2 `preempted`, so read the two together.
 
-The reason describes the *switch-out*, not a split of the interval's time. A
-`blocked` interval runs until the thread is switched back in, so it also
-contains the run-queue delay between its wakeup and its next turn on a CPU;
-the report says so, and splitting the two with `sched_wakeup` is future work.
+The reason describes the *switch-out*. A `blocked` interval runs until the
+thread is switched back in, so it holds two different waits: the time the
+thread slept until it was woken, and then the time it waited on a run queue for
+a CPU. `jonoffcpu` splits the two:
+
+| Part | What it is | Where it comes from |
+| --- | --- | --- |
+| **sleeping** | A `blocked` interval up to its wakeup (sometimes called blocking time) | `duration − runqueue` |
+| **runqueue** | Time runnable but waiting for a CPU: a `blocked` interval after its wakeup, and `runnable` and `preempted` intervals throughout | The growth of the scheduler's own `sched_info.run_delay` across the interval |
+
+The kernel already accounts for every task's run-queue wait in
+`task_struct.sched_info.run_delay` (the second field of
+`/proc/<pid>/schedstat`). The switch-out hook saves it and the switch-in hook
+reads it again, so the split costs two field reads in hooks that run anyway,
+with nothing new firing system-wide. A slow wakeup shows up as run-queue time:
+a sleeper at nice 19 sharing a CPU with three busy threads waited 1.4 ms for
+the CPU after each 1 ms sleep, against 0.1 µs when it had a CPU to itself.
+
+It needs a kernel built with `CONFIG_SCHED_INFO`, which mainstream
+distribution kernels enable through `CONFIG_TASK_DELAY_ACCT` or
+`CONFIG_SCHEDSTATS`; the accounting runs whether or not delay accounting or
+schedstats are switched on at runtime. On a kernel without it, the agent fails
+to start rather than recording without the split; set `timeSplit.source: off`
+to capture there anyway (see [Agent options](#agent-options)).
+
+An interval is left **unsplit**, never guessed, when there is no reading: in a
+capture recorded before the split existed, with `timeSplit.source: off`, when
+the counter went backwards, or for a `blocked` interval whose reading exceeds
+its duration. The scheduler's clock can be a few microseconds stale when a
+running thread is switched out, so a `runnable` or `preempted` interval's
+reading may slightly exceed its duration; those intervals are run-queue time
+throughout either way. For every interval, sleeping + runqueue + unsplit is
+exactly its duration, and the report's `offCpuReasons` gives the three per
+reason, with a `timeSplit` object naming the source and why any interval was
+left unsplit.
 
 The kernel keeps the original value (`prev_task_state`) and the `preempt` flag
 next to the reason, and the agent and the correlator recompute the reason from
@@ -598,6 +630,16 @@ java -jar jonoffcpu-correlator.jar stacks \
 java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
   --exclude 'io\.netty\.channel\.epoll\.Native\.epollWait0' --output app.collapsed
+
+# Only the time threads spent waiting for a CPU after they were woken
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --time runqueue --output runqueue.collapsed
+
+# Every interval, each stack ending in a [sleeping] or [runqueue] frame
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --time split --output split.collapsed
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
@@ -609,8 +651,12 @@ native frames are shown without their `+0x` offsets, kernel frames carry the
 `_[k]` suffix, and the profiler's own tracing frames at the leaf of a kernel
 stack are left out. `--weights estimated` renders the inverse-probability
 estimate instead of the observed durations, when the capture's population
-estimate is available. Rendered with its defaults, a profile reproduces
-`jonoffcpu-offcpu-stacks.collapsed` byte for byte.
+estimate is available. `--time` picks which part of each interval's time is
+weighed: `total` (the default), `sleeping`, `runqueue`, or `split`, which keeps
+the whole time and ends each line in a `[sleeping]`, `[runqueue]` or
+`[unsplit]` frame so one flame graph shows both waits; every mode but `total`
+needs a profile whose capture recorded the split. Rendered with its defaults, a
+profile reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 
 `--exclude REGEX` drops every interval with a frame matching the pattern, and
 `--include REGEX` keeps only intervals with one; both can be repeated (any
@@ -656,6 +702,7 @@ profiles cannot be merged, because each is rescaled by its own probability.
 | `sampling.admission.policy` | Required. `proportional`, `uniform`, or `none`. |
 | `sampling.admission.recordAllAboveMicros` | `proportional` only. Intervals at least this long are always recorded; shorter ones with probability `length / recordAllAboveMicros`. |
 | `sampling.admission.probability` | `uniform` only. `"0.000"` through `"1.000"`; every eligible interval is recorded with this probability. `"0"` is the same as policy `none`. Quote the value to keep its exact spelling in the capture metadata. |
+| `timeSplit.source` | `schedInfo` (default) records each interval's run-queue part from the scheduler's `sched_info.run_delay`, splitting its time into sleeping and run-queue time; `off` reads nothing, for a kernel without `CONFIG_SCHED_INFO`. See [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
 | `signalDelivery` | `queued` (default) uses a dedicated real-time signal and never merges notifications. `coalescing` uses a standard signal and may merge them, trading lost samples for a bounded pending-signal queue. |
 | `nativeStopTimeoutMillis` | Budget for detaching the eBPF source and draining the ring buffer at stop. Default 30000. |
 | `deliveryGraceMillis` | Time allowed after detach for already-requested signals to arrive. Default 100. |
@@ -746,8 +793,8 @@ else is paid only for intervals that are actually recorded:
 
 | Stage | Applies to | Cost | Where it lands |
 | --- | --- | --- | --- |
-| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the reason, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
-| Ring-buffer record + signal | each recorded interval | a 128-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
+| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the reason, a read of the scheduler's run delay, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
+| Ring-buffer record + signal | each recorded interval | a 136-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
 | Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
 | Drain and write | each recorded interval | a protobuf record of roughly 120 bytes | the collector's own thread; records are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
 | Symbolize | each **distinct** native stack | one stack-map lookup and per-frame symbol resolution, written once as a `stack` record | the collector's own thread, on first sight of that stack |

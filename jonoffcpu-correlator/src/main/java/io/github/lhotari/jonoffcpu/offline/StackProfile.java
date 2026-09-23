@@ -61,7 +61,8 @@ record StackProfile(Header header, List<Entry> entries) {
             String thinningProbability,
             long thinningSeed,
             long windowFromNanos,
-            long windowToNanos) {}
+            long windowToNanos,
+            String timeSplitJson) {}
 
     record Header(
             List<Provenance> sources,
@@ -69,11 +70,23 @@ record StackProfile(Header header, List<Entry> entries) {
             boolean estimateAvailable,
             String reportJson,
             String label,
-            List<String> dimensionsDropped) {
+            List<String> dimensionsDropped,
+            boolean timeSplitAvailable) {
         Header {
             sources = List.copyOf(sources);
             dimensions = List.copyOf(dimensions);
             dimensionsDropped = List.copyOf(dimensionsDropped);
+        }
+
+        /** A header whose entries carry no sleeping/run-queue split. */
+        Header(
+                List<Provenance> sources,
+                List<String> dimensions,
+                boolean estimateAvailable,
+                String reportJson,
+                String label,
+                List<String> dimensionsDropped) {
+            this(sources, dimensions, estimateAvailable, reportJson, label, dimensionsDropped, false);
         }
 
         /** The correlation-time thinning of the (single) source, or {@link Thinning#NONE}. */
@@ -96,9 +109,81 @@ record StackProfile(Header header, List<Entry> entries) {
             String thread,
             long intervals,
             long observedNanos,
-            long estimatedNanos) {
+            long estimatedNanos,
+            Split split) {
+        /** An entry whose time is all unsplit. */
+        Entry(
+                List<Frame> javaStack,
+                List<Frame> kernelStack,
+                List<Frame> userStack,
+                OffCpuReason reason,
+                int taskState,
+                String thread,
+                long intervals,
+                long observedNanos,
+                long estimatedNanos) {
+            this(
+                    javaStack,
+                    kernelStack,
+                    userStack,
+                    reason,
+                    taskState,
+                    thread,
+                    intervals,
+                    observedNanos,
+                    estimatedNanos,
+                    Split.unsplit(observedNanos, estimatedNanos));
+        }
+
         Key key() {
             return new Key(javaStack, kernelStack, userStack, reason, taskState, thread);
+        }
+    }
+
+    /**
+     * An entry's observed and estimated nanoseconds split by what the thread was doing: sleeping until its wakeup,
+     * waiting on a run queue, or unsplit when the interval had no usable run-queue reading. Each triple sums to its
+     * total; {@link TimeSplit} holds the rule.
+     */
+    record Split(
+            long sleeping,
+            long runqueue,
+            long unsplit,
+            long estimatedSleeping,
+            long estimatedRunqueue,
+            long estimatedUnsplit) {
+        static Split unsplit(long observedNanos, long estimatedNanos) {
+            return new Split(0, 0, observedNanos, 0, 0, estimatedNanos);
+        }
+
+        Split plus(Split other) throws IOException {
+            return new Split(
+                    U64.add(sleeping, other.sleeping, "Profile sleeping"),
+                    U64.add(runqueue, other.runqueue, "Profile run queue"),
+                    U64.add(unsplit, other.unsplit, "Profile unsplit"),
+                    U64.add(estimatedSleeping, other.estimatedSleeping, "Profile sleeping estimate"),
+                    U64.add(estimatedRunqueue, other.estimatedRunqueue, "Profile run queue estimate"),
+                    U64.add(estimatedUnsplit, other.estimatedUnsplit, "Profile unsplit estimate"));
+        }
+
+        /** The part of one kind, observed or estimated. */
+        long nanos(TimeSplit.Part part, boolean estimated) {
+            return switch (part) {
+                case SLEEPING -> estimated ? estimatedSleeping : sleeping;
+                case RUNQUEUE -> estimated ? estimatedRunqueue : runqueue;
+                case UNSPLIT -> estimated ? estimatedUnsplit : unsplit;
+            };
+        }
+
+        /** Whether each triple adds up to its entry's total. */
+        boolean adds(long observedNanos, long estimatedNanos) {
+            try {
+                return U64.add(U64.add(sleeping, runqueue, "split"), unsplit, "split") == observedNanos
+                        && U64.add(U64.add(estimatedSleeping, estimatedRunqueue, "split"), estimatedUnsplit, "split")
+                                == estimatedNanos;
+            } catch (IOException overflow) {
+                return false;
+            }
         }
     }
 
@@ -172,8 +257,9 @@ record StackProfile(Header header, List<Entry> entries) {
                     key.taskState(),
                     profile.threadName(key.thread()),
                     counters.intervals,
-                    counters.observedNanos,
-                    counters.estimatedNanos().longValueExact()));
+                    counters.observedNanos(),
+                    counters.estimatedNanos().longValueExact(),
+                    counters.split()));
         }
         CaptureInput capture = result.capture();
         Provenance provenance = new Provenance(
@@ -185,7 +271,10 @@ record StackProfile(Header header, List<Entry> entries) {
                 result.thinning().probability(),
                 result.thinning().seed(),
                 result.clipFromNanos() == null ? 0 : result.clipFromNanos(),
-                result.clipToNanos() == null ? 0 : result.clipToNanos());
+                result.clipToNanos() == null ? 0 : result.clipToNanos(),
+                capture.start.has("timeSplit")
+                        ? CaptureInput.object(capture.start, "timeSplit").toString()
+                        : "");
         return new StackProfile(
                 new Header(
                         List.of(provenance),
@@ -193,7 +282,8 @@ record StackProfile(Header header, List<Entry> entries) {
                         estimateAvailable,
                         reportJson,
                         label,
-                        profile.dropped()),
+                        profile.dropped(),
+                        result.timeSplit().available()),
                 entries);
     }
 
@@ -221,7 +311,9 @@ record StackProfile(Header header, List<Entry> entries) {
         List<Provenance> sources = new ArrayList<>();
         Set<String> dropped = new LinkedHashSet<>();
         boolean estimateAvailable = true;
+        boolean timeSplitAvailable = false;
         Map<Key, long[]> merged = new LinkedHashMap<>();
+        Map<Key, Split> splits = new HashMap<>();
         for (StackProfile profile : profiles) {
             Header header = profile.header();
             CaptureInput.require(header.dimensions().equals(dimensions), "Profiles with different grouping dimensions");
@@ -234,11 +326,15 @@ record StackProfile(Header header, List<Entry> entries) {
             }
             dropped.addAll(header.dimensionsDropped());
             estimateAvailable &= header.estimateAvailable();
+            // An input without the split contributes its time as unsplit, which its entries already say.
+            timeSplitAvailable |= header.timeSplitAvailable();
             for (Entry entry : profile.entries()) {
                 long[] counters = merged.computeIfAbsent(entry.key(), ignored -> new long[3]);
                 counters[0] = Math.addExact(counters[0], entry.intervals());
                 counters[1] = U64.add(counters[1], entry.observedNanos(), "Profile duration");
                 counters[2] = U64.add(counters[2], entry.estimatedNanos(), "Profile estimate");
+                Split split = splits.get(entry.key());
+                splits.put(entry.key(), split == null ? entry.split() : split.plus(entry.split()));
             }
         }
         List<Entry> entries = new ArrayList<>(merged.size());
@@ -254,10 +350,12 @@ record StackProfile(Header header, List<Entry> entries) {
                     key.thread(),
                     counters[0],
                     counters[1],
-                    counters[2]));
+                    counters[2],
+                    splits.get(key)));
         }
         return new StackProfile(
-                new Header(sources, dimensions, estimateAvailable, "", label, List.copyOf(dropped)), entries);
+                new Header(sources, dimensions, estimateAvailable, "", label, List.copyOf(dropped), timeSplitAvailable),
+                entries);
     }
 
     // ---- canonical order -----------------------------------------------------------------------
@@ -311,7 +409,7 @@ record StackProfile(Header header, List<Entry> entries) {
                 .addAllReason(REASONS)
                 .setWeightSemantics(WEIGHT_SEMANTICS)
                 .setEstimateAvailable(header.estimateAvailable())
-                .setTimeSplitAvailable(false)
+                .setTimeSplitAvailable(header.timeSplitAvailable())
                 .setReportJson(header.reportJson())
                 .setLabel(header.label());
         for (Provenance source : header.sources()) {
@@ -324,7 +422,8 @@ record StackProfile(Header header, List<Entry> entries) {
                     .setThinningProbability(source.thinningProbability())
                     .setThinningSeed(source.thinningSeed())
                     .setWindowFromNanos(source.windowFromNanos())
-                    .setWindowToNanos(source.windowToNanos()));
+                    .setWindowToNanos(source.windowToNanos())
+                    .setTimeSplitJson(source.timeSplitJson()));
         }
         emit(output, ProfileProto.Record.newBuilder().setProfileStart(start).build());
         Interner interner = new Interner(output);
@@ -339,6 +438,19 @@ record StackProfile(Header header, List<Entry> entries) {
                     .setIntervals(entry.intervals())
                     .setObservedNanos(entry.observedNanos())
                     .setEstimatedNanos(entry.estimatedNanos());
+            if (header.timeSplitAvailable()) {
+                Split split = entry.split();
+                row.setSleepingNanos(split.sleeping())
+                        .setRunqueueNanos(split.runqueue())
+                        .setUnsplitNanos(split.unsplit())
+                        .setEstimatedSleepingNanos(split.estimatedSleeping())
+                        .setEstimatedRunqueueNanos(split.estimatedRunqueue())
+                        .setEstimatedUnsplitNanos(split.estimatedUnsplit());
+            } else {
+                CaptureInput.require(
+                        entry.split().equals(Split.unsplit(entry.observedNanos(), entry.estimatedNanos())),
+                        "A profile without the time split has a split entry");
+            }
             emit(output, ProfileProto.Record.newBuilder().setEntry(row).build());
         }
         emit(
@@ -455,7 +567,7 @@ record StackProfile(Header header, List<Entry> entries) {
         CaptureInput.require(start.getReasonList().equals(REASONS), "Unsupported stack profile reason vocabulary");
         CaptureInput.require(
                 start.getWeightSemantics().equals(WEIGHT_SEMANTICS), "Unsupported stack profile weight semantics");
-        CaptureInput.require(!start.getTimeSplitAvailable(), "Stack profile time split is not supported yet");
+        boolean timeSplitAvailable = start.getTimeSplitAvailable();
         List<Provenance> sources = new ArrayList<>();
         for (ProfileProto.Provenance source : start.getSourceList()) {
             sources.add(new Provenance(
@@ -467,7 +579,8 @@ record StackProfile(Header header, List<Entry> entries) {
                     source.getThinningProbability(),
                     source.getThinningSeed(),
                     source.getWindowFromNanos(),
-                    source.getWindowToNanos()));
+                    source.getWindowToNanos(),
+                    source.getTimeSplitJson()));
         }
         List<String> strings = new ArrayList<>();
         strings.add(null);
@@ -508,6 +621,24 @@ record StackProfile(Header header, List<Entry> entries) {
                     ProfileProto.Entry entry = record.getEntry();
                     OffCpuReason reason = OffCpuReason.fromWire(entry.getReason());
                     CaptureInput.require(reason != null, "Invalid entry reason");
+                    Split split = new Split(
+                            entry.getSleepingNanos(),
+                            entry.getRunqueueNanos(),
+                            entry.getUnsplitNanos(),
+                            entry.getEstimatedSleepingNanos(),
+                            entry.getEstimatedRunqueueNanos(),
+                            entry.getEstimatedUnsplitNanos());
+                    if (timeSplitAvailable) {
+                        CaptureInput.require(
+                                split.adds(entry.getObservedNanos(), entry.getEstimatedNanos()),
+                                "Stack profile entry split does not add up to its totals");
+                    } else {
+                        // A profile without the split (including one written before it existed) is all unsplit.
+                        CaptureInput.require(
+                                split.equals(new Split(0, 0, 0, 0, 0, 0)),
+                                "Stack profile entry carries a split its header does not announce");
+                        split = Split.unsplit(entry.getObservedNanos(), entry.getEstimatedNanos());
+                    }
                     entries.add(new Entry(
                             stack(nodes, frames, expanded, entry.getJavaStack()),
                             stack(nodes, frames, expanded, entry.getKernelStack()),
@@ -519,7 +650,8 @@ record StackProfile(Header header, List<Entry> entries) {
                                     : reference(strings, entry.getThreadNameString(), false),
                             entry.getIntervals(),
                             entry.getObservedNanos(),
-                            entry.getEstimatedNanos()));
+                            entry.getEstimatedNanos(),
+                            split));
                 }
                 case PROFILE_END -> end = record.getProfileEnd();
                 default -> throw new IOException("Unexpected stack profile record: " + record.getRecordCase());
@@ -533,7 +665,8 @@ record StackProfile(Header header, List<Entry> entries) {
                         start.getEstimateAvailable(),
                         start.getReportJson(),
                         start.getLabel(),
-                        end.getDimensionDroppedList()),
+                        end.getDimensionDroppedList(),
+                        timeSplitAvailable),
                 entries);
         CaptureInput.require(
                 end.getEntries() == entries.size()

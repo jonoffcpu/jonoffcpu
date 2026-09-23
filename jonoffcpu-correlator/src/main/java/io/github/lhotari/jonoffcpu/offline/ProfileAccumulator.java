@@ -61,28 +61,61 @@ final class ProfileAccumulator {
     /** One grouping key; a dimension that is not grouped holds -1. */
     record Key(int collapsed, int kernel, int user, int reason, int taskState, int thread) {}
 
+    /**
+     * One entry's counters, kept per {@link TimeSplit.Part}: the observed nanoseconds and the fixed-point
+     * inverse-probability weight of each part. An interval without the split is all unsplit, so its weight is exactly
+     * the whole-duration weight it always had.
+     */
     static final class Counters {
         long intervals;
-        long observedNanos;
-        BigInteger weighted = BigInteger.ZERO;
+        final long[] nanos = new long[3];
+        final BigInteger[] weighted = {BigInteger.ZERO, BigInteger.ZERO, BigInteger.ZERO};
 
-        void add(long durationNanos, long threshold) {
+        void add(long[] parts, long threshold) {
             intervals++;
-            observedNanos = Math.addExact(observedNanos, durationNanos);
-            weighted = weighted.add(BigInteger.valueOf(durationNanos)
-                    .shiftLeft(32 + ESTIMATE_FRACTION_BITS)
-                    .divide(BigInteger.valueOf(threshold)));
+            BigInteger divisor = BigInteger.valueOf(threshold);
+            for (int part = 0; part < 3; part++) {
+                if (parts[part] == 0) continue;
+                nanos[part] = Math.addExact(nanos[part], parts[part]);
+                weighted[part] = weighted[part].add(BigInteger.valueOf(parts[part])
+                        .shiftLeft(32 + ESTIMATE_FRACTION_BITS)
+                        .divide(divisor));
+            }
         }
 
         void add(Counters other) {
             intervals += other.intervals;
-            observedNanos = Math.addExact(observedNanos, other.observedNanos);
-            weighted = weighted.add(other.weighted);
+            for (int part = 0; part < 3; part++) {
+                nanos[part] = Math.addExact(nanos[part], other.nanos[part]);
+                weighted[part] = weighted[part].add(other.weighted[part]);
+            }
+        }
+
+        long observedNanos() {
+            return Math.addExact(Math.addExact(nanos[0], nanos[1]), nanos[2]);
         }
 
         /** The inverse-probability weighted duration, floored to whole nanoseconds. */
         BigInteger estimatedNanos() {
-            return weighted.shiftRight(ESTIMATE_FRACTION_BITS);
+            return weighted[0].add(weighted[1]).add(weighted[2]).shiftRight(ESTIMATE_FRACTION_BITS);
+        }
+
+        /**
+         * The parts of both totals. The estimated parts are floored cumulatively — sleeping, then sleeping plus run
+         * queue, then the whole — so they add up exactly to {@link #estimatedNanos()}, and a part with no weight
+         * stays exactly zero.
+         */
+        StackProfile.Split split() {
+            BigInteger sleeping = weighted[0].shiftRight(ESTIMATE_FRACTION_BITS);
+            BigInteger throughRunqueue = weighted[0].add(weighted[1]).shiftRight(ESTIMATE_FRACTION_BITS);
+            BigInteger whole = estimatedNanos();
+            return new StackProfile.Split(
+                    nanos[0],
+                    nanos[1],
+                    nanos[2],
+                    sleeping.longValueExact(),
+                    throughRunqueue.subtract(sleeping).longValueExact(),
+                    whole.subtract(throughRunqueue).longValueExact());
         }
     }
 
@@ -105,7 +138,7 @@ final class ProfileAccumulator {
             OffCpuReason reason,
             int taskState,
             String threadName,
-            long durationNanos,
+            long[] parts,
             long threshold) {
         int thread = -1;
         if (active.contains(THREAD) && threadName != null) {
@@ -121,7 +154,7 @@ final class ProfileAccumulator {
                 reason.ordinal(),
                 taskState,
                 thread);
-        entries.computeIfAbsent(key, ignored -> new Counters()).add(durationNanos, threshold);
+        entries.computeIfAbsent(key, ignored -> new Counters()).add(parts, threshold);
         while (entries.size() > maxEntries && dropNext()) {
             // Each drop merges entries; stop when nothing optional is left to drop.
         }
@@ -172,6 +205,6 @@ final class ProfileAccumulator {
     }
 
     long retainedBytes() {
-        return entries.size() * 160L + threadNameList.size() * 96L;
+        return entries.size() * 240L + threadNameList.size() * 96L;
     }
 }

@@ -130,6 +130,9 @@ Options before `asprofpath` belong to JONOFFCPU:
   microseconds.
 - `min-off-cpu-micros`: optional strict lower duration bound in microseconds.
 - `max-off-cpu-micros`: optional strict upper duration bound in microseconds.
+- `time-split=schedInfo|off`: where each interval's run-queue part comes from,
+  `timeSplit.source` in YAML. Defaults to `schedInfo`; `off` is for a kernel
+  without `CONFIG_SCHED_INFO`, where `schedInfo` fails at prepare.
 - `nativestoptimeoutmillis`, `deliverygracemillis`, and
   `shutdowntimeoutmillis`: bounded lifecycle timeouts.
 
@@ -146,8 +149,16 @@ the others are counted by reason in `captureEnd` (`switchOutsBlocked`,
 observation row carries its `reason` next to the raw `sched_switch` arguments
 it was derived from, `prevTaskState` and `preempted`; the agent recomputes the
 reason and checks it was selected for every row at stop, as it does the
-admission threshold. A capture that classifies its intervals is written at
-control `schemaVersion` 3.
+admission threshold.
+
+The resolved `timeSplit` object (`{"source": "schedInfo"}` unless configured) is
+sent to the source, echoed by it and written into the manifest, `captureStart`
+and `analysisInputs` like `sampling`. Under `schedInfo` each observation row
+carries `runqueueNanos`, the growth of the scheduler's `sched_info.run_delay`
+across the interval, from which the correlator splits the interval into
+sleeping and run-queue time; `captureEnd` counts readings the kernel dropped in
+`runqueueInversions`. The agent rejects a row that carries a reading under
+`off`. A capture is written at control `schemaVersion` 4.
 
 The source applies the duration bounds before the admission policy. A duration
 is eligible only when it is strictly greater than the configured minimum and

@@ -151,6 +151,9 @@ final class CaptureStream {
             }
             if (observation.hasPreempted()) row.addProperty("preempted", observation.getPreempted());
         }
+        if (observation.hasRunqueueNanos()) {
+            row.addProperty("runqueueNanos", Long.toUnsignedString(observation.getRunqueueNanos()));
+        }
         return row;
     }
 
