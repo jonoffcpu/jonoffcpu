@@ -182,6 +182,19 @@ final class ProfileAccumulator {
         return false;
     }
 
+    /**
+     * Scales every entry's inverse-probability weight by {@code numerator / denominator}, the correction for an
+     * accounted loss. Called once, after the last interval was added; observed nanoseconds are left alone.
+     */
+    void scaleEstimates(BigInteger numerator, BigInteger denominator) {
+        for (Counters counters : entries.values()) {
+            for (int part = 0; part < 3; part++) {
+                counters.weighted[part] =
+                        counters.weighted[part].multiply(numerator).divide(denominator);
+            }
+        }
+    }
+
     Map<Key, Counters> entries() {
         return entries;
     }

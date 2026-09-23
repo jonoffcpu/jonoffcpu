@@ -210,7 +210,29 @@ The estimate is marked `available` only when source rows and the kernel/userspac
 selection, receipt and write counters prove complete coverage and the capture did
 not report source-loss conditions. Otherwise the observed source duration remains
 visible, `estimatedDurationNanos` is null and `unavailableReasons` says which
-coverage proof failed. This is an inverse-probability estimate under the recorded
+coverage proof failed.
+
+One loss is accounted for instead of disqualifying: sequence contention. When
+the kernel selects an interval but cannot allocate its correlation sequence, it
+drops the interval and counts it in `sequenceContentions`. If
+`selectedIntervals - sequenceContentions` equals the source rows and the
+received and written counts, every other failure counter is zero and nothing
+else fails, the estimate is `available` with an `accountedLoss` object
+(`intervals`, `fraction` of `selectedIntervals` to six significant digits,
+`reason: "sequence-contention"`),
+`sourceCoverageComplete` is false, and the sum is scaled by
+`selectedIntervals / receivedObservations` in the same exact fixed-point
+arithmetic. That scaling is unbiased only if contention is independent of an
+interval's stack and duration, which `assumptions` states. The stack profile's
+per-entry estimates take the same scale, so `stacks --weights estimated` stays
+consistent with the total. A loss above `--max-accounted-loss` (a fraction of the
+selected intervals, default `0.01`, at least 0 and below 1) is refused with
+`accounted-loss-above-limit`, `accountedLoss` still reported. A gap the
+contention count does not explain, or one beside any other nonzero failure
+counter, keeps `nonzero-sequenceContentions` and
+`selected-source-row-count-mismatch` as before.
+
+This is an inverse-probability estimate under the recorded
 random admission policy; it is not a confidence interval or an adjustment for
 missing Java stacks. Under `proportional`, a rare short interval that was admitted
 carries a weight of up to the full reference duration, so per-stack estimates for

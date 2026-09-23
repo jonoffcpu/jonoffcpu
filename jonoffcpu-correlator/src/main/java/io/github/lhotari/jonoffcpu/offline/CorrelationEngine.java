@@ -15,7 +15,9 @@ import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.MathContext;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -40,10 +42,24 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     /** Fixed-point scale for the inverse-probability sum; see {@link #sourceAggregate}. */
     private static final int ESTIMATE_FRACTION_BITS = 64;
 
+    /** The assumption under which an estimate scaled for an accounted sequence-contention loss stays unbiased. */
+    static final String CONTENTION_INDEPENDENCE =
+            "sequence contention is independent of the interval's stack and duration";
+
     /** Marks a cookie that was observed but thinned away, so duplicate detection still sees it. */
     static final int DROPPED = Integer.MAX_VALUE;
 
-    record SourceAggregate(BigInteger duration, BigInteger estimatedDuration, int rows) {}
+    /** {@code weighted} is the inverse-probability sum in fixed point, {@link #ESTIMATE_FRACTION_BITS} below one. */
+    record SourceAggregate(BigInteger duration, BigInteger weighted, int rows) {
+        BigInteger estimatedDuration() {
+            return weighted.shiftRight(ESTIMATE_FRACTION_BITS);
+        }
+
+        /** The estimate scaled by {@code numerator / denominator} in fixed point, then truncated. */
+        BigInteger estimatedDuration(BigInteger numerator, BigInteger denominator) {
+            return weighted.multiply(numerator).divide(denominator).shiftRight(ESTIMATE_FRACTION_BITS);
+        }
+    }
 
     private final OfflineCorrelator.Limits limits;
     private final SourceColumns sources;
@@ -56,6 +72,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private final Thinning thinning;
     private final Long narrowedToNanos;
     private CaptureInput.Budget budget;
+    // selected / received when an available population estimate was scaled for an accounted loss.
+    private BigInteger[] accountedScale;
     private LongIntMap announcedStacks;
     // Total JFR samples the exporter delivered, kept or thinned away: the JFR-side parse-completeness
     // check counts what was parsed, not what this stage retained.
@@ -565,6 +583,10 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
         OfflineCorrelator.PopulationEstimate estimate =
                 capture.partial ? null : populationEstimate(capture, aggregate, BigInteger.valueOf(total));
+        if (accountedScale != null) {
+            // The per-entry estimates are the same inverse-probability sum, so they take the same scale.
+            profile.scaleEstimates(accountedScale[0], accountedScale[1]);
+        }
         return new CorrelationResult(
                 capture,
                 selectionMetadata,
@@ -637,7 +659,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                     .divide(BigInteger.valueOf(sources.threshold(slot))));
             rows++;
         }
-        return new SourceAggregate(duration, weighted.shiftRight(ESTIMATE_FRACTION_BITS), rows);
+        return new SourceAggregate(duration, weighted, rows);
     }
 
     /** The configured {@code --to-ns} bound narrowed further by a ladder-chosen window cut, whichever is tighter. */
@@ -680,15 +702,10 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         BigInteger rejected = optionalCounter(kernel, "admissionRejections", reasons);
         BigInteger received = optionalCounter(userspace, "receivedObservations", reasons);
         BigInteger written = optionalCounter(userspace, "writtenObservations", reasons);
-        if (selected != null
-                && (!selected.equals(sourceRows)
-                        || received != null && !selected.equals(received)
-                        || written != null && !selected.equals(written))) {
-            reasons.add("selected-source-row-count-mismatch");
-        }
         if (eligible != null && rejected != null && selected != null && !eligible.equals(rejected.add(selected))) {
             reasons.add("eligible-selection-counter-mismatch");
         }
+        BigInteger contentions = null;
         for (String key : List.of(
                 "targetNamespaceFailures",
                 "ringReserveFailures",
@@ -697,7 +714,9 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 "lifetimeRejections",
                 "threadStateFailures")) {
             BigInteger value = optionalCounter(kernel, key, reasons);
-            if (value != null && value.signum() != 0) {
+            if (key.equals("sequenceContentions")) {
+                contentions = value;
+            } else if (value != null && value.signum() != 0) {
                 reasons.add("nonzero-" + key);
             }
         }
@@ -707,8 +726,43 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 reasons.add("nonzero-" + key);
             }
         }
+        // Sequence contention drops a selected interval after the kernel counted it, and counts the drop. When
+        // that count alone closes the gap between selection and every downstream count, and nothing else is
+        // wrong, the loss is accounted for; any other discrepancy keeps the reasons it always had.
+        boolean contended = contentions != null && contentions.signum() != 0;
+        boolean rowsMismatch = selected != null
+                && (!selected.equals(sourceRows)
+                        || received != null && !selected.equals(received)
+                        || written != null && !selected.equals(written));
+        OfflineCorrelator.AccountedLoss accountedLoss = null;
+        List<String> assumptions = List.of();
+        if (contended
+                && reasons.isEmpty()
+                && selected.subtract(contentions).equals(sourceRows)
+                && sourceRows.equals(received)
+                && sourceRows.equals(written)) {
+            accountedLoss = new OfflineCorrelator.AccountedLoss(
+                    contentions.toString(),
+                    new BigDecimal(contentions).divide(new BigDecimal(selected), new MathContext(6)),
+                    "sequence-contention");
+            assumptions = List.of(CONTENTION_INDEPENDENCE);
+            if (new BigDecimal(contentions).compareTo(limits.maxAccountedLoss().multiply(new BigDecimal(selected)))
+                    > 0) {
+                reasons.add("accounted-loss-above-limit");
+            }
+        } else {
+            if (contended) reasons.add("nonzero-sequenceContentions");
+            if (rowsMismatch) reasons.add("selected-source-row-count-mismatch");
+        }
         reasons = reasons.stream().distinct().sorted().toList();
         boolean available = reasons.isEmpty();
+        String estimated = null;
+        if (available && accountedLoss != null) {
+            accountedScale = new BigInteger[] {selected, sourceRows};
+            estimated = aggregate.estimatedDuration(selected, sourceRows).toString();
+        } else if (available) {
+            estimated = aggregate.estimatedDuration().toString();
+        }
         return new OfflineCorrelator.PopulationEstimate(
                 "inverse-probability-source-duration",
                 available ? "available" : "unavailable",
@@ -717,10 +771,12 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 aggregate.duration().toString(),
                 matchedDuration.toString(),
                 Integer.toString(aggregate.rows()),
-                available ? aggregate.estimatedDuration().toString() : null,
-                available,
+                estimated,
+                available && accountedLoss == null,
                 false,
-                reasons);
+                reasons,
+                accountedLoss,
+                assumptions);
     }
 
     private static BigInteger optionalCounter(JsonObject counters, String key, List<String> reasons) {

@@ -1,10 +1,10 @@
 Usage: java -jar jonoffcpu-correlator.jar [-hV] [--audit=LEVEL] [--collapsed-reason-frame=MODE]
                                           [--estimate-population=true|false] [--format=FORMAT]
                                           [--from=TIME] [--from-ns=N] [--jfr=FILE]
-                                          [--max-handler-delay-ns=N] [--max-profile-entries=N]
-                                          [--max-retained-bytes=N] [--max-rows=N]
-                                          [--max-synthetic-events=N] [--on-limit=POLICY]
-                                          [--output=DIR] [--partial=true|false]
+                                          [--max-accounted-loss=F] [--max-handler-delay-ns=N]
+                                          [--max-profile-entries=N] [--max-retained-bytes=N]
+                                          [--max-rows=N] [--max-synthetic-events=N]
+                                          [--on-limit=POLICY] [--output=DIR] [--partial=true|false]
                                           [--partial-jfr=true|false] [--profile-group-by=LIST]
                                           [--profile-output=true|false] [--quantum-ns=N]
                                           [--source=FILE] [--summary-output=true|false]
@@ -41,6 +41,10 @@ produces. Without a subcommand it correlates, with the options below.
       --estimate-population=true|false
                              Report the inverse-probability population estimate. Requires the
                                complete, unselected JFR and an unthinned source. Default: false.
+      --max-accounted-loss=F The largest fraction of selected intervals the collector may have
+                               dropped under counted sequence contention for the population
+                               estimate to stay available, scaled up by the loss (0 <= F < 1).
+                               Default: 0.01.
       --audit=LEVEL          Per-row audit output: full, matches or none. Default: matches, which
                                writes jonoffcpu-matches.jsonl but not jonoffcpu-classified-records.
                                jsonl.

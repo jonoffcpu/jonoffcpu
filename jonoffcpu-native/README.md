@@ -75,6 +75,15 @@ including bit 63, with `SI_KERNEL`, pidfd-backed process lifetime binding and
 per-task interval state. The exact leader binding is checked again immediately
 before the signal request.
 
+The cookie's low 32 bits are a capture-wide sequence taken from one global
+counter by compare-and-swap, so a sequence is never issued twice and zero stays
+the exhaustion sentinel (`sequenceExhaustions`). A lost compare-and-swap means
+another CPU took a sequence in the meantime; the switch-in hook retries from the
+value that CPU left, up to 16 attempts, and only an interval that loses every
+attempt is dropped and counted in `sequenceContentions`. The correlator accounts
+for that exactly counted loss in its population estimate (see
+[OFFLINE.md](../jonoffcpu-correlator/OFFLINE.md)).
+
 The reusable collector exports the C ABI in `include/jonoffcpu_collector.h` from
 `libjonoffcpu_native.so`. Its lifecycle is disabled `prepare`, configured `enable`,
 quiesce/detach/drain `stop`, then `close`. The drain thread never observes

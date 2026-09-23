@@ -1127,6 +1127,8 @@ The generated help is the reference: `java -jar jonoffcpu-correlator.jar help
 | `--from`, `--to` | Select samples by JFR event time. Accepts ISO-8601 timestamps, epoch milliseconds, durations, or offsets from the recording start such as `30s` and `2m`. |
 | `--max-handler-delay-ns` | Reject matches whose Java stack was captured more than this long after the interval ended. |
 | `--from-ns`, `--to-ns` | Clip matched intervals to a window in the source monotonic clock. |
+| `--estimate-population true` | Add a `populationEstimate` to the report: the total off-CPU time of every eligible interval, reweighted by each row's admission threshold. See [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md). |
+| `--max-accounted-loss <f>` | Largest fraction of selected intervals that counted sequence contention may drop before the population estimate is refused (`accounted-loss-above-limit`). Below it the estimate is scaled for the loss and reports it in `accountedLoss`. Default `0.01`. |
 | `--format collapsed\|jfr` | Produce only one of the two derived outputs. |
 | `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
 | `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json` or the synthetic JFR. |
