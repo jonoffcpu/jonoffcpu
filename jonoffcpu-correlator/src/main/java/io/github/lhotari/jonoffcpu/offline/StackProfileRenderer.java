@@ -3,6 +3,8 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonNull;
 import com.google.gson.JsonObject;
 import java.io.BufferedWriter;
 import java.io.IOException;
@@ -578,21 +580,45 @@ final class StackProfileRenderer {
         return array;
     }
 
-    /** One row per entry with its stacks expanded, for tools such as DuckDB. */
-    static void export(StackProfile profile, String format, BufferedWriter writer) throws IOException {
-        switch (format) {
+    /**
+     * How {@link #export} writes a profile: the format, the {@code run} every row is tagged with, and whether counters
+     * are JSON strings as before 0.5.0 instead of numbers.
+     */
+    record Export(String format, String run, boolean numbersAsStrings) {}
+
+    /** The largest integer a JSON number carries exactly as an IEEE double, and DuckDB infers as BIGINT. */
+    private static final long MAX_SAFE_INTEGER = (1L << 53) - 1;
+
+    /** A profile's default {@code run}: its label without the trailing separator, else its first source's session. */
+    static String defaultRun(StackProfile profile) {
+        String label = profile.header().label();
+        while (label.endsWith(";")) label = label.substring(0, label.length() - 1);
+        if (!label.isEmpty()) return label;
+        List<StackProfile.Provenance> sources = profile.header().sources();
+        return sources.isEmpty() ? "" : sources.get(0).sessionId();
+    }
+
+    /**
+     * One row per entry with its stacks expanded, for tools such as DuckDB. The columns before 0.5.0 keep their
+     * names, order and meaning; the ones after them are appended, so a reader by name or by position keeps working.
+     */
+    static void export(StackProfile profile, Export options, BufferedWriter writer) throws IOException {
+        boolean estimateAvailable = profile.header().estimateAvailable();
+        switch (options.format()) {
             case "csv" -> {
                 writer.write("reason,task_state,thread,java_stack,kernel_stack,user_stack,"
                         + "intervals,observed_nanos,estimated_nanos,sleeping_nanos,runqueue_nanos,unsplit_nanos,"
-                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,java_stack_kinds");
+                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,java_stack_kinds,"
+                        + "canonical_java_stack,thread_pool,run,estimate_available");
                 writer.newLine();
                 for (StackProfile.Entry entry : profile.entries()) {
+                    String javaStack = joined(entry.javaStack(), false);
                     writer.write(String.join(
                             ",",
                             entry.reason().label(),
                             Integer.toUnsignedString(entry.taskState()),
                             csv(entry.thread()),
-                            csv(joined(entry.javaStack(), false)),
+                            csv(javaStack),
                             csv(joined(entry.kernelStack(), true)),
                             csv(joined(entry.userStack(), true)),
                             Long.toString(entry.intervals()),
@@ -604,37 +630,133 @@ final class StackProfileRenderer {
                             Long.toUnsignedString(entry.split().estimatedSleeping()),
                             Long.toUnsignedString(entry.split().estimatedRunqueue()),
                             Long.toUnsignedString(entry.split().estimatedUnsplit()),
-                            csv(javaKinds(entry.javaStack()))));
+                            csv(javaKinds(entry.javaStack())),
+                            csv(javaStack == null ? null : StackTransforms.canonicalName(javaStack)),
+                            csv(entry.thread() == null ? null : StackTransforms.poolName(entry.thread())),
+                            csv(options.run()),
+                            Boolean.toString(estimateAvailable)));
                     writer.newLine();
                 }
             }
             case "jsonl" -> {
                 var gson = new GsonBuilder().serializeNulls().create();
+                boolean strings = options.numbersAsStrings();
                 for (StackProfile.Entry entry : profile.entries()) {
                     JsonObject row = new JsonObject();
+                    String javaStack = joined(entry.javaStack(), false);
                     row.addProperty("reason", entry.reason().label());
                     row.addProperty("taskState", Integer.toUnsignedLong(entry.taskState()));
                     row.addProperty("thread", entry.thread());
-                    row.addProperty("javaStack", joined(entry.javaStack(), false));
+                    row.addProperty("javaStack", javaStack);
                     row.addProperty("kernelStack", joined(entry.kernelStack(), true));
                     row.addProperty("userStack", joined(entry.userStack(), true));
                     row.addProperty("intervals", entry.intervals());
-                    row.addProperty("observedNanos", Long.toUnsignedString(entry.observedNanos()));
-                    row.addProperty("estimatedNanos", Long.toUnsignedString(entry.estimatedNanos()));
+                    counter(row, "observedNanos", entry.observedNanos(), strings);
+                    counter(row, "estimatedNanos", entry.estimatedNanos(), strings);
                     StackProfile.Split split = entry.split();
-                    row.addProperty("sleepingNanos", Long.toUnsignedString(split.sleeping()));
-                    row.addProperty("runqueueNanos", Long.toUnsignedString(split.runqueue()));
-                    row.addProperty("unsplitNanos", Long.toUnsignedString(split.unsplit()));
-                    row.addProperty("estimatedSleepingNanos", Long.toUnsignedString(split.estimatedSleeping()));
-                    row.addProperty("estimatedRunqueueNanos", Long.toUnsignedString(split.estimatedRunqueue()));
-                    row.addProperty("estimatedUnsplitNanos", Long.toUnsignedString(split.estimatedUnsplit()));
+                    counter(row, "sleepingNanos", split.sleeping(), strings);
+                    counter(row, "runqueueNanos", split.runqueue(), strings);
+                    counter(row, "unsplitNanos", split.unsplit(), strings);
+                    counter(row, "estimatedSleepingNanos", split.estimatedSleeping(), strings);
+                    counter(row, "estimatedRunqueueNanos", split.estimatedRunqueue(), strings);
+                    counter(row, "estimatedUnsplitNanos", split.estimatedUnsplit(), strings);
                     row.addProperty("javaStackKinds", javaKinds(entry.javaStack()));
+                    row.add("javaFrames", names(entry.javaStack(), false));
+                    row.add("javaFrameKinds", kinds(entry.javaStack()));
+                    row.add("kernelFrames", names(entry.kernelStack(), true));
+                    row.add("userFrames", names(entry.userStack(), true));
+                    row.addProperty(
+                            "canonicalJavaStack", javaStack == null ? null : StackTransforms.canonicalName(javaStack));
+                    row.addProperty(
+                            "threadPool", entry.thread() == null ? null : StackTransforms.poolName(entry.thread()));
+                    row.addProperty("run", options.run());
+                    row.addProperty("estimateAvailable", estimateAvailable);
                     gson.toJson(row, writer);
                     writer.newLine();
                 }
             }
-            default -> throw new IllegalArgumentException("Invalid export format: " + format);
+            default -> throw new IllegalArgumentException("Invalid export format: " + options.format());
         }
+    }
+
+    /**
+     * An unsigned 64-bit counter: a JSON number while a double holds it exactly, which covers about 104 days of
+     * nanoseconds per entry, and a decimal string beyond that or when strings are asked for.
+     */
+    static void counter(JsonObject row, String name, long value, boolean strings) {
+        if (!strings && value >= 0 && value <= MAX_SAFE_INTEGER) {
+            row.addProperty(name, value);
+        } else {
+            row.addProperty(name, Long.toUnsignedString(value));
+        }
+    }
+
+    private static void counter(JsonObject row, String name, BigInteger value) {
+        if (value.signum() >= 0 && value.compareTo(BigInteger.valueOf(MAX_SAFE_INTEGER)) <= 0) {
+            row.addProperty(name, value.longValue());
+        } else {
+            row.addProperty(name, value.toString());
+        }
+    }
+
+    /**
+     * What {@code export --run-metadata} writes: one object describing the profile, joined to its rows on {@code
+     * run}, so the provenance, estimate validity and totals no longer need the header or the report beside them.
+     */
+    static JsonObject runMetadata(StackProfile profile, String run) {
+        JsonObject metadata = new JsonObject();
+        metadata.addProperty("schemaVersion", 1);
+        metadata.addProperty("run", run);
+        metadata.addProperty("label", profile.header().label());
+        JsonArray sources = new JsonArray();
+        for (StackProfile.Provenance source : profile.header().sources()) {
+            JsonObject item = new JsonObject();
+            item.addProperty("sessionId", source.sessionId());
+            item.addProperty("captureEpoch", source.captureEpoch());
+            counter(item, "windowFromNanos", source.windowFromNanos(), false);
+            counter(item, "windowToNanos", source.windowToNanos(), false);
+            item.addProperty("samplingJson", source.samplingJson());
+            item.addProperty("thinningProbability", source.thinningProbability());
+            item.addProperty("timeSplitJson", source.timeSplitJson());
+            sources.add(item);
+        }
+        metadata.add("sources", sources);
+        JsonArray dimensions = new JsonArray();
+        profile.header().dimensions().forEach(dimensions::add);
+        metadata.add("dimensions", dimensions);
+        metadata.addProperty("estimateAvailable", profile.header().estimateAvailable());
+        metadata.addProperty("timeSplitAvailable", profile.header().timeSplitAvailable());
+        metadata.addProperty("entries", profile.entries().size());
+        BigInteger observed = BigInteger.ZERO;
+        long intervals = 0;
+        for (StackProfile.Entry entry : profile.entries()) {
+            observed = observed.add(new BigInteger(Long.toUnsignedString(entry.observedNanos())));
+            intervals = Math.addExact(intervals, entry.intervals());
+        }
+        metadata.addProperty("intervals", intervals);
+        counter(metadata, "observedNanos", observed);
+        return metadata;
+    }
+
+    /** A stack's frames as a JSON array, root first, as {@link #joined} renders them; null for an absent stack. */
+    private static JsonElement names(List<StackProfile.Frame> stack, boolean nativeFrames) {
+        if (stack == null) return JsonNull.INSTANCE;
+        JsonArray array = new JsonArray();
+        int end = nativeFrames && !stack.isEmpty() && stack.get(0).kind() == StackProfile.Kind.KERNEL
+                ? kernelEnd(stack)
+                : stack.size();
+        for (int index = 0; index < end; index++) {
+            StackProfile.Frame frame = stack.get(index);
+            array.add(nativeFrames ? escape(nativeName(frame)) : frame.name());
+        }
+        return array;
+    }
+
+    private static JsonElement kinds(List<StackProfile.Frame> stack) {
+        if (stack == null) return JsonNull.INSTANCE;
+        JsonArray array = new JsonArray();
+        for (StackProfile.Frame frame : stack) array.add(frame.kind() == StackProfile.Kind.JAVA ? "java" : "native");
+        return array;
     }
 
     private static String joined(List<StackProfile.Frame> stack, boolean nativeFrames) {

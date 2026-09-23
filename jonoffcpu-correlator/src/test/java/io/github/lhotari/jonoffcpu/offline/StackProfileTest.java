@@ -302,12 +302,14 @@ public final class StackProfileTest {
         check(rows.get(0).startsWith("reason,task_state,thread,java_stack"), "CSV header changed: " + rows.get(0));
         check(rows.size() == read.entries().size() + 1, "One CSV row per entry");
         check(rows.get(1).startsWith("unspecified,0,main,"), "Unexpected CSV row: " + rows.get(1));
-        // The last column names each Java-stack frame's kind, parallel to java_stack.
-        check(rows.get(0).endsWith(",java_stack_kinds"), "CSV header lacks the kinds: " + rows.get(0));
+        // A column names each Java-stack frame's kind, parallel to java_stack; the 0.5.0 columns follow it.
+        check(
+                rows.get(0).endsWith(",java_stack_kinds,canonical_java_stack,thread_pool,run,estimate_available"),
+                "CSV header lacks the kinds: " + rows.get(0));
         String firstStack = String.join(
                 ";",
                 read.entries().get(0).javaStack().stream().map(frame -> "java").toList());
-        check(rows.get(1).endsWith("," + firstStack), "Unexpected CSV kinds: " + rows.get(1));
+        check(rows.get(1).contains("," + firstStack + ","), "Unexpected CSV kinds: " + rows.get(1));
 
         // A damaged file is refused rather than half read.
         byte[] bytes = Files.readAllBytes(profile);
@@ -641,7 +643,7 @@ public final class StackProfileTest {
                 csv.get(0)
                         .endsWith(",sleeping_nanos,runqueue_nanos,unsplit_nanos,"
                                 + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,"
-                                + "java_stack_kinds"),
+                                + "java_stack_kinds,canonical_java_stack,thread_pool,run,estimate_available"),
                 "CSV header: " + csv.get(0));
 
         // A profile without the split refuses the parts, and merging it with one that has them keeps it unsplit.
@@ -915,7 +917,7 @@ public final class StackProfileTest {
                 "Only JAVA frames may be shortened: " + dropped);
         List<String> csv = exportCsv(profile, dir.resolve("native.csv"));
         check(
-                csv.stream().filter(row -> row.contains("libjvm.so")).allMatch(row -> row.endsWith(",java;native")),
+                csv.stream().filter(row -> row.contains("libjvm.so")).allMatch(row -> row.contains(",java;native,")),
                 "Kinds not exported: " + csv);
 
         // Filters match the full names in every mode, so they select the same entries with the same totals.
