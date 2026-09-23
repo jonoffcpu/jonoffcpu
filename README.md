@@ -26,7 +26,12 @@ ordinary async-profiler JFR.
   - [2. Record](#2-record)
   - [3. Correlate](#3-correlate)
   - [4. Render the flame graph](#4-render-the-flame-graph)
+  - [Other views of the same recording](#other-views-of-the-same-recording)
   - [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile)
+  - [6. Find what to optimize](#6-find-what-to-optimize)
+- [Analyzing with AI agents](#analyzing-with-ai-agents)
+- [Analyzing with SQL](#analyzing-with-sql)
+- [Example: Apache Pulsar](#example-apache-pulsar)
 - [Configuration](#configuration)
   - [Agent options](#agent-options)
   - [Choosing what to sample](#choosing-what-to-sample)
@@ -573,12 +578,20 @@ partial result.
 java -jar jonoffcpu-correlator.jar \
   --source /tmp/jonoffcpu-capture.pb \
   --jfr /tmp/jonoffcpu-capture.jfr \
-  --output /tmp/jonoffcpu-analysis
+  --output /tmp/jonoffcpu-analysis \
+  --estimate-population true
 ```
 
+`--estimate-population true` keeps the inverse-probability estimates valid,
+which comparisons between runs need when sampling is proportional or uniform:
+on an Apache Pulsar broker the busy waits add up to 49.0 s observed but
+101.4 s estimated, because proportional admission keeps short waits with a
+lower probability.
+
 The output directory then holds `jonoffcpu-report.json`,
-`jonoffcpu-offcpu-stacks.collapsed`, `jonoffcpu-offcpu-synthetic.jfr`, the
-row-level audit files, and `jonoffcpu-complete.json` as the last file written;
+`jonoffcpu-offcpu-stacks.collapsed`, `jonoffcpu-offcpu-profile.pb`, the digest
+`jonoffcpu-summary.md`, `jonoffcpu-offcpu-synthetic.jfr`, the row-level audit
+files, and `jonoffcpu-complete.json` as the last file written;
 [Files jonoffcpu writes](#files-jonoffcpu-writes) describes each one.
 
 ### 4. Render the flame graph
@@ -602,6 +615,33 @@ with `--countname=µs`, works on the same file.
 
 The synthetic JFR opens directly in
 [JDK Mission Control](https://jdk.java.net/jmc/) and other JFR viewers.
+
+### Other views of the same recording
+
+The agent's JFR also holds whatever `asyncProfilerOptions` recorded, and the
+same converter renders it. Render a view only for events that were
+configured: `jfrsync` alone does not make an allocation or lock view
+meaningful.
+
+| `asyncProfilerOptions` contains | View | Converter |
+| --- | --- | --- |
+| `event=cpu` (or `itimer`, `ctimer`) | CPU | `--cpu` |
+| `event=wall` or `wall=` | wall clock | `--wall` |
+| `alloc=` | allocation | `--alloc --total` |
+| `lock=` | Java lock contention | `--lock --total` |
+
+```sh
+java -jar jfr-converter.jar --cpu -o collapsed /tmp/jonoffcpu-capture.jfr cpu.collapsed
+java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
+  --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
+java -jar jfr-converter.jar cpu-trimmed.collapsed cpu.html
+```
+
+Add `--threads` for a per-thread split and `-o collapsed` for
+machine-readable output. The converter writes class names as
+`org/example/Class` with `_[j]`-style markers; `stacks --collapsed-input` and
+`top --collapsed-input` normalize them, so the transforms of step 5 and the
+tables of step 6 apply to these views too.
 
 ### 5. Slice and filter with the stack profile
 
@@ -762,6 +802,153 @@ java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
 A merged profile sums durations across its inputs: it shows what dominates
 across the runs, not what fraction of any one run's time it took. Thinned
 profiles cannot be merged, because each is rescaled by its own probability.
+
+### 6. Find what to optimize
+
+A flame graph of every off-CPU interval is dominated by threads waiting for
+work: event loops in `epoll_wait`, pool workers waiting for a task, the JVM's
+own service threads. In an Apache Pulsar broker that is over 99 % of the time.
+Rank what remains by the application code that waited:
+
+```sh
+java -jar jonoffcpu-correlator.jar top \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --app '^com\.example\.' --idle-from preset:jvm-idle --format md
+```
+
+Each row is the deepest frame of your code in the stack (its *boundary*) with
+the *blocker* below it — a monitor, a `ReentrantLock`, a park — and the time
+and intervals spent there. Idle waits are listed in their own table, so you can
+check that nothing important was classified as idle; the over-exclusion line
+counts idle intervals that still waited on a lock. Add `--idle` or
+`--idle-from` lines for your own queues' waits for work: on a Pulsar broker,
+with `--app '^org\.apache\.'` and one more idle line for BookKeeper's executor
+queue (`--idle '^org\.apache\.bookkeeper\.common\.collections\.[\w$]*BlockingQueue\.take(All)?$'`),
+the top of the table reads:
+
+| Boundary | Blocker | s | Intervals |
+| --- | --- | ---: | ---: |
+| `…PersistentDispatcherMultipleConsumers.internalConsumerFlow` | `C2 Runtime complete_monitor_locking` | 11.982 | 4,245 |
+| `…GrowableBatchedArrayBlockingQueue.offer` | `java.util.concurrent.locks.ReentrantLock.lock` | 4.946 | 1,565 |
+| `…MessageDeduplication.isDuplicateNormal` | `C2 Runtime complete_monitor_locking` | 0.801 | 187 |
+
+Then look at one row in context with a trimmed flame graph:
+
+```sh
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude-from preset:jvm-idle \
+  --root-at '^com\.example\.' --collapse-leaf-from preset:jvm-wait-machinery \
+  --package-names drop --output busy.collapsed
+java -jar jfr-converter.jar --units µs busy.collapsed busy.html
+```
+
+`--root-at` starts each stack at your first frame, so the same call reached
+through different threads or executors merges; `--collapse-leaf` replaces the
+lock and park internals under the blocker with the blocker itself. Finally,
+`--time split` shows whether a row's time was spent asleep or waiting for a
+CPU after the wakeup.
+
+To compare two runs, give `top` the earlier profile as `--baseline` and each
+run's work as units, for example millions of messages; it lists each boundary's
+time per unit in both runs and warns when the runs are not comparable:
+
+```sh
+java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
+  --units 5 --baseline-units 5 --weights estimated \
+  --app '^com\.example\.' --idle-from preset:jvm-idle
+```
+
+## Analyzing with AI agents
+
+Give an agent the digest first: `jonoffcpu-summary.md` in the analysis
+directory (or `summarize --profile … --report …`). It is bounded in size,
+states the capture's coverage and losses, and holds the ranked tables with the
+exact command that reproduces each one, so the agent can drill down with
+`top --format json` or `stacks` instead of reading raw stacks. For custom
+questions, `export --format jsonl` gives one row per profile entry, frames as
+arrays (see [Analyzing with SQL](#analyzing-with-sql)). Do not hand an agent
+the capture stream, the JFR or the synthetic JFR: they are large, binary, and
+the correlator has already extracted what they contain. When comparing runs,
+give it `top --baseline` output, which normalizes per unit of work and warns
+when the runs are not comparable.
+
+## Analyzing with SQL
+
+`export --format jsonl` writes one row per profile entry that
+[DuckDB](https://duckdb.org/) reads without a schema: the stacks as arrays
+(`javaFrames`, `kernelFrames`, `userFrames`), counters as numbers, the thread's
+pool, a canonical stack that joins across runs, and on every row the `run` and
+whether its estimated columns are valid. Rank the busy waits by application
+boundary:
+
+```sh
+java -jar jonoffcpu-correlator.jar export \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --format jsonl --output broker-offcpu.jsonl
+```
+
+```sql
+CREATE TEMP TABLE entries AS
+SELECT javaFrames AS frames, observedNanos AS nanos, intervals
+FROM read_json('broker-offcpu.jsonl', format = 'newline_delimited');
+
+SELECT coalesce(list_filter(frames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1],
+                '[no application frame]') AS boundary,
+       round(sum(nanos) / 1e9, 3) AS seconds, sum(intervals) AS intervals
+FROM entries
+WHERE NOT list_bool_or(list_transform(frames, lambda f: regexp_matches(f,
+      '^(io\.netty\.channel\.epoll\.Native\.epollWait0?|java\.util\.concurrent\.ThreadPoolExecutor\.getTask|sun\.nio\.ch\.SelectorImpl\.select|java\.util\.concurrent\.ForkJoinPool\.awaitWork)$|BlockingQueue\.take(All)?$|^java\.lang\.ref\.|^libasyncProfiler\.so\.')))
+GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
+```
+
+On a Pulsar broker this returns `internalConsumerFlow` with 11.982 s in 4,245
+intervals and `GrowableBatchedArrayBlockingQueue.offer` with 4.946 s in 1,565
+as the top application rows, as `top` does. To compare runs, export each with
+its own `--run-label` and load them into one table; `--run-metadata FILE`
+writes each profile's provenance and totals as one JSON object to join on
+`run`. Seconds per million measured messages and share of busy application
+time, for two runs of 5 million messages each:
+
+```sql
+CREATE TEMP TABLE e AS
+SELECT 5.0 AS mmsgs, * FROM read_json(['alpine.jsonl', 'wolfi.jsonl'], format = 'newline_delimited');
+
+WITH b AS (
+  SELECT run, mmsgs, observedNanos AS nanos,
+         list_filter(javaFrames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1] AS boundary
+  FROM e
+  WHERE NOT list_bool_or(list_transform(javaFrames, lambda f: regexp_matches(f, '<idle patterns>'))))
+SELECT boundary,
+       round(sum(nanos) FILTER (WHERE run = 'alpine') / 1e9 / any_value(mmsgs), 3) AS alpine_s_per_m,
+       round(sum(nanos) FILTER (WHERE run = 'wolfi') / 1e9 / any_value(mmsgs), 3) AS wolfi_s_per_m
+FROM b WHERE boundary IS NOT NULL
+GROUP BY 1 ORDER BY greatest(coalesce(alpine_s_per_m, 0), coalesce(wolfi_s_per_m, 0)) DESC LIMIT 20;
+```
+
+Replace `<idle patterns>` with the lines of `preset:jvm-idle`
+(`stacks --list-presets` prints them) joined with `|`. Use `estimatedNanos`
+instead of `observedNanos` only when `estimateAvailable` is true for both runs:
+under proportional admission observed time under-weights short waits (the
+broker's busy slice is 49.0 s observed and 101.4 s estimated).
+
+## Example: Apache Pulsar
+
+jonoffcpu grew out of optimizing [Apache Pulsar](https://pulsar.apache.org/).
+The Pulsar performance launcher profiles a broker and its clients with the
+agent under a load scenario, then correlates and renders the results. In an
+IoT scenario (5 million messages from 500 producers to one topic) the broker
+spent 8,519 s off-CPU across its threads, and after `preset:jvm-idle` and one
+BookKeeper queue line only 49.0 s of that was busy. `top --app
+'^org\.apache\.'` put two rows ahead of everything else:
+`PersistentDispatcherMultipleConsumers.internalConsumerFlow` waiting on a
+monitor, 12.0 s, and the BookKeeper executor queue's `offer` waiting on a
+`ReentrantLock`, 4.9 s. The same tables on an Alpine (musl) image counted
+2,019 s as busy instead of 49 s: on musl every native frame is
+`/lib/ld-musl-x86_64.so.1`, so the JVM's own idle GC and compiler threads cannot
+be recognized, and a glibc image is needed for the busy total without an
+application frame to mean anything. The application rows still compare, which
+is what `top --baseline` restricts itself to.
 
 `export --format jsonl` also carries each stack as an array (`javaFrames`,
 `kernelFrames`, `userFrames`), the stack without generated-class addresses
@@ -930,6 +1117,10 @@ The agent can also be started programmatically with
 `Agent-Class` entry point. See [jonoffcpu-agent/README.md](jonoffcpu-agent/README.md).
 
 ### Correlator options
+
+The generated help is the reference: `java -jar jonoffcpu-correlator.jar help
+<command>` lists every option of `correlate`, `stacks`, `top`, `summarize`,
+`merge`, `export` and `dump`. The most used correlation options:
 
 | Option | Meaning |
 | --- | --- |
