@@ -228,7 +228,14 @@ val nativeTasks = allNativePlatforms.mapValues { (platform, spec) ->
             rootProject.file("async-profiler/Makefile")
         )
         outputs.files(nativeFileNames.map { name -> output.map { it.file(name) } })
+        val asyncProfilerHeader = rootProject.file("async-profiler/src/asprof.h")
         doFirst {
+            // An uninitialized submodule otherwise surfaces as an opaque Docker COPY failure.
+            if (!asyncProfilerHeader.isFile) {
+                throw GradleException(
+                    "The async-profiler submodule is not checked out; run 'git submodule update --init'"
+                )
+            }
             delete(output)
         }
     }

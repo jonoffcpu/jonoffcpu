@@ -65,6 +65,13 @@ tasks.withType<Javadoc>().configureEach {
 }
 
 val jar = tasks.named<Jar>("jar") {
+    // An uninitialized submodule leaves no sources, which would otherwise yield an empty JAR.
+    val converterMain = converterSourceDir.file("one/convert/Main.java").asFile
+    doFirst {
+        if (!converterMain.isFile) {
+            throw GradleException("The async-profiler submodule is not checked out; run 'git submodule update --init'")
+        }
+    }
     isPreserveFileTimestamps = false
     isReproducibleFileOrder = true
     manifest {
