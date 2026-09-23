@@ -631,6 +631,11 @@ java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
   --exclude 'io\.netty\.channel\.epoll\.Native\.epollWait0' --output app.collapsed
 
+# A kept list of idle waits, one pattern per line
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude-from idle-waits.txt --output busy-java.collapsed
+
 # Only the time threads spent waiting for a CPU after they were woken
 java -jar jonoffcpu-correlator.jar stacks \
   --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
@@ -692,6 +697,12 @@ stacks they were matched against (`filterScope`), and under `filtered` what
 the filters removed, so the kept and removed time add up to the unfiltered
 slice. The converter's own `-I`/`-X` still work on a rendered file, but see
 only the frames in its lines and cannot account for what they drop.
+
+`--include-from FILE` and `--exclude-from FILE` read patterns from a file, one
+per line, and add them to any given with `--include`/`--exclude`; both repeat.
+Blank lines and lines starting with `#` are skipped (write `\#` for a pattern
+that starts with `#`), and every other line is taken verbatim, spaces included.
+A file with no patterns, or with an invalid one, is refused, naming the line.
 
 Profiles merge and export as well:
 

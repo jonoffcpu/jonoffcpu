@@ -115,8 +115,8 @@ public final class OffCpuCorrelator {
         Gson gson = new GsonBuilder().serializeNulls().create();
         Map<Long, JsonArray> stacks = new java.util.HashMap<>();
         try (java.io.InputStream input = new java.io.BufferedInputStream(java.nio.file.Files.newInputStream(source));
-                BufferedWriter writer = new BufferedWriter(
-                        new java.io.OutputStreamWriter(System.out, java.nio.charset.StandardCharsets.UTF_8))) {
+                BufferedWriter writer =
+                        new BufferedWriter(new java.io.OutputStreamWriter(System.out, StandardCharsets.UTF_8))) {
             CaptureStream.readHeader(input);
             CaptureStream.Framed framed;
             while ((framed = CaptureStream.next(
@@ -175,7 +175,8 @@ public final class OffCpuCorrelator {
                     + " [--stack java|kernel|user|java+kernel|java+user+kernel] [--weights observed|estimated]"
                     + " [--reason-frame auto|always|never] [--time total|sleeping|runqueue|split]"
                     + " [--package-names full|abbreviate|drop] [--summary summary.json]"
-                    + " [--include REGEX]... [--exclude REGEX]...");
+                    + " [--include REGEX]... [--exclude REGEX]..."
+                    + " [--include-from FILE]... [--exclude-from FILE]...");
             System.out.println(
                     "       java -jar jonoffcpu-correlator.jar merge --profiles a.pb,b.pb --output merged.pb");
             System.out.println("       java -jar jonoffcpu-correlator.jar export --profile " + OutputFiles.PROFILE
@@ -701,7 +702,7 @@ public final class OffCpuCorrelator {
     private static int stacks(String[] args) throws IOException {
         Map<String, String> options = new HashMap<>();
         Map<String, List<String>> repeated = new HashMap<>();
-        args = takeRepeated(args, Set.of("--include", "--exclude"), repeated);
+        args = takeRepeated(args, Set.of("--include", "--exclude", "--include-from", "--exclude-from"), repeated);
         parseOptions(
                 args,
                 Set.of(
@@ -726,7 +727,7 @@ public final class OffCpuCorrelator {
         StackProfileRenderer.PackageNames packages =
                 StackProfileRenderer.PackageNames.parse(options.getOrDefault("--package-names", "full"));
         StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
-                repeated.getOrDefault("--include", List.of()), repeated.getOrDefault("--exclude", List.of()));
+                patterns(repeated, "--include", "--include-from"), patterns(repeated, "--exclude", "--exclude-from"));
         StackProfileRenderer.Slice slice = StackProfileRenderer.render(
                 profile,
                 reasons,
@@ -756,6 +757,40 @@ public final class OffCpuCorrelator {
                                 + " stacks"
                         : ""));
         return 0;
+    }
+
+    /** A filter option's patterns: those given inline, then those of each pattern file in order. */
+    private static List<String> patterns(Map<String, List<String>> repeated, String inline, String fromFile)
+            throws IOException {
+        List<String> patterns = new java.util.ArrayList<>(repeated.getOrDefault(inline, List.of()));
+        for (String file : repeated.getOrDefault(fromFile, List.of())) patterns.addAll(patternFile(fromFile, file));
+        return patterns;
+    }
+
+    /**
+     * Reads a pattern file: one regular expression per line, as {@code --include}/{@code --exclude} would take it.
+     * Blank lines and lines starting with {@code #} are skipped; a pattern starting with {@code #} is written
+     * {@code \#}. A line is otherwise taken verbatim, spaces included, since frame names can contain them. A file
+     * without any pattern is refused rather than read as no filter, which for an include would keep everything.
+     */
+    static List<String> patternFile(String option, String file) throws IOException {
+        List<String> patterns = new java.util.ArrayList<>();
+        List<String> lines = Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);
+        for (int index = 0; index < lines.size(); index++) {
+            String line = lines.get(index);
+            if (line.isBlank() || line.startsWith("#")) continue;
+            try {
+                java.util.regex.Pattern.compile(line);
+            } catch (java.util.regex.PatternSyntaxException invalid) {
+                throw new IllegalArgumentException(
+                        "Invalid pattern in " + option + " " + file + " line " + (index + 1) + ": "
+                                + invalid.getMessage(),
+                        invalid);
+            }
+            patterns.add(line);
+        }
+        if (patterns.isEmpty()) throw new IllegalArgumentException(option + " " + file + " contains no patterns");
+        return patterns;
     }
 
     /** Moves each occurrence of a repeatable option's value into {@code repeated}; returns the other arguments. */

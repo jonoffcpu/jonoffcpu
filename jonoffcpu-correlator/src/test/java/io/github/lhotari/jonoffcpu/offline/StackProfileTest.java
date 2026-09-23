@@ -1130,6 +1130,63 @@ public final class StackProfileTest {
                 "--exclude",
                 () -> stacks(profile, dir.resolve("missing.collapsed"), "--exclude"));
 
+        // Pattern files hold one pattern per line, skipping blank and '#' lines, and add to the inline patterns.
+        Path includes = dir.resolve("includes.txt");
+        Files.writeString(includes, "# idle-free waits\nfutex_wait\n\n   \nsched_yield\r\n");
+        check(
+                stacks(profile, dir.resolve("include-from.collapsed"), "--include-from", includes.toString())
+                        .equals(union),
+                "A pattern file must read like repeated --include options");
+        Path excludes = dir.resolve("excludes.txt");
+        Files.writeString(excludes, "sched_yield\n");
+        Path fromSummary = dir.resolve("from.json");
+        String mixed = stacks(
+                profile,
+                dir.resolve("mixed-from.collapsed"),
+                "--include-from",
+                includes.toString(),
+                "--exclude",
+                "futex_wait",
+                "--exclude-from",
+                excludes.toString(),
+                "--summary",
+                fromSummary.toString());
+        check(mixed.isEmpty(), "Inline and file patterns combine: " + mixed);
+        check(
+                summaryOf(fromSummary).getAsJsonArray("include").toString().equals("[\"futex_wait\",\"sched_yield\"]")
+                        && summaryOf(fromSummary)
+                                .getAsJsonArray("exclude")
+                                .toString()
+                                .equals("[\"futex_wait\",\"sched_yield\"]"),
+                "The summary lists the patterns read from files: " + summaryOf(fromSummary));
+        // A pattern that starts with '#' is escaped, since such a line is a comment.
+        check(
+                OffCpuCorrelator.patternFile(
+                                        "--exclude-from",
+                                        Files.writeString(dir.resolve("hash.txt"), "\\#x\n")
+                                                .toString())
+                                .equals(List.of("\\#x"))
+                        && "#x".matches("\\#x"),
+                "An escaped '#' pattern must survive");
+        Path empty = Files.writeString(dir.resolve("empty.txt"), "# nothing\n\n");
+        rejects(
+                IllegalArgumentException.class,
+                "contains no patterns",
+                () -> stacks(profile, dir.resolve("empty.collapsed"), "--include-from", empty.toString()));
+        Path invalid = Files.writeString(dir.resolve("invalid.txt"), "futex_wait\n(\n");
+        rejects(
+                IllegalArgumentException.class,
+                "line 2",
+                () -> stacks(profile, dir.resolve("invalid.collapsed"), "--exclude-from", invalid.toString()));
+        rejects(
+                java.nio.file.NoSuchFileException.class,
+                "absent.txt",
+                () -> stacks(
+                        profile,
+                        dir.resolve("absent.collapsed"),
+                        "--exclude-from",
+                        dir.resolve("absent.txt").toString()));
+
         // A profile not grouped by kernel stacks cannot be filtered by them, and the summary says so.
         Path narrow = dir.resolve("narrow.pb");
         new StackProfile(

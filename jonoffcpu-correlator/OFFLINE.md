@@ -271,6 +271,7 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--time total|sleeping|runqueue|split] [--package-names full|abbreviate|drop]
     [--summary S]
     [--include REGEX]... [--exclude REGEX]...
+    [--include-from FILE]... [--exclude-from FILE]...
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
 ```
@@ -307,7 +308,11 @@ lines, and before `--reason-frame auto` decides whether the slice mixes reasons.
 An entry is dropped when any frame of any stack the profile is grouped by
 matches an exclude pattern, and otherwise kept when there are no include
 patterns or a frame matches one; each option repeats, meaning any of its
-patterns. The frames matched are the ones a collapsed line would carry — Java
+patterns. `--include-from`/`--exclude-from` add the patterns of a file, one per
+line after the inline ones; blank lines and lines starting with `#` are skipped
+(`\#` escapes a leading `#`), other lines are taken verbatim, and a file without
+patterns is refused, since an empty include list would keep everything. The
+summary lists the patterns read, not the file names. The frames matched are the ones a collapsed line would carry — Java
 names, offset-free native symbols, kernel symbols with `_[k]` and without the
 tracing frames, and the `[kernel stack unavailable]`/`[user stack unavailable]`
 placeholders — for every grouped stack, whichever `--stack` selects; patterns
