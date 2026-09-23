@@ -173,7 +173,8 @@ public final class OffCpuCorrelator {
             System.out.println("       java -jar jonoffcpu-correlator.jar stacks --profile " + OutputFiles.PROFILE
                     + " --output out.collapsed [--reason all|blocked,runnable,preempted,unspecified]"
                     + " [--stack java|kernel|user|java+kernel|java+user+kernel] [--weights observed|estimated]"
-                    + " [--reason-frame auto|always|never] [--summary summary.json]"
+                    + " [--reason-frame auto|always|never] [--time total|sleeping|runqueue|split]"
+                    + " [--summary summary.json]"
                     + " [--include REGEX]... [--exclude REGEX]...");
             System.out.println(
                     "       java -jar jonoffcpu-correlator.jar merge --profiles a.pb,b.pb --output merged.pb");
@@ -535,6 +536,7 @@ public final class OffCpuCorrelator {
             view.add("dimensions", gson.toJsonTree(profile.header().dimensions()));
             view.add("dimensionsDropped", gson.toJsonTree(profile.header().dimensionsDropped()));
             view.addProperty("estimateAvailable", profile.header().estimateAvailable());
+            view.addProperty("timeSplitAvailable", profile.header().timeSplitAvailable());
             report.add("stackProfile", view);
         }
         // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
@@ -550,7 +552,8 @@ public final class OffCpuCorrelator {
                                     header.estimateAvailable(),
                                     reportJson,
                                     header.label(),
-                                    header.dimensionsDropped()),
+                                    header.dimensionsDropped(),
+                                    header.timeSplitAvailable()),
                             profile.entries())
                     .write(directory.resolve(OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX)));
         }
@@ -701,7 +704,15 @@ public final class OffCpuCorrelator {
         args = takeRepeated(args, Set.of("--include", "--exclude"), repeated);
         parseOptions(
                 args,
-                Set.of("--profile", "--output", "--reason", "--stack", "--weights", "--reason-frame", "--summary"),
+                Set.of(
+                        "--profile",
+                        "--output",
+                        "--reason",
+                        "--stack",
+                        "--weights",
+                        "--reason-frame",
+                        "--time",
+                        "--summary"),
                 options);
         requireOptions(options, "--profile", "--output");
         StackProfile profile = StackProfile.read(Path.of(options.get("--profile")));
@@ -710,6 +721,7 @@ public final class OffCpuCorrelator {
                 StackProfileRenderer.StackKinds.parse(options.getOrDefault("--stack", "java"));
         StackProfileRenderer.Weights weights =
                 StackProfileRenderer.Weights.parse(options.getOrDefault("--weights", "observed"));
+        StackProfileRenderer.Time time = StackProfileRenderer.Time.parse(options.getOrDefault("--time", "total"));
         StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
                 repeated.getOrDefault("--include", List.of()), repeated.getOrDefault("--exclude", List.of()));
         StackProfileRenderer.Slice slice = StackProfileRenderer.render(
@@ -718,11 +730,12 @@ public final class OffCpuCorrelator {
                 kinds,
                 weights,
                 StackProfileRenderer.ReasonFrame.parse(options.getOrDefault("--reason-frame", "auto")),
+                time,
                 filter);
         try (BufferedWriter writer = newFile(Path.of(options.get("--output")))) {
             StackProfileRenderer.writeCollapsed(slice, writer);
         }
-        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, filter);
+        JsonObject summary = StackProfileRenderer.summary(slice, profile, reasons, kinds, weights, time, filter);
         if (options.containsKey("--summary")) {
             try (BufferedWriter writer = newFile(Path.of(options.get("--summary")))) {
                 new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(summary, writer);
@@ -731,6 +744,7 @@ public final class OffCpuCorrelator {
         }
         System.out.println("Wrote " + slice.nanos().size() + " collapsed stacks to " + options.get("--output") + ": "
                 + slice.intervals() + " intervals, " + slice.totalNanos() + " ns"
+                + (time == StackProfileRenderer.Time.TOTAL ? "" : " of " + time.label() + " time")
                 + (filter.active()
                         ? "; filtered out " + slice.filteredIntervals() + " intervals, " + slice.filteredNanos()
                                 + " ns, matching " + String.join(",", StackProfileRenderer.Filter.scope(profile))

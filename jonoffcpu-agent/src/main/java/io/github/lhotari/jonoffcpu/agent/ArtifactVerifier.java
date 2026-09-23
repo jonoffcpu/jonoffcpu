@@ -26,9 +26,10 @@ final class ArtifactVerifier {
     private static final int MAX_LINE_BYTES = 1024 * 1024;
     /**
      * Version 2 interns stacks: each distinct stack is one record that observations reference by id. Version 3
-     * classifies every observation by its switch-out reason and adds {@code sampling.reasons}.
+     * classifies every observation by its switch-out reason and adds {@code sampling.reasons}. Version 4 adds
+     * {@code timeSplit} and each observation's run-queue part.
      */
-    static final int SCHEMA_VERSION = 3;
+    static final int SCHEMA_VERSION = 4;
 
     private static final int MAX_STACK_FRAMES = 4096;
     private static final BigInteger MAX_U64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
@@ -65,6 +66,7 @@ final class ArtifactVerifier {
             int signal,
             String delivery,
             SamplingConfig sampling,
+            TimeSplitConfig timeSplit,
             long hostTgid,
             long targetPid,
             JsonObject verifiedIdentity)
@@ -110,6 +112,8 @@ final class ArtifactVerifier {
                         JsonSupport.requireEqual(
                                 "sampling", sampling.json(), JsonSupport.requireObject(row, "sampling"));
                         JsonSupport.requireEqual(
+                                "timeSplit", timeSplit.json(), JsonSupport.requireObject(row, "timeSplit"));
+                        JsonSupport.requireEqual(
                                 "hostTgid", hostTgid, JsonSupport.requireNumber(row, "hostTgid", 1, 0xffffffffL));
                         JsonSupport.requireEqual(
                                 "targetPid", targetPid, JsonSupport.requireNumber(row, "targetPid", 1, 0xffffffffL));
@@ -151,6 +155,7 @@ final class ArtifactVerifier {
                                 sessionId,
                                 epoch,
                                 sampling,
+                                timeSplit,
                                 hostTgid,
                                 targetPid,
                                 verifiedIdentity,
@@ -192,7 +197,8 @@ final class ArtifactVerifier {
             "switchOutsRunnable",
             "switchOutsPreempted",
             "reasonRejections",
-            "reasonRejectedDurationMicros"
+            "reasonRejectedDurationMicros",
+            "runqueueInversions"
         }) {
             requireU64(kernel, key);
         }
@@ -321,6 +327,7 @@ final class ArtifactVerifier {
             String sessionId,
             long epoch,
             SamplingConfig sampling,
+            TimeSplitConfig timeSplit,
             long hostTgid,
             long targetPid,
             JsonObject verifiedIdentity,
@@ -365,6 +372,14 @@ final class ArtifactVerifier {
         JsonSupport.requireEqual("observation offCpuReason", derived, reason);
         if (!sampling.reasons().contains(SamplingConfig.OffCpuReason.parse(reason))) {
             throw new IOException("Observation reason was not selected by sampling.reasons: " + reason);
+        }
+        // The run-queue part is the raw growth of the scheduler's run delay; the consumers apply the split rule, so
+        // only its presence is checked here: never without the source, and a well-formed u64 with it.
+        if (row.has("runqueueNanos")) {
+            if (timeSplit.source() == TimeSplitConfig.Source.OFF) {
+                throw new IOException("Observation carries a run-queue part although timeSplit.source is off");
+            }
+            requireU64(row, "runqueueNanos");
         }
         // A stack is either announced by an earlier record or explained by an error on this row.
         for (String stack : new String[] {"kernelStack", "userStack"}) {

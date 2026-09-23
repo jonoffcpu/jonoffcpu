@@ -542,6 +542,32 @@ public final class SignalCaptureControllerTest {
                         .equals(java.util.List.of(
                                 SamplingConfig.OffCpuReason.BLOCKED, SamplingConfig.OffCpuReason.RUNNABLE)),
                 "sampling-reasons native option not parsed: " + reasons.sampling());
+        check(config.timeSplit().equals(TimeSplitConfig.DEFAULT), "native options must default to schedInfo");
+        AgentConfig splitOff = AgentConfig.parseNativeOptions(
+                "jonoffcpuoutput="
+                        + root.resolve("split-off.ndjson")
+                        + ",sampling-policy=proportional,record-all-above-micros=250,time-split=off,asprofpath="
+                        + ap
+                        + ",event=cpu,file="
+                        + root.resolve("split-off.jfr"),
+                nativeLibrary);
+        check(
+                splitOff.timeSplit().json().toString().equals("{\"source\":\"off\"}"),
+                "time-split native option not parsed: " + splitOff.timeSplit());
+        try {
+            AgentConfig.parseNativeOptions(
+                    "jonoffcpuoutput="
+                            + root.resolve("split-wakeup.ndjson")
+                            + ",sampling-policy=proportional,record-all-above-micros=250,time-split=wakeup,"
+                            + "asprofpath="
+                            + ap
+                            + ",event=cpu,file="
+                            + root.resolve("split-wakeup.jfr"),
+                    nativeLibrary);
+            throw new AssertionError("Expected unknown time-split source rejection");
+        } catch (IllegalArgumentException expected) {
+            check(expected.getMessage().contains("timeSplit source"), "wrong time-split failure");
+        }
         check(config.asyncProfilerOptions().contains("event=cpu,alloc=1m,jfrsync=profile"), "AP tail changed");
         check(config.jfrOutput().equals(jfr), "AP output path not retained");
 
@@ -626,6 +652,34 @@ public final class SignalCaptureControllerTest {
                                 1000L,
                                 new SamplingConfig.Uniform(new BigDecimal("0.125"), 536_870_912L))),
                 "YAML sampling policy not parsed exactly: " + config.sampling());
+        check(config.timeSplit().equals(TimeSplitConfig.DEFAULT), "YAML must default to timeSplit schedInfo");
+        String splitBase = """
+                correlationOutput: %s
+                asyncProfilerLibrary: %s
+                nativeCollectorLibrary: %s
+                asyncProfilerOptions: event=cpu,file=%s
+                sampling:
+                  admission:
+                    policy: proportional
+                    recordAllAboveMicros: 250
+                """.formatted(root.resolve("split.ndjson"), ap, nativeLibrary, root.resolve("split.jfr"));
+        AgentConfig splitOff = AgentConfig.parse(splitBase + "timeSplit:\n  source: \"off\"\n");
+        check(
+                splitOff.timeSplit().source() == TimeSplitConfig.Source.OFF,
+                "YAML timeSplit not parsed: " + splitOff.timeSplit());
+        for (String rejected : new String[] {
+            "timeSplit:\n  source: wakeup\n",
+            "timeSplit:\n  source: \"off\"\n  extra: 1\n",
+            "timeSplit: {}\n",
+            "timeSplit: \"off\"\n"
+        }) {
+            try {
+                AgentConfig.parse(splitBase + rejected);
+                throw new AssertionError("Expected timeSplit rejection: " + rejected);
+            } catch (IllegalArgumentException expected) {
+                // Rejected as intended.
+            }
+        }
         try {
             AgentConfig.parse("correlationOutput: /tmp/a\nunknownOption: true\n");
             throw new AssertionError("Expected unknown YAML key rejection");
@@ -901,6 +955,7 @@ public final class SignalCaptureControllerTest {
                 "event=cpu",
                 "queued",
                 sampling,
+                TimeSplitConfig.DEFAULT,
                 50,
                 0,
                 1000);
@@ -1023,6 +1078,7 @@ public final class SignalCaptureControllerTest {
         private boolean nativeStackFailure;
         private Path source;
         private JsonObject sampling;
+        private JsonObject timeSplit;
         private long targetPid;
         private int signal;
         private String session;
@@ -1034,6 +1090,7 @@ public final class SignalCaptureControllerTest {
             JsonObject config = JsonParser.parseString(configJson).getAsJsonObject();
             source = Path.of(config.get("outputPath").getAsString());
             sampling = config.getAsJsonObject("sampling");
+            timeSplit = config.getAsJsonObject("timeSplit");
             targetPid = config.get("targetPid").getAsLong();
             JsonObject result = success("prepared");
             result.addProperty("handle", HANDLE);
@@ -1041,6 +1098,7 @@ public final class SignalCaptureControllerTest {
             result.addProperty("targetPid", config.get("targetPid").getAsLong());
             result.addProperty("hostTgid", config.get("targetPid").getAsLong());
             result.add("sampling", sampling.deepCopy());
+            result.add("timeSplit", timeSplit.deepCopy());
             JsonObject identity = new JsonObject();
             identity.addProperty("registrationToken", "0123456789abcdef");
             identity.addProperty("processGenerationNs", "9");
@@ -1069,6 +1127,7 @@ public final class SignalCaptureControllerTest {
             result.addProperty("targetPid", targetPid);
             result.addProperty("hostTgid", targetPid);
             result.add("sampling", sampling.deepCopy());
+            result.add("timeSplit", timeSplit.deepCopy());
             JsonObject identity = new JsonObject();
             identity.addProperty("registrationToken", "0123456789abcdef");
             identity.addProperty("processGenerationNs", "9");
@@ -1079,7 +1138,7 @@ public final class SignalCaptureControllerTest {
             identity.addProperty("monotonicOffsetNanos", "0");
             result.add("verifiedIdentity", identity);
             JsonObject start = new JsonObject();
-            start.addProperty("schemaVersion", 3);
+            start.addProperty("schemaVersion", 4);
             start.addProperty("recordType", "captureStart");
             start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             start.addProperty("sessionId", session);
@@ -1087,6 +1146,7 @@ public final class SignalCaptureControllerTest {
             start.addProperty("signal", signal);
             start.addProperty("signalDelivery", signal >= 34 ? "queued" : "coalescing");
             start.add("sampling", sampling.deepCopy());
+            start.add("timeSplit", timeSplit.deepCopy());
             start.addProperty("startedMonotonicNanos", "9");
             start.addProperty("hostTgid", targetPid);
             start.addProperty("targetPid", targetPid);
@@ -1118,7 +1178,7 @@ public final class SignalCaptureControllerTest {
             try {
                 if (nativeStackFailure) {
                     JsonObject observation = new JsonObject();
-                    observation.addProperty("schemaVersion", 3);
+                    observation.addProperty("schemaVersion", 4);
                     observation.addProperty("recordType", "observation");
                     observation.addProperty("sourceId", "jonoffcpu.offcpu.v1");
                     observation.addProperty("sessionId", session);
@@ -1142,10 +1202,11 @@ public final class SignalCaptureControllerTest {
                     observation.addProperty("offCpuReason", "blocked");
                     observation.addProperty("prevTaskState", 1);
                     observation.addProperty("preempted", false);
+                    observation.addProperty("runqueueNanos", "1");
                     observation.addProperty("comm", "fixture");
                     // One announced stack for the kernel side; the user side failed, so it has no record.
                     JsonObject stack = new JsonObject();
-                    stack.addProperty("schemaVersion", 3);
+                    stack.addProperty("schemaVersion", 4);
                     stack.addProperty("recordType", "stack");
                     stack.addProperty("sourceId", "jonoffcpu.offcpu.v1");
                     stack.addProperty("sessionId", session);
@@ -1198,7 +1259,7 @@ public final class SignalCaptureControllerTest {
 
         private static JsonObject captureEnd(String session, boolean complete) {
             JsonObject end = new JsonObject();
-            end.addProperty("schemaVersion", 3);
+            end.addProperty("schemaVersion", 4);
             end.addProperty("recordType", "captureEnd");
             end.addProperty("sourceId", "jonoffcpu.offcpu.v1");
             end.addProperty("sessionId", session);
@@ -1233,7 +1294,8 @@ public final class SignalCaptureControllerTest {
                 "switchOutsRunnable",
                 "switchOutsPreempted",
                 "reasonRejections",
-                "reasonRejectedDurationMicros"
+                "reasonRejectedDurationMicros",
+                "runqueueInversions"
             }) kernel.addProperty(key, "0");
             JsonObject userspace = new JsonObject();
             for (String key : new String[] {

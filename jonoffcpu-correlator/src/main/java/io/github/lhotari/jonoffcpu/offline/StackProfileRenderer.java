@@ -18,9 +18,9 @@ import java.util.function.Predicate;
 import java.util.regex.Pattern;
 
 /**
- * Projects a {@link StackProfile} onto collapsed stacks: one slice by switch-out reason, stack kind and weighting.
- * Rendered with the profile's own defaults — every reason, Java stacks, observed weights — a profile reproduces
- * the correlator's {@code jonoffcpu-offcpu-stacks.collapsed} byte for byte. A {@link Filter} keeps or drops whole
+ * Projects a {@link StackProfile} onto collapsed stacks: one slice by switch-out reason, stack kind, weighting and
+ * {@link Time time part}. Rendered with the profile's own defaults — every reason, Java stacks, observed weights, the
+ * whole time — a profile reproduces the correlator's {@code jonoffcpu-offcpu-stacks.collapsed} byte for byte. A {@link Filter} keeps or drops whole
  * entries by their frames before they are merged into lines, so it sees stacks the slice does not render, and the
  * time it removes stays accountable.
  */
@@ -63,6 +63,35 @@ final class StackProfileRenderer {
                 case "estimated" -> ESTIMATED;
                 default -> throw new IllegalArgumentException("Invalid weights: " + text);
             };
+        }
+    }
+
+    /**
+     * Which part of each interval's time a slice weighs: all of it, only the sleeping or the run-queue part, or all of
+     * it with each line ending in a {@code [sleeping]}, {@code [runqueue]} or {@code [unsplit]} leaf frame, so one
+     * flame graph shows both parts. Every mode but {@code total} needs a profile with the split.
+     */
+    enum Time {
+        TOTAL(null),
+        SLEEPING(TimeSplit.Part.SLEEPING),
+        RUNQUEUE(TimeSplit.Part.RUNQUEUE),
+        SPLIT(null);
+
+        final TimeSplit.Part part;
+
+        Time(TimeSplit.Part part) {
+            this.part = part;
+        }
+
+        String label() {
+            return name().toLowerCase(java.util.Locale.ROOT);
+        }
+
+        static Time parse(String text) {
+            for (Time time : values()) {
+                if (time.label().equals(text)) return time;
+            }
+            throw new IllegalArgumentException("Invalid time part: " + text);
         }
     }
 
@@ -169,14 +198,17 @@ final class StackProfileRenderer {
 
     /**
      * The collapsed lines of one slice and the totals behind them, for a summary a reader can reconcile. The
-     * filtered totals are what the slice's filter removed: an unfiltered slice's totals less the kept ones.
+     * filtered totals are what the slice's filter removed: an unfiltered slice's totals less the kept ones. The
+     * unsplit total is the part of the kept entries' time that has no sleeping/run-queue split, which a
+     * {@code sleeping} or {@code runqueue} slice leaves out.
      */
     record Slice(
             Map<String, BigInteger> nanos,
             long intervals,
             BigInteger totalNanos,
             long filteredIntervals,
-            BigInteger filteredNanos) {}
+            BigInteger filteredNanos,
+            BigInteger unsplitNanos) {}
 
     private static final Pattern OFFSET = Pattern.compile("\\+0x[0-9a-fA-F]+$");
     /**
@@ -208,18 +240,20 @@ final class StackProfileRenderer {
             StackKinds kinds,
             Weights weights,
             ReasonFrame frame,
+            Time time,
             Filter filter)
             throws IOException {
-        Slice kept = project(profile, reasons, kinds, weights, frame, filter.predicate(profile));
+        Slice kept = project(profile, reasons, kinds, weights, frame, time, filter.predicate(profile));
         if (!filter.active()) return kept;
         // Rendered unfiltered as well, so the removed time is exact even where thinning rounds line by line.
-        Slice all = project(profile, reasons, kinds, weights, frame, entry -> true);
+        Slice all = project(profile, reasons, kinds, weights, frame, time, entry -> true);
         return new Slice(
                 kept.nanos(),
                 kept.intervals(),
                 kept.totalNanos(),
                 Math.subtractExact(all.intervals(), kept.intervals()),
-                all.totalNanos().subtract(kept.totalNanos()));
+                all.totalNanos().subtract(kept.totalNanos()),
+                kept.unsplitNanos());
     }
 
     private static Slice project(
@@ -228,6 +262,7 @@ final class StackProfileRenderer {
             StackKinds kinds,
             Weights weights,
             ReasonFrame frame,
+            Time time,
             Predicate<StackProfile.Entry> keeps)
             throws IOException {
         if (weights == Weights.ESTIMATED) {
@@ -235,6 +270,13 @@ final class StackProfileRenderer {
                     profile.header().estimateAvailable(),
                     "This profile's inverse-probability estimate is unavailable; use observed weights");
         }
+        if (time != Time.TOTAL) {
+            CaptureInput.require(
+                    profile.header().timeSplitAvailable(),
+                    "This profile has no sleeping/run-queue split (its capture predates timeSplit or ran with"
+                            + " timeSplit.source off); use --time total");
+        }
+        boolean estimated = weights == Weights.ESTIMATED;
         if (kinds.kernel) requireDimension(profile, ProfileAccumulator.KERNEL);
         if (kinds.user) requireDimension(profile, ProfileAccumulator.USER);
         Set<OffCpuReason> selected = reasons == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(reasons);
@@ -244,15 +286,21 @@ final class StackProfileRenderer {
             if (!selected.contains(entry.reason()) || !keeps.test(entry)) continue;
             entries.add(entry);
             // Only reasons that contribute a line count, as in the correlator's own collapsed file.
-            if (entry.observedNanos() > 0) present.add(entry.reason());
+            long contributes =
+                    time.part == null ? entry.observedNanos() : entry.split().nanos(time.part, false);
+            if (contributes > 0) present.add(entry.reason());
         }
         boolean withReason = frame.applies(present.size());
         String label = profile.header().label();
         Map<String, BigInteger> raw = new TreeMap<>();
         long intervals = 0;
+        long unsplit = 0;
         for (StackProfile.Entry entry : entries) {
             intervals = Math.addExact(intervals, entry.intervals());
-            long nanos = weights == Weights.OBSERVED ? entry.observedNanos() : entry.estimatedNanos();
+            unsplit = U64.add(unsplit, entry.split().nanos(TimeSplit.Part.UNSPLIT, estimated), "Unsplit duration");
+            long nanos = time.part != null
+                    ? entry.split().nanos(time.part, estimated)
+                    : estimated ? entry.estimatedNanos() : entry.observedNanos();
             if (nanos == 0) continue;
             StringBuilder line = new StringBuilder(label);
             if (withReason) line.append(reasonFrame(entry.reason())).append(';');
@@ -260,7 +308,15 @@ final class StackProfileRenderer {
             if (kinds.java) appendJava(line, entry.javaStack());
             if (kinds.user) appendNative(line, start, userNames(entry.userStack()));
             if (kinds.kernel) appendNative(line, start, kernelNames(entry.kernelStack()));
-            raw.merge(line.toString(), BigInteger.valueOf(nanos), BigInteger::add);
+            if (time != Time.SPLIT) {
+                raw.merge(line.toString(), BigInteger.valueOf(nanos), BigInteger::add);
+                continue;
+            }
+            for (TimeSplit.Part part : TimeSplit.Part.values()) {
+                long partNanos = entry.split().nanos(part, estimated);
+                if (partNanos == 0) continue;
+                raw.merge(line + ";" + partFrame(part), BigInteger.valueOf(partNanos), BigInteger::add);
+            }
         }
         Thinning thinning = weights == Weights.OBSERVED ? profile.header().thinning() : Thinning.NONE;
         Map<String, BigInteger> scaled = new TreeMap<>();
@@ -271,7 +327,13 @@ final class StackProfileRenderer {
             scaled.put(line.getKey(), value);
             total = total.add(value);
         }
-        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO);
+        BigInteger unsplitTotal = thinning.active() ? thinning.scale(unsplit) : BigInteger.valueOf(unsplit);
+        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO, unsplitTotal);
+    }
+
+    /** The leaf frame naming one part of an interval's time in a {@link Time#SPLIT} slice. */
+    static String partFrame(TimeSplit.Part part) {
+        return "[" + part.label() + "]";
     }
 
     private static void requireDimension(StackProfile profile, String dimension) throws IOException {
@@ -352,6 +414,7 @@ final class StackProfileRenderer {
             Set<OffCpuReason> reasons,
             StackKinds kinds,
             Weights weights,
+            Time time,
             Filter filter) {
         JsonObject summary = new JsonObject();
         summary.addProperty("schemaVersion", 1);
@@ -362,12 +425,17 @@ final class StackProfileRenderer {
         summary.add("reasons", selected);
         summary.addProperty("stack", kinds.text);
         summary.addProperty("weights", weights.name().toLowerCase(java.util.Locale.ROOT));
+        summary.addProperty("time", time.label());
         summary.addProperty(
                 "reasonSemantics",
-                "switch-out reason; a blocked interval's duration includes its run-queue delay after wakeup");
+                "switch-out reason; a blocked interval's time is split into sleeping before its wakeup and runqueue"
+                        + " after it, and runnable and preempted intervals are runqueue throughout, when the profile"
+                        + " has the split");
         summary.addProperty("intervals", Long.toString(slice.intervals()));
         summary.addProperty("lines", slice.nanos().size());
         summary.addProperty("totalNanos", slice.totalNanos().toString());
+        // The kept entries' time without a split: part of a total or split slice, left out of sleeping and runqueue.
+        summary.addProperty("unsplitNanos", slice.unsplitNanos().toString());
         summary.add("include", patterns(filter.include()));
         summary.add("exclude", patterns(filter.exclude()));
         JsonArray scope = new JsonArray();
@@ -394,7 +462,8 @@ final class StackProfileRenderer {
         switch (format) {
             case "csv" -> {
                 writer.write("reason,task_state,thread,java_stack,kernel_stack,user_stack,"
-                        + "intervals,observed_nanos,estimated_nanos");
+                        + "intervals,observed_nanos,estimated_nanos,sleeping_nanos,runqueue_nanos,unsplit_nanos,"
+                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos");
                 writer.newLine();
                 for (StackProfile.Entry entry : profile.entries()) {
                     writer.write(String.join(
@@ -407,7 +476,13 @@ final class StackProfileRenderer {
                             csv(joined(entry.userStack(), true)),
                             Long.toString(entry.intervals()),
                             Long.toUnsignedString(entry.observedNanos()),
-                            Long.toUnsignedString(entry.estimatedNanos())));
+                            Long.toUnsignedString(entry.estimatedNanos()),
+                            Long.toUnsignedString(entry.split().sleeping()),
+                            Long.toUnsignedString(entry.split().runqueue()),
+                            Long.toUnsignedString(entry.split().unsplit()),
+                            Long.toUnsignedString(entry.split().estimatedSleeping()),
+                            Long.toUnsignedString(entry.split().estimatedRunqueue()),
+                            Long.toUnsignedString(entry.split().estimatedUnsplit())));
                     writer.newLine();
                 }
             }
@@ -424,6 +499,13 @@ final class StackProfileRenderer {
                     row.addProperty("intervals", entry.intervals());
                     row.addProperty("observedNanos", Long.toUnsignedString(entry.observedNanos()));
                     row.addProperty("estimatedNanos", Long.toUnsignedString(entry.estimatedNanos()));
+                    StackProfile.Split split = entry.split();
+                    row.addProperty("sleepingNanos", Long.toUnsignedString(split.sleeping()));
+                    row.addProperty("runqueueNanos", Long.toUnsignedString(split.runqueue()));
+                    row.addProperty("unsplitNanos", Long.toUnsignedString(split.unsplit()));
+                    row.addProperty("estimatedSleepingNanos", Long.toUnsignedString(split.estimatedSleeping()));
+                    row.addProperty("estimatedRunqueueNanos", Long.toUnsignedString(split.estimatedRunqueue()));
+                    row.addProperty("estimatedUnsplitNanos", Long.toUnsignedString(split.estimatedUnsplit()));
                     gson.toJson(row, writer);
                     writer.newLine();
                 }

@@ -12,9 +12,10 @@ a 12-byte header, then length-delimited protobuf records. A capture holds a
 `captureStart`, a `stack` record for each distinct native stack, one
 `observation` per recorded off-CPU interval, a `captureEnd`, and the
 `captureFinalized` footer. The three control records carry the JSON object they
-have always carried, at `schemaVersion` 3 (2 for captures recorded before
-switch-out reasons were classified, which are still read), and that JSON is
-still read with the strict parser; observations and stacks are native protobuf.
+have always carried, at `schemaVersion` 4 (3 for captures recorded before the
+sleeping/run-queue split, and 2 for captures recorded before switch-out reasons
+were classified, both still read), and that JSON is still read with the strict
+parser; observations and stacks are native protobuf.
 All control records of one capture carry the same version. Read a capture with
 `java -jar jonoffcpu-correlator.jar --dump --source <file>`, which prints one
 JSON object per record with each observation's stacks expanded.
@@ -45,15 +46,56 @@ The reason describes the switch-out. `runnable` is how a user-space thread
 preempted by the scheduler tick appears (it is switched out at an ordinary
 `schedule()` on its return to user mode), and `preempted` is a preemption inside
 the kernel; both are time spent waiting for a CPU. A `blocked` interval's duration
-includes its run-queue delay between wakeup and switch-in; the two are not split.
+includes its run-queue delay between wakeup and switch-in; the next section splits
+the two.
 
 The report's `offCpuReasons` object, present for classified captures, lists the
-selected reasons, the matched intervals and observed nanoseconds of each, the
-kernel's per-reason switch-out counts — taken before its reason filter, so a
+selected reasons, the matched intervals, observed nanoseconds and their
+sleeping/run-queue split for each, the kernel's per-reason switch-out counts — taken before its reason filter, so a
 blocked-only capture still shows how often its threads were preempted — and the
 count and total duration of intervals the filter rejected. The population
 estimate covers the selected reasons only, since the kernel's eligibility counters
 are taken after the reason filter.
+
+## Sleeping and run-queue time
+
+A `schemaVersion` 4 capture names where each interval's run-queue part comes from
+in `captureStart.timeSplit` — `{"source": "schedInfo"}` or `{"source": "off"}` —
+and the same object in the manifest and in the footer's `analysisInputs`, all
+compared structurally. It is a block of its own beside `sampling` because it
+changes what is measured, not which intervals are kept. Under `schedInfo` every
+observation carries `runqueueNanos`: the growth of the scheduler's
+`task_struct.sched_info.run_delay` between switch-out and switch-in, which the
+kernel adds to on every run-queue wait whether or not delay accounting or
+schedstats are switched on. The collector refuses `schedInfo` at prepare on a
+kernel whose BTF has no such field; there is no silent fallback to `off`. The
+kernel drops a reading only when the counter went backwards
+(`runqueueInversions` in the `captureEnd` kernel counters). A row carrying
+`runqueueNanos` under `off`, and a version 3 or older capture with a `timeSplit`
+block or a version 4 one without it, are rejected.
+
+The correlator applies one rule, and the report, the profile and every slice
+share it:
+
+- a `blocked` interval sleeps for its duration minus `runqueueNanos` and then
+  waits `runqueueNanos` for a CPU: the run-queue part is the tail
+  `[end - runqueueNanos, end]`;
+- a `runnable` or `preempted` interval never left the run queue and is run-queue
+  time throughout, whatever the reading. The scheduler's clock can lag a few
+  microseconds when a running task departs, so such a reading may slightly
+  exceed the duration;
+- an interval without a reading (a version 2 or 3 capture, `off`, or a dropped
+  reading), or a `blocked` one whose reading exceeds its duration, is **unsplit**.
+  Nothing is guessed or clamped.
+
+Each part is clipped to the `--from-ns`/`--to-ns` window separately, so sleeping,
+run-queue and unsplit time add up exactly to every interval's clipped duration.
+`offCpuReasons.matched` gives `sleepingNanos`, `runqueueNanos` and `unsplitNanos`
+per reason, and `offCpuReasons.timeSplit` names the `source`, whether the split is
+`available`, the rule, the unsplit intervals by cause (`withoutReading`,
+`readingExceedsInterval`) and the kernel's `runqueueInversions`. The default
+collapsed files, the audit files and the synthetic JFR carry the whole interval
+as before; the split reaches the stack profile and the `stacks --time` slices.
 
 A record's length prefix is checked against the record limit before any bytes
 are read, so a corrupt length cannot drive an allocation. A truncated final
@@ -193,7 +235,12 @@ the matched interval count, the selected observed nanoseconds (clipped to the
 analysis window and before any thinning reweight), and the same intervals'
 inverse-probability weight, floored to whole nanoseconds; `estimate_available`
 repeats the population estimate's verdict on whether that weight may be used.
-Fields for the sleeping/run-queue split are reserved and marked unavailable.
+When `time_split_available` is set, an entry also splits its observed and
+estimated nanoseconds into sleeping, run-queue and unsplit parts that add up
+exactly to the totals; the estimated parts are floored cumulatively (sleeping,
+then sleeping plus run queue, then the whole), so a part with no weight stays
+zero. A profile without the flag, including one written before the split existed,
+reads as all unsplit.
 Past `--max-profile-entries` (default 2,000,000) the thread, then the user stack,
 then the kernel stack are dropped from the key; that merges entries without
 changing any total, and `profile_end` and the report's `stackProfile` object name
@@ -207,7 +254,8 @@ and refuses a truncated or foreign file. Three subcommands use it:
 java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--reason all|blocked,runnable,preempted,unspecified]
     [--stack java|kernel|user|java+kernel|java+user+kernel]
-    [--weights observed|estimated] [--reason-frame auto|always|never] [--summary S]
+    [--weights observed|estimated] [--reason-frame auto|always|never]
+    [--time total|sleeping|runqueue|split] [--summary S]
     [--include REGEX]... [--exclude REGEX]...
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
@@ -218,6 +266,14 @@ byte, including the thinning label and reweighting. Native frames are rendered
 without their `+0x` offsets, kernel frames with an `_[k]` suffix, and a kernel
 stack stops before the tracing frames that captured it (`__traceiter_*`,
 `__bpf_trace_*`, `bpf_trace_run*`, `bpf_prog_*`); the profile keeps them.
+
+`--time` picks which part of each entry's time a slice weighs: `total` (the
+default), `sleeping`, `runqueue`, or `split`, which keeps the whole time and ends
+each line in a `[sleeping]`, `[runqueue]` or `[unsplit]` frame. Every mode but
+`total` refuses a profile without the split. `--reason-frame auto` counts a
+reason only when it contributes to the selected part. The `--summary` file names
+the `time` part and carries `unsplitNanos`, the kept entries' unsplit time, which
+a `sleeping` or `runqueue` slice leaves out.
 
 `--include`/`--exclude` filter whole profile entries before they are merged into
 lines, and before `--reason-frame auto` decides whether the slice mixes reasons.
@@ -238,7 +294,10 @@ unfiltered slice exactly, thinning included, because the unfiltered slice is
 rendered to compute it. `merge`
 sums identical entries and keeps every input's provenance; it refuses profiles
 with different grouping, and thinned profiles, whose weights have no common scale.
-`export` writes one row per entry with expanded stacks, for tools such as DuckDB.
+It sums the split parts too, so an input without the split contributes its time
+as unsplit and the merged profile has the split when any input has it.
+`export` writes one row per entry with expanded stacks and the six split columns,
+for tools such as DuckDB.
 
 ## Degradation
 
@@ -348,23 +407,24 @@ columns, the cookie index, the interned JFR stacks and the few retained control
 objects. Retention is proportional to the number of *distinct stacks*, not to the
 number of recorded intervals — a capture of 1.12 million samples carrying 10,631
 distinct stacks holds one copy of each — so the guard is a usable steering signal
-rather than a proxy for input size. Roughly 95 bytes of retention per recorded
+rather than a proxy for input size. Roughly 103 bytes of retention per recorded
 interval, plus the interned stacks and the stack profile's entries, is the figure
 to plan a capture against — it is the load-bearing number here. A source column
-slot is 51 bytes: the switch-out reason, the task state and both native stack ids
-are kept for the stack profile. The scale fixture
+slot is 59 bytes: the switch-out reason, the task state, both native stack ids and
+the run-queue reading are kept for the stack profile. The scale fixture
 (`StreamingCorrelatorTest.scale`, 2,000,000 observations and a matching 2,000,000
 JFR samples) asserts a bound of 400 MiB on peak retained bytes and has measured
 comfortably inside it; the exact figure moves with the engine's structures and is
 not a number to plan against.
 
 A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
-distinct Java stacks) measured 226 MiB (237,145,343 bytes) of peak retained
-bytes — about 211 bytes per recorded interval, roughly 2.2x the 95-byte
-column-only figure above, and 11 % above the 203 MiB it measured before the
-native stacks and the stack profile were retained. Real JVM stacks are far deeper
-than the synthetic scale fixture's, so interned stacks account for the
-difference; treat 95 bytes/interval as a lower bound for the column storage
+distinct Java stacks) measured 271 MiB (284,167,413 bytes) of peak retained
+bytes — about 253 bytes per recorded interval, roughly 2.5x the 103-byte
+column-only figure above, against 260 MiB (272,115,381 bytes) for the same
+capture before the run-queue reading was kept and 203 MiB before the native
+stacks and the stack profile were. Real JVM
+stacks are far deeper than the synthetic scale fixture's, so interned stacks
+account for the difference; treat 103 bytes/interval as a lower bound for the column storage
 alone, not the full per-interval budget, when planning against real captures.
 Its stack profile is 913 KB for 12,914 entries, against a 6.3 MB collapsed file,
 and renders any slice in about a third of a second.

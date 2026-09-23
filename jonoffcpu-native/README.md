@@ -27,6 +27,18 @@ the original current-task ID, comm, kernel-stack, and user-stack semantics while
 using `BPF_PROG_TYPE_TRACING`, for which the kernel permits
 `bpf_send_signal_task`.
 
+With `timeSplit.source` `schedInfo`, the switch-out hook also saves the task's
+`sched_info.run_delay` and the switch-in hook reads it again; the difference is
+the interval's run-queue time, written to the observation as `runqueue_nanos`.
+The scheduler adds each run-queue wait to that counter in `prepare_task_switch`,
+before the switch-in hook runs, whether or not delay accounting or schedstats
+are enabled at runtime. The fields are read through local CO-RE flavours guarded
+by `bpf_core_field_exists`, so the object loads on a kernel without
+`CONFIG_SCHED_INFO`, and the collector checks the running kernel's BTF for the
+field before load and refuses `schedInfo` when it is missing. A counter that went
+backwards drops the reading and counts `runqueueInversions`; nothing else is
+dropped or clamped in the kernel.
+
 Run the switch-out reason proof:
 
 ```sh
@@ -44,6 +56,19 @@ ones. On the tested 16-CPU 7.1.5 kernel the spinners came back 2,861
 `runnable` and 2 `preempted`: a user-space thread preempted by the tick is
 switched out on its return to user mode, where `preempt` is false, so
 `preempted` is only a preemption inside the kernel.
+
+The same proof checks the run-queue reading. A second sleeper runs at nice 19,
+pinned beside three nice-0 spinners. For each sleeper, the run-queue parts of
+its recorded intervals must add up to the growth of its thread's
+`/proc/<pid>/task/<tid>/schedstat` run delay over the phase (they matched to the
+nanosecond for the uncontended sleeper), the contended sleeper must wait far
+longer for a CPU after each wakeup (1.4 ms against 0.1 µs on the tested kernel),
+runnable and preempted intervals must be run-queue time nearly throughout
+(99.96 %), no blocked interval may queue for longer than it lasted, and a third
+phase with the split off must record no reading. It also reports how far a
+runnable interval's reading exceeds its duration: `rq_clock` can lag a few
+microseconds when a running task departs, and on the tested kernel about 3 % of
+such intervals overshot, by at most 26 µs.
 
 The required proof on the tested 7.1.5 kernel delivers the full 64-bit cookie,
 including bit 63, with `SI_KERNEL`, pidfd-backed process lifetime binding and

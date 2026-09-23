@@ -21,6 +21,7 @@ record AgentConfig(
         String asyncProfilerOptions,
         String signalDelivery,
         SamplingConfig sampling,
+        TimeSplitConfig timeSplit,
         long nativeStopTimeoutMillis,
         long deliveryGraceMillis,
         long shutdownTimeoutMillis) {
@@ -33,6 +34,7 @@ record AgentConfig(
             "asyncProfilerOptions",
             "signalDelivery",
             "sampling",
+            "timeSplit",
             "nativeStopTimeoutMillis",
             "deliveryGraceMillis",
             "shutdownTimeoutMillis");
@@ -128,6 +130,11 @@ record AgentConfig(
                     admission.addProperty("recordAllAboveMicros", parseOptionLong(key, option));
                 case "min-off-cpu-micros" -> sampling.addProperty("minOffCpuMicros", parseOptionLong(key, option));
                 case "max-off-cpu-micros" -> sampling.addProperty("maxOffCpuMicros", parseOptionLong(key, option));
+                case "time-split" -> {
+                    JsonObject timeSplit = new JsonObject();
+                    timeSplit.addProperty("source", option);
+                    value.add("timeSplit", timeSplit);
+                }
                 case "nativestoptimeoutmillis" ->
                     value.addProperty("nativeStopTimeoutMillis", parseOptionLong(key, option));
                 case "deliverygracemillis" -> value.addProperty("deliveryGraceMillis", parseOptionLong(key, option));
@@ -159,6 +166,10 @@ record AgentConfig(
         }
         // Sampling is mandatory so that a profiler-only run is always an explicit decision.
         SamplingConfig sampling = SamplingConfig.parse(JsonSupport.requireObject(value, "sampling"));
+        // The split is on by default; a kernel without the accounting needs an explicit source off.
+        TimeSplitConfig timeSplit = value.has("timeSplit")
+                ? TimeSplitConfig.parse(JsonSupport.requireObject(value, "timeSplit"))
+                : TimeSplitConfig.DEFAULT;
         AgentConfig config = new AgentConfig(
                 absolute(value, "correlationOutput"),
                 absolute(value, "asyncProfilerLibrary"),
@@ -168,6 +179,7 @@ record AgentConfig(
                 JsonSupport.requireString(value, "asyncProfilerOptions"),
                 value.has("signalDelivery") ? JsonSupport.requireString(value, "signalDelivery") : "queued",
                 sampling,
+                timeSplit,
                 optionalLong(value, "nativeStopTimeoutMillis", 30_000, 1, 3_600_000),
                 optionalLong(value, "deliveryGraceMillis", 100, 0, 60_000),
                 optionalLong(value, "shutdownTimeoutMillis", 10_000, 1, 3_600_000));

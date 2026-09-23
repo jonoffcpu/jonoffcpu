@@ -475,27 +475,65 @@ interface AnalysisOutput {
                 JsonObject value = new JsonObject();
                 value.addProperty(
                         "semantics",
-                        "switch-out reason: why the scheduler took the thread off the CPU. A blocked interval's"
-                                + " duration includes its run-queue delay after wakeup; the two are not split.");
+                        "switch-out reason: why the scheduler took the thread off the CPU. Each reason's time is"
+                                + " further split into sleeping (a blocked interval before its wakeup) and runqueue"
+                                + " (waiting for a CPU) when the capture recorded run-queue readings; see timeSplit.");
                 com.google.gson.JsonArray selected = new com.google.gson.JsonArray();
                 for (OffCpuReason reason : result.sampling().reasons()) selected.add(reason.label());
                 value.add("selected", selected);
-                long[] intervals = new long[OffCpuReason.values().length];
-                long[] nanos = new long[OffCpuReason.values().length];
+                int reasons = OffCpuReason.values().length;
+                long[] intervals = new long[reasons];
+                long[] nanos = new long[reasons];
+                long[][] split = new long[reasons][3];
+                long[] unsplitIntervals = new long[TimeSplit.Outcome.values().length];
+                long[] parts = new long[3];
                 for (int slot = 0; slot < result.sources().size(); slot++) {
                     if (result.sources().outcome(slot) != Outcome.MATCHED) continue;
                     int reason = result.sources().offCpuReason(slot).ordinal();
                     intervals[reason]++;
                     nanos[reason] = Math.addExact(nanos[reason], result.durationNanos(slot));
+                    unsplitIntervals[result.split(slot, parts).ordinal()]++;
+                    for (int part = 0; part < 3; part++) {
+                        split[reason][part] = Math.addExact(split[reason][part], parts[part]);
+                    }
                 }
                 JsonObject matched = new JsonObject();
                 for (OffCpuReason reason : result.sampling().reasons()) {
                     JsonObject counts = new JsonObject();
                     counts.addProperty("intervals", Long.toString(intervals[reason.ordinal()]));
                     counts.addProperty("observedNanos", Long.toString(nanos[reason.ordinal()]));
+                    for (TimeSplit.Part part : TimeSplit.Part.values()) {
+                        counts.addProperty(
+                                part.label() + "Nanos", Long.toString(split[reason.ordinal()][part.ordinal()]));
+                    }
                     matched.add(reason.label(), counts);
                 }
                 value.add("matched", matched);
+                TimeSplit.Source source = result.timeSplit();
+                JsonObject timeSplit = new JsonObject();
+                timeSplit.addProperty("source", source.label());
+                timeSplit.addProperty("available", source.available());
+                timeSplit.addProperty(
+                        "rule",
+                        "runqueue is the growth of the scheduler's sched_info.run_delay across the interval. A"
+                                + " blocked interval sleeps for its duration minus that and then waits that long for"
+                                + " a CPU; a runnable or preempted interval is runqueue throughout. An interval"
+                                + " without a reading, or a blocked one whose reading exceeds its duration, is"
+                                + " unsplit.");
+                JsonObject unsplit = new JsonObject();
+                unsplit.addProperty(
+                        "withoutReading", Long.toString(unsplitIntervals[TimeSplit.Outcome.NO_READING.ordinal()]));
+                unsplit.addProperty(
+                        "readingExceedsInterval",
+                        Long.toString(unsplitIntervals[TimeSplit.Outcome.EXCEEDS_INTERVAL.ordinal()]));
+                timeSplit.add("unsplitIntervals", unsplit);
+                JsonObject counters = result.capture().end == null
+                        ? null
+                        : result.capture().end.getAsJsonObject("counters").getAsJsonObject("kernel");
+                com.google.gson.JsonElement inversions = counters == null ? null : counters.get("runqueueInversions");
+                timeSplit.add(
+                        "runqueueInversions", inversions == null ? com.google.gson.JsonNull.INSTANCE : inversions);
+                value.add("timeSplit", timeSplit);
                 // The kernel counts every switch-out by reason before its filter, so a blocked-only capture
                 // still shows how often its threads were preempted.
                 JsonObject kernel = result.capture().end == null

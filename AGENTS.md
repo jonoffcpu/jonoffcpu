@@ -68,9 +68,23 @@ smallest relevant layer before running privileged end-to-end tests.
   `preempt` argument and pre-switch `prev_state` are authoritative; do not
   derive the reason from the trace event's encoded `prev_state` or from a
   re-read of `prev->__state`. Keep the reason (why the interval began) apart
-  from any future sleeping/run-queue split of its time. A future rate cap belongs in a
+  from the sleeping/run-queue split of its time. A future rate cap belongs in a
   separate `sampling.limit` block, orthogonal to `admission`, because its loss
   is not random and must be reported, not reweighted.
+- The sleeping/run-queue split is one `timeSplit` object beside `sampling`, not
+  inside it, because it changes what is measured rather than which intervals
+  are kept: `source` is `schedInfo` (default) or `off`, resolved, echoed and
+  compared exactly like `sampling`. `schedInfo` fails closed on a kernel whose
+  BTF lacks `task_struct.sched_info.run_delay`; never fall back to `off`
+  silently. Each observation carries the raw growth of `run_delay` across the
+  interval (`runqueue_nanos`), dropped in the kernel only when the counter went
+  backwards, and the consumers apply the one rule: a `blocked` interval's
+  run-queue part is its tail, a `runnable` or `preempted` interval is run-queue
+  time throughout, and anything else is reported unsplit, never guessed or
+  clamped. Do not add a `sched_wakeup` hook for this: it fires for every wakeup
+  on the host. Waker attribution, if wanted, belongs in a new source that
+  hooks `sched_wakeup` (not `sched_waking`, which can fire before the
+  switch-out it would close).
 - Partial JFR and interrupted-capture modes must remain explicit and visibly
   different from a complete, integrity-verified result.
 

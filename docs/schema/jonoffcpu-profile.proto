@@ -48,7 +48,9 @@ message ProfileStart {
   // Whether estimated_nanos is an available inverse-probability estimate. When false it must not be
   // used, although it is still written.
   bool estimate_available = 7;
-  // Whether the phase-2 sleeping/run-queue split (Entry fields 20-23) is populated.
+  // Whether the entries carry the sleeping/run-queue split (Entry fields 20-25): true when any input capture
+  // recorded run-queue parts (schemaVersion 4 with timeSplit.source schedInfo). When false, fields 20-25 are
+  // 0 and every entry's time reads as unsplit.
   bool time_split_available = 8;
   // The producing run's jonoffcpu-report.json, verbatim; empty for a merged profile.
   string report_json = 9;
@@ -70,6 +72,8 @@ message Provenance {
   // The clip window in the source monotonic clock; 0 when unbounded on that side.
   uint64 window_from_nanos = 8;
   uint64 window_to_nanos = 9;
+  // The capture's resolved timeSplit object, verbatim JSON; empty for a capture older than schemaVersion 4.
+  string time_split_json = 10;
 }
 
 message StringRecord {
@@ -119,12 +123,18 @@ message Entry {
   // nanoseconds. Meaningful only when ProfileStart.estimate_available.
   uint64 estimated_nanos = 12;
 
-  // Reserved for the sleeping/run-queue split; ProfileStart.time_split_available says whether they are
-  // populated.
+  // The observed nanoseconds split by what the thread was doing, populated when
+  // ProfileStart.time_split_available: sleeping (a blocked interval before its wakeup), runqueue (waiting for
+  // a CPU: a blocked interval after its wakeup, and runnable and preempted intervals throughout), and unsplit
+  // (intervals without a usable run-queue reading). The three always sum to observed_nanos.
   uint64 sleeping_nanos = 20;
   uint64 runqueue_nanos = 21;
+  // The same split of estimated_nanos. Each part's inverse-probability sum is floored cumulatively
+  // (sleeping, then sleeping + runqueue, then the whole), so the three sum exactly to estimated_nanos.
   uint64 estimated_sleeping_nanos = 22;
   uint64 estimated_runqueue_nanos = 23;
+  uint64 unsplit_nanos = 24;
+  uint64 estimated_unsplit_nanos = 25;
 }
 
 message ProfileEnd {

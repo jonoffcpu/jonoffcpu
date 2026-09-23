@@ -55,7 +55,9 @@ struct Observation {
     prev_task_state: u32,
     reason: u8,
     preempted: u8,
-    reserved: [u8; 2],
+    has_runqueue: u8,
+    reserved: u8,
+    runqueue_ns: u64,
 }
 
 #[repr(C)]
@@ -83,6 +85,7 @@ struct KernelStats {
     switch_outs_preempted: u64,
     reason_rejections: u64,
     reason_rejected_duration_us: u64,
+    runqueue_inversions: u64,
 }
 
 impl KernelStats {

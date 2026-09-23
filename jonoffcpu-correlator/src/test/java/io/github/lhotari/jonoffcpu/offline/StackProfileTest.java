@@ -456,6 +456,239 @@ public final class StackProfileTest {
         rejects(IOException.class, "canonical", () -> correlate(uncanonical, jfr, dir.resolve("a5")));
     }
 
+    /** The one split rule: a blocked interval's run-queue part is its tail, clipped part by part. */
+    private static void timeSplitRule() {
+        long[] parts = new long[3];
+        java.util.function.BiConsumer<long[], String> expect =
+                (expected, what) -> check(Arrays.equals(parts, expected), what + ": " + Arrays.toString(parts));
+        // Blocked for 100 ns, woken at 70: 70 sleeping, 30 on the run queue.
+        check(TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 30, 0, 100, parts) == TimeSplit.Outcome.SPLIT, "");
+        expect.accept(new long[] {70, 30, 0}, "unclipped");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 30, 50, 90, parts);
+        expect.accept(new long[] {20, 20, 0}, "window across the wakeup");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 30, 80, 100, parts);
+        expect.accept(new long[] {0, 20, 0}, "window after the wakeup");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 30, 0, 60, parts);
+        expect.accept(new long[] {60, 0, 0}, "window before the wakeup");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 0, 0, 100, parts);
+        expect.accept(new long[] {100, 0, 0}, "ran as soon as it woke");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 100, 0, 100, parts);
+        expect.accept(new long[] {0, 100, 0}, "woken at once");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 50, 100, 100, parts);
+        expect.accept(new long[] {0, 0, 0}, "empty window");
+        // Nothing is guessed or clamped: no reading, or one longer than a blocked interval, leaves it unsplit.
+        check(
+                TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, false, 0, 0, 100, parts) == TimeSplit.Outcome.NO_READING,
+                "no reading");
+        expect.accept(new long[] {0, 0, 100}, "no reading");
+        check(
+                TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, 101, 0, 100, parts)
+                        == TimeSplit.Outcome.EXCEEDS_INTERVAL,
+                "exceeds");
+        expect.accept(new long[] {0, 0, 100}, "exceeds");
+        TimeSplit.split(OffCpuReason.BLOCKED, 0, 100, true, -1L, 0, 100, parts);
+        expect.accept(new long[] {0, 0, 100}, "a u64 reading compares unsigned");
+        TimeSplit.split(OffCpuReason.UNSPECIFIED, 0, 100, true, 10, 0, 100, parts);
+        expect.accept(new long[] {0, 0, 100}, "unclassified");
+        // Runnable and preempted intervals never left the run queue, whatever the reading.
+        for (OffCpuReason reason : List.of(OffCpuReason.RUNNABLE, OffCpuReason.PREEMPTED)) {
+            TimeSplit.split(reason, 0, 100, true, 103, 20, 100, parts);
+            expect.accept(new long[] {0, 80, 0}, reason + " overshooting");
+            TimeSplit.split(reason, 0, 100, true, 60, 0, 100, parts);
+            expect.accept(new long[] {0, 100, 0}, reason.label());
+        }
+    }
+
+    /** Rows of the time-split fixture: blocked, runnable and preempted in turn, each with a run-queue reading. */
+    private static List<JsonObject> splitObservations(long tid) {
+        List<JsonObject> rows = observations(tid, row -> ALL_REASONS.get(row % 3));
+        for (int row = 0; row < rows.size(); row++) {
+            long duration = 3000 + 7L * row * row;
+            Long reading =
+                    switch (row) {
+                        case 0 -> 1000L; // blocked: 2000 sleeping, 1000 on the run queue
+                        case 3 -> 0L; // blocked, ran as soon as it woke
+                        case 6 -> null; // blocked, the kernel dropped the reading
+                        case 9 -> duration + 1; // blocked, a reading longer than the interval
+                        case 1 -> duration + 5; // runnable, the scheduler clock ran a little ahead
+                        default -> row % 3 == 1 ? duration - 3 : duration;
+                    };
+            if (reading != null) rows.get(row).addProperty("runqueueNanos", Long.toString(reading));
+        }
+        return rows;
+    }
+
+    private static JsonObject timeSplit(String source) {
+        JsonObject value = new JsonObject();
+        value.addProperty("source", source);
+        return value;
+    }
+
+    private static Path v4Capture(Path dir, Path jfr, List<JsonObject> rows, JsonObject timeSplit) throws IOException {
+        JsonObject counters = reasonCounters();
+        counters.addProperty("runqueueInversions", "1");
+        return OfflineCorrelatorTest.source(
+                Files.createDirectories(dir), jfr, rows, sampling(ALL_REASONS), 4, counters, timeSplit);
+    }
+
+    private static BigInteger totalNanos(Path summary) throws IOException {
+        return new BigInteger(summaryOf(summary).get("totalNanos").getAsString());
+    }
+
+    /**
+     * A version 4 capture splits each reason's time into sleeping and run-queue parts: the report, the profile and
+     * every {@code --time} slice agree, and the parts always add up to the whole.
+     */
+    private static void sleepingAndRunqueue(Path dir) throws Exception {
+        Path jfr = recording(dir);
+        long tid = sampleThread(jfr);
+        Path source = v4Capture(dir.resolve("split"), jfr, splitObservations(tid), timeSplit("schedInfo"));
+        Path analysis = correlate(source, jfr, dir.resolve("analysis"));
+
+        JsonObject reasons = report(analysis).getAsJsonObject("offCpuReasons");
+        JsonObject matched = reasons.getAsJsonObject("matched");
+        java.util.function.BiFunction<String, String, String> part =
+                (reason, key) -> matched.getAsJsonObject(reason).get(key).getAsString();
+        // Durations are 3000 + 7 row^2 ns: blocked rows 0, 3, 6, 9; runnable 1, 4, 7, 10; preempted 2, 5, 8, 11.
+        check(part.apply("blocked", "sleepingNanos").equals("5063"), "Blocked sleeping: " + matched);
+        check(part.apply("blocked", "runqueueNanos").equals("1000"), "Blocked run queue: " + matched);
+        check(part.apply("blocked", "unsplitNanos").equals("6819"), "Blocked unsplit: " + matched);
+        check(part.apply("runnable", "runqueueNanos").equals("13162"), "Runnable run queue: " + matched);
+        check(part.apply("runnable", "sleepingNanos").equals("0"), "Runnable never sleeps: " + matched);
+        check(part.apply("preempted", "runqueueNanos").equals("13498"), "Preempted run queue: " + matched);
+        for (String reason : ALL_REASONS) {
+            long sum = 0;
+            for (String key : List.of("sleepingNanos", "runqueueNanos", "unsplitNanos")) {
+                sum += Long.parseLong(part.apply(reason, key));
+            }
+            check(sum == Long.parseLong(part.apply(reason, "observedNanos")), "Parts must add up for " + reason);
+        }
+        JsonObject split = reasons.getAsJsonObject("timeSplit");
+        check(
+                split.get("source").getAsString().equals("schedInfo")
+                        && split.get("available").getAsBoolean()
+                        && split.get("runqueueInversions").getAsString().equals("1"),
+                "Time split accounting: " + split);
+        JsonObject unsplit = split.getAsJsonObject("unsplitIntervals");
+        check(
+                unsplit.get("withoutReading").getAsString().equals("1")
+                        && unsplit.get("readingExceedsInterval").getAsString().equals("1"),
+                "Unsplit causes: " + unsplit);
+
+        // The default outputs are unchanged by the split: the profile still reproduces the collapsed file.
+        Path profile = analysis.resolve(OutputFiles.PROFILE);
+        String collapsed = Files.readString(analysis.resolve(OutputFiles.COLLAPSED));
+        check(
+                stacks(profile, dir.resolve("total.collapsed")).equals(collapsed),
+                "Profile does not reproduce collapsed");
+        StackProfile read = StackProfile.read(profile);
+        check(read.header().timeSplitAvailable(), "The profile must announce its split");
+        check(
+                read.header().sources().get(0).timeSplitJson().equals("{\"source\":\"schedInfo\"}"),
+                "The profile must record its source: " + read.header().sources().get(0));
+        Path rewritten = dir.resolve("rewritten.pb");
+        read.write(rewritten);
+        check(Arrays.equals(Files.readAllBytes(profile), Files.readAllBytes(rewritten)), "Profile is not canonical");
+
+        // Every --time slice is one part of the whole, and the three add up to it.
+        Map<String, BigInteger> totals = new HashMap<>();
+        for (String time : List.of("total", "sleeping", "runqueue", "split")) {
+            Path summary = dir.resolve(time + ".json");
+            String text = stacks(
+                    profile, dir.resolve(time + "-slice.collapsed"), "--time", time, "--summary", summary.toString());
+            totals.put(time, totalNanos(summary));
+            check(summaryOf(summary).get("time").getAsString().equals(time), "Summary must name its time part");
+            check(
+                    summaryOf(summary).get("unsplitNanos").getAsString().equals("6819"),
+                    "Summary must report the unsplit time: " + summaryOf(summary));
+            if (time.equals("split")) {
+                check(
+                        text.lines()
+                                .allMatch(line -> line.contains(";[sleeping] ")
+                                        || line.contains(";[runqueue] ")
+                                        || line.contains(";[unsplit] ")),
+                        "Split lines must end in a part frame: " + text);
+            }
+        }
+        check(totals.get("sleeping").equals(BigInteger.valueOf(5063)), "Sleeping slice: " + totals);
+        check(totals.get("runqueue").equals(BigInteger.valueOf(1000 + 13162 + 13498)), "Run-queue slice: " + totals);
+        check(
+                totals.get("split").equals(totals.get("total"))
+                        && totals.get("sleeping")
+                                .add(totals.get("runqueue"))
+                                .add(BigInteger.valueOf(6819))
+                                .equals(totals.get("total")),
+                "The parts must add up to the whole: " + totals);
+        // Estimated parts are floored cumulatively, so they add up exactly too.
+        for (StackProfile.Entry entry : read.entries()) {
+            check(entry.split().adds(entry.observedNanos(), entry.estimatedNanos()), "Entry split: " + entry);
+        }
+        List<String> csv = exportCsv(profile, dir.resolve("entries.csv"));
+        check(
+                csv.get(0)
+                        .endsWith(",sleeping_nanos,runqueue_nanos,unsplit_nanos,"
+                                + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos"),
+                "CSV header: " + csv.get(0));
+
+        // A profile without the split refuses the parts, and merging it with one that has them keeps it unsplit.
+        Path v3 = v3Capture(dir.resolve("v3"), jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
+        Path v3Profile = correlate(v3, jfr, dir.resolve("v3-analysis")).resolve(OutputFiles.PROFILE);
+        check(!StackProfile.read(v3Profile).header().timeSplitAvailable(), "A version 3 profile has no split");
+        rejects(
+                IOException.class,
+                "no sleeping/run-queue split",
+                () -> stacks(v3Profile, dir.resolve("v3-runqueue.collapsed"), "--time", "runqueue"));
+        StackProfile merged = StackProfile.merge(List.of(read, StackProfile.read(v3Profile)));
+        check(merged.header().timeSplitAvailable(), "A merge with a split input has the split");
+        long mergedUnsplit = merged.entries().stream()
+                .mapToLong(entry -> entry.split().unsplit())
+                .sum();
+        check(mergedUnsplit == 6819 + read.totalObservedNanos(), "The version 3 input merges as unsplit");
+        Path mergedFile = dir.resolve("merged.pb");
+        merged.write(mergedFile);
+        check(StackProfile.read(mergedFile).entries().equals(merged.entries()), "A merged split must round-trip");
+
+        // With the source off, no row may carry a reading.
+        Path off = v4Capture(dir.resolve("off"), jfr, splitObservations(tid), timeSplit("off"));
+        JsonObject offReport = report(correlate(off, jfr, dir.resolve("off-analysis")));
+        check(
+                offReport.get("invalidSource").getAsInt() == 11,
+                "Rows with a reading under source off must be invalid: " + offReport.get("invalidSource"));
+        List<JsonObject> plain = observations(tid, row -> ALL_REASONS.get(row % 3));
+        JsonObject offSplit = report(correlate(
+                        v4Capture(dir.resolve("off-plain"), jfr, plain, timeSplit("off")),
+                        jfr,
+                        dir.resolve("off-plain-analysis")))
+                .getAsJsonObject("offCpuReasons")
+                .getAsJsonObject("timeSplit");
+        check(
+                offSplit.get("source").getAsString().equals("off")
+                        && !offSplit.get("available").getAsBoolean(),
+                "Source off: " + offSplit);
+        // Version 4 always names its source, and an older capture never does.
+        rejects(
+                IOException.class,
+                "Source schema/timeSplit mismatch",
+                () -> correlate(
+                        v4Capture(dir.resolve("unnamed"), jfr, plain, null), jfr, dir.resolve("unnamed-analysis")));
+        rejects(
+                IOException.class,
+                "Unknown timeSplit source",
+                () -> correlate(
+                        v4Capture(dir.resolve("wakeup"), jfr, plain, timeSplit("wakeup")),
+                        jfr,
+                        dir.resolve("wakeup-analysis")));
+    }
+
+    private static List<String> exportCsv(Path profile, Path csv) throws Exception {
+        check(
+                OffCpuCorrelator.run(
+                                new String[] {"export", "--profile", profile.toString(), "--output", csv.toString()})
+                        == 0,
+                "Export must succeed");
+        return Files.readAllLines(csv);
+    }
+
     private static List<StackProfile.Frame> frames(StackProfile.Kind kind, String... names) {
         return Arrays.stream(names)
                 .map(name -> new StackProfile.Frame(kind, name, kind == StackProfile.Kind.USER ? "libc.so.6" : ""))
@@ -634,6 +867,8 @@ public final class StackProfileTest {
             mixedReasons(Files.createDirectories(dir.resolve("mixed")));
             classificationIsVerified(Files.createDirectories(dir.resolve("verified")));
             filters(Files.createDirectories(dir.resolve("filters")));
+            timeSplitRule();
+            sleepingAndRunqueue(Files.createDirectories(dir.resolve("split")));
             System.out.println("Stack profile fixtures passed");
         } finally {
             try (var files = Files.walk(dir)) {

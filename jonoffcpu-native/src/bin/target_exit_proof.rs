@@ -88,6 +88,7 @@ fn parent_proof() -> Result<()> {
                     "probabilityThreshold": 4_294_967_296_u64,
                 },
             },
+            "timeSplit": {"source": "schedInfo"},
         })
         .to_string();
         jonoffcpu_collector_prepare(input.as_ptr().cast(), input.len(), out)

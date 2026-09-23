@@ -6,7 +6,7 @@ import java.util.BitSet;
 
 /**
  * One slot per observation, in capture file order, holding only what the join and the aggregates
- * read. Fifty-one bytes a row replaces a retained Gson object graph.
+ * read. Fifty-nine bytes a row replaces a retained Gson object graph.
  *
  * <p>Timestamps, the cookie and the admission threshold are raw u64 bits; compare them through
  * {@link U64}. The interned kernel and user stack ids are kept for the stack profile, which groups
@@ -29,8 +29,10 @@ final class SourceColumns {
     private int[] taskState;
     private int[] kernelStack;
     private int[] userStack;
+    private long[] runqueue;
     private final BitSet verified = new BitSet();
     private final BitSet signalFailed = new BitSet();
+    private final BitSet hasRunqueue = new BitSet();
     private int size;
 
     SourceColumns(int expected) {
@@ -46,6 +48,7 @@ final class SourceColumns {
         taskState = new int[capacity];
         kernelStack = new int[capacity];
         userStack = new int[capacity];
+        runqueue = new long[capacity];
     }
 
     void add(
@@ -67,7 +70,9 @@ final class SourceColumns {
                 OffCpuReason.UNSPECIFIED,
                 0,
                 NO_STACK,
-                NO_STACK);
+                NO_STACK,
+                false,
+                0);
     }
 
     void add(
@@ -81,8 +86,12 @@ final class SourceColumns {
             OffCpuReason switchOut,
             int prevTaskState,
             int kernelStackId,
-            int userStackId) {
+            int userStackId,
+            boolean runqueueRecorded,
+            long runqueueNanos) {
         if (size == cookie.length) grow();
+        hasRunqueue.set(size, runqueueRecorded);
+        runqueue[size] = runqueueNanos;
         offCpuReason[size] = (byte) switchOut.ordinal();
         taskState[size] = prevTaskState;
         kernelStack[size] = kernelStackId;
@@ -152,6 +161,16 @@ final class SourceColumns {
         return userStack[slot];
     }
 
+    /** Whether the observation carries a run-queue reading; see {@link TimeSplit}. */
+    boolean hasRunqueue(int slot) {
+        return hasRunqueue.get(slot);
+    }
+
+    /** The raw u64 run-queue reading, meaningful only when {@link #hasRunqueue}. */
+    long runqueue(int slot) {
+        return runqueue[slot];
+    }
+
     Outcome outcome(int slot) {
         return Outcome.of(outcome[slot]);
     }
@@ -169,8 +188,8 @@ final class SourceColumns {
     }
 
     long retainedBytes() {
-        return (long) cookie.length * (Long.BYTES * 4 + Integer.BYTES * 4 + 3)
-                + (verified.size() + signalFailed.size()) / 8L;
+        return (long) cookie.length * (Long.BYTES * 5 + Integer.BYTES * 4 + 3)
+                + (verified.size() + signalFailed.size() + hasRunqueue.size()) / 8L;
     }
 
     private void grow() {
@@ -186,5 +205,6 @@ final class SourceColumns {
         taskState = Arrays.copyOf(taskState, capacity);
         kernelStack = Arrays.copyOf(kernelStack, capacity);
         userStack = Arrays.copyOf(userStack, capacity);
+        runqueue = Arrays.copyOf(runqueue, capacity);
     }
 }

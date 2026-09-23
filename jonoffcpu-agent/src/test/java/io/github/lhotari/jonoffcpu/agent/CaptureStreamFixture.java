@@ -153,6 +153,9 @@ final class CaptureStreamFixture {
         if (row.has("prevTaskState"))
             builder.setPrevTaskState((int) row.get("prevTaskState").getAsLong());
         if (row.has("preempted")) builder.setPreempted(row.get("preempted").getAsBoolean());
+        if (row.has("runqueueNanos"))
+            builder.setRunqueueNanos(
+                    Long.parseUnsignedLong(row.get("runqueueNanos").getAsString()));
         return builder.build();
     }
 

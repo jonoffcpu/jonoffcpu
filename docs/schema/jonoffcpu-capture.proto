@@ -76,9 +76,15 @@ message Observation {
   optional uint32 prev_task_state = 19;
   // The `preempt` argument of `sched_switch`.
   optional bool preempted = 20;
-  // Field 21 is reserved for the wakeup timestamp that splits an interval into sleeping and run-queue
-  // time.
-  reserved 21;
+  // How long the thread waited on a run queue during the interval: the raw growth of the scheduler's
+  // own `sched_info.run_delay` between switch-out and switch-in, in the scheduler's rq_clock
+  // nanoseconds. Present when `timeSplit.source` is `schedInfo`. Absent in a schemaVersion 2 or 3
+  // capture, under `timeSplit.source` `off`, and when the counter went backwards (counted as
+  // `runqueueInversions`); such an interval is unsplit. The consumers apply the split rule: a `blocked`
+  // interval slept for its duration minus this value and then waited this long for a CPU, and is
+  // unsplit when this value exceeds its duration; a `runnable` or `preempted` interval is run-queue
+  // time throughout, and this value may exceed its duration by the few microseconds rq_clock can lag.
+  optional uint64 runqueue_nanos = 21;
 }
 
 // A thread is `blocked` when it left the CPU in a waiting state (sleeping on a futex, a socket, a timer,
