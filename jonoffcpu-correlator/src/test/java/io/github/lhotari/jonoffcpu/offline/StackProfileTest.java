@@ -803,10 +803,15 @@ public final class StackProfileTest {
                 "--include",
                 "app\\.one\\.");
         check(filtered.equals("Thread.run;Worker.park 2\n"), "Filters must see full names: " + filtered);
-        rejects(
-                IllegalArgumentException.class,
-                "Invalid package names mode",
-                () -> stacks(profile, dir.resolve("bad.collapsed"), "--package-names", "short"));
+        CommandLineTest.usageError(
+                "expected one of full, abbreviate, drop but was 'short'",
+                "stacks",
+                "--profile",
+                profile.toString(),
+                "--output",
+                dir.resolve("bad.collapsed").toString(),
+                "--package-names",
+                "short");
     }
 
     /**
@@ -1125,10 +1130,14 @@ public final class StackProfileTest {
                 java.util.regex.PatternSyntaxException.class,
                 "Unclosed group",
                 () -> stacks(profile, dir.resolve("bad.collapsed"), "--include", "("));
-        rejects(
-                IllegalArgumentException.class,
-                "--exclude",
-                () -> stacks(profile, dir.resolve("missing.collapsed"), "--exclude"));
+        CommandLineTest.usageError(
+                "Missing required parameter for option '--exclude'",
+                "stacks",
+                "--profile",
+                profile.toString(),
+                "--output",
+                dir.resolve("missing.collapsed").toString(),
+                "--exclude");
 
         // Pattern files hold one pattern per line, skipping blank and '#' lines, and add to the inline patterns.
         Path includes = dir.resolve("includes.txt");

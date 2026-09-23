@@ -17,7 +17,8 @@ sleeping/run-queue split, and 2 for captures recorded before switch-out reasons
 were classified, both still read), and that JSON is still read with the strict
 parser; observations and stacks are native protobuf.
 All control records of one capture carry the same version. Read a capture with
-`java -jar jonoffcpu-correlator.jar --dump --source <file>`, which prints one
+`java -jar jonoffcpu-correlator.jar dump --source <file>` (formerly `--dump --source`,
+still accepted), which prints one
 JSON object per record with each observation's stacks expanded.
 
 Stacks are interned: an observation names its two stacks through
@@ -501,7 +502,9 @@ java -jar jonoffcpu-correlator.jar \
 ```
 
 A successfully written partial diagnostic run exits with **status 2**. Complete
-analysis exits with status 0; errors exit with status 1. Partial mode never promotes
+analysis exits with status 0; an invalid command line exits with status 64 after
+printing the problem and the command's usage, and other errors exit with status 1.
+Partial mode never promotes
 its result to complete, even if the supplied inputs happen to be finalized.
 Its new output directory holds a visibly different file set:
 

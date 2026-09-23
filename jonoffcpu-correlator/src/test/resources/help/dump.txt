@@ -1,0 +1,6 @@
+Usage: java -jar jonoffcpu-correlator.jar dump [-hV] [--source=FILE]
+Prints the capture stream as NDJSON, each observation's interned stacks expanded.
+`--dump --source FILE` is a deprecated alias.
+  -h, --help          Show this help message and exit.
+      --source=FILE   The capture stream. Required.
+  -V, --version       Print version information and exit.

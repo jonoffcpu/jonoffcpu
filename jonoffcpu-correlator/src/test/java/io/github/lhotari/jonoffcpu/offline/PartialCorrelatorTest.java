@@ -418,7 +418,7 @@ public final class PartialCorrelatorTest {
                     "--partial",
                     "true"));
             args.addAll(extra);
-            rejects(() -> OffCpuCorrelator.run(args.toArray(String[]::new)), "Partial mode supports");
+            CommandLineTest.usageError("Partial mode supports", args.toArray(String[]::new));
             check(!Files.exists(rejected), "Unsupported partial output created files");
         }
         Path subprocess = dir.resolve("partial-subprocess");

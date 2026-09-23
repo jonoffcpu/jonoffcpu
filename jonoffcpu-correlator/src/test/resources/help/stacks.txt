@@ -1,0 +1,33 @@
+Usage: java -jar jonoffcpu-correlator.jar stacks [-hV] [--output=FILE] [--package-names=MODE]
+                                                 [--profile=FILE] [--reason=REASONS]
+                                                 [--reason-frame=MODE] [--stack=KINDS]
+                                                 [--summary=FILE] [--time=PART] [--weights=WEIGHTS]
+                                                 [--exclude=REGEX]... [--exclude-from=FILE]...
+                                                 [--include=REGEX]... [--include-from=FILE]...
+Renders one collapsed slice of a stack profile: by switch-out reason, stack kinds, weights and time
+part, keeping or dropping whole intervals by their frames.
+      --profile=FILE         The stack profile, such as jonoffcpu-offcpu-profile.pb. Required.
+      --reason=REASONS       all, or a comma-separated list of blocked, runnable, preempted and
+                               unspecified. Default: all.
+      --stack=KINDS          Which stacks a line is made of: java, kernel, user, java+kernel or
+                               java+user+kernel. Default: java.
+      --weights=WEIGHTS      observed durations, or the estimated inverse-probability population
+                               when the profile's estimate is available. Default: observed.
+      --time=PART            Which part of each interval's time is weighed: total, sleeping,
+                               runqueue, or split (the whole time, each line ending in its part's
+                               frame). Default: total.
+      --package-names=MODE   How a Java frame's package is shown: full, abbreviate (initials) or
+                               drop. Default: full.
+      --output=FILE          The collapsed file to write; must not exist. Required.
+      --reason-frame=MODE    Whether each line starts with its [offcpu: <reason>] frame: auto (when
+                               the slice mixes reasons), always or never. Default: auto.
+      --summary=FILE         Also write a JSON summary of the slice: its totals, patterns and what
+                               the filters removed.
+      --include=REGEX        Keep only intervals with a frame matching the pattern; repeatable, any
+                               matches.
+      --exclude=REGEX        Drop every interval with a frame matching the pattern; repeatable, and
+                               an exclusion wins.
+      --include-from=FILE    Read --include patterns from a file, one per line; repeatable.
+      --exclude-from=FILE    Read --exclude patterns from a file, one per line; repeatable.
+  -h, --help                 Show this help message and exit.
+  -V, --version              Print version information and exit.

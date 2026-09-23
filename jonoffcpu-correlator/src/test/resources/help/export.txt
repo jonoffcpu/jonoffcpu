@@ -1,0 +1,8 @@
+Usage: java -jar jonoffcpu-correlator.jar export [-hV] [--format=FORMAT] [--output=FILE]
+                                                 [--profile=FILE]
+Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.
+      --profile=FILE    The stack profile to export. Required.
+      --format=FORMAT   csv or jsonl. Default: csv.
+      --output=FILE     The file to write. Required.
+  -h, --help            Show this help message and exit.
+  -V, --version         Print version information and exit.
