@@ -85,6 +85,7 @@ report = json.loads((out / 'analysis/jonoffcpu-report.json').read_text())
 events = json.loads((out / 'event-counts.json').read_text())
 collapsed = (out / 'analysis/compatibility-view.collapsed').read_text().splitlines()
 converted = sum(int(line.rsplit(' ', 1)[1]) for line in collapsed)
+# Counters are uint64 in the report, printed as decimal strings by the proto3 JSON mapping.
 expected = int(report['syntheticJfr']['syntheticEvents'])
 required = ('jdk.ExecutionSample', 'profiler.SignalSample', 'profiler.WallClockSample',
             'jdk.JavaMonitorEnter', 'jdk.JVMInformation', 'jdk.GCHeapSummary', 'jonoffcpu.IntegrationMarker')
@@ -94,14 +95,15 @@ allocations = int(events.get('jdk.ObjectAllocationInNewTLAB', 0)) \
 if allocations <= 0:
     missing.append('allocation samples')
 failures = {
-    'unmatchedSource': report['unmatchedSource'],
-    'orphanJfr': report['orphanJfr'],
-    'invalidSource': report['invalidSource'],
-    'invalidJfr': report['invalidJfr'],
-    'identityUnverified': report['identityUnverified'],
+    'unmatchedSource': int(report['unmatchedSource']),
+    'orphanJfr': int(report['orphanJfr']),
+    'invalidSource': int(report['invalidSource']),
+    'invalidJfr': int(report['invalidJfr']),
+    'identityUnverified': int(report['identityUnverified']),
 }
-if report['matched'] <= 0 or any(failures.values()):
-    raise SystemExit(f'invalid correlation result: matched={report["matched"]}, failures={failures}')
+matched = int(report['matched'])
+if matched <= 0 or any(failures.values()):
+    raise SystemExit(f'invalid correlation result: matched={matched}, failures={failures}')
 if missing:
     raise SystemExit(f'missing mixed event categories: {missing}')
 if converted != expected:
@@ -112,7 +114,7 @@ summary = {
     'libc': 'musl',
     'javaVersion': 17,
     'delivery': __import__('os').environ['JONOFFCPU_DELIVERY'],
-    'matched': report['matched'],
+    'matched': matched,
     **failures,
     'syntheticEvents': expected,
     'convertedEvents': converted,

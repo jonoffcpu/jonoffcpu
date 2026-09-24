@@ -27,18 +27,33 @@ smallest relevant layer before running privileged end-to-end tests.
   incomplete data in normal mode.
 - Join records by capture identity and the exact 64-bit cookie. Timestamps are
   for clipping and delivery-delay analysis, never a heuristic join key.
-- The capture stream is length-delimited protobuf defined by
-  `jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`, which is
-  the format's single definition: the collector generates its codec from it
+- Protobuf is the single definition of every structured format. The
+  capture stream and the agent/collector protocol are defined in
+  `jonoffcpu-capture-codec/src/main/proto` (`jonoffcpu-capture.proto`,
+  `jonoffcpu-collector.proto`); the collector generates its codec from them
   with protox (no protoc in the build containers), and
-  `jonoffcpu-capture-codec` generates the one Java codec with the protobuf
-  Gradle plugin, which the agent and the correlator both embed. Control records keep their JSON object, still read with the strict
-  parser. Do not add a second definition of the wire format. The stack
-  profile the correlator writes is a separate, derived format with its own
-  single definition in
-  `jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`; only the
-  correlator generates it, and a default rendering of a profile must keep
-  reproducing `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
+  `jonoffcpu-capture-codec` generates the one Java codec, with the full
+  protobuf runtime, which the agent and the correlator both embed. The
+  agent's manifest is defined in `jonoffcpu-agent/src/main/proto`, and the
+  correlator's derived formats (the stack profile, the report, the analysis
+  outputs and the JFR signal rows) in `jonoffcpu-correlator/src/main/proto`;
+  only their owner generates them. Every stream record, control records
+  included, is a typed message; do not add a second definition of any format.
+  A default rendering of a profile must keep reproducing
+  `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
+- The agent and the collector exchange encoded protobuf messages across JNI
+  (collector ABI version 2): `prepare` and `enable` take a request message and
+  every call returns a `CollectorReply`, whose state and typed error code the
+  agent acts on. The C bridge only copies bytes; never put JSON or
+  message-text classification back on that boundary.
+- JSON is only a view of a message, for people and tools: every JSON file or
+  line jonoffcpu writes or reads goes through `ProtoJson` (the proto3 JSON
+  mapping: lowerCamelCase names, 64-bit integers as strings, enums by their
+  prefixed UPPER_SNAKE value names, fields without presence always printed,
+  unknown fields rejected). Never build or parse JSON by hand. The
+  collector's proof tools print the same mapping through pbjson. The agent's
+  configuration file is not a message dump: its reader maps its own
+  spellings (`blocked`, `uniform`, `schedInfo`, ...) onto the enums.
 - Native stacks are interned in the stream: one `stack` record per distinct BPF
   stack id, always written before the first observation that references it, and
   observations carry only the ids. Keep that ordering guarantee, keep the
@@ -62,7 +77,9 @@ smallest relevant layer before running privileged end-to-end tests.
   (`probability`) or `proportional` (`recordAllAboveMicros`). Each policy has
   exactly one parameter; `none` rejects bounds and reasons. The same resolved object is
   sent to the native source, echoed by it, and written into the manifest,
-  `captureStart` and `analysisInputs`; consumers compare it structurally.
+  `captureStart` and `analysisInputs`; consumers compare the copies as
+  messages. The names here are the configuration file's spellings; the
+  messages use the `Sampling` enums and `oneof admission`.
   Every observation row carries the exact `admissionThreshold` the kernel drew
   against, recomputable from the policy and the row's duration, so population
   estimates stay exact inverse-probability sums. Every observation likewise
@@ -97,10 +114,13 @@ smallest relevant layer before running privileged end-to-end tests.
 - `jonoffcpu-agent`: Java 17 bytecode, Java-agent/controller code, JNI bridge,
   packaged native libraries, and native integration fixtures. Keep JFR
   post-processing out of this module.
-- `jonoffcpu-capture-codec`: Java 17 bytecode, the capture stream's generated
-  Java codec and nothing else, plus the test fixtures that encode stream records
-  for both modules' tests. It is not published: the agent and the correlator
-  embed it through `embeddedRuntime` and relocate its protobuf runtime.
+- `jonoffcpu-capture-codec`: Java 17 bytecode, the generated codecs of the
+  capture stream and the collector protocol, the stream's framing
+  (`CaptureFormat`) and the one JSON printer and parser (`ProtoJson`), plus
+  the test fixtures both modules' tests share (`CaptureRecordFixture` to write
+  and read streams, `CaptureFixtures` to build valid records). It is not
+  published: the agent and the correlator embed it through `embeddedRuntime`
+  and relocate its protobuf runtime.
 - `jonoffcpu-correlator`: Java 21 bytecode, offline correlation library and CLI,
   including synthetic compatibility JFR output.
 - `jonoffcpu-jfr-converter`: Java 21 build of async-profiler's converter
@@ -180,7 +200,9 @@ and exact-cookie matches rather than only checking process exit status.
 
 - Keep the agent and correlator as shaded, self-contained JARs: the agent is a
   `-javaagent` JAR, the correlator a runnable one. Relocate bundled
-  dependencies to avoid conflicts for users of their Java APIs. The
+  dependencies to avoid conflicts for users of their Java APIs. Gson stays
+  embedded only because protobuf-java-util's `JsonFormat` needs it at run
+  time; jonoffcpu code does not use it. The
   jfr-converter has no dependencies and keeps its upstream `one.*` packages and
   Apache-2.0 license.
 - The agent JAR embeds Linux x86-64 and arm64 copies of the JNI bridge, native

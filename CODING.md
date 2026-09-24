@@ -51,9 +51,8 @@ plugin:
   component, and the shaded modules publish only their shaded JAR.
 - **Fixtures are not copied between modules.** A fixture that several modules need lives in the test fixtures of the
   module that owns what it builds, and the others depend on it with `testFixtures(project(…))`. The capture stream's
-  `CaptureRecordFixture`, which encodes JSON rows as stream records, is in `jonoffcpu-capture-codec`, beside the
-  codec it uses; the parts that need a module's package-private `CaptureStream`, such as its header and reader, stay
-  in that module's `CaptureStreamFixture`.
+  fixtures are in `jonoffcpu-capture-codec`, beside the codec they use: `CaptureRecordFixture` writes and reads streams
+  of typed records, and `CaptureFixtures` builds valid records to start from.
 
 Integration tests say what they need with a tag, and the build routes each tag:
 
@@ -125,6 +124,9 @@ not the same by default:
   when each invocation needs its own injected context.
 - **Files go in `@TempDir`**, which JUnit deletes; never create and clean temporary directories by hand. A test never
   depends on another test having run first.
+- **Assert on messages, not on JSON text.** Every structured output is a protobuf message: read a JSON output back
+  with `ProtoJson.parse` into its message type, which also proves it follows the schema, and assert on its fields or
+  compare whole messages with `isEqualTo`. Build inputs as messages too, never as hand-written JSON.
 - **AssertJ, idiomatically.** Assert on the value, not on a boolean about it: `assertThat(report.matched())
   .isEqualTo(1)`, `.contains(…)`, `.hasSize(…)`, `.isRegularFile()`, `.hasSameTextualContentAs(…)`. Keep the domain
   reason with `.as("…")` when it adds information. Expected failures use `assertThatThrownBy`,
