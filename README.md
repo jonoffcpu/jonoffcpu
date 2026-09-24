@@ -1216,9 +1216,13 @@ configure-on-demand and parallel execution; the modules share their build
 logic through the convention plugins in `build-logic/`, and every library and
 plugin version is in `gradle/libs.versions.toml`. The native bundle's Dockerfiles
 compile the collector's Cargo dependencies in a layer of their own, so a
-collector change rebuilds only the collector. The tests are main-based
-fixtures; each reports its class and every scenario with `STARTED`, `PASSED`
-or `FAILED` and the time it took. CI publishes a
+collector change rebuilds only the collector. The tests are JUnit Jupiter
+tests with AssertJ: `src/test` holds unit tests that run on any platform with
+Java, and `src/integrationTest` holds the tests that need the native bundle,
+a packaged JAR, Docker or an external tool, including the agent's end-to-end
+tests against the host kernel in privileged Testcontainers. `check` runs
+both; [`CODING.md`](CODING.md) describes the conventions and the time budget
+they keep. CI publishes a
 [Build Scan](https://scans.gradle.com) for every Gradle build, and restores
 the native bundle's Docker layers from the GitHub Actions cache with
 `-PdockerCache=gha` (`-PdockerCacheWrite=true` also exports them, which CI

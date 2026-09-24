@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
-import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -11,15 +15,22 @@ import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.FieldSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import picocli.CommandLine;
 import picocli.CommandLine.Model.CommandSpec;
 import picocli.CommandLine.Model.OptionSpec;
@@ -29,16 +40,10 @@ import picocli.CommandLine.Model.OptionSpec;
  * message and usage and no stack trace, {@code run} never exits, and the README's option names and defaults are the
  * parser's. Run with {@code -Djonoffcpu.updateHelp=DIR} to rewrite the snapshots into {@code DIR}.
  */
-public final class CommandLineTest {
+class CommandLineTest {
     /** Every command with its own help, the top-level one as the empty name. */
     static final List<String> COMMANDS =
             List.of("", "correlate", "stacks", "top", "summarize", "merge", "export", "dump");
-
-    private CommandLineTest() {}
-
-    static void check(boolean condition, String message) {
-        if (!condition) throw new AssertionError(message);
-    }
 
     record Invocation(int code, String out, String err) {}
 
@@ -53,12 +58,16 @@ public final class CommandLineTest {
     /** Checks that a command line is refused as a usage error, with its usage and without a stack trace. */
     static Invocation usageError(String message, String... args) throws Exception {
         Invocation invocation = invoke(args);
-        check(invocation.code() == Cli.USAGE, "A usage error must return 64, got " + invocation);
-        check(invocation.err().contains(message), "The usage error must say '" + message + "': " + invocation.err());
-        check(invocation.err().contains("Usage: "), "A usage error must show the usage: " + invocation.err());
-        check(
-                !invocation.err().contains("Exception") && !invocation.err().contains("\tat "),
-                "A usage error must not print a stack trace: " + invocation.err());
+        assertThat(invocation.code())
+                .as("A usage error must return 64: %s", invocation)
+                .isEqualTo(Cli.USAGE);
+        assertThat(invocation.err())
+                .as("The usage error must say '%s'", message)
+                .contains(message)
+                .as("A usage error must show the usage")
+                .contains("Usage: ")
+                .as("A usage error must not print a stack trace")
+                .doesNotContain("Exception", "\tat ");
         return invocation;
     }
 
@@ -69,86 +78,119 @@ public final class CommandLineTest {
         return words.toArray(String[]::new);
     }
 
-    private static void helpSnapshots() throws Exception {
+    /** One test per command: its help matches the checked-in snapshot, from {@code --help} and {@code help}. */
+    @ParameterizedTest(name = "help ''{0}''")
+    @FieldSource("COMMANDS")
+    void helpSnapshots(String command) throws Exception {
         String update = System.getProperty("jonoffcpu.updateHelp");
-        for (String command : COMMANDS) {
-            Invocation flag = invoke(words(command, "--help"));
-            Invocation helpCommand = invoke(command.isEmpty() ? new String[] {"help"} : new String[] {"help", command});
-            check(flag.code() == 0 && helpCommand.code() == 0, "Help must return 0 for '" + command + "'");
-            check(flag.out().equals(helpCommand.out()), "help " + command + " and --help must agree");
-            check(flag.err().isEmpty(), "Help goes to stdout: " + flag.err());
-            String name = (command.isEmpty() ? "jonoffcpu-correlator" : command) + ".txt";
-            if (update != null) {
-                Files.writeString(Files.createDirectories(Path.of(update)).resolve(name), flag.out());
-                continue;
-            }
-            String expected;
-            try (InputStream input = CommandLineTest.class.getResourceAsStream("/help/" + name)) {
-                check(input != null, "Missing help snapshot " + name);
-                expected = new String(input.readAllBytes(), StandardCharsets.UTF_8);
-            }
-            check(
-                    flag.out().equals(expected),
-                    "Help for '" + command + "' differs from src/test/resources/help/" + name + ":\n" + flag.out());
+        Invocation flag = invoke(words(command, "--help"));
+        Invocation helpCommand = invoke(command.isEmpty() ? new String[] {"help"} : new String[] {"help", command});
+        assertThat(flag.code()).as("--help must return 0 for '%s'", command).isZero();
+        assertThat(helpCommand.code())
+                .as("help must return 0 for '%s'", command)
+                .isZero();
+        assertThat(flag.out()).as("help %s and --help must agree", command).isEqualTo(helpCommand.out());
+        assertThat(flag.err()).as("Help goes to stdout").isEmpty();
+        String name = (command.isEmpty() ? "jonoffcpu-correlator" : command) + ".txt";
+        if (update != null) {
+            Files.writeString(Files.createDirectories(Path.of(update)).resolve(name), flag.out());
+            return;
         }
-        Invocation none = invoke();
-        check(none.code() == 0 && none.out().equals(invoke("--help").out()), "No arguments must print the help");
-        Invocation version = invoke("--version");
-        check(
-                version.code() == 0
-                        && version.out().startsWith("jonoffcpu-correlator ")
-                        && version.out().contains("async-profiler fork "),
-                "--version must name the build and the async-profiler fork: " + version.out());
-        check(invoke("stacks", "-V").out().equals(version.out()), "Every command has --version");
+        String expected;
+        try (InputStream input = CommandLineTest.class.getResourceAsStream("/help/" + name)) {
+            assertThat(input).as("Missing help snapshot %s", name).isNotNull();
+            expected = new String(input.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        assertThat(flag.out())
+                .as("Help for '%s' differs from src/test/resources/help/%s", command, name)
+                .isEqualTo(expected);
     }
 
-    private static void usageErrors() throws Exception {
+    @Test
+    void noArgumentsAndVersion() throws Exception {
+        Invocation none = invoke();
+        assertThat(none.code()).as("No arguments must print the help").isZero();
+        assertThat(none.out())
+                .as("No arguments must print the help")
+                .isEqualTo(invoke("--help").out());
+        Invocation version = invoke("--version");
+        assertThat(version.code()).isZero();
+        assertThat(version.out())
+                .as("--version must name the build and the async-profiler fork")
+                .startsWith("jonoffcpu-correlator ")
+                .contains("async-profiler fork ");
+        assertThat(invoke("stacks", "-V").out())
+                .as("Every command has --version")
+                .isEqualTo(version.out());
+    }
+
+    /** A typo is a usage error that suggests the option and shows the subcommand's usage. */
+    @Test
+    void usageErrorSuggestsOption() throws Exception {
         Invocation typo = usageError("Unknown options: '--stakc'", "stacks", "--stakc", "java");
-        check(typo.err().contains("--stack"), "A typo must suggest the option: " + typo.err());
-        check(typo.err().contains("Usage: java -jar jonoffcpu-correlator.jar stacks"), "The stacks usage: " + typo);
-        usageError(
-                "expected one of full, abbreviate, drop but was 'short'",
-                "stacks",
-                "--profile",
-                "p.pb",
-                "--output",
-                "o.collapsed",
-                "--package-names",
-                "short");
-        usageError("Give exactly one of --profile and --collapsed-input", "stacks", "--output", "o.collapsed");
-        usageError("Missing required option: '--source=FILE'", "--jfr", "x.jfr", "--output", "out");
-        usageError("Missing required option: '--jfr=FILE'", "correlate", "--source", "x.pb", "--output", "out");
-        usageError("should be specified only once", "--source", "a", "--source", "b");
-        usageError("'maybe' is not a boolean", "--partial", "maybe");
-        usageError("expected nanoseconds", "--from-ns", "-1");
-        usageError("duplicate reason 'blocked'", "stacks", "--reason", "blocked,blocked");
-        usageError("Empty profile path", "merge", "--profiles", "a.pb,,b.pb", "--output", "m.pb");
-        usageError(
-                "Population estimates require the unthinned source",
-                "--source",
-                "a",
-                "--jfr",
-                "b",
-                "--output",
-                "c",
-                "--estimate-population",
-                "true",
-                "--thinning",
-                "0.5");
-        usageError(
-                "Thinning probability must be in (0, 1]",
-                "--source",
-                "a",
-                "--jfr",
-                "b",
-                "--output",
-                "c",
-                "--thinning",
-                "2");
+        assertThat(typo.err())
+                .as("A typo must suggest the option")
+                .contains("--stack")
+                .as("The stacks usage")
+                .contains("Usage: java -jar jonoffcpu-correlator.jar stacks");
+    }
+
+    /** Each case: the message the usage error must carry, then the command line. */
+    private static final List<List<String>> USAGE_ERRORS = List.of(
+            List.of(
+                    "expected one of full, abbreviate, drop but was 'short'",
+                    "stacks",
+                    "--profile",
+                    "p.pb",
+                    "--output",
+                    "o.collapsed",
+                    "--package-names",
+                    "short"),
+            List.of("Give exactly one of --profile and --collapsed-input", "stacks", "--output", "o.collapsed"),
+            List.of("Missing required option: '--source=FILE'", "--jfr", "x.jfr", "--output", "out"),
+            List.of("Missing required option: '--jfr=FILE'", "correlate", "--source", "x.pb", "--output", "out"),
+            List.of("should be specified only once", "--source", "a", "--source", "b"),
+            List.of("'maybe' is not a boolean", "--partial", "maybe"),
+            List.of("expected nanoseconds", "--from-ns", "-1"),
+            List.of("duplicate reason 'blocked'", "stacks", "--reason", "blocked,blocked"),
+            List.of("Empty profile path", "merge", "--profiles", "a.pb,,b.pb", "--output", "m.pb"),
+            List.of(
+                    "Population estimates require the unthinned source",
+                    "--source",
+                    "a",
+                    "--jfr",
+                    "b",
+                    "--output",
+                    "c",
+                    "--estimate-population",
+                    "true",
+                    "--thinning",
+                    "0.5"),
+            List.of(
+                    "Thinning probability must be in (0, 1]",
+                    "--source",
+                    "a",
+                    "--jfr",
+                    "b",
+                    "--output",
+                    "c",
+                    "--thinning",
+                    "2"));
+
+    static Stream<Arguments> usageErrorCases() {
+        return USAGE_ERRORS.stream()
+                .map(testCase -> Arguments.of(testCase.get(0), testCase.subList(1, testCase.size())));
+    }
+
+    @ParameterizedTest(name = "{1}")
+    @MethodSource("usageErrorCases")
+    void usageErrors(String message, List<String> args) throws Exception {
+        usageError(message, args.toArray(String[]::new));
     }
 
     /** {@code --dump --source} and {@code dump --source} write the same bytes, and neither closes stdout. */
-    private static void dumpAlias(Path dir) throws Exception {
+    @Test
+    void dumpAlias(@TempDir Path dir) throws Exception {
         Path jfr = OfflineCorrelatorTest.recording(dir, 1);
         long[] tid = new long[1];
         SignalJfrExporter.visit(jfr, row -> {
@@ -158,7 +200,8 @@ public final class CommandLineTest {
         Path source = OfflineCorrelatorTest.source(dir, jfr, List.of(observation));
         byte[] alias = stdout("--dump", "--source", source.toString());
         byte[] command = stdout("dump", "--source", source.toString());
-        check(alias.length > 0 && java.util.Arrays.equals(alias, command), "dump and --dump must agree");
+        assertThat(alias).as("dump must write something").isNotEmpty();
+        assertThat(alias).as("dump and --dump must agree").isEqualTo(command);
 
         // The pre-picocli spellings used by the README and the Pulsar launcher keep their exit codes, and the default
         // command and its explicit name write the same analysis.
@@ -182,71 +225,74 @@ public final class CommandLineTest {
         List<String> explicit = new ArrayList<>(List.of("correlate"));
         explicit.addAll(common);
         explicit.addAll(List.of("--output", second.toString()));
-        check(OffCpuCorrelator.run(implicit.toArray(String[]::new)) == 0, "The default command must correlate");
-        check(OffCpuCorrelator.run(explicit.toArray(String[]::new)) == 0, "correlate must correlate");
-        check(
-                Files.exists(first.resolve(OutputFiles.SUMMARY_MD)),
-                "No digest: " + Files.readString(first.resolve(OutputFiles.REPORT)));
+        assertThat(OffCpuCorrelator.run(implicit.toArray(String[]::new)))
+                .as("The default command must correlate")
+                .isZero();
+        assertThat(OffCpuCorrelator.run(explicit.toArray(String[]::new)))
+                .as("correlate must correlate")
+                .isZero();
+        assertThat(first.resolve(OutputFiles.SUMMARY_MD))
+                .as("No digest: %s", Files.readString(first.resolve(OutputFiles.REPORT)))
+                .exists();
         for (String file : List.of(
                 OutputFiles.COLLAPSED,
                 OutputFiles.PROFILE,
                 OutputFiles.SUMMARY_JSON,
                 OutputFiles.SUMMARY_MD,
                 OutputFiles.COMPLETE)) {
-            check(
-                    java.util.Arrays.equals(
-                            Files.readAllBytes(first.resolve(file)), Files.readAllBytes(second.resolve(file))),
-                    file + " must not depend on how correlate is named");
+            assertThat(Files.readAllBytes(first.resolve(file)))
+                    .as("%s must not depend on how correlate is named", file)
+                    .isEqualTo(Files.readAllBytes(second.resolve(file)));
         }
         // Correlation writes the digest by default and names it in the report; --summary-output false does not.
-        com.google.gson.JsonObject digest = com.google.gson.JsonParser.parseString(
-                        Files.readString(first.resolve(OutputFiles.REPORT)))
+        JsonObject digest = JsonParser.parseString(Files.readString(first.resolve(OutputFiles.REPORT)))
                 .getAsJsonObject()
                 .getAsJsonObject("digest");
-        check(
-                digest.get("path").getAsString().equals(OutputFiles.SUMMARY_MD)
-                        && digest.get("json").getAsString().equals(OutputFiles.SUMMARY_JSON)
-                        && Files.readString(first.resolve(OutputFiles.SUMMARY_MD))
-                                .startsWith("# jonoffcpu analysis digest"),
-                "The report must name the digest: " + digest);
+        assertThat(digest.get("path").getAsString())
+                .as("The report must name the digest: %s", digest)
+                .isEqualTo(OutputFiles.SUMMARY_MD);
+        assertThat(digest.get("json").getAsString())
+                .as("The report must name the digest: %s", digest)
+                .isEqualTo(OutputFiles.SUMMARY_JSON);
+        assertThat(Files.readString(first.resolve(OutputFiles.SUMMARY_MD))).startsWith("# jonoffcpu analysis digest");
         Path withoutDigest = dir.resolve("without-digest");
         List<String> noDigest = new ArrayList<>(common);
         noDigest.addAll(List.of("--output", withoutDigest.toString(), "--summary-output", "false"));
-        check(OffCpuCorrelator.run(noDigest.toArray(String[]::new)) == 0, "Correlation without a digest");
-        check(
-                !Files.exists(withoutDigest.resolve(OutputFiles.SUMMARY_MD))
-                        && !Files.exists(withoutDigest.resolve(OutputFiles.SUMMARY_JSON))
-                        && !Files.readString(withoutDigest.resolve(OutputFiles.REPORT))
-                                .contains("\"digest\""),
-                "--summary-output false must write no digest");
+        assertThat(OffCpuCorrelator.run(noDigest.toArray(String[]::new)))
+                .as("Correlation without a digest")
+                .isZero();
+        assertThat(withoutDigest.resolve(OutputFiles.SUMMARY_MD))
+                .as("--summary-output false must write no digest")
+                .doesNotExist();
+        assertThat(withoutDigest.resolve(OutputFiles.SUMMARY_JSON))
+                .as("--summary-output false must write no digest")
+                .doesNotExist();
+        assertThat(Files.readString(withoutDigest.resolve(OutputFiles.REPORT)))
+                .as("--summary-output false must write no digest")
+                .doesNotContain("\"digest\"");
         Path slice = dir.resolve("slice.collapsed");
         Path patterns = Files.writeString(dir.resolve("idle.txt"), "epollWait\n");
-        check(
-                OffCpuCorrelator.run(new String[] {
-                            "stacks",
-                            "--profile",
-                            first.resolve(OutputFiles.PROFILE).toString(),
-                            "--package-names",
-                            "drop",
-                            "--summary",
-                            dir.resolve("slice.json").toString(),
-                            "--output",
-                            slice.toString(),
-                            "--exclude-from",
-                            patterns.toString()
-                        })
-                        == 0,
-                "The launcher's stacks invocation must succeed");
+        assertThat(OffCpuCorrelator.run(new String[] {
+                    "stacks",
+                    "--profile",
+                    first.resolve(OutputFiles.PROFILE).toString(),
+                    "--package-names",
+                    "drop",
+                    "--summary",
+                    dir.resolve("slice.json").toString(),
+                    "--output",
+                    slice.toString(),
+                    "--exclude-from",
+                    patterns.toString()
+                }))
+                .as("The launcher's stacks invocation must succeed")
+                .isZero();
 
-        // A failing analysis still throws out of run instead of exiting.
-        try {
-            OffCpuCorrelator.run(
-                    new String[] {"--source", source.toString(), "--jfr", jfr.toString(), "--output", first.toString()
-                    });
-            throw new AssertionError("An existing output directory must fail");
-        } catch (java.nio.file.FileAlreadyExistsException expected) {
-            // run returned control to the caller.
-        }
+        // A failing analysis still throws out of run instead of exiting: an existing output directory must fail.
+        assertThatExceptionOfType(FileAlreadyExistsException.class)
+                .isThrownBy(() -> OffCpuCorrelator.run(new String[] {
+                    "--source", source.toString(), "--jfr", jfr.toString(), "--output", first.toString()
+                }));
     }
 
     private static byte[] stdout(String... args) throws Exception {
@@ -254,8 +300,12 @@ public final class CommandLineTest {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         try (PrintStream capture = new PrintStream(bytes, true, StandardCharsets.UTF_8)) {
             System.setOut(capture);
-            check(OffCpuCorrelator.run(args) == 0, "dump must succeed");
-            check(!capture.checkError(), "dump must not close stdout");
+            int code = OffCpuCorrelator.run(args);
+            boolean closed = capture.checkError();
+            // Restored before asserting, so that a failure is reported on the real stdout.
+            System.setOut(original);
+            assertThat(code).as("dump must succeed").isZero();
+            assertThat(closed).as("dump must not close stdout").isFalse();
         } finally {
             System.setOut(original);
         }
@@ -270,7 +320,7 @@ public final class CommandLineTest {
     /** The lines of the README section starting at {@code heading}, up to the next heading of its level or above. */
     static List<String> section(List<String> readme, String heading) {
         int start = readme.indexOf(heading);
-        check(start >= 0, "README has no section " + heading);
+        assertThat(start).as("README has no section %s", heading).isNotNegative();
         int level = heading.indexOf(' ');
         List<String> lines = new ArrayList<>();
         boolean fenced = false;
@@ -296,12 +346,10 @@ public final class CommandLineTest {
                 : root.getSubcommands().get(command).getCommandSpec();
     }
 
-    private static void readmeMatchesParser() throws IOException {
+    @Test
+    void readmeMatchesParser() throws IOException {
         String path = System.getProperty("jonoffcpu.readme");
-        if (path == null) {
-            System.out.println("Skipping the README check: -Djonoffcpu.readme is not set");
-            return;
-        }
+        assumeTrue(path != null, "Skipping the README check: -Djonoffcpu.readme is not set");
         List<String> readme = Files.readAllLines(Path.of(path), StandardCharsets.UTF_8);
         CommandSpec correlate = spec("");
         // Each table row names its options in the first column; a stated default must be the parser's.
@@ -310,19 +358,22 @@ public final class CommandLineTest {
             String[] columns = line.split("(?<!\\\\)\\|");
             Set<String> names = options(columns[1]);
             for (String name : names) {
-                check(correlate.findOption(name) != null, "README option " + name + " is not a correlate option");
+                assertThat(correlate.findOption(name))
+                        .as("README option %s is not a correlate option", name)
+                        .isNotNull();
             }
             Matcher stated = DEFAULT.matcher(columns[2]);
             if (names.size() == 1 && stated.find()) {
                 OptionSpec option = correlate.findOption(names.iterator().next());
-                check(
-                        stated.group(1).equals(option.defaultValue()),
-                        "README default of " + option.longestName() + " is " + stated.group(1) + ", the parser's is "
-                                + option.defaultValue());
+                assertThat(stated.group(1))
+                        .as("README default of %s must be the parser's", option.longestName())
+                        .isEqualTo(option.defaultValue());
             }
         }
         for (String name : options(String.join("\n", section(readme, "### Correlator options")))) {
-            check(correlate.findOption(name) != null, "README mentions unknown correlate option " + name);
+            assertThat(correlate.findOption(name))
+                    .as("README mentions unknown correlate option %s", name)
+                    .isNotNull();
         }
         // The slicing section's commands: every option it names belongs to one of them.
         List<CommandSpec> profileCommands =
@@ -333,28 +384,15 @@ public final class CommandLineTest {
                 "## Analyzing with AI agents",
                 "## Analyzing with SQL")) {
             for (String name : options(String.join("\n", section(readme, heading)))) {
-                check(
-                        profileCommands.stream().anyMatch(command -> command.findOption(name) != null),
-                        "README section " + heading + " mentions unknown option " + name);
+                assertThat(profileCommands)
+                        .as("README section %s mentions unknown option %s", heading, name)
+                        .anyMatch(command -> command.findOption(name) != null);
             }
         }
         for (String name : options(String.join("\n", section(readme, "### 3. Correlate")))) {
-            check(correlate.findOption(name) != null, "README correlate step mentions unknown option " + name);
-        }
-    }
-
-    public static void main(String[] args) throws Exception {
-        Path dir = Files.createTempDirectory("jonoffcpu-cli-test-");
-        try {
-            FixtureSteps.step("helpSnapshots", () -> helpSnapshots());
-            FixtureSteps.step("usageErrors", () -> usageErrors());
-            FixtureSteps.step("dumpAlias", () -> dumpAlias(dir));
-            FixtureSteps.step("readmeMatchesParser", () -> readmeMatchesParser());
-            System.out.println("Command line fixtures passed");
-        } finally {
-            try (var files = Files.walk(dir)) {
-                for (Path path : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
-            }
+            assertThat(correlate.findOption(name))
+                    .as("README correlate step mentions unknown option %s", name)
+                    .isNotNull();
         }
     }
 }

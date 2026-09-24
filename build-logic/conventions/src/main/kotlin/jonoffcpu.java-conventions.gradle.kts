@@ -1,8 +1,11 @@
 // Every jonoffcpu module: built by Amazon Corretto 25 for the release its `jonoffcpu.javaRelease` names (21 by
-// default), with sources and javadoc JARs for Maven Central. The tests are main-based fixtures (FixtureExec), which
-// `check` runs, together with the root project's formatting check.
+// default), with sources and javadoc JARs for Maven Central. Tests are JUnit Jupiter with AssertJ and Awaitility, in
+// two suites: `test` holds unit tests that run on any platform with Java, and `integrationTest` holds the tests that
+// need the native bundle, a packaged JAR or an external tool. `check` runs both, with the root project's formatting
+// check.
 plugins {
     `java-library`
+    `jvm-test-suite`
 }
 
 val jonoffcpu = extensions.create<JonoffcpuJavaExtension>("jonoffcpu")
@@ -30,12 +33,69 @@ tasks.withType<Javadoc>().configureEach {
     (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:none", "-quiet")
 }
 
-tasks.named("test") {
-    enabled = false
+// Precompiled script plugins get no `libs` accessor.
+val libs = versionCatalogs.named("libs")
+
+fun library(alias: String) = libs.findLibrary(alias).get()
+
+testing {
+    suites {
+        withType<JvmTestSuite>().configureEach {
+            useJUnitJupiter(libs.findVersion("junit").get().requiredVersion)
+            dependencies {
+                implementation(platform(library("junit-bom")))
+                implementation(platform(library("testcontainers-bom")))
+                implementation(library("assertj-core"))
+                implementation(library("awaitility"))
+            }
+        }
+        register<JvmTestSuite>("integrationTest") {
+            dependencies {
+                // The classes themselves, as the unit tests see them: a shaded module's plain JAR is never built.
+                implementation(sourceSets.main.get().output)
+                // The unit tests' fixture builders and JFR event types, shared rather than copied.
+                implementation(sourceSets.test.get().output)
+            }
+            targets.configureEach {
+                testTask.configure { shouldRunAfter(tasks.test) }
+            }
+        }
+    }
+}
+
+// Integration tests see what the unit tests see: the module's own dependencies, which a shaded module declares
+// compileOnly, and the unit tests' runtime libraries.
+configurations.named("integrationTestImplementation") { extendsFrom(configurations.testImplementation.get()) }
+configurations.named("integrationTestRuntimeOnly") { extendsFrom(configurations.testRuntimeOnly.get()) }
+
+// Test libraries without the module's classes or its unrelocated dependencies, for tests that exercise a packaged JAR.
+val packagedJarTestRuntime =
+    configurations.register("packagedJarTestRuntime") {
+        isCanBeConsumed = false
+    }
+dependencies {
+    packagedJarTestRuntime(platform(library("junit-bom")))
+    packagedJarTestRuntime("org.junit.jupiter:junit-jupiter")
+    packagedJarTestRuntime("org.junit.platform:junit-platform-launcher")
+    packagedJarTestRuntime(library("assertj-core"))
+}
+
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("started", "passed", "skipped", "failed")
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        showStandardStreams = false
+    }
+    // No test may take more than a minute; the few that need longer say so with @Timeout.
+    systemProperty("junit.jupiter.execution.timeout.default", "60 s")
+    // Parallel across JVMs only: JFR recordings in one JVM would capture each other's events. Each test class gets a
+    // fresh JVM, so what an earlier class compiled or recorded cannot change how a later one's fixtures come out.
+    maxParallelForks = (Runtime.getRuntime().availableProcessors() / 2).coerceIn(1, 4)
+    forkEvery = 1
 }
 
 tasks.named("check") {
-    dependsOn(tasks.withType<FixtureExec>())
+    dependsOn(tasks.named("integrationTest"))
     // By path, so that no project configures another.
     dependsOn(":spotlessCheck")
 }

@@ -150,7 +150,7 @@ The CLI defaults to `matches`: `jonoffcpu-matches.jsonl` is written but
 `jonoffcpu-classified-records.jsonl` is **not**, which is a backward-incompatible
 change from earlier releases that always wrote both. Anything that reads
 `jonoffcpu-classified-records.jsonl` — including
-[`jonoffcpu-agent/tools/run-native-agent-interruptions.py`](../jonoffcpu-agent/tools/run-native-agent-interruptions.py)
+the agent's `AsyncProfilerFirstStopTest`
 and
 [`jonoffcpu-native/tools/run-agent-signal-pressure.py`](../jonoffcpu-native/tools/run-agent-signal-pressure.py)
 — must now pass `--audit full` explicitly. `--audit none` writes neither audit

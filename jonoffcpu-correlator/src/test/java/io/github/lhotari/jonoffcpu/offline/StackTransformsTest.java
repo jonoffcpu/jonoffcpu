@@ -1,25 +1,27 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
-import io.github.lhotari.jonoffcpu.testing.FixtureSteps;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Stream;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /** Frame-level transforms of {@code stacks}: each transform on hand-built stacks, then through the command line. */
-public final class StackTransformsTest {
-    private StackTransformsTest() {}
-
-    static void check(boolean condition, String message) {
-        if (!condition) throw new AssertionError(message);
-    }
-
+class StackTransformsTest {
     private static List<StackProfile.Frame> java(String... names) {
         return Arrays.stream(names)
                 .map(name -> new StackProfile.Frame(
@@ -60,84 +62,109 @@ public final class StackTransformsTest {
                         .toList());
     }
 
-    private static void expect(StackTransforms transforms, String stack, String expected) {
-        String actual = apply(transforms, stack);
-        check(actual.equals(expected), stack + " must become " + expected + ", was " + actual);
-    }
-
     /** The spec's unit cases, one transform at a time. */
-    private static void transformsInIsolation() throws IOException {
+    static Stream<Arguments> transformsInIsolation() throws IOException {
         List<StackTransforms.Sourced> none = List.of();
         StackTransforms trim = transforms(none, inline("^(A|B|C)$"), none, none, none, false);
-        expect(trim, "A;B;C;x.App.m;D", "x.App.m;D");
-        // The run stops at the first frame that does not match: B here, A in the second case.
-        expect(transforms(none, inline("^(A|C)$"), none, none, none, false), "A;B;C;x.App.m;D", "B;C;x.App.m;D");
-        expect(transforms(none, inline("^(B|C)$"), none, none, none, false), "A;B;C;x.App.m;D", "A;B;C;x.App.m;D");
-        expect(trim, "A;B;C", "C");
-        // Only the root-side run is trimmed: an application call into a matching frame keeps it.
-        expect(trim, "A;x.App.m;B", "x.App.m;B");
-
         StackTransforms rootAt = transforms(none, none, inline("^x\\."), none, none, false);
-        expect(rootAt, "T;x.App.a;y.Lib.b;x.App.c;L1;L2", "x.App.a;y.Lib.b;x.App.c;L1;L2");
-        expect(rootAt, "T;L1", StackTransforms.NO_APPLICATION_FRAME);
         StackTransforms keep = new StackTransforms(
                 false, none, none, inline("^x\\."), true, none, none, false, StackTransforms.ThreadFrame.NONE);
-        expect(keep, "T;L1", "T;L1");
         StackTransforms leafAt = transforms(none, none, none, inline("^x\\."), none, false);
-        expect(leafAt, "T;x.App.a;y.Lib.b;x.App.c;L1;L2", "T;x.App.a;y.Lib.b;x.App.c");
-        expect(leafAt, "T;L1", "T;L1");
-
         StackTransforms hide = transforms(inline("^y\\."), none, none, none, none, false);
-        expect(hide, "T;x.App.a;y.Lib.b;x.App.c", "T;x.App.a;x.App.c");
-        expect(hide, "y.Lib.a;y.Lib.b", "y.Lib.b");
-
+        List<StackTransforms.Sourced> machinery = preset("jvm-wait-machinery");
+        StackTransforms collapse = transforms(none, none, none, none, machinery, false);
+        StackTransforms category = transforms(none, none, none, none, machinery, true);
         String lock = "x.App.m;java.util.concurrent.locks.ReentrantLock.lock;"
                 + "java.util.concurrent.locks.AbstractQueuedSynchronizer.acquire;jdk.internal.misc.Unsafe.park;"
                 + "libc.so.6.__futex_abstimed_wait_cancelable64";
-        List<StackTransforms.Sourced> machinery = preset("jvm-wait-machinery");
-        expect(
-                transforms(none, none, none, none, machinery, false),
-                lock,
-                "x.App.m;java.util.concurrent.locks.ReentrantLock.lock");
-        expect(transforms(none, none, none, none, machinery, true), lock, "x.App.m;[lock]");
         String monitor = "x.App.m;C2 Runtime complete_monitor_locking;libjvm.so.ObjectMonitor::enter;"
                 + "libc.so.6.__GI___pthread_cond_wait";
-        expect(transforms(none, none, none, none, machinery, true), monitor, "x.App.m;[monitor]");
-        expect(
-                transforms(none, none, none, none, machinery, true),
-                "x.App.m;jdk.internal.misc.Unsafe.park;libjvm.so.Unsafe_Park",
-                "x.App.m;[park]");
-        expect(
-                transforms(none, none, none, none, machinery, true),
-                "x.App.m;java.lang.Thread.sleep;java.lang.Thread.sleepNanos0",
-                "x.App.m;[sleep]");
-        expect(transforms(none, none, none, none, machinery, true), "x.App.m;java.lang.Object.wait0", "x.App.m;[wait]");
-        expect(
-                transforms(none, none, none, none, machinery, true),
-                "x.App.m;libc.so.6.read;vfs_read_[k]",
-                "x.App.m;[native]");
-        expect(transforms(none, none, none, none, machinery, true), "x.App.m;__schedule_[k]", "x.App.m;[kernel]");
-        // Nothing to collapse leaves the stack alone.
-        expect(transforms(none, none, none, none, machinery, true), "x.App.m;x.App.n", "x.App.m;x.App.n");
+        return Stream.of(
+                Arguments.of("trim-root", trim, "A;B;C;x.App.m;D", "x.App.m;D"),
+                // The run stops at the first frame that does not match: B here, A in the second case.
+                Arguments.of(
+                        "trim-root stops at B",
+                        transforms(none, inline("^(A|C)$"), none, none, none, false),
+                        "A;B;C;x.App.m;D",
+                        "B;C;x.App.m;D"),
+                Arguments.of(
+                        "trim-root stops at A",
+                        transforms(none, inline("^(B|C)$"), none, none, none, false),
+                        "A;B;C;x.App.m;D",
+                        "A;B;C;x.App.m;D"),
+                Arguments.of("trim-root keeps the leaf", trim, "A;B;C", "C"),
+                // Only the root-side run is trimmed: an application call into a matching frame keeps it.
+                Arguments.of("trim-root only at the root", trim, "A;x.App.m;B", "x.App.m;B"),
+                Arguments.of("root-at", rootAt, "T;x.App.a;y.Lib.b;x.App.c;L1;L2", "x.App.a;y.Lib.b;x.App.c;L1;L2"),
+                Arguments.of(
+                        "root-at without an application frame", rootAt, "T;L1", StackTransforms.NO_APPLICATION_FRAME),
+                Arguments.of("root-at keeping unmatched", keep, "T;L1", "T;L1"),
+                Arguments.of("leaf-at", leafAt, "T;x.App.a;y.Lib.b;x.App.c;L1;L2", "T;x.App.a;y.Lib.b;x.App.c"),
+                Arguments.of("leaf-at without an application frame", leafAt, "T;L1", "T;L1"),
+                Arguments.of("hide", hide, "T;x.App.a;y.Lib.b;x.App.c", "T;x.App.a;x.App.c"),
+                Arguments.of("hide keeps the leaf", hide, "y.Lib.a;y.Lib.b", "y.Lib.b"),
+                Arguments.of(
+                        "collapse-leaf lock", collapse, lock, "x.App.m;java.util.concurrent.locks.ReentrantLock.lock"),
+                Arguments.of("collapse-leaf category lock", category, lock, "x.App.m;[lock]"),
+                Arguments.of("collapse-leaf category monitor", category, monitor, "x.App.m;[monitor]"),
+                Arguments.of(
+                        "collapse-leaf category park",
+                        category,
+                        "x.App.m;jdk.internal.misc.Unsafe.park;libjvm.so.Unsafe_Park",
+                        "x.App.m;[park]"),
+                Arguments.of(
+                        "collapse-leaf category sleep",
+                        category,
+                        "x.App.m;java.lang.Thread.sleep;java.lang.Thread.sleepNanos0",
+                        "x.App.m;[sleep]"),
+                Arguments.of(
+                        "collapse-leaf category wait", category, "x.App.m;java.lang.Object.wait0", "x.App.m;[wait]"),
+                Arguments.of(
+                        "collapse-leaf category native",
+                        category,
+                        "x.App.m;libc.so.6.read;vfs_read_[k]",
+                        "x.App.m;[native]"),
+                Arguments.of("collapse-leaf category kernel", category, "x.App.m;__schedule_[k]", "x.App.m;[kernel]"),
+                // Nothing to collapse leaves the stack alone.
+                Arguments.of("collapse-leaf with nothing to collapse", category, "x.App.m;x.App.n", "x.App.m;x.App.n"));
+    }
 
-        check(
-                StackTransforms.canonicalName("a.B$$Lambda.0x0000000081a06030.run")
-                        .equals(StackTransforms.canonicalName("a.B$$Lambda.0x00000000819ed250.run")),
-                "Two lambdas of one site must compare");
-        check(
-                StackTransforms.canonicalName("a.B$$Lambda.0x0000000081a06030.run")
-                        .equals("a.B$$Lambda.run"),
-                StackTransforms.canonicalName("a.B$$Lambda.0x0000000081a06030.run"));
-        check(
-                StackTransforms.canonicalName("java.lang.invoke.LambdaForm$MH/0x0000000800c01000.invoke")
-                        .equals("java.lang.invoke.LambdaForm$MH.invoke"),
-                "Lambda forms lose their address");
-        check(
-                StackTransforms.canonicalName("a.B$$Lambda$14/0x0000000800066840.run")
-                        .equals("a.B$$Lambda.run"),
-                "Pre-JDK 21 lambdas lose their index and address");
-        check(StackTransforms.poolName("pulsar-io-3-25").equals("pulsar-io-#-#"), "Pool of a numbered thread");
-        check(StackTransforms.poolName("[tid=12345]").equals("[tid=#]"), "Pool of a thread id");
+    @ParameterizedTest(name = "{0}: {2}")
+    @MethodSource
+    void transformsInIsolation(String transform, StackTransforms transforms, String stack, String expected) {
+        assertThat(apply(transforms, stack))
+                .as("%s must become %s", stack, expected)
+                .isEqualTo(expected);
+    }
+
+    @Test
+    void lambdasOfOneSiteCompare() {
+        assertThat(StackTransforms.canonicalName("a.B$$Lambda.0x0000000081a06030.run"))
+                .as("Two lambdas of one site must compare")
+                .isEqualTo(StackTransforms.canonicalName("a.B$$Lambda.0x00000000819ed250.run"));
+    }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @CsvSource({
+        "a.B$$Lambda.0x0000000081a06030.run, a.B$$Lambda.run",
+        // Lambda forms lose their address.
+        "java.lang.invoke.LambdaForm$MH/0x0000000800c01000.invoke, java.lang.invoke.LambdaForm$MH.invoke",
+        // Pre-JDK 21 lambdas lose their index and address.
+        "a.B$$Lambda$14/0x0000000800066840.run, a.B$$Lambda.run"
+    })
+    void canonicalName(String name, String canonical) {
+        assertThat(StackTransforms.canonicalName(name)).isEqualTo(canonical);
+    }
+
+    @ParameterizedTest(name = "{0} -> {1}")
+    @CsvSource({
+        // A numbered thread.
+        "pulsar-io-3-25, pulsar-io-#-#",
+        // A thread id.
+        "[tid=12345], [tid=#]"
+    })
+    void poolName(String thread, String pool) {
+        assertThat(StackTransforms.poolName(thread)).isEqualTo(pool);
     }
 
     private static StackProfile.Entry entry(List<StackProfile.Frame> stack, String thread, long intervals, long nanos) {
@@ -149,7 +176,9 @@ public final class StackTransformsTest {
         List<String> command = new ArrayList<>(List.of("stacks", "--output", output.toString()));
         command.addAll(List.of(args));
         CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
-        check(invocation.code() == 0, "stacks " + List.of(args) + " failed: " + invocation);
+        assertThat(invocation.code())
+                .as("stacks %s failed: %s", List.of(args), invocation)
+                .isZero();
         return Files.readString(output);
     }
 
@@ -158,7 +187,8 @@ public final class StackTransformsTest {
     }
 
     /** The transforms through the command line: merging, totals, the filter order, presets and summaries. */
-    private static void commandLine(Path dir) throws Exception {
+    @Test
+    void commandLine(@TempDir Path dir) throws Exception {
         List<StackProfile.Entry> entries = List.of(
                 entry(
                         java("java.lang.Thread.run", "io.netty.A.run", "x.App.m", "x.App.park"),
@@ -195,23 +225,25 @@ public final class StackTransformsTest {
                 summary.toString(),
                 "--include",
                 "x\\.App\\.park");
-        check(trimmed.equals("x.App.m;x.App.park 5\n"), "Prefixes must merge: " + trimmed);
+        assertThat(trimmed).as("Prefixes must merge").isEqualTo("x.App.m;x.App.park 5\n");
         JsonObject transforms = json(summary).getAsJsonObject("transforms");
-        check(
-                transforms.get("linesBefore").getAsInt() == 2
-                        && transforms.get("linesAfter").getAsInt() == 1
-                        && json(summary).get("intervals").getAsString().equals("5")
-                        && json(summary).get("totalNanos").getAsString().equals("5000"),
-                "The summary must report 2 lines becoming 1 and keep the totals: " + json(summary));
-        check(
-                transforms
+        String summaryMessage = "The summary must report 2 lines becoming 1 and keep the totals: " + json(summary);
+        assertThat(transforms.get("linesBefore").getAsInt()).as(summaryMessage).isEqualTo(2);
+        assertThat(transforms.get("linesAfter").getAsInt()).as(summaryMessage).isEqualTo(1);
+        assertThat(json(summary).get("intervals").getAsString())
+                .as(summaryMessage)
+                .isEqualTo("5");
+        assertThat(json(summary).get("totalNanos").getAsString())
+                .as(summaryMessage)
+                .isEqualTo("5000");
+        assertThat(transforms
                         .getAsJsonArray("trimRoot")
                         .get(0)
                         .getAsJsonObject()
                         .get("source")
-                        .getAsString()
-                        .equals("inline"),
-                "Each pattern names its source: " + transforms);
+                        .getAsString())
+                .as("Each pattern names its source: %s", transforms)
+                .isEqualTo("inline");
 
         // Filters see the untransformed stack: io.netty.A.run is trimmed away and still excludes its entry.
         String excluded = stacks(
@@ -225,7 +257,7 @@ public final class StackTransformsTest {
                 "^io\\.netty\\.A\\.run$",
                 "--include",
                 "x\\.App\\.park");
-        check(excluded.equals("x.App.m;x.App.park 3\n"), "--exclude must see removed frames: " + excluded);
+        assertThat(excluded).as("--exclude must see removed frames").isEqualTo("x.App.m;x.App.park 3\n");
 
         // --root-at buckets entries without an application frame, and the summary accounts for them.
         Path rootSummary = dir.resolve("root.json");
@@ -238,30 +270,34 @@ public final class StackTransformsTest {
                 "^x\\.App\\.",
                 "--summary",
                 rootSummary.toString());
-        check(
-                rooted.equals("[no application frame] 7\nx.App.m;x.App.park 5\nx.App.n 3\n"),
-                "--root-at must re-root and bucket: " + rooted);
+        assertThat(rooted)
+                .as("--root-at must re-root and bucket")
+                .isEqualTo("[no application frame] 7\nx.App.m;x.App.park 5\nx.App.n 3\n");
         JsonObject bucket = json(rootSummary).getAsJsonObject("transforms").getAsJsonObject("noApplicationFrame");
-        check(
-                bucket.get("weight").getAsString().equals("7000")
-                        && bucket.get("share").getAsString().equals("0.482759"),
-                "The bucket's weight and share: " + bucket);
+        assertThat(bucket.get("weight").getAsString())
+                .as("The bucket's weight and share: %s", bucket)
+                .isEqualTo("7000");
+        assertThat(bucket.get("share").getAsString())
+                .as("The bucket's weight and share: %s", bucket)
+                .isEqualTo("0.482759");
 
         // Canonical names merge two runs' lambdas.
         String canonical = stacks(
                 dir, "canonical", "--profile", profile.toString(), "--canonical-names", "--include", "x\\.App\\.n");
-        check(canonical.equals("x.Other$$Lambda.run;x.App.n 3\n"), "Lambdas must merge: " + canonical);
+        assertThat(canonical).as("Lambdas must merge").isEqualTo("x.Other$$Lambda.run;x.App.n 3\n");
 
         // The pool frame groups numbered threads.
         String pools = stacks(
                 dir, "pool", "--profile", profile.toString(), "--thread-frame", "pool", "--root-at", "^x\\.App\\.");
-        check(
-                pools.equals("event-loop-#;[no application frame] 7\npool-#-thread-#;x.App.m;x.App.park 5\n"
-                        + "worker-#;x.App.n 3\n"),
-                "Pool frames: " + pools);
+        assertThat(pools)
+                .as("Pool frames")
+                .isEqualTo("event-loop-#;[no application frame] 7\npool-#-thread-#;x.App.m;x.App.park 5\n"
+                        + "worker-#;x.App.n 3\n");
 
         // No transform, no change; and every combination keeps the totals.
-        check(untransformed.equals(stacks(dir, "plain-again", "--profile", profile.toString())), "Determinism");
+        assertThat(stacks(dir, "plain-again", "--profile", profile.toString()))
+                .as("Determinism")
+                .isEqualTo(untransformed);
         Path all = dir.resolve("all.json");
         stacks(
                 dir,
@@ -283,10 +319,12 @@ public final class StackTransformsTest {
                 "category",
                 "--summary",
                 all.toString());
-        check(
-                json(all).get("totalNanos").getAsString().equals("14500")
-                        && json(all).get("intervals").getAsString().equals("12"),
-                "Transforms never change totals: " + json(all));
+        assertThat(json(all).get("totalNanos").getAsString())
+                .as("Transforms never change totals: %s", json(all))
+                .isEqualTo("14500");
+        assertThat(json(all).get("intervals").getAsString())
+                .as("Transforms never change totals: %s", json(all))
+                .isEqualTo("12");
 
         // A thread frame needs the thread dimension.
         Path narrow = dir.resolve("narrow.pb");
@@ -296,30 +334,26 @@ public final class StackTransformsTest {
                                 .map(entry -> entry(entry.javaStack(), null, entry.intervals(), entry.observedNanos()))
                                 .toList())
                 .write(narrow);
-        try {
-            stacks(dir, "narrow", "--profile", narrow.toString(), "--thread-frame", "name");
-            throw new AssertionError("--thread-frame must need the thread dimension");
-        } catch (IOException expected) {
-            check(expected.getMessage().contains("thread"), "Unexpected failure: " + expected);
-        }
+        assertThatThrownBy(() -> stacks(dir, "narrow", "--profile", narrow.toString(), "--thread-frame", "name"))
+                .as("--thread-frame must need the thread dimension")
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("thread");
 
         // Presets work in every -from option, including the filters, and are listed.
         CommandLineTest.Invocation listing = CommandLineTest.invoke("stacks", "--list-presets");
-        check(
-                listing.code() == 0
-                        && listing.out().contains("preset:jvm-infra")
-                        && listing.out().contains("preset:jvm-wait-machinery")
-                        && listing.out().contains("preset:jvm-idle"),
-                "--list-presets must list every preset: " + listing);
+        assertThat(listing.code()).as("--list-presets failed: %s", listing).isZero();
+        assertThat(listing.out())
+                .as("--list-presets must list every preset")
+                .contains("preset:jvm-infra", "preset:jvm-wait-machinery", "preset:jvm-idle");
         String idle = stacks(
                 dir, "idle", "--profile", profile.toString(), "--exclude-from", "preset:jvm-idle", "--include", "x\\.");
-        check(!idle.isEmpty(), "preset:jvm-idle must be accepted by --exclude-from");
-        try {
-            stacks(dir, "unknown", "--profile", profile.toString(), "--hide-from", "preset:nope");
-            throw new AssertionError("An unknown preset must be refused");
-        } catch (IllegalArgumentException expected) {
-            check(expected.getMessage().contains("Unknown preset: nope"), "Unexpected failure: " + expected);
-        }
+        assertThat(idle)
+                .as("preset:jvm-idle must be accepted by --exclude-from")
+                .isNotEmpty();
+        assertThatThrownBy(() -> stacks(dir, "unknown", "--profile", profile.toString(), "--hide-from", "preset:nope"))
+                .as("An unknown preset must be refused")
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unknown preset: nope");
         CommandLineTest.usageError(
                 "Give exactly one of --profile and --collapsed-input",
                 "stacks",
@@ -328,7 +362,8 @@ public final class StackTransformsTest {
     }
 
     /** Any collapsed file: the converter's markers and slashes are normalised, and reason options are refused. */
-    private static void collapsedInput(Path dir) throws Exception {
+    @Test
+    void collapsedInput(@TempDir Path dir) throws Exception {
         Path input = Files.writeString(
                 dir.resolve("converter-cpu.collapsed"),
                 "java/lang/Thread.run_[0];org/apache/X.m_[j];__schedule_[k] 5\n"
@@ -336,15 +371,17 @@ public final class StackTransformsTest {
                         + "java/lang/Thread.run_[0];io/netty/Y.run_[1] 3\n");
         Path summary = dir.resolve("cpu.json");
         String plain = stacks(dir, "cpu", "--collapsed-input", input.toString(), "--summary", summary.toString());
-        check(
-                plain.equals("java.lang.Thread.run;io.netty.Y.run 3\n"
+        assertThat(plain)
+                .as("Collapsed input must be normalised")
+                .isEqualTo("java.lang.Thread.run;io.netty.Y.run 3\n"
                         + "java.lang.Thread.run;org.apache.X.m;I2C/C2I adapters 2.5\n"
-                        + "java.lang.Thread.run;org.apache.X.m;__schedule_[k] 5\n"),
-                "Collapsed input must be normalised: " + plain);
-        check(
-                json(summary).get("input").getAsString().equals("collapsed")
-                        && json(summary).get("totalWeight").getAsString().equals("10.5"),
-                "The summary keeps the input's unit: " + json(summary));
+                        + "java.lang.Thread.run;org.apache.X.m;__schedule_[k] 5\n");
+        assertThat(json(summary).get("input").getAsString())
+                .as("The summary keeps the input's unit: %s", json(summary))
+                .isEqualTo("collapsed");
+        assertThat(json(summary).get("totalWeight").getAsString())
+                .as("The summary keeps the input's unit: %s", json(summary))
+                .isEqualTo("10.5");
         String rooted = stacks(
                 dir,
                 "cpu-root",
@@ -356,11 +393,11 @@ public final class StackTransformsTest {
                 "preset:jvm-wait-machinery",
                 "--package-names",
                 "drop");
-        check(
-                rooted.equals("X.m;I2C/C2I adapters 2.5\nX.m;__schedule_[k] 5\n[no application frame] 3\n"),
-                "Transforms apply to collapsed input: " + rooted);
+        assertThat(rooted)
+                .as("Transforms apply to collapsed input")
+                .isEqualTo("X.m;I2C/C2I adapters 2.5\nX.m;__schedule_[k] 5\n[no application frame] 3\n");
         String excluded = stacks(dir, "cpu-exclude", "--collapsed-input", input.toString(), "--exclude", "_\\[k\\]$");
-        check(!excluded.contains("__schedule"), "Filters apply to collapsed input: " + excluded);
+        assertThat(excluded).as("Filters apply to collapsed input").doesNotContain("__schedule");
         CommandLineTest.usageError(
                 "--reason needs a stack profile",
                 "stacks",
@@ -370,19 +407,5 @@ public final class StackTransformsTest {
                 "blocked",
                 "--output",
                 dir.resolve("refused").toString());
-    }
-
-    public static void main(String[] args) throws Exception {
-        Path dir = Files.createTempDirectory("jonoffcpu-transforms-test-");
-        try {
-            FixtureSteps.step("transformsInIsolation", () -> transformsInIsolation());
-            FixtureSteps.step("commandLine", () -> commandLine(dir));
-            FixtureSteps.step("collapsedInput", () -> collapsedInput(dir));
-            System.out.println("Stack transform fixtures passed");
-        } finally {
-            try (var files = Files.walk(dir)) {
-                for (Path path : files.sorted(Comparator.reverseOrder()).toList()) Files.delete(path);
-            }
-        }
     }
 }

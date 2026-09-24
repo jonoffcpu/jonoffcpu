@@ -104,40 +104,27 @@ jobs:
         with:
           use: false
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
-      # The glibc runner JDK exercises the host-native JNI fixtures in check; the
-      # musl bundle cannot load into the glibc build JVM, so its evidence is the
-      # packaged smoke in an Alpine container of the same architecture.
+      # check runs the unit tests and both kinds of integration tests. The
+      # host-native ones load the bundle into the test JVM: directly for glibc,
+      # and in an Alpine container of the same architecture for musl, whose
+      # bundle cannot load into the glibc build JVM. The privileged-container
+      # ones run the packaged agent and correlator end to end in Testcontainers
+      # against the runner's kernel, in the Corretto image of the job's libc.
       - name: Build and run checks
         env:
           NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
           NATIVE_LIBC: ${{ matrix.libc }}
+          IN_CONTAINER: ${{ matrix.libc == 'musl' }}
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
           DOCKER_CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
         run: >-
           ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
           -PnativeArchitectures="$NATIVE_ARCHITECTURE"
           -PnativeLibcs="$NATIVE_LIBC"
+          -PintegrationTestsInContainer="$IN_CONTAINER"
           -PdockerCache=gha
           -PdockerCacheWrite="$DOCKER_CACHE_WRITE"
           --no-daemon
-      - name: Run packaged agent end-to-end smoke test
-        env:
-          NATIVE_LIBC: ${{ matrix.libc }}
-          BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
-          JONOFFCPU_DOCKER_CACHE: gha
-          JONOFFCPU_DOCKER_CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
-        run: |
-          java_home_option=()
-          if [ "$NATIVE_LIBC" = glibc ]; then
-            java_home_option=(--java-home "$JAVA_HOME")
-          fi
-          python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py \
-            --libc "$NATIVE_LIBC" \
-            --agent-jar "jonoffcpu-agent/build/libs/jonoffcpu-agent-${ORG_GRADLE_PROJECT_version}.jar" \
-            --correlator-jar "jonoffcpu-correlator/build/libs/jonoffcpu-correlator-${ORG_GRADLE_PROJECT_version}.jar" \
-            --test-classes jonoffcpu-agent/build/classes/java/test \
-            "${java_home_option[@]}" \
-            --output jonoffcpu-agent/build/packaged-smoke
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ inputs.native_artifact_prefix }}-${{ matrix.bundle-prefix }}-${{ matrix.native-architecture }}

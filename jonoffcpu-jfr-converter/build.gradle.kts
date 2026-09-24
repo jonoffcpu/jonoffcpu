@@ -73,10 +73,11 @@ val verifyRuntimeJar =
             )
     }
 tasks.check {
-    dependsOn(verifyRuntimeJar)
+    dependsOn(verifyRuntimeJar, "testConverterRendersCollapsed")
 }
 
-tasks.register<FixtureExec>("testConverterRendersCollapsed") {
+tasks.register<JavaExec>("testConverterRendersCollapsed") {
+    group = "verification"
     description = "Checks that the converter JAR renders a collapsed off-CPU profile as a flame graph."
     val checkDir = layout.buildDirectory.dir("converter-check")
     val collapsed = checkDir.map { it.file("converter-check.collapsed") }

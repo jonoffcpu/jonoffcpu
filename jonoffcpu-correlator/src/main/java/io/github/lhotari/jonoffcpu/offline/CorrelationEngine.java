@@ -36,8 +36,6 @@ import java.util.Map;
  * {@link #resolveDeferred(CaptureInput)} with the same precedence the retained chain had.
  */
 final class CorrelationEngine implements CaptureInput.SourceVisitor {
-    /** Checked every this many decoded records, so a growing structure cannot pass the budget unseen. */
-    private static final int WATERMARK_ROWS = 1 << 16;
 
     /** Fixed-point scale for the inverse-probability sum; see {@link #sourceAggregate}. */
     private static final int ESTIMATE_FRACTION_BITS = 64;
@@ -275,7 +273,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 stackColumn(observation.getUserStackId(), observation.getUserStackError()),
                 observation.hasRunqueueNanos(),
                 observation.getRunqueueNanos());
-        if (sources.size() % WATERMARK_ROWS == 0) {
+        if (sources.size() % limits.watermarkRows() == 0) {
             try {
                 budget.structures(retainedBytes());
             } catch (RetentionLimitExceeded limit) {
@@ -385,7 +383,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         if ((cookie >>> 32) != captureEpoch || (cookie & 0xffffffffL) == 0) {
             samples.reason(samples.size() - 1, Reason.INVALID_COOKIE);
         }
-        if (samples.size() % WATERMARK_ROWS == 0) {
+        if (samples.size() % limits.watermarkRows() == 0) {
             try {
                 budget.structures(retainedBytes());
             } catch (RetentionLimitExceeded limit) {

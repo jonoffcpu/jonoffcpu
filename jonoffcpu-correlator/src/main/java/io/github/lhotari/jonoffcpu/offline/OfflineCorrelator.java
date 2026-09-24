@@ -43,7 +43,15 @@ final class OfflineCorrelator {
             BigInteger maxHandlerDelayNanos,
             BigInteger fromNanos,
             BigInteger toNanos,
-            BigDecimal maxAccountedLoss) {
+            BigDecimal maxAccountedLoss,
+            int watermarkRows) {
+        /**
+         * How many decoded rows of either input pass between checks of retention against the budget. The degradation
+         * ladder can only narrow the window at one of these watermarks, so a smaller interval narrows more finely and
+         * costs more checks.
+         */
+        public static final int DEFAULT_WATERMARK_ROWS = 1 << 16;
+
         /**
          * The largest fraction of kernel-selected intervals that an exactly counted loss (sequence
          * contention) may remove before the population estimate is refused.
@@ -51,7 +59,7 @@ final class OfflineCorrelator {
         public static final BigDecimal DEFAULT_MAX_ACCOUNTED_LOSS = new BigDecimal("0.01");
 
         public Limits {
-            if (maxRows <= 0 || maxLineBytes <= 0 || maxRetainedBytes <= 0 || maxFrames <= 0) {
+            if (maxRows <= 0 || maxLineBytes <= 0 || maxRetainedBytes <= 0 || maxFrames <= 0 || watermarkRows <= 0) {
                 throw new IllegalArgumentException("Resource limits must be positive");
             }
             // Clock values are held as signed longs in the columns, so the engine's arithmetic is exact.
@@ -89,6 +97,27 @@ final class OfflineCorrelator {
                     fromNanos,
                     toNanos,
                     DEFAULT_MAX_ACCOUNTED_LOSS);
+        }
+
+        public Limits(
+                int maxRows,
+                int maxLineBytes,
+                long maxRetainedBytes,
+                int maxFrames,
+                BigInteger maxHandlerDelayNanos,
+                BigInteger fromNanos,
+                BigInteger toNanos,
+                BigDecimal maxAccountedLoss) {
+            this(
+                    maxRows,
+                    maxLineBytes,
+                    maxRetainedBytes,
+                    maxFrames,
+                    maxHandlerDelayNanos,
+                    fromNanos,
+                    toNanos,
+                    maxAccountedLoss,
+                    DEFAULT_WATERMARK_ROWS);
         }
 
         public static Limits defaults() {

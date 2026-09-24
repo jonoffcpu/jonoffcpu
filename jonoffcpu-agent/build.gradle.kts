@@ -197,44 +197,103 @@ tasks.check {
     dependsOn(verifyRuntimeJar)
 }
 
-val fixtureClasspath = files(sourceSets.test.map { it.runtimeClasspath }, agentJar)
+// The integration tests come in two kinds, by tag:
+// - `host-native` tests load the native bundle into the test JVM, so they need Linux and the host's own bundle. They
+//   run on the host when it runs Linux with a selected C library, or in a Linux container through the JUnit Console
+//   Launcher (-PintegrationTestsInContainer, the default on any other host), once for each selected C library of the
+//   host's architecture.
+// - `privileged-container` tests run the packaged agent end to end in privileged Testcontainers, once for each
+//   selected C library of the host's architecture, and check the capture with the packaged correlator. They need a
+//   Linux host with Docker, BTF and tracefs, and run from the host test JVM.
+val integrationTestsInContainer =
+    providers
+        .gradleProperty("integrationTestsInContainer")
+        .map(String::toBoolean)
+        .getOrElse(!providers.systemProperty("os.name").get().startsWith("Linux"))
+val linuxHost = providers.systemProperty("os.name").get().startsWith("Linux")
+val hostArchitecturePlatforms = nativePlatforms.map(NativePlatform.ALL::getValue).filter { it.architecture == hostArchitecture }
 
-tasks.register<FixtureExec>("testSignalCaptureController") {
-    classpath = fixtureClasspath
-    mainClass = "io.github.lhotari.jonoffcpu.agent.SignalCaptureControllerTest"
+// The correlator's shaded JAR, which the end-to-end tests run as a user would.
+val correlatorJar =
+    configurations.create("correlatorJar") {
+        isCanBeConsumed = false
+        isTransitive = false
+        attributes {
+            attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage.JAVA_RUNTIME))
+            attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category.LIBRARY))
+            attribute(Bundling.BUNDLING_ATTRIBUTE, objects.named(Bundling.SHADOWED))
+        }
+    }
+dependencies {
+    correlatorJar(project(":jonoffcpu-correlator"))
+    "integrationTestImplementation"(libs.testcontainers)
+    "integrationTestImplementation"(libs.testcontainers.junit.jupiter)
 }
 
-tasks.register<FixtureExec>("testNativeLibc") {
-    classpath = fixtureClasspath
-    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeLibcTest"
-}
-
-tasks.register<FixtureExec>("testShadedAgentJar") {
-    description = "Exercises relocated YAML parsing from the published agent JAR."
-    classpath = files(sourceSets.test.map { it.output }, agentJar)
-    mainClass = "io.github.lhotari.jonoffcpu.agent.ShadedAgentJarTest"
-}
-
-tasks.register<FixtureExec>("testNativeCollectorJni") {
+tasks.named<Test>("integrationTest") {
     dependsOn(verifyNativeArchitectures)
-    classpath = fixtureClasspath
-    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeCollectorJniTest"
-    args(
-        nativeRoot
-            .get()
-            .file("$hostPlatform/libjonoffcpu.so")
-            .asFile.absolutePath,
+    classpath += files(agentJar)
+    val options = options as JUnitPlatformOptions
+    if (integrationTestsInContainer || !hostPlatformSelected) options.excludeTags("host-native")
+    if (!linuxHost) options.excludeTags("privileged-container")
+    // Whatever this host cannot run is excluded above, which may leave nothing.
+    failOnNoDiscoveredTests = false
+
+    // Local copies: a task action must not capture the build script itself.
+    val agent = agentJar
+    val correlator = files(correlatorJar)
+    val workloads = files(sourceSets.test.map { it.output.classesDirs })
+    inputs.files(correlator).withPropertyName("correlatorJar").withNormalizer(ClasspathNormalizer::class)
+    jvmArgumentProviders.add(
+        CommandLineArgumentProvider {
+            listOf(
+                "-Djonoffcpu.agentJar=${agent.get().asFile.absolutePath}",
+                "-Djonoffcpu.correlatorJar=${correlator.singleFile.absolutePath}",
+                "-Djonoffcpu.workloadClasses=${workloads.files.first { it.path.contains("/java/") }.absolutePath}",
+            )
+        },
     )
-    // A local copy: a task action must not capture the build script itself.
-    val selected = hostPlatformSelected
-    onlyIf("selected native platforms include the current host") { selected }
+    systemProperty(
+        "jonoffcpu.runtimeImages",
+        hostArchitecturePlatforms.joinToString(",") { "${it.libc}=${ContainerImages.forLibc(it.libc)}" },
+    )
 }
 
-tasks.register<FixtureExec>("testNativeBundleLoader") {
-    description = "Extracts the host bundle from the JAR and exercises async-profiler through the native C API."
-    classpath = fixtureClasspath
-    mainClass = "io.github.lhotari.jonoffcpu.agent.NativeBundleLoaderTest"
-    // A local copy: a task action must not capture the build script itself.
-    val selected = hostPlatformSelected
-    onlyIf("selected native platforms include the current host") { selected }
+val junitConsole =
+    configurations.create("junitConsole") {
+        isCanBeConsumed = false
+    }
+dependencies {
+    junitConsole(platform(libs.junit.bom))
+    junitConsole(libs.junit.platform.console)
+}
+
+val integrationTestSourceSet = sourceSets.named("integrationTest")
+val containerIntegrationTests =
+    hostArchitecturePlatforms
+        .map { spec ->
+            val platform = spec.name
+            tasks.register<ContainerIntegrationTest>("containerIntegrationTest${spec.taskSuffix}") {
+                description = "Runs the host-native integration tests against the $platform bundle in a Linux container."
+                dependsOn(verifyNativeArchitectures)
+                testClasspath.from(integrationTestSourceSet.map { it.runtimeClasspath }, agentJar)
+                testClassesDirs.from(integrationTestSourceSet.map { it.output.classesDirs })
+                consoleLauncher.from(junitConsole)
+                image = ContainerImages.forLibc(spec.libc)
+                includeTags.add("host-native")
+                projectDirectory = rootDirectory
+                reportsDirectory = layout.buildDirectory.dir("test-results/containerIntegrationTest${spec.taskSuffix}")
+                shouldRunAfter(tasks.named("test"))
+            }
+        }
+if (integrationTestsInContainer) {
+    tasks.check {
+        dependsOn(containerIntegrationTests)
+    }
+}
+
+// JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
+// classpath leaves out on purpose, so the packaged-JAR tests are also named.
+tasks.named<Test>("packagedJarTest") {
+    filter { includeTestsMatching("io.github.lhotari.jonoffcpu.agent.ShadedAgentJarTest") }
 }

@@ -251,6 +251,10 @@ final class Cli {
                         + " loss (0 <= F < 1). Default: ${DEFAULT-VALUE}.")
         BigDecimal maxAccountedLoss;
 
+        /** Not a supported option: it lets tests drive the degradation ladder with a small input. */
+        @Option(names = "--watermark-rows", paramLabel = "N", hidden = true)
+        Integer watermarkRows;
+
         @Option(
                 names = "--audit",
                 paramLabel = "LEVEL",
@@ -665,7 +669,10 @@ final class Cli {
                     options.maxHandlerDelayNs,
                     options.fromNs,
                     options.toNs,
-                    options.maxAccountedLoss);
+                    options.maxAccountedLoss,
+                    options.watermarkRows == null
+                            ? OfflineCorrelator.Limits.DEFAULT_WATERMARK_ROWS
+                            : options.watermarkRows);
         } catch (IllegalArgumentException invalid) {
             throw options.usage(invalid.getMessage());
         }
