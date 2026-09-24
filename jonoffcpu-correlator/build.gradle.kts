@@ -122,9 +122,6 @@ testing.suites.named<JvmTestSuite>("test") {
         }
     }
 }
-tasks.check {
-    dependsOn("readmeTest")
-}
 
 tasks.named<Test>("integrationTest") {
     // The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
@@ -145,9 +142,6 @@ testing.suites.named<JvmTestSuite>("integrationTest") {
             jvmArgs("-XX:FlightRecorderOptions:stackdepth=256")
         }
     }
-}
-tasks.check {
-    dependsOn("scaleTest")
 }
 
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this

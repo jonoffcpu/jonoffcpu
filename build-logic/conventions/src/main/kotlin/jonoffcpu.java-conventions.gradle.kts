@@ -109,7 +109,8 @@ tasks.withType<Test>().configureEach {
 }
 
 tasks.named("check") {
-    dependsOn(tasks.named("integrationTest"))
+    // The suites rather than their default tasks, so every target a module adds to one also runs.
+    dependsOn(testing.suites.named("test"), testing.suites.named("integrationTest"))
     // By path, so that no project configures another.
     dependsOn(":spotlessCheck")
 }
