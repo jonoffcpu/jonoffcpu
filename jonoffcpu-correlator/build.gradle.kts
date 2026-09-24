@@ -104,10 +104,25 @@ tasks.withType<Test>().configureEach {
 
 tasks.test {
     maxHeapSize = "1g"
-    // The README's option tables are checked against the parser, so documentation and help cannot drift.
-    val readme = rootDirectory.file("README.md")
-    inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
-    systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
+    (options as JUnitPlatformOptions).excludeTags("readme")
+}
+
+// The README's option tables are checked against the parser, so documentation and help cannot drift. The check is a
+// task of its own because the README is its input: editing the README reruns this one test, not the unit tests.
+val readmeTest =
+    tasks.register<Test>("readmeTest") {
+        group = "verification"
+        description = "Checks the README's correlator option tables against the command-line parser."
+        testClassesDirs = files(sourceSets.test.map { it.output.classesDirs })
+        classpath = files(sourceSets.test.map { it.runtimeClasspath })
+        useJUnitPlatform { includeTags("readme") }
+        val readme = rootDirectory.file("README.md")
+        inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
+        systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
+        shouldRunAfter(tasks.test)
+    }
+tasks.check {
+    dependsOn(readmeTest)
 }
 
 tasks.named<Test>("integrationTest") {
