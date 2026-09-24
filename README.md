@@ -529,7 +529,7 @@ contains the three JARs:
 gh release download -p '*.jar' -R lhotari/jonoffcpu
 ```
 
-Pass a tag such as `v0.4.0` after `download` to pick a specific release
+Pass a tag such as `v0.5.0` after `download` to pick a specific release
 instead of the latest one.
 
 | JAR | What it is | When you use it |
@@ -1164,9 +1164,9 @@ contracts are in [jonoffcpu-correlator/OFFLINE.md](jonoffcpu-correlator/OFFLINE.
 
 ```kotlin
 dependencies {
-    implementation("io.github.lhotari:jonoffcpu-agent:0.4.0")
-    implementation("io.github.lhotari:jonoffcpu-correlator:0.4.0")
-    implementation("io.github.lhotari:jonoffcpu-jfr-converter:0.4.0")
+    implementation("io.github.lhotari:jonoffcpu-agent:0.5.0")
+    implementation("io.github.lhotari:jonoffcpu-correlator:0.5.0")
+    implementation("io.github.lhotari:jonoffcpu-jfr-converter:0.5.0")
 }
 ```
 
