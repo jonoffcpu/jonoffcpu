@@ -16,7 +16,8 @@ val jmcWriterSources =
 
 dependencies {
     embeddedRuntime(project(":jonoffcpu-capture-codec"))
-    embeddedRuntime(libs.protobuf.javalite)
+    embeddedRuntime(libs.protobuf.java)
+    embeddedRuntime(libs.protobuf.java.util)
     embeddedRuntime(libs.gson)
     embeddedRuntime(libs.jmc.flightrecorder.writer)
     embeddedRuntime(libs.picocli)
@@ -28,7 +29,8 @@ tasks.verifyDependencyDigests {
     artifacts.from(jmcWriterSources)
     digests =
         mapOf(
-            "protobuf-javalite-4.33.1.jar" to "a1a1cccbcfa861e988b7ccde58dbe95204156906dd6cd42786b9c8f74d5fe34e",
+            "protobuf-java-4.33.1.jar" to "fd5cf3d55bc2c3ddb2a8640c9d4c69daa9a5b326fb6e05bae0e56b3f4f85e0f7",
+            "protobuf-java-util-4.33.1.jar" to "f8788f87658d46f8ddb864455eaa046aa218e419c98c93326643ae465aa5c843",
             "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
             "picocli-4.7.7.jar" to "f86e30fffd10d2b13b8caa8d4b237a7ee61f2ffccf5b1941de718b765d235bf8",
             "flightrecorder.writer-9.1.2.jar" to "8313e66f798f31de144c65b257a0434afca07b1bce1b59f17e63aed38c0dc9c1",
