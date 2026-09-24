@@ -14,7 +14,7 @@ submodule:
 ```
 
 The build creates the Java 17 compatible
-`io.github.lhotari:jonoffcpu-agent:1.0.0` artifact. It embeds its runtime
+`io.github.jonoffcpu:jonoffcpu-agent:1.0.0` artifact. It embeds its runtime
 configuration dependencies and builds the native components with Corretto 25 in
 the pinned Rust container for the current host architecture by default. To build
 both Linux x86-64 and aarch64 bundles, use `-PnativeArchitectures=all`. If an
@@ -44,7 +44,7 @@ extracts the matching bundle into an owner-only temporary directory, verifies
 each digest, and loads the colocated libraries. Nothing has to be installed
 outside the JAR. If the JAR has no bundle for the detected platform, startup
 fails with a message listing the embedded bundles rather than trying another
-flavour. `-Dio.github.lhotari.jonoffcpu.nativeLibc=glibc` or `=musl` overrides
+flavour. `-Dio.github.jonoffcpu.agent.nativeLibc=glibc` or `=musl` overrides
 the detection.
 
 The native Docker stages intentionally use the running kernel's BTF to compile
@@ -81,7 +81,7 @@ every capture file recognisable.
 
 The manifest is an audit record for people and tools, rewritten atomically at
 every lifecycle step (at most 1 MiB). Its single definition is the
-`io.github.lhotari.jonoffcpu.agent.v1.Manifest` message in
+`io.github.jonoffcpu.agent.v1.Manifest` message in
 [`src/main/proto/jonoffcpu-manifest.proto`](src/main/proto/jonoffcpu-manifest.proto),
 printed in protobuf's proto3 JSON mapping: lowerCamelCase field names, 64-bit
 integers as decimal strings, enums by their value names (`"state":
@@ -119,7 +119,7 @@ C API and adds only its cookie session arguments. The JAR does not embed or call
 and jonoffcpu signal events therefore use the same original JFR.
 
 Applications that already include the artifact as a runtime dependency may call
-`io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent.start(yamlOrConfigPath)` and later
+`io.github.jonoffcpu.agent.SignalCaptureAgent.start(yamlOrConfigPath)` and later
 `SignalCaptureAgent.stop()`. The same JAR supports `premain` and `agentmain`.
 
 The older raw `-agentpath` entry point remains available for development. In
@@ -241,7 +241,7 @@ async-profiler validates ownership and collision constraints.
 The companion Java controller runs on one daemon worker. A JVM shutdown hook
 submits the same serialized stop operation and waits only for its configured
 budget; it never cancels a native stop or frees a handle still owned by a worker.
-Applications may call `io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent.stop()` for reliable
+Applications may call `io.github.jonoffcpu.agent.SignalCaptureAgent.stop()` for reliable
 explicit finalization.
 
 JFR correlation and derived output generation live in the separate Java 21

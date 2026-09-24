@@ -1,4 +1,4 @@
-// Publication to Maven Central under io.github.lhotari:<project name>. The module registers its publication and
+// Publication to Maven Central under io.github.jonoffcpu:<project name>. The module registers its publication and
 // sets `jonoffcpuPublication.displayName` and `description`; the license is MIT unless it says otherwise. The release
 // workflow signs with -PsignAllPublications=true.
 plugins {
@@ -20,7 +20,7 @@ mavenPublishing {
     pom {
         name = publication.displayName
         description = publication.description
-        url = "https://github.com/lhotari/jonoffcpu"
+        url = "https://github.com/jonoffcpu/jonoffcpu"
         licenses {
             license {
                 name = publication.licenseName
@@ -37,9 +37,9 @@ mavenPublishing {
             }
         }
         scm {
-            connection = "scm:git:https://github.com/lhotari/jonoffcpu.git"
-            developerConnection = "scm:git:ssh://git@github.com/lhotari/jonoffcpu.git"
-            url = "https://github.com/lhotari/jonoffcpu"
+            connection = "scm:git:https://github.com/jonoffcpu/jonoffcpu.git"
+            developerConnection = "scm:git:ssh://git@github.com/jonoffcpu/jonoffcpu.git"
+            url = "https://github.com/jonoffcpu/jonoffcpu"
         }
     }
 }

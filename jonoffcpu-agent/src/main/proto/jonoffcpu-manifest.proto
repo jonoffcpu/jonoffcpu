@@ -8,13 +8,13 @@
 
 syntax = "proto3";
 
-package io.github.lhotari.jonoffcpu.agent.v1;
+package io.github.jonoffcpu.agent.v1;
 
 import "google/protobuf/timestamp.proto";
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-collector.proto";
 
-option java_package = "io.github.lhotari.jonoffcpu.agent";
+option java_package = "io.github.jonoffcpu.agent";
 option java_outer_classname = "ManifestProto";
 
 message Manifest {
@@ -30,19 +30,19 @@ message Manifest {
   string jdk_version = 9;
   ThreadPolicy thread_policy = 10;
   // The resolved configuration, as sent to the collector and written into the stream.
-  io.github.lhotari.jonoffcpu.capture.v1.Sampling sampling = 11;
-  io.github.lhotari.jonoffcpu.capture.v1.TimeSplit time_split = 12;
+  io.github.jonoffcpu.capture.v1.Sampling sampling = 11;
+  io.github.jonoffcpu.capture.v1.TimeSplit time_split = 12;
   AsyncProfiler async_profiler = 13;
 
   // The collector's replies, verbatim, as each call returned them.
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_prepare = 14;
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_enable = 15;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_prepare = 14;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_enable = 15;
   // The latest stop and close replies; a retried call replaces the earlier one.
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_stop = 16;
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_close = 17;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_stop = 16;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_close = 17;
   // Cleanup after a failed start.
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_cleanup_stop = 18;
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_cleanup_close = 19;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_cleanup_stop = 18;
+  io.github.jonoffcpu.capture.v1.CollectorReply native_cleanup_close = 19;
   optional string native_cleanup_failure = 20;
 
   AsyncProfilerStop async_profiler_stop = 21;
@@ -51,12 +51,12 @@ message Manifest {
   optional string async_profiler_cleanup_failure = 23;
 
   // The verified terminal record of the stream, once it is verified.
-  io.github.lhotari.jonoffcpu.capture.v1.CaptureEnd source_capture_end = 24;
+  io.github.jonoffcpu.capture.v1.CaptureEnd source_capture_end = 24;
   ProcessStartTime process_start_time = 25;
   // The finalized stream, footer included.
-  io.github.lhotari.jonoffcpu.capture.v1.FileArtifact correlation_artifact = 26;
+  io.github.jonoffcpu.capture.v1.FileArtifact correlation_artifact = 26;
   // A copy of the footer's analysis inputs, set when the capture completes.
-  io.github.lhotari.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 27;
+  io.github.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 27;
   // Set while the capture is failed or incomplete; cleared on completion.
   Failure failure = 28;
 }
@@ -121,7 +121,7 @@ message NegotiatedCapture {
   string session_id = 1;
   uint32 capture_epoch = 2;
   int32 signal = 3;
-  io.github.lhotari.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 4;
+  io.github.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 4;
 }
 
 message ActualIdentity {
@@ -138,7 +138,7 @@ message AsyncProfilerStop {
   optional bool finalized = 2;
   optional uint64 stopped_at_monotonic_nanos = 3;
   string reason = 4;
-  io.github.lhotari.jonoffcpu.capture.v1.AsyncProfilerStats counters = 5;
+  io.github.jonoffcpu.capture.v1.AsyncProfilerStats counters = 5;
 }
 
 message ProcessStartTime {
@@ -155,7 +155,7 @@ message Failure {
   // At most 4096 characters.
   string message = 3;
   // Set when the collector reported the failure.
-  io.github.lhotari.jonoffcpu.capture.v1.CollectorError collector_error = 4;
+  io.github.jonoffcpu.capture.v1.CollectorError collector_error = 4;
   google.protobuf.Timestamp recorded_at = 5;
 }
 

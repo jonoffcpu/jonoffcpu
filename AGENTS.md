@@ -131,7 +131,7 @@ smallest relevant layer before running privileged end-to-end tests.
   tools.
 - `async-profiler`: pinned submodule containing the generic signal-cookie JFR
   support. Keep jonoffcpu lifecycle policy out of async-profiler. Commit changes
-  to the `lhotari/async-profiler` fork separately, then update the submodule
+  to the `jonoffcpu/async-profiler` fork separately, then update the submodule
   pointer here.
 
 Do not edit generated build output. Treat generated BPF bindings and native

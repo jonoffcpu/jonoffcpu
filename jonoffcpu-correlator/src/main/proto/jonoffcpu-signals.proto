@@ -9,12 +9,12 @@
 
 syntax = "proto3";
 
-package io.github.lhotari.jonoffcpu.signals.v1;
+package io.github.jonoffcpu.correlator.signals.v1;
 
 import "google/protobuf/timestamp.proto";
 import "jonoffcpu-capture.proto";
 
-option java_package = "io.github.lhotari.jonoffcpu.offline";
+option java_package = "io.github.jonoffcpu.correlator";
 option java_outer_classname = "SignalProto";
 
 message SignalRecord {
@@ -32,7 +32,7 @@ message SignalCapture {
   uint32 capture_epoch = 2;
   google.protobuf.Timestamp start_time = 3;
   int32 signal = 4;
-  io.github.lhotari.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 5;
+  io.github.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 5;
   uint64 process_id = 6;
   int64 process_start_time_millis = 7;
 }
@@ -73,7 +73,7 @@ message SignalCaptureStats {
   string session_id = 1;
   uint32 capture_epoch = 2;
   google.protobuf.Timestamp start_time = 3;
-  io.github.lhotari.jonoffcpu.capture.v1.AsyncProfilerStats counters = 4;
+  io.github.jonoffcpu.capture.v1.AsyncProfilerStats counters = 4;
 }
 
 // Written once the whole recording was read: the parse completed, with these event counts.

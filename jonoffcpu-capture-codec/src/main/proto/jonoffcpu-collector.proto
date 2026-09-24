@@ -7,11 +7,11 @@
 
 syntax = "proto3";
 
-package io.github.lhotari.jonoffcpu.capture.v1;
+package io.github.jonoffcpu.capture.v1;
 
 import "jonoffcpu-capture.proto";
 
-option java_package = "io.github.lhotari.jonoffcpu.capture";
+option java_package = "io.github.jonoffcpu.capture";
 option java_outer_classname = "CollectorProto";
 
 // Attach the collector to the target, disabled, and create the source stream.

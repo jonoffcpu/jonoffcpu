@@ -36,17 +36,17 @@ struct profiler_output {
 
 static struct profiler_output current_profiler_output;
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_prepare(
         JNIEnv* env, jclass ignored, jbyteArray request);
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_enable(
         JNIEnv* env, jclass ignored, jlong handle, jbyteArray request);
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_stop(
         JNIEnv* env, jclass ignored, jlong handle, jlong timeout_millis);
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_close(
         JNIEnv* env, jclass ignored, jlong handle);
-JNIEXPORT void JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_initialize0(
+JNIEXPORT void JNICALL Java_io_github_jonoffcpu_agent_NativeProfiler_initialize0(
         JNIEnv* env, jclass ignored, jstring library);
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_execute0(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeProfiler_execute0(
         JNIEnv* env, jclass ignored, jbyteArray command);
 
 static void throw_by_name(JNIEnv* env, const char* class_name, const char* message) {
@@ -185,27 +185,27 @@ static void fail_vm_init(JNIEnv* env, const char* message) {
 static void JNICALL on_vm_init(jvmtiEnv* jvmti, JNIEnv* env, jthread thread) {
     (void)jvmti;
     (void)thread;
-    jclass native_collector = (*env)->FindClass(env, "io/github/lhotari/jonoffcpu/agent/NativeCollector");
+    jclass native_collector = (*env)->FindClass(env, "io/github/jonoffcpu/agent/NativeCollector");
     if (native_collector == NULL) {
         fail_vm_init(env, "JONOFFCPU agent cannot load NativeCollector from companion JAR");
         return;
     }
     JNINativeMethod methods[] = {
         {(char*)"prepare", (char*)"([B)[B",
-         (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare},
+         (void*)Java_io_github_jonoffcpu_agent_NativeCollector_prepare},
         {(char*)"enable", (char*)"(J[B)[B",
-         (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable},
+         (void*)Java_io_github_jonoffcpu_agent_NativeCollector_enable},
         {(char*)"stop", (char*)"(JJ)[B",
-         (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop},
+         (void*)Java_io_github_jonoffcpu_agent_NativeCollector_stop},
         {(char*)"close", (char*)"(J)[B",
-         (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close},
+         (void*)Java_io_github_jonoffcpu_agent_NativeCollector_close},
     };
     if ((*env)->RegisterNatives(env, native_collector, methods,
             (jint)(sizeof(methods) / sizeof(methods[0]))) != 0) {
         fail_vm_init(env, "JONOFFCPU agent cannot register NativeCollector methods");
         return;
     }
-    jclass agent = (*env)->FindClass(env, "io/github/lhotari/jonoffcpu/agent/SignalCaptureAgent");
+    jclass agent = (*env)->FindClass(env, "io/github/jonoffcpu/agent/SignalCaptureAgent");
     if (agent == NULL) {
         fail_vm_init(env, "JONOFFCPU agent cannot load Java controller from companion JAR");
         return;
@@ -282,7 +282,7 @@ JNIEXPORT void JNICALL Agent_OnUnload(JavaVM* vm) {
     agent_library_path = NULL;
 }
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_prepare(
         JNIEnv* env, jclass ignored, jbyteArray request) {
     (void)ignored;
     jsize length = 0;
@@ -295,7 +295,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollec
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_enable(
         JNIEnv* env, jclass ignored, jlong handle, jbyteArray request) {
     (void)ignored;
     jsize length = 0;
@@ -308,7 +308,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollec
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_stop(
         JNIEnv* env, jclass ignored, jlong handle, jlong timeout_millis) {
     (void)ignored;
     if (timeout_millis < 0) {
@@ -321,7 +321,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollec
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeCollector_close(
         JNIEnv* env, jclass ignored, jlong handle) {
     (void)ignored;
     struct jonoffcpu_result result;
@@ -330,7 +330,7 @@ JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollec
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT void JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_initialize0(
+JNIEXPORT void JNICALL Java_io_github_jonoffcpu_agent_NativeProfiler_initialize0(
         JNIEnv* env, jclass ignored, jstring library) {
     (void)ignored;
     if (library == NULL) {
@@ -396,7 +396,7 @@ JNIEXPORT void JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_ini
     (*env)->ReleaseStringUTFChars(env, library, path);
 }
 
-JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_execute0(
+JNIEXPORT jbyteArray JNICALL Java_io_github_jonoffcpu_agent_NativeProfiler_execute0(
         JNIEnv* env, jclass ignored, jbyteArray command) {
     (void)ignored;
     if (command == NULL) {

@@ -183,7 +183,7 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           sed -E -i \
-            -e "s#(io\.github\.lhotari:jonoffcpu-(agent|correlator|jfr-converter):)[0-9A-Za-z.-]+#\1${RELEASE_VERSION}#g" \
+            -e "s#(io\.github\.jonoffcpu:jonoffcpu-(agent|correlator|jfr-converter):)[0-9A-Za-z.-]+#\1${RELEASE_VERSION}#g" \
             -e "s#(Pass a tag such as \`)v[0-9A-Za-z.-]+(\`)#\1${RELEASE_TAG}\2#" \
             README.md
           grep -q "jonoffcpu-agent:${RELEASE_VERSION}" README.md

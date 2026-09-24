@@ -61,7 +61,7 @@ wall-clock sampler notices at each tick that a thread is off-CPU, but neither
 how long the interval lasted nor whether the thread was sleeping or merely
 queued.
 
-[![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/lhotari/jonoffcpu/main/docs/images/offcpu-timeline.svg)
+[![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
 The kernel sees the *mechanism* of a wait, never its *reason*. A thread never
 blocks "on the database": with a synchronous JDBC driver it sleeps in a socket
@@ -145,7 +145,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 
 ## How it works
 
-[![jonoffcpu architecture](docs/images/architecture.svg)](https://raw.githubusercontent.com/lhotari/jonoffcpu/main/docs/images/architecture.svg)
+[![jonoffcpu architecture](docs/images/architecture.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/architecture.svg)
 
 1. A [CO-RE eBPF program](jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c)
    hooks `sched_switch` and `sched_exit_tp`. When a
@@ -158,7 +158,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
    The kernel then sends the resumed thread a signal whose payload is only that
    key.
 3. The signal handler, in the bundled
-   [`lhotari/async-profiler`](https://github.com/lhotari/async-profiler/tree/jonoffcpu-dev)
+   [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
    fork, records a
    `profiler.SignalSample` event with the Java stack, the thread, and the key,
    in the same JFR recording that holds ordinary CPU, allocation, lock, and
@@ -168,7 +168,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
    native stacks, and appends each observation to the correlation stream.
    The Java agent finalizes that stream with a footer that binds the JFR's size
    and SHA-256.
-5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/lhotari/jonoffcpu/offline/OffCpuCorrelator.java)
+5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/correlator/OffCpuCorrelator.java)
    runs offline. It joins each `SignalSample` to its
    observation by key, weights the Java stack by the kernel-measured duration,
    and writes a report, a collapsed-stack file, a stack profile from which
@@ -353,9 +353,9 @@ linked against both glibc and musl (Alpine), verifies them against a SHA-256
 manifest, and extracts them to a private temporary directory at startup.
 Nothing needs to be installed on the host. The agent picks the glibc or musl
 bundle from the C library mapped into the running JVM; on an unusual host,
-`-Dio.github.lhotari.jonoffcpu.nativeLibc=glibc` or `=musl` selects it
+`-Dio.github.jonoffcpu.agent.nativeLibc=glibc` or `=musl` selects it
 explicitly. If the temporary directory is mounted `noexec`, point
-`-Dio.github.lhotari.jonoffcpu.nativeWorkDir` at an executable location.
+`-Dio.github.jonoffcpu.agent.nativeWorkDir` at an executable location.
 
 ### Kernel settings
 
@@ -458,7 +458,7 @@ repository's proof scripts do.
 | BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default seccomp profile permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
 | `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | Earlier releases attached `sched_switch` as a classic tracepoint, for which libbpf reads the numeric id from `events/sched/sched_switch/id`. Both hooks are now BTF raw tracepoints, and on a Linux host the packaged smoke passes without `tracefs` mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
 | Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
-| An executable temporary directory | `-Dio.github.lhotari.jonoffcpu.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
+| An executable temporary directory | `-Dio.github.jonoffcpu.agent.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
 
 BTF needs nothing: `/sys/kernel/btf/vmlinux` is part of the container's own
 `sysfs` and is readable already.
@@ -534,11 +534,11 @@ JVM running natively on macOS or Windows is invisible to it.
 ### 1. Get the JARs
 
 Download the latest
-[GitHub Release](https://github.com/lhotari/jonoffcpu/releases), which
+[GitHub Release](https://github.com/jonoffcpu/jonoffcpu/releases), which
 contains the three JARs:
 
 ```sh
-gh release download -p '*.jar' -R lhotari/jonoffcpu
+gh release download -p '*.jar' -R jonoffcpu/jonoffcpu
 ```
 
 Pass a tag such as `v0.5.0` after `download` to pick a specific release
@@ -580,7 +580,7 @@ java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
 ```
 
 The capture finishes when the JVM exits normally, or earlier if the application
-calls `io.github.lhotari.jonoffcpu.agent.SignalCaptureAgent.stop()`. Abrupt
+calls `io.github.jonoffcpu.agent.SignalCaptureAgent.stop()`. Abrupt
 termination leaves visibly incomplete artifacts rather than a plausible-looking
 partial result.
 
@@ -1180,9 +1180,9 @@ contracts are in [jonoffcpu-correlator/OFFLINE.md](jonoffcpu-correlator/OFFLINE.
 
 ```kotlin
 dependencies {
-    implementation("io.github.lhotari:jonoffcpu-agent:0.5.0")
-    implementation("io.github.lhotari:jonoffcpu-correlator:0.5.0")
-    implementation("io.github.lhotari:jonoffcpu-jfr-converter:0.5.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-agent:0.5.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-correlator:0.5.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-jfr-converter:0.5.0")
 }
 ```
 
@@ -1200,7 +1200,7 @@ Clone with the async-profiler submodule and build for the current host
 architecture:
 
 ```sh
-git clone --recurse-submodules https://github.com/lhotari/jonoffcpu.git
+git clone --recurse-submodules https://github.com/jonoffcpu/jonoffcpu.git
 cd jonoffcpu
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
 ```
@@ -1252,11 +1252,11 @@ The converter is built from the same fork's `src/converter` sources by the
 ./gradlew :jonoffcpu-jfr-converter:check
 ```
 
-Every [CI run](https://github.com/lhotari/jonoffcpu/actions) also publishes
+Every [CI run](https://github.com/jonoffcpu/jonoffcpu/actions) also publishes
 the three JARs as a `jonoffcpu-runnable-jars` workflow artifact:
 
 ```sh
-gh run download <run-id> --repo lhotari/jonoffcpu \
+gh run download <run-id> --repo jonoffcpu/jonoffcpu \
   --name jonoffcpu-runnable-jars --dir jonoffcpu-runnable-jars
 ```
 
@@ -1275,7 +1275,7 @@ are in [AGENTS.md](AGENTS.md).
 | [`jonoffcpu-correlator/`](jonoffcpu-correlator/) | Offline correlator: JFR reader and derived-output writers ([OFFLINE.md](jonoffcpu-correlator/OFFLINE.md)) |
 | [`jonoffcpu-jfr-converter/`](jonoffcpu-jfr-converter/) | async-profiler's jfr-converter, built from the submodule's sources |
 | [`build-logic/`](build-logic/) | Gradle convention plugins and task types the modules share |
-| [`async-profiler/`](async-profiler/) | Submodule tracking the [`jonoffcpu-dev`](https://github.com/lhotari/async-profiler/tree/jonoffcpu-dev) branch of [`lhotari/async-profiler`](https://github.com/lhotari/async-profiler) |
+| [`async-profiler/`](async-profiler/) | Submodule tracking the [`jonoffcpu-dev`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev) branch of [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler) |
 
 ## License
 
