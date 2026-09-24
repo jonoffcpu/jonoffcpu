@@ -46,7 +46,7 @@ def compile_mask_helper(module, jdk, log):
     output.parent.mkdir(parents=True, exist_ok=True)
     run(["cc", "-D_GNU_SOURCE", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
          "-fPIC", "-shared", "-I", jdk / "include", "-I", jdk / "include/linux",
-         "-o", output, module / "src/test/c/signal_mask_helper.c", "-pthread"], log)
+         "-o", output, module / "src/testFixtures/c/signal_mask_helper.c", "-pthread"], log)
     return output
 
 

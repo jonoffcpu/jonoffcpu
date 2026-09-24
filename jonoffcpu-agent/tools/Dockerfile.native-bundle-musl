@@ -110,7 +110,7 @@ FROM collector-dependencies AS collector-build
 ARG TARGETARCH
 COPY jonoffcpu-native jonoffcpu-native
 # The capture stream schema: build.rs compiles it into the collector's codec.
-COPY docs/schema docs/schema
+COPY jonoffcpu-capture-codec/src/main/proto jonoffcpu-capture-codec/src/main/proto
 # The static CRT, libgcc_s and AArch64 atomics flags are set up with the
 # dependencies above.
 RUN --mount=type=cache,id=jonoffcpu-cargo-registry-musl,target=/usr/local/cargo/registry,sharing=locked \

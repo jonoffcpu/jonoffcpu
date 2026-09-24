@@ -14,6 +14,7 @@ configure<SpotlessExtension> {
     java {
         target(
             "jonoffcpu-agent/src/**/*.java",
+            "jonoffcpu-capture-codec/src/**/*.java",
             "jonoffcpu-correlator/src/**/*.java",
         )
         removeUnusedImports()

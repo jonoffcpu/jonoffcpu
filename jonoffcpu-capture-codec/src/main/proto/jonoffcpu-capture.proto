@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
 // The jonoffcpu capture stream: the file the agent writes during a capture and the correlator reads
-// offline. This schema is the format's definition; the Rust collector and both Java modules generate
-// their codecs from it.
+// offline. This schema is the format's definition; the Rust collector generates its codec from it, and
+// jonoffcpu-capture-codec the one Java codec the agent and the correlator embed.
 //
 // Layout: a 12-byte header, then length-delimited `Record` messages (a varint byte count followed by
 // the message), appended in order. The agent appends the final `capture_finalized` record after the

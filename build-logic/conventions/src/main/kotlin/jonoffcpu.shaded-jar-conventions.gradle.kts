@@ -1,8 +1,8 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
 // A self-contained module: its runtime libraries, declared in `embeddedRuntime`, are verified against pinned
-// SHA-256 digests (`verifyDependencyDigests.digests`), relocated into the module's own package by the module's
-// shadowJar configuration, and embedded in the one JAR that is built and published. The module adds its relocations,
+// SHA-256 digests (`verifyDependencyDigests.digests`) when they are external, relocated into the module's own package
+// by the module's shadowJar configuration, and embedded in the one JAR that is built and published. The module adds its relocations,
 // manifest entries and any further contents.
 plugins {
     id("jonoffcpu.publish-conventions")
@@ -17,7 +17,12 @@ val embeddedRuntime =
 configurations.compileOnly {
     extendsFrom(embeddedRuntime)
 }
-configurations.testImplementation {
+// The plain variants describe the module's own, unrelocated classes to consumers inside the build, so they carry the
+// unrelocated libraries those classes need. They are never published.
+configurations.apiElements {
+    extendsFrom(embeddedRuntime)
+}
+configurations.runtimeElements {
     extendsFrom(embeddedRuntime)
 }
 
@@ -25,12 +30,14 @@ val verifyDependencyDigests =
     tasks.register<VerifyDependencyDigests>("verifyDependencyDigests") {
         group = "verification"
         description = "Checks the exact embedded artifacts against their pinned SHA-256 digests before embedding them."
-        artifacts.from(embeddedRuntime)
+        // Only external libraries are pinned; the build's own projects, such as the capture codec, are built here.
+        artifacts.from(embeddedRuntime.incoming.artifactView { componentFilter { it is ModuleComponentIdentifier } }.files)
     }
 
-// The plain JAR is never published or consumed; the shaded JAR is the only artifact.
+// The plain JAR is what the plain variants hold, for consumers inside the build; it is never published. Its classifier
+// keeps it apart from the shaded JAR, which is the only published artifact and takes the unclassified name.
 tasks.named<Jar>("jar") {
-    enabled = false
+    archiveClassifier = "plain"
 }
 
 tasks.named<ShadowJar>("shadowJar") {

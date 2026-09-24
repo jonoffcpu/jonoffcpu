@@ -175,7 +175,7 @@ class StackTransformsTest {
         Path output = dir.resolve(name + ".collapsed");
         List<String> command = new ArrayList<>(List.of("stacks", "--output", output.toString()));
         command.addAll(List.of(args));
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code())
                 .as("stacks %s failed: %s", List.of(args), invocation)
                 .isZero();
@@ -340,7 +340,7 @@ class StackTransformsTest {
                 .hasMessageContaining("thread");
 
         // Presets work in every -from option, including the filters, and are listed.
-        CommandLineTest.Invocation listing = CommandLineTest.invoke("stacks", "--list-presets");
+        CommandLineFixture.Invocation listing = CommandLineFixture.invoke("stacks", "--list-presets");
         assertThat(listing.code()).as("--list-presets failed: %s", listing).isZero();
         assertThat(listing.out())
                 .as("--list-presets must list every preset")
@@ -354,7 +354,7 @@ class StackTransformsTest {
                 .as("An unknown preset must be refused")
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unknown preset: nope");
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "Give exactly one of --profile and --collapsed-input",
                 "stacks",
                 "--output",
@@ -398,7 +398,7 @@ class StackTransformsTest {
                 .isEqualTo("X.m;I2C/C2I adapters 2.5\nX.m;__schedule_[k] 5\n[no application frame] 3\n");
         String excluded = stacks(dir, "cpu-exclude", "--collapsed-input", input.toString(), "--exclude", "_\\[k\\]$");
         assertThat(excluded).as("Filters apply to collapsed input").doesNotContain("__schedule");
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "--reason needs a stack profile",
                 "stacks",
                 "--collapsed-input",

@@ -42,18 +42,18 @@ class StackProfileTest {
     private static Path recording(Path dir) throws IOException {
         Path file = dir.resolve("profile.jfr");
         try (Recording recording = new Recording()) {
-            recording.enable(OfflineCorrelatorTest.Capture.class);
-            recording.enable(OfflineCorrelatorTest.Sample.class).withStackTrace();
-            recording.enable(OfflineCorrelatorTest.Stats.class);
+            recording.enable(CorrelationFixture.Capture.class);
+            recording.enable(CorrelationFixture.Sample.class).withStackTrace();
+            recording.enable(CorrelationFixture.Stats.class);
             recording.start();
-            new OfflineCorrelatorTest.Capture().commit();
+            new CorrelationFixture.Capture().commit();
             for (int row = 0; row < ROWS; row++) {
-                OfflineCorrelatorTest.Sample sample = new OfflineCorrelatorTest.Sample();
+                CorrelationFixture.Sample sample = new CorrelationFixture.Sample();
                 sample.correlationId = (EPOCH << 32) | (row + 1);
                 sample.monotonicTimeNanos = 5000L + 100L * row;
                 commitAtDepth(1 + row % STACKS, sample);
             }
-            OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
+            CorrelationFixture.Stats stats = new CorrelationFixture.Stats();
             stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = ROWS;
             stats.commit();
             recording.stop();
@@ -62,7 +62,7 @@ class StackProfileTest {
         return file;
     }
 
-    private static void commitAtDepth(int depth, OfflineCorrelatorTest.Sample event) {
+    private static void commitAtDepth(int depth, CorrelationFixture.Sample event) {
         if (depth <= 1) {
             event.commit();
         } else {
@@ -82,7 +82,7 @@ class StackProfileTest {
     private static List<JsonObject> observations(long tid, IntFunction<String> reason) {
         List<JsonObject> observations = new ArrayList<>();
         for (int row = 0; row < ROWS; row++) {
-            JsonObject observation = OfflineCorrelatorTest.observation(tid);
+            JsonObject observation = CorrelationFixture.observation(tid);
             observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
             observation.addProperty("startMonotonicNanos", Long.toString(1000 + 100L * row));
             observation.addProperty("endMonotonicNanos", Long.toString(4000 + 100L * row + 7L * row * row));
@@ -98,7 +98,7 @@ class StackProfileTest {
     }
 
     private static JsonObject sampling(List<String> reasons) {
-        JsonObject sampling = OfflineCorrelatorTest.uniformSampling();
+        JsonObject sampling = CorrelationFixture.uniformSampling();
         JsonArray names = new JsonArray();
         for (String reason : reasons) names.add(reason);
         JsonObject ordered = new JsonObject();
@@ -118,12 +118,12 @@ class StackProfileTest {
     }
 
     private static Path v2Capture(Path dir, Path jfr) throws IOException {
-        return OfflineCorrelatorTest.source(dir, jfr, observations(sampleThread(jfr), null));
+        return CorrelationFixture.source(dir, jfr, observations(sampleThread(jfr), null));
     }
 
     private static Path v3Capture(Path dir, Path jfr, List<String> reasons, IntFunction<String> reason)
             throws IOException {
-        return OfflineCorrelatorTest.source(
+        return CorrelationFixture.source(
                 Files.createDirectories(dir),
                 jfr,
                 observations(sampleThread(jfr), reason),
@@ -415,7 +415,7 @@ class StackProfileTest {
         // A reason that disagrees with the raw sched_switch arguments.
         List<JsonObject> rows = observations(sampleThread(jfr), row -> "blocked");
         rows.get(0).addProperty("prevTaskState", 0);
-        Path disagreeing = OfflineCorrelatorTest.source(
+        Path disagreeing = CorrelationFixture.source(
                 Files.createDirectories(dir.resolve("disagreeing")),
                 jfr,
                 rows,
@@ -430,24 +430,24 @@ class StackProfileTest {
         // A classified row in an unclassified capture.
         List<JsonObject> legacy = observations(sampleThread(jfr), null);
         legacy.get(0).addProperty("offCpuReason", "blocked");
-        Path mixedLegacy = OfflineCorrelatorTest.source(Files.createDirectories(dir.resolve("legacy")), jfr, legacy);
+        Path mixedLegacy = CorrelationFixture.source(Files.createDirectories(dir.resolve("legacy")), jfr, legacy);
         assertThat(report(correlate(mixedLegacy, jfr, dir.resolve("a3")))
                         .get("invalidSource")
                         .getAsInt())
                 .as("A version 2 capture cannot carry a classification")
                 .isEqualTo(1);
         // A version 3 capture must name its reasons, and a version 2 one must not.
-        Path unnamed = OfflineCorrelatorTest.source(
+        Path unnamed = CorrelationFixture.source(
                 Files.createDirectories(dir.resolve("unnamed")),
                 jfr,
                 observations(sampleThread(jfr), row -> "blocked"),
-                OfflineCorrelatorTest.uniformSampling(),
+                CorrelationFixture.uniformSampling(),
                 3,
                 reasonCounters());
         assertThatThrownBy(() -> correlate(unnamed, jfr, dir.resolve("a4")))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("Source schema/sampling reasons mismatch");
-        Path uncanonical = OfflineCorrelatorTest.source(
+        Path uncanonical = CorrelationFixture.source(
                 Files.createDirectories(dir.resolve("uncanonical")),
                 jfr,
                 observations(sampleThread(jfr), row -> "blocked"),
@@ -535,7 +535,7 @@ class StackProfileTest {
     private static Path v4Capture(Path dir, Path jfr, List<JsonObject> rows, JsonObject timeSplit) throws IOException {
         JsonObject counters = reasonCounters();
         counters.addProperty("runqueueInversions", "1");
-        return OfflineCorrelatorTest.source(
+        return CorrelationFixture.source(
                 Files.createDirectories(dir), jfr, rows, sampling(ALL_REASONS), 4, counters, timeSplit);
     }
 
@@ -826,7 +826,7 @@ class StackProfileTest {
                 "--include",
                 "app\\.one\\.");
         assertThat(filtered).as("Filters must see full names").isEqualTo("Thread.run;Worker.park 2\n");
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "expected one of full, abbreviate, drop but was 'short'",
                 "stacks",
                 "--profile",
@@ -1174,7 +1174,7 @@ class StackProfileTest {
         assertThatThrownBy(() -> stacks(profile, dir.resolve("bad.collapsed"), "--include", "("))
                 .isInstanceOf(java.util.regex.PatternSyntaxException.class)
                 .hasMessageContaining("Unclosed group");
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "Missing required parameter for option '--exclude'",
                 "stacks",
                 "--profile",

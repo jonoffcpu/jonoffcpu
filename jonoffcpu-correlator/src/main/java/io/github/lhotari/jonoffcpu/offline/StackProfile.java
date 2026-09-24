@@ -23,7 +23,7 @@ import java.util.Set;
 
 /**
  * The stack profile: deduplicated stacks with their counters, from which any collapsed-stack slice can be
- * rendered again without re-reading the capture and the JFR. {@code docs/schema/jonoffcpu-profile.proto} is the
+ * rendered again without re-reading the capture and the JFR. {@code src/main/proto/jonoffcpu-profile.proto} is the
  * file format's definition; this class holds the expanded, in-memory form.
  *
  * <p>Entries are kept in one canonical order — by Java stack, kernel stack, user stack, reason, task state and

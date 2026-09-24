@@ -12,9 +12,9 @@ import java.util.Arrays;
 import java.util.HexFormat;
 
 /**
- * Framing of the capture stream defined by {@code docs/schema/jonoffcpu-capture.proto}: a fixed header
- * followed by length-delimited protobuf records. The agent reads the stream to verify it and appends the
- * finalization footer as one more record.
+ * Framing of the capture stream defined by {@code jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto}:
+ * a fixed header followed by length-delimited protobuf records. The agent reads the stream to verify it and appends
+ * the finalization footer as one more record.
  */
 final class CaptureStream {
     static final byte[] MAGIC = "JONOFFCPU\0".getBytes(StandardCharsets.US_ASCII);

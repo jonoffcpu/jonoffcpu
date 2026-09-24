@@ -1,29 +1,26 @@
 // SPDX-License-Identifier: MIT
-package io.github.lhotari.jonoffcpu.agent;
+package io.github.lhotari.jonoffcpu.capture;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
-import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Encodes fixture rows, which are written as JSON for readability, into the capture stream's binary
- * framing. Control records keep their JSON verbatim, so a fixture can still inject malformed control
- * JSON; stack and observation rows are converted field by field.
+ * Converts the JSON rows fixtures are written in into capture stream records, for the agent's and the correlator's
+ * fixtures alike.
  */
-final class CaptureStreamFixture {
-    private CaptureStreamFixture() {}
+public final class CaptureRecordFixture {
+    private CaptureRecordFixture() {}
 
-    static byte[] encode(List<JsonObject> rows) throws IOException {
+    /**
+     * A whole stream: the module's own header, which a fixture takes from the codec under test, then every row as
+     * its record.
+     */
+    public static byte[] encode(byte[] header, List<JsonObject> rows) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        bytes.write(header());
+        bytes.write(header);
         for (JsonObject row : rows) {
             record(row).writeDelimitedTo(bytes);
         }
@@ -31,7 +28,7 @@ final class CaptureStreamFixture {
     }
 
     /** A control record whose JSON is supplied verbatim, for malformed-input fixtures. */
-    static byte[] controlRecord(String json) throws IOException {
+    public static byte[] controlRecord(String json) throws IOException {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
         CaptureProto.Record.newBuilder()
                 .setCaptureStart(CaptureProto.ControlJson.newBuilder().setJson(json))
@@ -40,41 +37,8 @@ final class CaptureStreamFixture {
         return bytes.toByteArray();
     }
 
-    /** Appends one record to a stream the fixture is building. */
-    static void append(Path source, JsonObject row) throws IOException {
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        record(row).writeDelimitedTo(bytes);
-        Files.write(source, bytes.toByteArray(), StandardOpenOption.APPEND);
-    }
-
-    /** The stream decoded back into the JSON rows the fixtures assert on. */
-    static List<JsonObject> rows(Path source) throws IOException {
-        List<JsonObject> rows = new ArrayList<>();
-        try (InputStream input = new java.io.BufferedInputStream(Files.newInputStream(source))) {
-            CaptureStream.readHeader(input);
-            io.github.lhotari.jonoffcpu.capture.CaptureProto.Record record;
-            while ((record = CaptureStream.next(input, 1024 * 1024)) != null) {
-                rows.add(
-                        switch (record.getRecordCase()) {
-                            case STACK -> CaptureStream.stackRow(record.getStack());
-                            case OBSERVATION -> CaptureStream.observationRow(record.getObservation());
-                            default ->
-                                com.google.gson.JsonParser.parseString(CaptureStream.controlJson(record))
-                                        .getAsJsonObject();
-                        });
-            }
-        }
-        return rows;
-    }
-
-    static byte[] header() {
-        byte[] header = new byte[CaptureStream.HEADER_BYTES];
-        System.arraycopy(CaptureStream.MAGIC, 0, header, 0, CaptureStream.MAGIC.length);
-        header[CaptureStream.MAGIC.length] = (byte) CaptureStream.FORMAT_VERSION;
-        return header;
-    }
-
-    static CaptureProto.Record record(JsonObject row) {
+    /** One fixture row as its stream record: control rows keep their JSON verbatim, the rest field by field. */
+    public static CaptureProto.Record record(JsonObject row) {
         String type = row.get("recordType").getAsString();
         return switch (type) {
             case "captureStart" ->
@@ -140,6 +104,9 @@ final class CaptureStreamFixture {
                 .setUserStackId(row.get("userStackId").getAsLong())
                 .setKernelStackError(text(row, "kernelStackError"))
                 .setUserStackError(text(row, "userStackError"));
+        // A classified observation names its reason; the raw wire number lets a fixture write an invalid one.
+        if (row.has("offCpuReasonValue"))
+            builder.setReasonValue(row.get("offCpuReasonValue").getAsInt());
         JsonElement reason = row.get("offCpuReason");
         if (reason != null && !reason.isJsonNull()) {
             builder.setReasonValue(
@@ -153,9 +120,10 @@ final class CaptureStreamFixture {
         if (row.has("prevTaskState"))
             builder.setPrevTaskState((int) row.get("prevTaskState").getAsLong());
         if (row.has("preempted")) builder.setPreempted(row.get("preempted").getAsBoolean());
-        if (row.has("runqueueNanos"))
+        if (row.has("runqueueNanos")) {
             builder.setRunqueueNanos(
                     Long.parseUnsignedLong(row.get("runqueueNanos").getAsString()));
+        }
         return builder.build();
     }
 

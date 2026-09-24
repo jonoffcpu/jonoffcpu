@@ -31,7 +31,7 @@ def compile_helper(module, jdk, log):
     library.parent.mkdir(parents=True, exist_ok=True)
     run(["cc", "-D_GNU_SOURCE", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror",
          "-fPIC", "-shared", "-I", jdk / "include", "-I", jdk / "include/linux",
-         "-o", library, module / "src/test/c/known_wait_helper.c", "-pthread"], log)
+         "-o", library, module / "src/testFixtures/c/known_wait_helper.c", "-pthread"], log)
 
 
 def main():

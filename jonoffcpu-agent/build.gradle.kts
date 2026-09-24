@@ -1,6 +1,5 @@
 plugins {
     id("jonoffcpu.shaded-jar-conventions")
-    id("jonoffcpu.protobuf-conventions")
 }
 
 jonoffcpu {
@@ -13,6 +12,7 @@ jonoffcpuPublication {
 }
 
 dependencies {
+    embeddedRuntime(project(":jonoffcpu-capture-codec"))
     embeddedRuntime(libs.protobuf.javalite)
     embeddedRuntime(libs.gson)
     embeddedRuntime(libs.snakeyaml)
@@ -25,13 +25,6 @@ tasks.verifyDependencyDigests {
             "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
             "snakeyaml-2.7.jar" to "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e",
         )
-}
-
-sourceSets {
-    main {
-        // The stack profile is the correlator's derived artifact; the agent never reads or writes one.
-        proto.exclude("jonoffcpu-profile.proto")
-    }
 }
 
 val rootDirectory = isolated.rootProject.projectDirectory
@@ -108,6 +101,7 @@ val nativeTasks =
                 fileTree(rootDirectory.dir("jonoffcpu-native/src")),
                 rootDirectory.file("jonoffcpu-native/Cargo.toml"),
                 rootDirectory.file("jonoffcpu-native/Cargo.lock"),
+                rootDirectory.dir("jonoffcpu-capture-codec/src/main/proto"),
                 fileTree(asyncProfilerDir.dir("src")),
                 asyncProfilerDir.file("Makefile"),
             )
@@ -225,6 +219,7 @@ val correlatorJar =
         }
     }
 dependencies {
+    testFixturesApi(testFixtures(project(":jonoffcpu-capture-codec")))
     correlatorJar(project(":jonoffcpu-correlator"))
     "integrationTestImplementation"(libs.testcontainers)
     "integrationTestImplementation"(libs.testcontainers.junit.jupiter)
@@ -242,7 +237,7 @@ tasks.named<Test>("integrationTest") {
     // Local copies: a task action must not capture the build script itself.
     val agent = agentJar
     val correlator = files(correlatorJar)
-    val workloads = files(sourceSets.test.map { it.output.classesDirs })
+    val workloads = files(sourceSets.testFixtures.map { it.output.classesDirs })
     inputs.files(correlator).withPropertyName("correlatorJar").withNormalizer(ClasspathNormalizer::class)
     jvmArgumentProviders.add(
         CommandLineArgumentProvider {

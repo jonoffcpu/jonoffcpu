@@ -17,4 +17,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "jonoffcpu"
 
-include("jonoffcpu-agent", "jonoffcpu-correlator", "jonoffcpu-jfr-converter")
+include("jonoffcpu-agent", "jonoffcpu-capture-codec", "jonoffcpu-correlator", "jonoffcpu-jfr-converter")

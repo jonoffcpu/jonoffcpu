@@ -7,7 +7,7 @@ footer binds the source prefix and JFR hashes, capture identity and stop counter
 No separate manifest or exporter subprocess is required. Stored artifact paths
 are advisory, so recordings can be moved together or supplied from new locations.
 
-The stream is defined by [`docs/schema/jonoffcpu-capture.proto`](../docs/schema/jonoffcpu-capture.proto):
+The stream is defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto):
 a 12-byte header, then length-delimited protobuf records. A capture holds a
 `captureStart`, a `stack` record for each distinct native stack, one
 `observation` per recorded off-CPU interval, a `captureEnd`, and the
@@ -242,7 +242,7 @@ rare stacks are noisy even when the total is unbiased.
 
 `jonoffcpu-offcpu-profile.pb` is a derived artifact from which any collapsed-stack
 slice can be rendered again without re-reading the two inputs. Its format is
-defined by [`docs/schema/jonoffcpu-profile.proto`](../docs/schema/jonoffcpu-profile.proto):
+defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](src/main/proto/jonoffcpu-profile.proto):
 a 12-byte header, then length-delimited records — `profile_start`, a string
 constant pool, frames, a prefix-shared stack-node tree, one `entry` per distinct
 grouping key, and `profile_end` with the totals. Every string, frame and node is

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import static io.github.lhotari.jonoffcpu.offline.ExportFixture.export;
+import static io.github.lhotari.jonoffcpu.offline.ExportFixture.frame;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.google.gson.JsonObject;
@@ -17,25 +19,11 @@ import org.junit.jupiter.api.io.TempDir;
  * checks that DuckDB reads the export are in the integration test {@code ExportDuckDbTest}.
  */
 class ExportTest {
-    static StackProfile.Frame frame(StackProfile.Kind kind, String name) {
-        return new StackProfile.Frame(kind, name, kind == StackProfile.Kind.USER ? "libc.so.6" : "");
-    }
-
     private static List<JsonObject> jsonl(Path file) throws Exception {
         List<JsonObject> rows = new ArrayList<>();
         for (String line : Files.readAllLines(file))
             rows.add(JsonParser.parseString(line).getAsJsonObject());
         return rows;
-    }
-
-    static Path export(Path dir, String name, Path profile, String... extra) throws Exception {
-        Path output = dir.resolve(name);
-        List<String> args =
-                new ArrayList<>(List.of("export", "--profile", profile.toString(), "--output", output.toString()));
-        args.addAll(List.of(extra));
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(args.toArray(String[]::new));
-        assertThat(invocation.code()).as("Export failed: %s", invocation).isZero();
-        return output;
     }
 
     /** Two entries: one with every stack and a lambda frame, one past 2^53 - 1 observed nanoseconds. */
@@ -172,7 +160,7 @@ class ExportTest {
 
     @Test
     void unknownNumbersIsAUsageError(@TempDir Path dir) throws Exception {
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "expected one of number, string",
                 "export",
                 "--profile",

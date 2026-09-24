@@ -8,6 +8,7 @@ import static org.junit.jupiter.api.DynamicTest.dynamicTest;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.capture.CaptureRecordFixture;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -46,14 +47,14 @@ class PartialCorrelatorTest {
     private record Fixture(Path jfr, JsonObject observation, Path source, List<JsonObject> complete) {}
 
     private static Fixture fixture(Path dir) throws IOException {
-        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        Path jfr = CorrelationFixture.recording(dir, 1);
         long[] tid = new long[1];
         SignalJfrExporter.visit(jfr, row -> {
             if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
         });
-        JsonObject observation = OfflineCorrelatorTest.observation(tid[0]);
-        Path source = OfflineCorrelatorTest.source(dir, jfr, List.of(observation));
-        return new Fixture(jfr, observation, source, OfflineCorrelatorTest.readRows(source));
+        JsonObject observation = CorrelationFixture.observation(tid[0]);
+        Path source = CorrelationFixture.source(dir, jfr, List.of(observation));
+        return new Fixture(jfr, observation, source, CorrelationFixture.readRows(source));
     }
 
     private static void rejects(ThrowingCallable action, String reason) {
@@ -74,27 +75,27 @@ class PartialCorrelatorTest {
             int submitted)
             throws IOException {
         try (Recording recording = new Recording()) {
-            recording.enable(OfflineCorrelatorTest.Capture.class);
-            recording.enable(OfflineCorrelatorTest.Sample.class).withStackTrace();
-            recording.enable(OfflineCorrelatorTest.Stats.class);
+            recording.enable(CorrelationFixture.Capture.class);
+            recording.enable(CorrelationFixture.Sample.class).withStackTrace();
+            recording.enable(CorrelationFixture.Stats.class);
             recording.enable(UnknownSignal.class);
             recording.start();
-            new OfflineCorrelatorTest.Capture().commit();
+            new CorrelationFixture.Capture().commit();
             if (stats && statsFirst) stats(submitted);
             for (int i = 0; i < samples; i++) {
-                OfflineCorrelatorTest.Sample sample = new OfflineCorrelatorTest.Sample();
+                CorrelationFixture.Sample sample = new CorrelationFixture.Sample();
                 sample.correlationId = (sample.correlationId & 0xffffffff00000000L) | sequence;
                 sample.commit();
             }
             if (unknown) new UnknownSignal().commit();
             if (conflict) {
-                OfflineCorrelatorTest.Capture capture = new OfflineCorrelatorTest.Capture();
+                CorrelationFixture.Capture capture = new CorrelationFixture.Capture();
                 capture.sessionId = UUID.randomUUID().toString();
                 capture.commit();
             } else {
                 // Leave a complete event after the sample, so a bad following chunk cannot hide that
                 // sample.
-                new OfflineCorrelatorTest.Capture().commit();
+                new CorrelationFixture.Capture().commit();
             }
             if (stats && !statsFirst) stats(submitted);
             recording.stop();
@@ -104,7 +105,7 @@ class PartialCorrelatorTest {
     }
 
     private static void stats(int samples) {
-        OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
+        CorrelationFixture.Stats stats = new CorrelationFixture.Stats();
         stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = samples;
         stats.commit();
     }
@@ -118,7 +119,7 @@ class PartialCorrelatorTest {
     /** One row as a length-delimited record, to append to a prefix. */
     private static byte[] record(JsonObject row) throws IOException {
         java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
-        CaptureStreamFixture.record(row).writeDelimitedTo(bytes);
+        CaptureRecordFixture.record(row).writeDelimitedTo(bytes);
         return bytes.toByteArray();
     }
 
@@ -324,7 +325,7 @@ class PartialCorrelatorTest {
         Files.write(combined, both);
         JsonObject second = observation.deepCopy();
         second.addProperty("correlationId", "8000000100000002");
-        Path source = OfflineCorrelatorTest.source(dir, combined, List.of(observation, second));
+        Path source = CorrelationFixture.source(dir, combined, List.of(observation, second));
         assertThat(OfflineCorrelator.correlate(source, combined, DEFAULTS).matched())
                 .as("Multi-chunk fixture invalid")
                 .isEqualTo(2);
@@ -364,7 +365,7 @@ class PartialCorrelatorTest {
     void malformedControlRecord(String bad, String reason, @TempDir Path dir) throws Exception {
         Fixture fixture = fixture(dir);
         Path source = fixture.source();
-        Files.write(source, concat(prefix(fixture.complete(), "observation"), CaptureStreamFixture.controlRecord(bad)));
+        Files.write(source, concat(prefix(fixture.complete(), "observation"), CaptureRecordFixture.controlRecord(bad)));
         rejects(() -> OfflineCorrelator.correlatePartial(source, fixture.jfr(), DEFAULTS), reason);
     }
 
@@ -430,7 +431,7 @@ class PartialCorrelatorTest {
         }
         Files.write(source, CaptureStreamFixture.encode(tampered));
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Source digest mismatch");
-        Files.write(source, concat(CaptureStreamFixture.encode(complete), CaptureStreamFixture.controlRecord("{}")));
+        Files.write(source, concat(CaptureStreamFixture.encode(complete), CaptureRecordFixture.controlRecord("{}")));
         rejects(() -> OfflineCorrelator.correlatePartial(source, jfr, DEFAULTS), "Rows follow captureFinalized");
         Files.write(source, prefix(complete, "observation"));
         CaptureInput snapshot = CaptureInput.readPartial(source, jfr, DEFAULTS, new CaptureInput.SourceVisitor() {
@@ -512,7 +513,7 @@ class PartialCorrelatorTest {
         Path source = fixture.source();
         Files.write(source, prefix(fixture.complete(), "observation"));
         Path rejected = dir.resolve("rejected-output");
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "Partial mode supports",
                 "--source",
                 source.toString(),
