@@ -108,21 +108,22 @@ tasks.test {
 }
 
 // The README's option tables are checked against the parser, so documentation and help cannot drift. The check is a
-// task of its own because the README is its input: editing the README reruns this one test, not the unit tests.
-val readmeTest =
-    tasks.register<Test>("readmeTest") {
-        group = "verification"
-        description = "Checks the README's correlator option tables against the command-line parser."
-        testClassesDirs = files(sourceSets.test.map { it.output.classesDirs })
-        classpath = files(sourceSets.test.map { it.runtimeClasspath })
-        useJUnitPlatform { includeTags("readme") }
-        val readme = rootDirectory.file("README.md")
-        inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
-        systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
-        shouldRunAfter(tasks.test)
+// target of its own of the unit test suite because the README is its input: editing the README reruns this one test,
+// not the unit tests.
+testing.suites.named<JvmTestSuite>("test") {
+    targets.register("readmeTest") {
+        testTask.configure {
+            description = "Checks the README's correlator option tables against the command-line parser."
+            (options as JUnitPlatformOptions).includeTags("readme")
+            val readme = rootDirectory.file("README.md")
+            inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
+            systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
+            shouldRunAfter(tasks.test)
+        }
     }
+}
 tasks.check {
-    dependsOn(readmeTest)
+    dependsOn("readmeTest")
 }
 
 tasks.named<Test>("integrationTest") {
@@ -134,22 +135,20 @@ tasks.named<Test>("integrationTest") {
 
 // Spec acceptance 4: the scale test's assertion is the heap cap itself, so it runs in a JVM of its own under exactly
 // the bound it proves. At its full size it is -PscaleRows=2000000 -PscaleHeap=1g.
-val integrationTestSourceSet = sourceSets.named("integrationTest")
-val scaleTest =
-    tasks.register<Test>("scaleTest") {
-        group = "verification"
-        description = "Checks that correlation retention tracks distinct stacks, not intervals, under a capped heap."
-        testClassesDirs = files(integrationTestSourceSet.map { it.output.classesDirs })
-        classpath = files(integrationTestSourceSet.map { it.runtimeClasspath })
-        useJUnitPlatform { includeTags("scale") }
-        systemProperty("jonoffcpu.scaleRows", providers.gradleProperty("scaleRows").getOrElse(""))
-        maxHeapSize = providers.gradleProperty("scaleHeap").getOrElse("128m")
-        // Deeper than the fixture's deepest recursion, so each depth is a stack of its own.
-        jvmArgs("-XX:FlightRecorderOptions:stackdepth=256")
-        shouldRunAfter(tasks.test)
+testing.suites.named<JvmTestSuite>("integrationTest") {
+    targets.register("scaleTest") {
+        testTask.configure {
+            description = "Checks that correlation retention tracks distinct stacks, not intervals, under a capped heap."
+            (options as JUnitPlatformOptions).includeTags("scale")
+            systemProperty("jonoffcpu.scaleRows", providers.gradleProperty("scaleRows").getOrElse(""))
+            maxHeapSize = providers.gradleProperty("scaleHeap").getOrElse("128m")
+            // Deeper than the fixture's deepest recursion, so each depth is a stack of its own.
+            jvmArgs("-XX:FlightRecorderOptions:stackdepth=256")
+        }
     }
+}
 tasks.check {
-    dependsOn(scaleTest)
+    dependsOn("scaleTest")
 }
 
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
