@@ -152,55 +152,59 @@ tasks.check {
     dependsOn(verifyRuntimeJar)
 }
 
-// The patched JMC writer classes come first, so that they replace the writer's own.
-val fixtureClasspath = files(jmcWriterPatchClasses, sourceSets.test.map { it.runtimeClasspath }, correlatorJar)
-
-mapOf(
-    "SignalJfrExporter" to "io.github.lhotari.jonoffcpu.jfr.SignalJfrExporterTest",
-    "OfflineCorrelator" to "io.github.lhotari.jonoffcpu.offline.OfflineCorrelatorTest",
-    "PartialCorrelator" to "io.github.lhotari.jonoffcpu.offline.PartialCorrelatorTest",
-    "PrimitiveStructures" to "io.github.lhotari.jonoffcpu.offline.PrimitiveStructuresTest",
-    "StreamingCorrelator" to "io.github.lhotari.jonoffcpu.offline.StreamingCorrelatorTest",
-    "StackProfile" to "io.github.lhotari.jonoffcpu.offline.StackProfileTest",
-    "CommandLine" to "io.github.lhotari.jonoffcpu.offline.CommandLineTest",
-    "StackTransforms" to "io.github.lhotari.jonoffcpu.offline.StackTransformsTest",
-    "Export" to "io.github.lhotari.jonoffcpu.offline.ExportTest",
-    "Top" to "io.github.lhotari.jonoffcpu.offline.TopTest",
-    "FixtureAcceptance" to "io.github.lhotari.jonoffcpu.offline.FixtureAcceptanceTest",
-).forEach { (name, className) ->
-    tasks.register<FixtureExec>("test$name") {
-        classpath = fixtureClasspath
-        mainClass = className
-    }
+// A recorded sample's frames carry their execution type, so a fixture method the JIT compiles partway through a
+// recording splits one stack into several, differently from run to run, and the retention the degradation and scale
+// tests measure grows with the distinct stacks. The fixture's own methods therefore always run interpreted.
+tasks.withType<Test>().configureEach {
+    jvmArgs(
+        "-XX:CompileCommand=quiet",
+        "-XX:CompileCommand=exclude,io.github.lhotari.jonoffcpu.offline.ScaleFixture::*",
+        "-XX:CompileCommand=dontinline,io.github.lhotari.jonoffcpu.offline.ScaleFixture::*",
+    )
 }
 
-// The README's option tables are checked against the parser, so documentation and help cannot drift.
-tasks.named<FixtureExec>("testCommandLine") {
+// The patched JMC writer classes come first, so that they replace the writer's own.
+tasks.test {
+    classpath = files(jmcWriterPatchClasses) + classpath
+    maxHeapSize = "1g"
+    // The README's option tables are checked against the parser, so documentation and help cannot drift.
     val readme = rootDirectory.file("README.md")
-    inputs.file(readme)
+    inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
     systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
 }
 
-// The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
-tasks.named<FixtureExec>("testFixtureAcceptance") {
-    systemProperty("jonoffcpu.fixtures", providers.gradleProperty("jonoffcpuFixtures").getOrElse(""))
-}
-
-// Spec acceptance 4: the scale fixture's assertion is the heap cap itself, so it must run under
-// exactly the bound it proves, not whatever heap the other fixtures happen to get.
-tasks.named<FixtureExec>("testStreamingCorrelator") {
-    maxHeapSize = "1g"
-}
-
-tasks.register<FixtureExec>("testCorrelatorPublicApi") {
-    description = "Checks the published correlator JAR's dependency-free public API."
-    classpath = files(sourceSets.test.map { it.output }, correlatorJar)
-    mainClass = "io.github.lhotari.jonoffcpu.packaging.CorrelatorPublicApiTest"
-}
-
-tasks.register<FixtureExec>("testCompatibilityJfrWriter") {
+tasks.named<Test>("integrationTest") {
     dependsOn(buildAsyncProfilerConverter)
-    classpath = fixtureClasspath
-    mainClass = "io.github.lhotari.jonoffcpu.offline.CompatibilityJfrWriterTest"
-    args(asyncProfilerConverter.asFile.absolutePath)
+    classpath = files(jmcWriterPatchClasses) + classpath + files(correlatorJar)
+    inputs.file(asyncProfilerConverter).withPropertyName("jfrconv").withPathSensitivity(PathSensitivity.NONE)
+    systemProperty("jonoffcpu.jfrconv", asyncProfilerConverter.asFile.absolutePath)
+    // The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
+    systemProperty("jonoffcpu.fixtures", providers.gradleProperty("jonoffcpuFixtures").getOrElse(""))
+    (options as JUnitPlatformOptions).excludeTags("scale")
+}
+
+// Spec acceptance 4: the scale test's assertion is the heap cap itself, so it runs in a JVM of its own under exactly
+// the bound it proves. At its full size it is -PscaleRows=2000000 -PscaleHeap=1g.
+val integrationTestSourceSet = sourceSets.named("integrationTest")
+val scaleTest =
+    tasks.register<Test>("scaleTest") {
+        group = "verification"
+        description = "Checks that correlation retention tracks distinct stacks, not intervals, under a capped heap."
+        testClassesDirs = files(integrationTestSourceSet.map { it.output.classesDirs })
+        classpath = files(jmcWriterPatchClasses) + files(integrationTestSourceSet.map { it.runtimeClasspath })
+        useJUnitPlatform { includeTags("scale") }
+        systemProperty("jonoffcpu.scaleRows", providers.gradleProperty("scaleRows").getOrElse(""))
+        maxHeapSize = providers.gradleProperty("scaleHeap").getOrElse("128m")
+        // Deeper than the fixture's deepest recursion, so each depth is a stack of its own.
+        jvmArgs("-XX:FlightRecorderOptions:stackdepth=256")
+        shouldRunAfter(tasks.test)
+    }
+tasks.check {
+    dependsOn(scaleTest)
+}
+
+// JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
+// classpath leaves out on purpose, so the packaged-JAR tests are also named.
+tasks.named<Test>("packagedJarTest") {
+    filter { includeTestsMatching("io.github.lhotari.jonoffcpu.packaging.*") }
 }

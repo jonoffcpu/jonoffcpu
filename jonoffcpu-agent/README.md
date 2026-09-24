@@ -230,59 +230,37 @@ the publication locally with:
 See the repository's [release guide](../RELEASING.md) for the tag-driven release
 flow, Central Portal setup, and signing configuration.
 
-## Native integration smoke
+## Tests
 
-CI runs a packaged end-to-end smoke test on native x86-64 and arm64 runners,
-once for each C-library flavour. To run the same checks against already-built
-shaded JARs, use:
-
-```sh
-python3 tools/run-packaged-agent-smoke.py \
-  --libc glibc \
-  --agent-jar build/libs/jonoffcpu-agent-1.0.0.jar \
-  --correlator-jar ../jonoffcpu-correlator/build/libs/jonoffcpu-correlator-1.0.0.jar \
-  --test-classes build/classes/java/test \
-  --java-home "$JAVA_HOME" \
-  --output /path/to/new-glibc-smoke-directory
-python3 tools/run-packaged-agent-smoke.py \
-  --libc musl \
-  --agent-jar build/libs/jonoffcpu-agent-1.0.0.jar \
-  --correlator-jar ../jonoffcpu-correlator/build/libs/jonoffcpu-correlator-1.0.0.jar \
-  --test-classes build/classes/java/test \
-  --output /path/to/new-musl-smoke-directory
-```
-
-The check starts the shaded agent JAR in privileged Docker, records a finite
-mixed workload through the native eBPF source and async-profiler, finalizes the
-capture, and invokes the shaded correlator JAR. It requires at least one valid,
-identity-verified off-CPU match. The glibc run uses `tools/Dockerfile.runtime`
-(Ubuntu) with the mounted `--java-home`; the musl run uses
-`tools/Dockerfile.runtime-musl` (Alpine Corretto), whose own JDK proves the
-musl bundle loads with nothing installed beside the JVM. The JAR must contain
-the flavour under test.
-
-An opt-in smoke test exercises the actual native launcher, BPF source, mixed
-CPU/allocation/wall/lock/JVM recording and both offline output formats. It uses
-privileged Docker and a mounted glibc JDK, and requires a built matching
-async-profiler branch with cookie support:
+`src/test` holds unit tests, which run on any platform with Java and need no native code. `src/integrationTest`
+holds the tests that need the native bundle, the packaged JARs or a Linux kernel. `check` runs both:
 
 ```sh
-python3 tools/run-native-agent-smoke.py \
-  --ap-dir /path/to/async-profiler \
-  --java-home /path/to/jdk \
-  --output /path/to/new-smoke-directory \
-  --delivery queued
+./gradlew :jonoffcpu-agent:check
 ```
 
-Run `--delivery coalescing` into a separate new directory for the other policy.
-The test checks target thread identity in a private PID namespace, mixed event
-categories through `RecordingFile`, and synthetic JFR conversion with `jfrconv`.
-It retains commands, logs, original inputs and derived views in the output
-directory. It is a functional integration test, not a throughput benchmark.
+The integration tests come in three kinds, by JUnit tag:
 
-The Alpine/musl variant builds the native dependencies and matching profiler in
-an isolated container, runs the same checks, and retains a small runtime bundle
-with dependency and checksum manifests:
+- `host-native` tests load the bundle for the host's architecture into the test JVM: JNI control envelopes,
+  extraction and the async-profiler C API, and C-library detection. On a Linux host whose C library is selected
+  (`-PnativeLibcs=glibc` on a glibc host) they run in the test JVM. With `-PintegrationTestsInContainer=true`, the
+  default on any other host, including macOS, they run inside a Corretto container of each selected C library
+  through the JUnit Console Launcher (`containerIntegrationTest<Platform>`), so a glibc host can also test the musl
+  bundle. The container always runs at the host's own architecture, never under emulation.
+- `privileged-container` tests run the packaged agent end to end with Testcontainers, once for each selected C
+  library of the host's architecture, in the glibc or musl Corretto image the build pins, privileged, against the
+  host kernel's BTF and tracefs. `PackagedAgentSmokeTest` records a finite mixed workload with
+  `jfrsync=profile`, checks the CPU, allocation, wall-clock, lock, signal-cookie, JDK and marker events of the
+  combined recording, and correlates it with the packaged correlator JAR into identity-verified matches whose
+  switch-out reasons and sleeping/run-queue split account for every matched interval. `AgentShutdownTest`
+  finalizes from JVM shutdown alone (return, `System.exit`, SIGTERM). `AgentAbruptExitTest` checks that a
+  halted or SIGKILLed JVM leaves only explicitly incomplete artifacts the correlator refuses, and
+  `AsyncProfilerFirstStopTest` that when async-profiler stops first (its timeout, or the JFR master recording
+  stopping) every interval after its cutoff is explicitly unmatched. They need a Linux host with Docker; elsewhere they are skipped.
+- `packaged-jar` tests (`packagedJarTest`) run against the shaded JAR alone, without the module's classes or its
+  unrelocated dependencies, to prove the relocation.
+
+The musl flavour's lower-level proof tools remain under `../jonoffcpu-native/tools/`:
 
 ```sh
 python3 ../jonoffcpu-native/tools/run-agent-smoke-musl.py \
@@ -290,18 +268,4 @@ python3 ../jonoffcpu-native/tools/run-agent-smoke-musl.py \
   --output /path/to/new-musl-directory
 ```
 
-After building the glibc agent and running its smoke once (which prepares the
-runtime image), validate automatic finalization without application stop calls:
-
-```sh
-python3 tools/run-native-agent-shutdown.py \
-  --ap-dir /path/to/async-profiler --java-home /path/to/jdk \
-  --output /path/to/new-shutdown-directory
-```
-
-This checks normal return, `System.exit(0)` and SIGTERM. The separate
-`tools/run-native-agent-interruptions.py` checks abrupt termination and an
-async-profiler timeout or external synchronized-recording stop before the native
-collector stops. Abrupt termination must remain incomplete; observations after
-the profiler admission cutoff must never contribute duration to matched stacks.
-All of these are functional/lifecycle checks, not overhead benchmarks.
+All of these are functional and lifecycle checks, not overhead benchmarks.

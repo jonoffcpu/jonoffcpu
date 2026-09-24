@@ -65,3 +65,27 @@ publishing {
         artifact(tasks.named("javadocJar"))
     }
 }
+
+// Integration tests tagged `packaged-jar` exercise the published JAR alone: their classpath has the JAR and the test
+// libraries, but neither the module's classes nor its unrelocated dependencies, so they prove the relocation.
+val integrationTestSourceSet = sourceSets.named("integrationTest")
+val packagedJarTest =
+    tasks.register<Test>("packagedJarTest") {
+        group = "verification"
+        description = "Runs the integration tests tagged packaged-jar against the shaded JAR alone."
+        testClassesDirs = files(integrationTestSourceSet.map { it.output.classesDirs })
+        classpath =
+            files(
+                integrationTestSourceSet.map { it.output },
+                tasks.named<ShadowJar>("shadowJar").flatMap { it.archiveFile },
+                configurations.named("packagedJarTestRuntime"),
+            )
+        useJUnitPlatform { includeTags("packaged-jar") }
+        shouldRunAfter(tasks.named("test"))
+    }
+tasks.named<Test>("integrationTest") {
+    (options as JUnitPlatformOptions).excludeTags("packaged-jar")
+}
+tasks.named("check") {
+    dependsOn(packagedJarTest)
+}

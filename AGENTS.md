@@ -17,6 +17,8 @@ smallest relevant layer before running privileged end-to-end tests.
   collector and its kernel proof tools.
 - [`RELEASING.md`](RELEASING.md): publication, signing, tags, and release
   workflow.
+- [`CODING.md`](CODING.md): code and test conventions, the test layout, and the
+  time budget every test run keeps.
 
 ## Architecture contracts
 
@@ -148,22 +150,23 @@ the relevant proof tools. CI checks formatting and builds the collector for both
 supported architectures.
 
 Native eBPF tests require Linux, suitable BTF/kernel features, Docker, and
-privileged access. Use the existing scripts under `jonoffcpu-native/tools/` and
-`jonoffcpu-agent/tools/`; do not replace kernel-level evidence with mocked unit
-tests. The packaged end-to-end entry point is:
+privileged access. The agent's end-to-end tests are its `privileged-container`
+integration tests, which run the packaged agent and correlator in Testcontainers;
+lower-level proofs remain the scripts under `jonoffcpu-native/tools/`. Do not
+replace kernel-level evidence with mocked unit tests. The end-to-end entry point is:
 
 ```sh
-python3 jonoffcpu-agent/tools/run-packaged-agent-smoke.py --help
+./gradlew :jonoffcpu-agent:integrationTest --no-daemon
 ```
 
 CI builds and executes x86-64 and arm64 bundles on native runners, running the
-packaged smoke once per C-library flavour (Ubuntu for glibc, Alpine for musl).
-Do not add QEMU-based arm64 verification to CI. The arm64 collector must retain the
+integration tests once per C-library flavour (the glibc and Alpine musl Corretto
+images). Do not add QEMU-based arm64 verification to CI. The arm64 collector must retain the
 `libgcc` link needed by outlined atomics, and the native-bundle build must keep
 rejecting unresolved `__aarch64_*` helpers.
 
 When changing capture, shutdown, or correlation behavior, exercise the nearest
-focused fixture first, then the packaged smoke test when the host supports it.
+focused unit test first, then the end-to-end integration tests when the host supports them.
 Check loss counters, completion markers, capture identity, output finalization,
 and exact-cookie matches rather than only checking process exit status.
 
@@ -210,7 +213,7 @@ and exact-cookie matches rather than only checking process exit status.
   Keep verification behavior in that reusable workflow instead of duplicating
   it in CI and release jobs.
 
-The packaged Java-agent smoke starts async-profiler with `jfrsync=profile` and
+The packaged agent smoke (`PackagedAgentSmokeTest`) starts async-profiler with `jfrsync=profile` and
 checks CPU, allocation, wall-clock, lock, signal-cookie, ordinary JDK, and test
 marker events in the combined JFR before checking native capture, shutdown, and
 offline correlation. Keep those event assertions when changing profiler
