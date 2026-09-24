@@ -3,9 +3,7 @@ package io.github.lhotari.jonoffcpu.offline;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
@@ -31,28 +29,20 @@ class StreamingCorrelatorTest {
 
     /** A capture with the given number of observations, each matched by one JFR sample. */
     static Path capture(Path dir, Path jfr, long tid, int rows) throws IOException {
-        List<JsonObject> observations = new ArrayList<>();
+        List<CaptureProto.Observation> observations = new ArrayList<>();
         for (int row = 0; row < rows; row++) {
-            JsonObject observation = CorrelationFixture.observation(tid);
-            observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
-            observation.addProperty("startMonotonicNanos", Long.toString(1000 + row));
-            observation.addProperty("endMonotonicNanos", Long.toString(4000 + row));
-            observations.add(observation);
+            observations.add(CorrelationFixture.observation(tid)
+                    .setCorrelationId(CorrelationFixture.COOKIE + row)
+                    .setStartMonotonicNanos(1000 + row)
+                    .setEndMonotonicNanos(4000 + row)
+                    .build());
         }
         return CorrelationFixture.source(dir, jfr, observations);
     }
 
     /** The OS thread id of the recording's samples. */
     private static long sampleThreadId(Path jfr) throws IOException {
-        long[] tid = new long[1];
-        SignalJfrExporter.visit(jfr, row -> {
-            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
-        });
-        return tid[0];
-    }
-
-    private static JsonObject json(Path file) throws IOException {
-        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+        return CorrelationFixture.sampleThread(jfr);
     }
 
     private static int correlate(String... args) throws Exception {
@@ -72,19 +62,25 @@ class StreamingCorrelatorTest {
         assertThat(analysis.records())
                 .as("classified records cover both streams")
                 .hasSize(2);
-        assertThat(analysis.records().get(0).stream())
+        assertThat(analysis.records().get(0).hasSource())
                 .as("source records come first")
-                .isEqualTo("source");
-        assertThat(analysis.records().get(0).row()).as("source row numbering").isEqualTo(2);
-        assertThat(analysis.records().get(1).row()).as("JFR row numbering").isEqualTo(1);
-        assertThat(analysis.records()
-                        .get(0)
-                        .record()
-                        .getAsJsonObject("kernelStack")
-                        .has("frames"))
-                .as("classified source records re-expand the interned kernel stack")
                 .isTrue();
-        assertThat(analysis.matches().get(0).sample().getAsJsonArray("frames"))
+        assertThat(analysis.records().get(1).hasJfr())
+                .as("then the JFR records")
+                .isTrue();
+        assertThat(analysis.records().get(0).getRow())
+                .as("source row numbering")
+                .isEqualTo(2);
+        assertThat(analysis.records().get(1).getRow()).as("JFR row numbering").isEqualTo(1);
+        assertThat(analysis.records().get(0).getSource().getKernelFramesList())
+                .as("classified source records re-expand the interned kernel stack")
+                .extracting(CaptureProto.Frame::getSymbol)
+                .containsExactly("kernel_wait");
+        assertThat(analysis.records().get(0).getSource().getUserFramesList())
+                .as("classified source records re-expand the interned user stack")
+                .extracting(CaptureProto.Frame::getSymbol)
+                .containsExactly("user_wait");
+        assertThat(analysis.matches().get(0).sample().getFramesList())
                 .as("a match still carries its resolved JFR frames")
                 .isNotEmpty();
 
@@ -103,38 +99,45 @@ class StreamingCorrelatorTest {
                     .as("streamed and retained " + name)
                     .hasSameTextualContentAs(retained.resolve(name));
         }
-        JsonObject streamedReport = json(streamed.resolve(OutputFiles.REPORT));
-        JsonObject retainedReport = json(retained.resolve(OutputFiles.REPORT));
-        // Only the streamed path has the columns a stack profile is built from.
-        assertThat(streamedReport.remove("stackProfile"))
+        ReportProto.Report.Builder streamedReport =
+                CorrelationFixture.report(streamed.resolve(OutputFiles.REPORT)).toBuilder();
+        ReportProto.Report.Builder retainedReport =
+                CorrelationFixture.report(retained.resolve(OutputFiles.REPORT)).toBuilder();
+        // Only the streamed path has the columns a stack profile and the switch-out reasons are built from.
+        assertThat(streamedReport.hasStackProfile())
                 .as("the streamed report describes its stack profile")
-                .isNotNull();
+                .isTrue();
+        assertThat(streamedReport.hasOffCpuReasons())
+                .as("the streamed report accounts for switch-out reasons")
+                .isTrue();
         // The digest is made from the stack profile, so only the streamed run has one.
-        assertThat(streamedReport.remove("digest"))
+        assertThat(streamedReport.getDigest().getPath())
                 .as("the streamed report names its digest")
-                .isNotNull();
+                .isEqualTo(OutputFiles.SUMMARY_MD);
+        streamedReport.clearStackProfile().clearDigest().clearOffCpuReasons();
         assertThat(streamed.resolve(OutputFiles.PROFILE))
                 .as("the streamed run writes a stack profile")
                 .isRegularFile();
-        for (JsonObject report : List.of(streamedReport, retainedReport)) {
-            report.getAsJsonObject("syntheticJfr").remove("quantumNanos");
-            report.getAsJsonObject("syntheticJfr").remove("requestedQuantumNanos");
-            report.getAsJsonObject("syntheticJfr").remove("observedQuantumNanos");
-            report.getAsJsonObject("syntheticJfr").remove("quantumRaisedForEventLimit");
+        for (ReportProto.Report.Builder report : List.of(streamedReport, retainedReport)) {
+            report.getSyntheticJfrBuilder()
+                    .clearQuantumNanos()
+                    .clearRequestedQuantumNanos()
+                    .clearObservedQuantumNanos()
+                    .clearQuantumRaisedForEventLimit();
             // The streamed path builds a real ladder from the CLI's own limits and pre-decode estimate
             // (one settings() call even when nothing was needed); the retained/library path's
             // OutputOptions.defaults() ladder is inert (Degradation.none()), with no limit or estimate
             // of its own and no measured peak. Both report an empty stepsApplied either way, which is
             // what this equivalence check cares about.
-            JsonObject degradation = report.getAsJsonObject("degradation");
-            degradation.remove("attempts");
-            degradation.remove("peakRetainedBytes");
-            degradation.remove("retainedBytesLimit");
-            degradation.remove("estimatedRetainedBytes");
+            report.getDegradationBuilder()
+                    .clearAttempts()
+                    .clearPeakRetainedBytes()
+                    .clearRetainedBytesLimit()
+                    .clearEstimatedRetainedBytes();
         }
-        assertThat(streamedReport)
+        assertThat(streamedReport.build())
                 .as("reports beyond the synthetic quantum and degradation-measurement fields")
-                .isEqualTo(retainedReport);
+                .isEqualTo(retainedReport.build());
     }
 
     /** Spec §1: the audit outputs are the only consumers of the per-row documents. */
@@ -160,7 +163,8 @@ class StreamingCorrelatorTest {
             assertThat(output.resolve(OutputFiles.COLLAPSED))
                     .as("--audit never affects the collapsed stacks")
                     .isRegularFile();
-            assertThat(json(output.resolve(OutputFiles.REPORT)).get("audit").getAsString())
+            assertThat(CorrelationFixture.report(output.resolve(OutputFiles.REPORT))
+                            .getAudit())
                     .as("the report records the audit level")
                     .isEqualTo(level);
         }
@@ -227,14 +231,12 @@ class StreamingCorrelatorTest {
     void syntheticOrderTiesBreakOnCookie(@TempDir Path dir) throws Exception {
         Path jfr = recordingWithSequentialCorrelationIds(dir, 2);
         long tid = sampleThreadId(jfr);
-        JsonObject second = CorrelationFixture.observation(tid);
-        second.addProperty("correlationId", "8000000100000002");
-        second.addProperty("startMonotonicNanos", "1000");
-        second.addProperty("endMonotonicNanos", "4000");
-        JsonObject first = CorrelationFixture.observation(tid);
-        first.addProperty("correlationId", "8000000100000001");
-        first.addProperty("startMonotonicNanos", "1000");
-        first.addProperty("endMonotonicNanos", "4000");
+        CaptureProto.Observation second = CorrelationFixture.observation(tid)
+                .setCorrelationId(0x8000000100000002L)
+                .build();
+        CaptureProto.Observation first = CorrelationFixture.observation(tid)
+                .setCorrelationId(0x8000000100000001L)
+                .build();
         // Source-file order deliberately puts the higher cookie first: preserving capture order instead
         // of sorting by cookie would still pass without this check.
         Path source = CorrelationFixture.source(dir, jfr, List.of(second, first));
@@ -244,13 +246,13 @@ class StreamingCorrelatorTest {
                 .isEqualTo(2);
         var result = CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
 
-        List<String> viaAnalysisOrder = new ArrayList<>();
+        List<Long> viaAnalysisOrder = new ArrayList<>();
         SyntheticJfrSource.of(analysis).forEachInterval(interval -> viaAnalysisOrder.add(interval.correlationId()));
-        List<String> viaColumnsOrder = new ArrayList<>();
+        List<Long> viaColumnsOrder = new ArrayList<>();
         SyntheticJfrSource.of(result).forEachInterval(interval -> viaColumnsOrder.add(interval.correlationId()));
         assertThat(viaAnalysisOrder)
                 .as("the tie-break sorts ascending by cookie")
-                .containsExactly("8000000100000001", "8000000100000002");
+                .containsExactly(0x8000000100000001L, 0x8000000100000002L);
         assertThat(viaColumnsOrder)
                 .as("the column-backed tie-break order matches the retained one")
                 .isEqualTo(viaAnalysisOrder);

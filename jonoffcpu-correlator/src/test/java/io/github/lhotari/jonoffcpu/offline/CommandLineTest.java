@@ -7,9 +7,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import io.github.lhotari.jonoffcpu.offline.CommandLineFixture.Invocation;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -167,11 +164,7 @@ class CommandLineTest {
     @Test
     void dumpAlias(@TempDir Path dir) throws Exception {
         Path jfr = CorrelationFixture.recording(dir, 1);
-        long[] tid = new long[1];
-        SignalJfrExporter.visit(jfr, row -> {
-            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
-        });
-        JsonObject observation = CorrelationFixture.observation(tid[0]);
+        var observation = CorrelationFixture.observation(CorrelationFixture.sampleThread(jfr));
         Path source = CorrelationFixture.source(dir, jfr, List.of(observation));
         byte[] alias = stdout("--dump", "--source", source.toString());
         byte[] command = stdout("dump", "--source", source.toString());
@@ -220,13 +213,12 @@ class CommandLineTest {
                     .isEqualTo(Files.readAllBytes(second.resolve(file)));
         }
         // Correlation writes the digest by default and names it in the report; --summary-output false does not.
-        JsonObject digest = JsonParser.parseString(Files.readString(first.resolve(OutputFiles.REPORT)))
-                .getAsJsonObject()
-                .getAsJsonObject("digest");
-        assertThat(digest.get("path").getAsString())
+        ReportProto.DigestFiles digest =
+                CorrelationFixture.report(first.resolve(OutputFiles.REPORT)).getDigest();
+        assertThat(digest.getPath())
                 .as("The report must name the digest: %s", digest)
                 .isEqualTo(OutputFiles.SUMMARY_MD);
-        assertThat(digest.get("json").getAsString())
+        assertThat(digest.getJson())
                 .as("The report must name the digest: %s", digest)
                 .isEqualTo(OutputFiles.SUMMARY_JSON);
         assertThat(Files.readString(first.resolve(OutputFiles.SUMMARY_MD))).startsWith("# jonoffcpu analysis digest");

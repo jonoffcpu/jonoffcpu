@@ -18,6 +18,8 @@ dependencies {
     embeddedRuntime(project(":jonoffcpu-capture-codec"))
     embeddedRuntime(libs.protobuf.java)
     embeddedRuntime(libs.protobuf.java.util)
+    // Not used by the correlator's own code: protobuf-java-util's JsonFormat, which prints and parses every JSON
+    // output, needs it at run time.
     embeddedRuntime(libs.gson)
     embeddedRuntime(libs.jmc.flightrecorder.writer)
     embeddedRuntime(libs.picocli)
@@ -141,9 +143,13 @@ val verifyRuntimeJar =
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-LICENSE.txt",
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-THIRD_PARTY_LICENSES.txt",
                 "io/github/lhotari/jonoffcpu/offline/OffCpuCorrelator.class",
-                "io/github/lhotari/jonoffcpu/jfr/SignalJfrExporter.class",
-                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/gson/Gson.class",
+                "io/github/lhotari/jonoffcpu/offline/SignalJfrExporter.class",
+                "io/github/lhotari/jonoffcpu/offline/ReportProto.class",
+                "io/github/lhotari/jonoffcpu/capture/ProtoJson.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
+                // Every JSON output is printed by JsonFormat, which parses with the relocated Gson.
+                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/protobuf/util/JsonFormat.class",
+                "io/github/lhotari/jonoffcpu/correlator/internal/shaded/gson/JsonParser.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class",
                 "io/github/lhotari/jonoffcpu/correlator/internal/shaded/picocli/CommandLine.class",

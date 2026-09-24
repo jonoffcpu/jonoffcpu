@@ -4,10 +4,8 @@ package io.github.lhotari.jonoffcpu.offline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.capture.CaptureFixtures;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import io.github.lhotari.jonoffcpu.profile.ProfileProto;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -18,6 +16,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.function.IntFunction;
 import java.util.stream.Stream;
 import jdk.jfr.Recording;
@@ -31,10 +30,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 /** Fixtures for switch-out reason classification and the stack profile the correlator writes. */
 class StackProfileTest {
-    private static final long EPOCH = 0x80000001L;
+    private static final long EPOCH = Integer.toUnsignedLong(CorrelationFixture.EPOCH);
     private static final int ROWS = 12;
     private static final int STACKS = 3;
-    private static final List<String> ALL_REASONS = List.of("blocked", "runnable", "preempted");
+    private static final List<OffCpuReason> ALL_REASONS =
+            List.of(OffCpuReason.BLOCKED, OffCpuReason.RUNNABLE, OffCpuReason.PREEMPTED);
 
     // ---- fixtures ------------------------------------------------------------------------------
 
@@ -71,65 +71,64 @@ class StackProfileTest {
     }
 
     private static long sampleThread(Path jfr) throws IOException {
-        long[] tid = new long[1];
-        SignalJfrExporter.visit(jfr, row -> {
-            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
-        });
-        return tid[0];
+        return CorrelationFixture.sampleThread(jfr);
     }
 
-    /** Observations for every sample, each of a distinct duration, classified by {@code reason} when non-null. */
-    private static List<JsonObject> observations(long tid, IntFunction<String> reason) {
-        List<JsonObject> observations = new ArrayList<>();
+    /**
+     * Observations for every sample, each of a distinct duration, classified by {@code reason}; the fixture's
+     * default, blocked in TASK_INTERRUPTIBLE, when it is null.
+     */
+    private static List<CaptureProto.Observation.Builder> observations(long tid, IntFunction<OffCpuReason> reason) {
+        List<CaptureProto.Observation.Builder> observations = new ArrayList<>();
         for (int row = 0; row < ROWS; row++) {
-            JsonObject observation = CorrelationFixture.observation(tid);
-            observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
-            observation.addProperty("startMonotonicNanos", Long.toString(1000 + 100L * row));
-            observation.addProperty("endMonotonicNanos", Long.toString(4000 + 100L * row + 7L * row * row));
-            String label = reason == null ? null : reason.apply(row);
-            if (label != null) {
-                observation.addProperty("offCpuReason", label);
-                observation.addProperty("preempted", label.equals("preempted"));
-                observation.addProperty("prevTaskState", label.equals("blocked") ? 0x2001 : 0);
-            }
+            CaptureProto.Observation.Builder observation = CorrelationFixture.observation(tid)
+                    .setCorrelationId((EPOCH << 32) | (row + 1))
+                    .setStartMonotonicNanos(1000 + 100L * row)
+                    .setEndMonotonicNanos(4000 + 100L * row + 7L * row * row);
+            OffCpuReason label = reason == null ? null : reason.apply(row);
+            if (label != null) classify(observation, label);
             observations.add(observation);
         }
         return observations;
     }
 
-    private static JsonObject sampling(List<String> reasons) {
-        JsonObject sampling = CorrelationFixture.uniformSampling();
-        JsonArray names = new JsonArray();
-        for (String reason : reasons) names.add(reason);
-        JsonObject ordered = new JsonObject();
-        ordered.add("reasons", names);
-        for (var entry : sampling.entrySet()) ordered.add(entry.getKey(), entry.getValue());
-        return ordered;
+    /** Sets a reason and the raw sched_switch arguments the kernel derives it from. */
+    private static void classify(CaptureProto.Observation.Builder observation, OffCpuReason reason) {
+        observation
+                .setReason(reason.proto())
+                .setPreempted(reason == OffCpuReason.PREEMPTED)
+                .setPrevTaskState(reason == OffCpuReason.BLOCKED ? 0x2001 : 0);
     }
 
-    private static JsonObject reasonCounters() {
-        JsonObject counters = new JsonObject();
-        counters.addProperty("switchOutsBlocked", "40");
-        counters.addProperty("switchOutsRunnable", "5");
-        counters.addProperty("switchOutsPreempted", "300");
-        counters.addProperty("reasonRejections", "0");
-        counters.addProperty("reasonRejectedDurationMicros", "0");
-        return counters;
+    private static CaptureProto.Sampling sampling(List<OffCpuReason> reasons) {
+        return CaptureFixtures.uniformSampling(
+                "0.01",
+                CorrelationFixture.THRESHOLD,
+                reasons.stream().map(OffCpuReason::proto).toArray(CaptureProto.OffCpuReason[]::new));
     }
 
-    private static Path v2Capture(Path dir, Path jfr) throws IOException {
+    private static final Consumer<CaptureProto.KernelCounters.Builder> REASON_COUNTERS =
+            kernel -> kernel.setSwitchOutsBlocked(40).setSwitchOutsRunnable(5).setSwitchOutsPreempted(300);
+
+    private static final CaptureProto.TimeSplit OFF =
+            CorrelationFixture.timeSplit(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_OFF);
+    private static final CaptureProto.TimeSplit SCHED_INFO =
+            CorrelationFixture.timeSplit(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_SCHED_INFO);
+
+    /** The default capture: blocked intervals only, without the time split. */
+    private static Path blockedCapture(Path dir, Path jfr) throws IOException {
         return CorrelationFixture.source(dir, jfr, observations(sampleThread(jfr), null));
     }
 
-    private static Path v3Capture(Path dir, Path jfr, List<String> reasons, IntFunction<String> reason)
+    private static Path reasonCapture(Path dir, Path jfr, List<OffCpuReason> reasons, IntFunction<OffCpuReason> reason)
             throws IOException {
-        return CorrelationFixture.source(
-                Files.createDirectories(dir),
-                jfr,
-                observations(sampleThread(jfr), reason),
-                sampling(reasons),
-                3,
-                reasonCounters());
+        return reasonCapture(dir, jfr, observations(sampleThread(jfr), reason), sampling(reasons));
+    }
+
+    private static Path reasonCapture(
+            Path dir, Path jfr, List<CaptureProto.Observation.Builder> rows, CaptureProto.Sampling sampling)
+            throws IOException {
+        return CorrelationFixture.source(Files.createDirectories(dir), jfr, rows, sampling, REASON_COUNTERS, OFF);
     }
 
     private static Path correlate(Path source, Path jfr, Path output, String... extra) throws Exception {
@@ -152,25 +151,31 @@ class StackProfileTest {
         return Files.readString(output);
     }
 
-    private static JsonObject report(Path analysis) throws IOException {
-        return JsonParser.parseString(Files.readString(analysis.resolve(OutputFiles.REPORT)))
-                .getAsJsonObject();
+    private static ReportProto.Report report(Path analysis) throws IOException {
+        return CorrelationFixture.report(analysis.resolve(OutputFiles.REPORT));
+    }
+
+    private static ReportProto.ReasonTotals matched(ReportProto.OffCpuReasons reasons, OffCpuReason reason) {
+        return reasons.getMatchedList().stream()
+                .filter(totals -> totals.getReason() == reason.proto())
+                .findFirst()
+                .orElseThrow();
     }
 
     // ---- fixtures under test -------------------------------------------------------------------
 
     /**
-     * A capture without classification correlates as before, and the profile rendered with its defaults reproduces
+     * A capture of one reason correlates without reason frames, and the profile rendered with its defaults reproduces
      * the collapsed file byte for byte — the property that makes the profile a trustworthy stand-in for it.
      */
     @Test
-    void unclassifiedGolden(@TempDir Path dir) throws Exception {
+    void singleReasonGolden(@TempDir Path dir) throws Exception {
         Path jfr = recording(dir);
-        Path source = v2Capture(dir, jfr);
+        Path source = blockedCapture(dir, jfr);
         Path analysis = correlate(source, jfr, dir.resolve("analysis"));
         String collapsed = Files.readString(analysis.resolve(OutputFiles.COLLAPSED));
         assertThat(collapsed)
-                .as("An unclassified capture must not gain reason frames")
+                .as("A single-reason capture must not gain reason frames")
                 .doesNotContain("[offcpu:");
         assertThat(collapsed.lines())
                 .as("Expected one collapsed line per distinct stack: %s", collapsed)
@@ -179,11 +184,11 @@ class StackProfileTest {
         assertThat(stacks(profile, dir.resolve("default.collapsed")))
                 .as("Profile does not reproduce collapsed")
                 .isEqualTo(collapsed);
-        JsonObject report = report(analysis);
-        assertThat(report.has("offCpuReasons"))
-                .as("An unclassified capture has no reason accounting")
-                .isFalse();
-        assertThat(report.getAsJsonObject("stackProfile").get("entries").getAsInt())
+        ReportProto.Report report = report(analysis);
+        assertThat(report.getOffCpuReasons().getSelectedList())
+                .as("The reasons the capture kept")
+                .containsExactly(CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED);
+        assertThat(report.getStackProfile().getEntries())
                 .as("Wrong profile entry count")
                 .isEqualTo(STACKS);
 
@@ -192,13 +197,15 @@ class StackProfileTest {
         Path rewritten = dir.resolve("rewritten.pb");
         read.write(rewritten);
         assertThat(rewritten).as("Profile is not canonical").hasSameBinaryContentAs(profile);
-        assertThat(read.header().reportJson())
+        assertThat(read.header().report())
                 .as("The profile must carry the run's report")
-                .isEqualTo(
-                        Files.readString(analysis.resolve(OutputFiles.REPORT)).strip());
+                .isEqualTo(report);
+        assertThat(read.header().sources().get(0).getSampling())
+                .as("The profile must carry the capture's sampling")
+                .isEqualTo(CorrelationFixture.uniformSampling());
         assertThat(read.entries())
-                .as("Unclassified intervals must read back as unspecified")
-                .allMatch(entry -> entry.reason() == OffCpuReason.UNSPECIFIED);
+                .as("Blocked intervals must read back as blocked")
+                .allMatch(entry -> entry.reason() == OffCpuReason.BLOCKED);
         // The recording is made on the test thread, whose name the runner chooses.
         String thread = Thread.currentThread().getName();
         assertThat(read.entries()).as("Thread names are grouped").allMatch(entry -> thread.equals(entry.thread()));
@@ -231,10 +238,7 @@ class StackProfileTest {
                 "estimated",
                 "--summary",
                 summaryFile.toString());
-        BigInteger estimated = new BigInteger(JsonParser.parseString(Files.readString(summaryFile))
-                .getAsJsonObject()
-                .get("totalNanos")
-                .getAsString());
+        BigInteger estimated = new BigInteger(summaryOf(summaryFile).getTotalNanos());
         long observed = read.totalObservedNanos();
         assertThat(estimated)
                 .as("Estimate out of range for %s", observed)
@@ -297,7 +301,7 @@ class StackProfileTest {
         List<String> rows = exportCsv(profile, dir.resolve("entries.csv"));
         assertThat(rows.get(0)).as("CSV header changed").startsWith("reason,task_state,thread,java_stack");
         assertThat(rows).as("One CSV row per entry").hasSize(read.entries().size() + 1);
-        assertThat(rows.get(1)).as("Unexpected CSV row").startsWith("unspecified,0," + thread + ",");
+        assertThat(rows.get(1)).as("Unexpected CSV row").startsWith("blocked,1," + thread + ",");
         // A column names each Java-stack frame's kind, parallel to java_stack; the 0.5.0 columns follow it.
         assertThat(rows.get(0))
                 .as("CSV header lacks the kinds")
@@ -325,23 +329,22 @@ class StackProfileTest {
     @Test
     void mixedReasons(@TempDir Path dir) throws Exception {
         Path jfr = recording(dir);
-        Path source = v3Capture(dir, jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
+        Path source = reasonCapture(dir, jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
         Path analysis = correlate(source, jfr, dir.resolve("analysis"));
         String collapsed = Files.readString(analysis.resolve(OutputFiles.COLLAPSED));
         assertThat(collapsed.lines())
                 .as("Lines need reason frames: %s", collapsed)
                 .allMatch(line -> line.startsWith("[offcpu: "));
-        Map<String, String> perReason = new HashMap<>();
+        Map<OffCpuReason, String> perReason = new HashMap<>();
         StringBuilder prefixed = new StringBuilder();
-        for (String reason : ALL_REASONS) {
-            Path file =
-                    analysis.resolve(OutputFiles.collapsedForReason(OutputFiles.PREFIX, OffCpuReason.parse(reason)));
+        for (OffCpuReason reason : ALL_REASONS) {
+            Path file = analysis.resolve(OutputFiles.collapsedForReason(OutputFiles.PREFIX, reason));
             String text = Files.readString(file);
             perReason.put(reason, text);
             assertThat(text).as("A per-reason file needs no reason frame").doesNotContain("[offcpu:");
             text.lines()
                     .forEach(line -> prefixed.append("[offcpu: ")
-                            .append(reason)
+                            .append(reason.label())
                             .append("];")
                             .append(line)
                             .append('\n'));
@@ -355,7 +358,7 @@ class StackProfileTest {
                 .isEqualTo(collapsed);
         assertThat(stacks(profile, dir.resolve("blocked.collapsed"), "--reason", "blocked"))
                 .as("Profile does not reproduce the blocked slice")
-                .isEqualTo(perReason.get("blocked"));
+                .isEqualTo(perReason.get(OffCpuReason.BLOCKED));
         assertThat(stacks(profile, dir.resolve("never.collapsed"), "--reason-frame", "never")
                         .lines())
                 .as("--reason-frame never must drop the frames")
@@ -365,28 +368,26 @@ class StackProfileTest {
                 .as("A two-reason slice keeps its frames")
                 .allMatch(line -> line.startsWith("[offcpu: runnable]") || line.startsWith("[offcpu: preempted]"));
 
-        JsonObject reasons = report(analysis).getAsJsonObject("offCpuReasons");
-        assertThat(reasons.getAsJsonArray("selected").asList())
+        ReportProto.OffCpuReasons reasons = report(analysis).getOffCpuReasons();
+        assertThat(reasons.getSelectedList())
                 .as("Selected reasons missing: %s", reasons)
                 .hasSize(3);
-        for (String reason : ALL_REASONS) {
-            assertThat(reasons.getAsJsonObject("matched")
-                            .getAsJsonObject(reason)
-                            .get("intervals")
-                            .getAsString())
+        for (OffCpuReason reason : ALL_REASONS) {
+            assertThat(matched(reasons, reason).getIntervals())
                     .as("Wrong matched count for %s: %s", reason, reasons)
-                    .isEqualTo("4");
+                    .isEqualTo(4);
         }
-        assertThat(reasons.getAsJsonObject("kernelSwitchOuts").get("preempted").getAsString())
+        assertThat(reasons.getKernelSwitchOuts().getPreempted())
                 .as("Kernel switch-outs must be reported: %s", reasons)
-                .isEqualTo("300");
+                .isEqualTo(300);
         StackProfile read = StackProfile.read(profile);
         assertThat(read.entries().stream().filter(entry -> entry.reason() == OffCpuReason.BLOCKED))
                 .as("The blocked task state must be kept")
                 .allMatch(entry -> entry.taskState() == 0x2001);
 
         // Blocked only, the default: one reason, so the file is written exactly as an unclassified one.
-        Path blockedOnly = v3Capture(dir.resolve("blocked"), jfr, List.of("blocked"), row -> "blocked");
+        Path blockedOnly =
+                reasonCapture(dir.resolve("blocked"), jfr, List.of(OffCpuReason.BLOCKED), row -> OffCpuReason.BLOCKED);
         Path blockedAnalysis = correlate(blockedOnly, jfr, dir.resolve("blocked-analysis"));
         assertThat(Files.readString(blockedAnalysis.resolve(OutputFiles.COLLAPSED)))
                 .as("A single-reason capture needs no reason frames")
@@ -404,56 +405,44 @@ class StackProfileTest {
     @Test
     void classificationIsVerified(@TempDir Path dir) throws Exception {
         Path jfr = recording(dir);
+        List<OffCpuReason> blocked = List.of(OffCpuReason.BLOCKED);
         // An unselected reason: the kernel filter would have dropped it.
-        Path unselected = v3Capture(
-                dir.resolve("unselected"), jfr, List.of("blocked"), row -> row == 0 ? "preempted" : "blocked");
-        assertThat(report(correlate(unselected, jfr, dir.resolve("a1")))
-                        .get("invalidSource")
-                        .getAsInt())
+        Path unselected = reasonCapture(
+                dir.resolve("unselected"),
+                jfr,
+                blocked,
+                row -> row == 0 ? OffCpuReason.PREEMPTED : OffCpuReason.BLOCKED);
+        assertThat(report(correlate(unselected, jfr, dir.resolve("a1"))).getInvalidSource())
                 .as("An unselected reason must invalidate its row")
                 .isEqualTo(1);
         // A reason that disagrees with the raw sched_switch arguments.
-        List<JsonObject> rows = observations(sampleThread(jfr), row -> "blocked");
-        rows.get(0).addProperty("prevTaskState", 0);
-        Path disagreeing = CorrelationFixture.source(
-                Files.createDirectories(dir.resolve("disagreeing")),
-                jfr,
-                rows,
-                sampling(List.of("blocked")),
-                3,
-                reasonCounters());
-        assertThat(report(correlate(disagreeing, jfr, dir.resolve("a2")))
-                        .get("invalidSource")
-                        .getAsInt())
+        List<CaptureProto.Observation.Builder> rows = observations(sampleThread(jfr), row -> OffCpuReason.BLOCKED);
+        rows.get(0).setPrevTaskState(0);
+        Path disagreeing = reasonCapture(dir.resolve("disagreeing"), jfr, rows, sampling(blocked));
+        assertThat(report(correlate(disagreeing, jfr, dir.resolve("a2"))).getInvalidSource())
                 .as("A reason that disagrees with its task state must invalidate its row")
                 .isEqualTo(1);
-        // A classified row in an unclassified capture.
-        List<JsonObject> legacy = observations(sampleThread(jfr), null);
-        legacy.get(0).addProperty("offCpuReason", "blocked");
-        Path mixedLegacy = CorrelationFixture.source(Files.createDirectories(dir.resolve("legacy")), jfr, legacy);
-        assertThat(report(correlate(mixedLegacy, jfr, dir.resolve("a3")))
-                        .get("invalidSource")
-                        .getAsInt())
-                .as("A version 2 capture cannot carry a classification")
+        // The kernel always classifies: an unspecified reason is not a valid switch-out.
+        List<CaptureProto.Observation.Builder> unspecified = observations(sampleThread(jfr), null);
+        unspecified.get(0).setReason(CaptureProto.OffCpuReason.OFF_CPU_REASON_UNSPECIFIED);
+        Path unclassified = reasonCapture(dir.resolve("unclassified"), jfr, unspecified, sampling(blocked));
+        assertThat(report(correlate(unclassified, jfr, dir.resolve("a3"))).getInvalidSource())
+                .as("An unspecified reason must invalidate its row")
                 .isEqualTo(1);
-        // A version 3 capture must name its reasons, and a version 2 one must not.
-        Path unnamed = CorrelationFixture.source(
-                Files.createDirectories(dir.resolve("unnamed")),
+        // A capture must name the reasons it kept, distinct and in canonical order.
+        Path unnamed = reasonCapture(
+                dir.resolve("unnamed"),
                 jfr,
-                observations(sampleThread(jfr), row -> "blocked"),
-                CorrelationFixture.uniformSampling(),
-                3,
-                reasonCounters());
+                observations(sampleThread(jfr), row -> OffCpuReason.BLOCKED),
+                sampling(List.of()));
         assertThatThrownBy(() -> correlate(unnamed, jfr, dir.resolve("a4")))
                 .isInstanceOf(IOException.class)
-                .hasMessageContaining("Source schema/sampling reasons mismatch");
-        Path uncanonical = CorrelationFixture.source(
-                Files.createDirectories(dir.resolve("uncanonical")),
+                .hasMessageContaining("Sampling reasons must not be empty");
+        Path uncanonical = reasonCapture(
+                dir.resolve("uncanonical"),
                 jfr,
-                observations(sampleThread(jfr), row -> "blocked"),
-                sampling(List.of("preempted", "blocked")),
-                3,
-                reasonCounters());
+                observations(sampleThread(jfr), row -> OffCpuReason.BLOCKED),
+                sampling(List.of(OffCpuReason.PREEMPTED, OffCpuReason.BLOCKED)));
         assertThatThrownBy(() -> correlate(uncanonical, jfr, dir.resolve("a5")))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("canonical");
@@ -475,7 +464,7 @@ class StackProfileTest {
                 Arguments.of("no reading", blocked, false, 0L, 0L, 100L, new long[] {0, 0, 100}),
                 Arguments.of("exceeds", blocked, true, 101L, 0L, 100L, new long[] {0, 0, 100}),
                 Arguments.of("a u64 reading compares unsigned", blocked, true, -1L, 0L, 100L, new long[] {0, 0, 100}),
-                Arguments.of("unclassified", OffCpuReason.UNSPECIFIED, true, 10L, 0L, 100L, new long[] {0, 0, 100})));
+                Arguments.of("unspecified", OffCpuReason.UNSPECIFIED, true, 10L, 0L, 100L, new long[] {0, 0, 100})));
         // Runnable and preempted intervals never left the run queue, whatever the reading.
         for (OffCpuReason reason : List.of(OffCpuReason.RUNNABLE, OffCpuReason.PREEMPTED)) {
             cases.add(Arguments.of(reason + " overshooting", reason, true, 103L, 20L, 100L, new long[] {0, 80, 0}));
@@ -508,8 +497,8 @@ class StackProfileTest {
     }
 
     /** Rows of the time-split fixture: blocked, runnable and preempted in turn, each with a run-queue reading. */
-    private static List<JsonObject> splitObservations(long tid) {
-        List<JsonObject> rows = observations(tid, row -> ALL_REASONS.get(row % 3));
+    private static List<CaptureProto.Observation.Builder> splitObservations(long tid) {
+        List<CaptureProto.Observation.Builder> rows = observations(tid, row -> ALL_REASONS.get(row % 3));
         for (int row = 0; row < rows.size(); row++) {
             long duration = 3000 + 7L * row * row;
             Long reading =
@@ -521,88 +510,78 @@ class StackProfileTest {
                         case 1 -> duration + 5; // runnable, the scheduler clock ran a little ahead
                         default -> row % 3 == 1 ? duration - 3 : duration;
                     };
-            if (reading != null) rows.get(row).addProperty("runqueueNanos", Long.toString(reading));
+            if (reading != null) rows.get(row).setRunqueueNanos(reading);
         }
         return rows;
     }
 
-    private static JsonObject timeSplit(String source) {
-        JsonObject value = new JsonObject();
-        value.addProperty("source", source);
-        return value;
-    }
-
-    private static Path v4Capture(Path dir, Path jfr, List<JsonObject> rows, JsonObject timeSplit) throws IOException {
-        JsonObject counters = reasonCounters();
-        counters.addProperty("runqueueInversions", "1");
+    private static Path splitCapture(
+            Path dir, Path jfr, List<CaptureProto.Observation.Builder> rows, CaptureProto.TimeSplit timeSplit)
+            throws IOException {
         return CorrelationFixture.source(
-                Files.createDirectories(dir), jfr, rows, sampling(ALL_REASONS), 4, counters, timeSplit);
+                Files.createDirectories(dir),
+                jfr,
+                rows,
+                sampling(ALL_REASONS),
+                REASON_COUNTERS.andThen(kernel -> kernel.setRunqueueInversions(1)),
+                timeSplit);
     }
 
     private static BigInteger totalNanos(Path summary) throws IOException {
-        return new BigInteger(summaryOf(summary).get("totalNanos").getAsString());
+        return new BigInteger(summaryOf(summary).getTotalNanos());
     }
 
     /**
-     * A version 4 capture splits each reason's time into sleeping and run-queue parts: the report, the profile and
+     * A capture with the sched_info source splits each reason's time into sleeping and run-queue parts: the report, the profile and
      * every {@code --time} slice agree, and the parts always add up to the whole.
      */
     @Test
     void sleepingAndRunqueue(@TempDir Path dir) throws Exception {
         Path jfr = recording(dir);
         long tid = sampleThread(jfr);
-        Path source = v4Capture(dir.resolve("split"), jfr, splitObservations(tid), timeSplit("schedInfo"));
+        Path source = splitCapture(dir.resolve("split"), jfr, splitObservations(tid), SCHED_INFO);
         Path analysis = correlate(source, jfr, dir.resolve("analysis"));
 
-        JsonObject reasons = report(analysis).getAsJsonObject("offCpuReasons");
-        JsonObject matched = reasons.getAsJsonObject("matched");
-        java.util.function.BiFunction<String, String, String> part =
-                (reason, key) -> matched.getAsJsonObject(reason).get(key).getAsString();
+        ReportProto.OffCpuReasons reasons = report(analysis).getOffCpuReasons();
+        ReportProto.ReasonTotals blocked = matched(reasons, OffCpuReason.BLOCKED);
+        ReportProto.ReasonTotals runnable = matched(reasons, OffCpuReason.RUNNABLE);
+        ReportProto.ReasonTotals preempted = matched(reasons, OffCpuReason.PREEMPTED);
         // Durations are 3000 + 7 row^2 ns: blocked rows 0, 3, 6, 9; runnable 1, 4, 7, 10; preempted 2, 5, 8, 11.
-        assertThat(part.apply("blocked", "sleepingNanos"))
-                .as("Blocked sleeping: %s", matched)
-                .isEqualTo("5063");
-        assertThat(part.apply("blocked", "runqueueNanos"))
-                .as("Blocked run queue: %s", matched)
-                .isEqualTo("1000");
-        assertThat(part.apply("blocked", "unsplitNanos"))
-                .as("Blocked unsplit: %s", matched)
-                .isEqualTo("6819");
-        assertThat(part.apply("runnable", "runqueueNanos"))
-                .as("Runnable run queue: %s", matched)
-                .isEqualTo("13162");
-        assertThat(part.apply("runnable", "sleepingNanos"))
-                .as("Runnable never sleeps: %s", matched)
-                .isEqualTo("0");
-        assertThat(part.apply("preempted", "runqueueNanos"))
-                .as("Preempted run queue: %s", matched)
-                .isEqualTo("13498");
-        for (String reason : ALL_REASONS) {
-            long sum = 0;
-            for (String key : List.of("sleepingNanos", "runqueueNanos", "unsplitNanos")) {
-                sum += Long.parseLong(part.apply(reason, key));
-            }
-            assertThat(sum)
-                    .as("Parts must add up for %s", reason)
-                    .isEqualTo(Long.parseLong(part.apply(reason, "observedNanos")));
+        assertThat(blocked.getSleepingNanos())
+                .as("Blocked sleeping: %s", blocked)
+                .isEqualTo(5063);
+        assertThat(blocked.getRunqueueNanos())
+                .as("Blocked run queue: %s", blocked)
+                .isEqualTo(1000);
+        assertThat(blocked.getUnsplitNanos()).as("Blocked unsplit: %s", blocked).isEqualTo(6819);
+        assertThat(runnable.getRunqueueNanos())
+                .as("Runnable run queue: %s", runnable)
+                .isEqualTo(13162);
+        assertThat(runnable.getSleepingNanos())
+                .as("Runnable never sleeps: %s", runnable)
+                .isZero();
+        assertThat(preempted.getRunqueueNanos())
+                .as("Preempted run queue: %s", preempted)
+                .isEqualTo(13498);
+        for (ReportProto.ReasonTotals totals : reasons.getMatchedList()) {
+            assertThat(totals.getSleepingNanos() + totals.getRunqueueNanos() + totals.getUnsplitNanos())
+                    .as("Parts must add up for %s", totals.getReason())
+                    .isEqualTo(totals.getObservedNanos());
         }
-        JsonObject split = reasons.getAsJsonObject("timeSplit");
-        assertThat(split.get("source").getAsString())
+        ReportProto.TimeSplitReport split = reasons.getTimeSplit();
+        assertThat(split.getSource())
                 .as("Time split accounting: %s", split)
-                .isEqualTo("schedInfo");
-        assertThat(split.get("available").getAsBoolean())
+                .isEqualTo(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_SCHED_INFO);
+        assertThat(split.getAvailable()).as("Time split accounting: %s", split).isTrue();
+        assertThat(split.getRunqueueInversions())
                 .as("Time split accounting: %s", split)
-                .isTrue();
-        assertThat(split.get("runqueueInversions").getAsString())
-                .as("Time split accounting: %s", split)
-                .isEqualTo("1");
-        JsonObject unsplit = split.getAsJsonObject("unsplitIntervals");
-        assertThat(unsplit.get("withoutReading").getAsString())
-                .as("Unsplit causes: %s", unsplit)
-                .isEqualTo("1");
-        assertThat(unsplit.get("readingExceedsInterval").getAsString())
-                .as("Unsplit causes: %s", unsplit)
-                .isEqualTo("1");
+                .isEqualTo(1);
+        assertThat(split.getUnsplitIntervals().getWithoutReading())
+                .as("Unsplit causes: %s", split)
+                .isEqualTo(1);
+        assertThat(split.getUnsplitIntervals().getReadingExceedsInterval())
+                .as("Unsplit causes: %s", split)
+                .isEqualTo(1);
 
         // The default outputs are unchanged by the split: the profile still reproduces the collapsed file.
         Path profile = analysis.resolve(OutputFiles.PROFILE);
@@ -614,9 +593,9 @@ class StackProfileTest {
         assertThat(read.header().timeSplitAvailable())
                 .as("The profile must announce its split")
                 .isTrue();
-        assertThat(read.header().sources().get(0).timeSplitJson())
+        assertThat(read.header().sources().get(0).getTimeSplit())
                 .as("The profile must record its source")
-                .isEqualTo("{\"source\":\"schedInfo\"}");
+                .isEqualTo(SCHED_INFO);
         Path rewritten = dir.resolve("rewritten.pb");
         read.write(rewritten);
         assertThat(rewritten).as("Profile is not canonical").hasSameBinaryContentAs(profile);
@@ -628,10 +607,10 @@ class StackProfileTest {
             String text = stacks(
                     profile, dir.resolve(time + "-slice.collapsed"), "--time", time, "--summary", summary.toString());
             totals.put(time, totalNanos(summary));
-            assertThat(summaryOf(summary).get("time").getAsString())
+            assertThat(summaryOf(summary).getTime())
                     .as("Summary must name its time part")
                     .isEqualTo(time);
-            assertThat(summaryOf(summary).get("unsplitNanos").getAsString())
+            assertThat(summaryOf(summary).getUnsplitNanos())
                     .as("Summary must report the unsplit time: %s", summaryOf(summary))
                     .isEqualTo("6819");
             if (time.equals("split")) {
@@ -664,10 +643,10 @@ class StackProfileTest {
                         + "java_stack_kinds,canonical_java_stack,thread_pool,run,estimate_available");
 
         // A profile without the split refuses the parts, and merging it with one that has them keeps it unsplit.
-        Path v3 = v3Capture(dir.resolve("v3"), jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
+        Path v3 = reasonCapture(dir.resolve("v3"), jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
         Path v3Profile = correlate(v3, jfr, dir.resolve("v3-analysis")).resolve(OutputFiles.PROFILE);
         assertThat(StackProfile.read(v3Profile).header().timeSplitAvailable())
-                .as("A version 3 profile has no split")
+                .as("A profile of a capture with the source off has no split")
                 .isFalse();
         assertThatThrownBy(() -> stacks(v3Profile, dir.resolve("v3-runqueue.collapsed"), "--time", "runqueue"))
                 .isInstanceOf(IOException.class)
@@ -679,9 +658,7 @@ class StackProfileTest {
         long mergedUnsplit = merged.entries().stream()
                 .mapToLong(entry -> entry.split().unsplit())
                 .sum();
-        assertThat(mergedUnsplit)
-                .as("The version 3 input merges as unsplit")
-                .isEqualTo(6819 + read.totalObservedNanos());
+        assertThat(mergedUnsplit).as("The unsplit input merges as unsplit").isEqualTo(6819 + read.totalObservedNanos());
         Path mergedFile = dir.resolve("merged.pb");
         merged.write(mergedFile);
         assertThat(StackProfile.read(mergedFile).entries())
@@ -689,33 +666,27 @@ class StackProfileTest {
                 .isEqualTo(merged.entries());
 
         // With the source off, no row may carry a reading.
-        Path off = v4Capture(dir.resolve("off"), jfr, splitObservations(tid), timeSplit("off"));
-        JsonObject offReport = report(correlate(off, jfr, dir.resolve("off-analysis")));
-        assertThat(offReport.get("invalidSource").getAsInt())
+        Path off = splitCapture(dir.resolve("off"), jfr, splitObservations(tid), OFF);
+        ReportProto.Report offReport = report(correlate(off, jfr, dir.resolve("off-analysis")));
+        assertThat(offReport.getInvalidSource())
                 .as("Rows with a reading under source off must be invalid")
                 .isEqualTo(11);
-        List<JsonObject> plain = observations(tid, row -> ALL_REASONS.get(row % 3));
-        JsonObject offSplit = report(correlate(
-                        v4Capture(dir.resolve("off-plain"), jfr, plain, timeSplit("off")),
+        List<CaptureProto.Observation.Builder> plain = observations(tid, row -> ALL_REASONS.get(row % 3));
+        ReportProto.TimeSplitReport offSplit = report(correlate(
+                        splitCapture(dir.resolve("off-plain"), jfr, plain, OFF),
                         jfr,
                         dir.resolve("off-plain-analysis")))
-                .getAsJsonObject("offCpuReasons")
-                .getAsJsonObject("timeSplit");
-        assertThat(offSplit.get("source").getAsString())
+                .getOffCpuReasons()
+                .getTimeSplit();
+        assertThat(offSplit.getSource())
                 .as("Source off: %s", offSplit)
-                .isEqualTo("off");
-        assertThat(offSplit.get("available").getAsBoolean())
-                .as("Source off: %s", offSplit)
-                .isFalse();
-        // Version 4 always names its source, and an older capture never does.
+                .isEqualTo(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_OFF);
+        assertThat(offSplit.getAvailable()).as("Source off: %s", offSplit).isFalse();
+        // A capture always names its source; an unspecified one is refused, never read as off.
         assertThatThrownBy(() -> correlate(
-                        v4Capture(dir.resolve("unnamed"), jfr, plain, null), jfr, dir.resolve("unnamed-analysis")))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Source schema/timeSplit mismatch");
-        assertThatThrownBy(() -> correlate(
-                        v4Capture(dir.resolve("wakeup"), jfr, plain, timeSplit("wakeup")),
+                        splitCapture(dir.resolve("unnamed"), jfr, plain, CaptureProto.TimeSplit.getDefaultInstance()),
                         jfr,
-                        dir.resolve("wakeup-analysis")))
+                        dir.resolve("unnamed-analysis")))
                 .isInstanceOf(IOException.class)
                 .hasMessageContaining("Unknown timeSplit source");
     }
@@ -790,7 +761,7 @@ class StackProfileTest {
                         500,
                         0));
         Path profile = dir.resolve("packages.pb");
-        new StackProfile(new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of()), entries)
+        new StackProfile(new StackProfile.Header(List.of(), List.of("reason"), false, null, "", List.of()), entries)
                 .write(profile);
 
         assertThat(stacks(profile, dir.resolve("full.collapsed"), "--package-names", "full"))
@@ -809,10 +780,10 @@ class StackProfileTest {
         assertThat(dropped)
                 .as("Dropped packages")
                 .isEqualTo("Thread.run;Native.epollWait0 3\nThread.run;Worker.park 3\n");
-        assertThat(summaryOf(summary).get("packageNames").getAsString())
+        assertThat(summaryOf(summary).getPackageNames())
                 .as("Summary must name the mode")
                 .isEqualTo("drop");
-        assertThat(summaryOf(summary).get("totalNanos").getAsString())
+        assertThat(summaryOf(summary).getTotalNanos())
                 .as("Dropping packages keeps the time")
                 .isEqualTo("5500");
         // Filters match the full names, whatever is shown.
@@ -879,7 +850,7 @@ class StackProfileTest {
 
     /**
      * Native frames that async-profiler records inside the Java stack keep their library whatever the package-names
-     * mode: by their JFR_NATIVE kind, and, in a profile written before frames had kinds, by a native-looking name.
+     * mode: by their JFR_NATIVE kind, and, as a second line of defence, by a native-looking name.
      */
     @Test
     void nativeFrames(@TempDir Path dir) throws Exception {
@@ -929,7 +900,7 @@ class StackProfileTest {
                         1,
                         1000,
                         0));
-        StackProfile.Header header = new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of());
+        StackProfile.Header header = new StackProfile.Header(List.of(), List.of("reason"), false, null, "", List.of());
         StackProfile written = new StackProfile(header, entries);
         Path profile = dir.resolve("native.pb");
         written.write(profile);
@@ -958,16 +929,16 @@ class StackProfileTest {
                     "^libjvm\\.so\\.",
                     "--summary",
                     summary.toString());
-            assertThat(summaryOf(summary).get("totalNanos").getAsString())
+            assertThat(summaryOf(summary).getTotalNanos())
                     .as("Filtered totals changed with %s: %s", mode, summaryOf(summary))
                     .isEqualTo("3000");
-            assertThat(summaryOf(summary).get("intervals").getAsString())
+            assertThat(summaryOf(summary).getIntervals())
                     .as("Filtered totals changed with %s: %s", mode, summaryOf(summary))
-                    .isEqualTo("3");
+                    .isEqualTo(3);
         }
 
-        // A schema 1 profile tags every frame JAVA; it still reads, and the name rule protects its native frames.
-        List<StackProfile.Entry> legacyEntries = entries.stream()
+        // Frames all tagged JAVA, as another capture's recording could tag them: the name rule protects the native one.
+        List<StackProfile.Entry> javaEntries = entries.stream()
                 .map(entry -> new StackProfile.Entry(
                         entry.javaStack().stream()
                                 .map(frame -> new StackProfile.Frame(java, frame.name(), ""))
@@ -981,14 +952,14 @@ class StackProfileTest {
                         entry.observedNanos(),
                         entry.estimatedNanos()))
                 .toList();
-        Path legacy = dir.resolve("legacy.pb");
-        schemaVersion(new StackProfile(header, legacyEntries), 1, legacy);
-        String legacyDropped = stacks(legacy, dir.resolve("legacy.collapsed"), "--package-names", "drop");
-        assertThat(legacyDropped)
-                .as("A schema 1 profile's native frames must keep their names")
+        Path allJava = dir.resolve("all-java.pb");
+        new StackProfile(header, javaEntries).write(allJava);
+        String allJavaDropped = stacks(allJava, dir.resolve("all-java.collapsed"), "--package-names", "drop");
+        assertThat(allJavaDropped)
+                .as("A native-looking name must keep its library even as a JAVA frame")
                 .isEqualTo("Thread.run;Class.method 3\nThread.run;libjvm.so.Unsafe_Park 3\n");
-        // Merged with a newer profile, a frame either input calls JFR_NATIVE is JFR_NATIVE.
-        StackProfile merged = StackProfile.merge(List.of(StackProfile.read(legacy), read));
+        // Merged, a frame either input calls JFR_NATIVE is JFR_NATIVE.
+        StackProfile merged = StackProfile.merge(List.of(StackProfile.read(allJava), read));
         assertThat(merged.entries())
                 .as("Stacks that differ only in kinds must merge")
                 .hasSize(2)
@@ -997,17 +968,14 @@ class StackProfileTest {
         assertThat(merged.totalObservedNanos())
                 .as("Merging must keep every nanosecond")
                 .isEqualTo(12_000);
-        // A schema 1 profile cannot carry the kind schema 2 introduced, and an unknown schema is refused by name.
-        Path forged = dir.resolve("forged.pb");
-        schemaVersion(written, 1, forged);
-        assertThatThrownBy(() -> StackProfile.read(forged))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Invalid frame kind");
-        Path future = dir.resolve("future.pb");
-        schemaVersion(written, StackProfile.SCHEMA_VERSION + 1, future);
-        assertThatThrownBy(() -> StackProfile.read(future))
-                .isInstanceOf(IOException.class)
-                .hasMessageContaining("Unsupported stack profile schema " + (StackProfile.SCHEMA_VERSION + 1));
+        // An older or a newer schema is refused by name rather than read with fields it does not have.
+        for (int schema : new int[] {1, StackProfile.SCHEMA_VERSION - 1, StackProfile.SCHEMA_VERSION + 1}) {
+            Path other = dir.resolve("schema-" + schema + ".pb");
+            schemaVersion(written, schema, other);
+            assertThatThrownBy(() -> StackProfile.read(other))
+                    .isInstanceOf(IOException.class)
+                    .hasMessageContaining("Unsupported stack profile schema " + schema);
+        }
     }
 
     /** Writes a profile with its profile_start's schema version replaced, as an older or newer writer would. */
@@ -1036,8 +1004,9 @@ class StackProfileTest {
                 .toList();
     }
 
-    private static JsonObject summaryOf(Path file) throws IOException {
-        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+    private static AnalysisProto.SliceSummary summaryOf(Path file) throws IOException {
+        return CorrelationFixture.parse(file, AnalysisProto.SliceSummary.newBuilder())
+                .build();
     }
 
     /**
@@ -1087,7 +1056,7 @@ class StackProfileTest {
                         0));
         List<String> grouped = List.of("reason", ProfileAccumulator.KERNEL, ProfileAccumulator.USER, "thread");
         Path profile = dir.resolve("filters.pb");
-        new StackProfile(new StackProfile.Header(List.of(), grouped, false, "{}", "", List.of()), entries)
+        new StackProfile(new StackProfile.Header(List.of(), grouped, false, null, "", List.of()), entries)
                 .write(profile);
 
         String all = stacks(profile, dir.resolve("all.collapsed"));
@@ -1105,24 +1074,16 @@ class StackProfileTest {
                 summary.toString());
         assertThat(netty).as("Netty wait not dropped").doesNotContain("epollWait0");
         assertThat(netty.lines()).as("Netty wait not dropped: %s", netty).hasSize(2);
-        JsonObject counts = summaryOf(summary);
-        assertThat(counts.get("intervals").getAsString())
-                .as("Kept intervals: %s", counts)
-                .isEqualTo("3");
-        assertThat(counts.get("totalNanos").getAsString())
-                .as("Kept nanos: %s", counts)
-                .isEqualTo("2500");
-        JsonObject filtered = counts.getAsJsonObject("filtered");
-        assertThat(filtered.get("intervals").getAsString())
-                .as("Filtered intervals: %s", counts)
-                .isEqualTo("3");
-        assertThat(filtered.get("totalNanos").getAsString())
-                .as("Filtered nanos: %s", counts)
-                .isEqualTo("3000");
-        assertThat(counts.getAsJsonArray("exclude").asList())
+        AnalysisProto.SliceSummary counts = summaryOf(summary);
+        assertThat(counts.getIntervals()).as("Kept intervals: %s", counts).isEqualTo(3);
+        assertThat(counts.getTotalNanos()).as("Kept nanos: %s", counts).isEqualTo("2500");
+        AnalysisProto.FilteredSlice filtered = counts.getFiltered();
+        assertThat(filtered.getIntervals()).as("Filtered intervals: %s", counts).isEqualTo(3);
+        assertThat(filtered.getTotalNanos()).as("Filtered nanos: %s", counts).isEqualTo("3000");
+        assertThat(counts.getExcludeList())
                 .as("Patterns must be reported: %s", counts)
                 .hasSize(1);
-        assertThat(counts.getAsJsonArray("filterScope").asList())
+        assertThat(counts.getFilterScopeList())
                 .as("Every grouped stack is searched: %s", counts)
                 .hasSize(3);
 
@@ -1156,7 +1117,7 @@ class StackProfileTest {
                         none.toString()))
                 .as("Exclusion must win")
                 .isEmpty();
-        assertThat(summaryOf(none).getAsJsonObject("filtered").get("totalNanos").getAsString())
+        assertThat(summaryOf(none).getFiltered().getTotalNanos())
                 .as("An empty slice still accounts for the time: %s", summaryOf(none))
                 .isEqualTo("5500");
 
@@ -1204,12 +1165,12 @@ class StackProfileTest {
                 "--summary",
                 fromSummary.toString());
         assertThat(mixed).as("Inline and file patterns combine").isEmpty();
-        assertThat(summaryOf(fromSummary).getAsJsonArray("include").toString())
+        assertThat(summaryOf(fromSummary).getIncludeList())
                 .as("The summary lists the patterns read from files: %s", summaryOf(fromSummary))
-                .isEqualTo("[\"futex_wait\",\"sched_yield\"]");
-        assertThat(summaryOf(fromSummary).getAsJsonArray("exclude").toString())
+                .containsExactly("futex_wait", "sched_yield");
+        assertThat(summaryOf(fromSummary).getExcludeList())
                 .as("The summary lists the patterns read from files: %s", summaryOf(fromSummary))
-                .isEqualTo("[\"futex_wait\",\"sched_yield\"]");
+                .containsExactly("futex_wait", "sched_yield");
         // A pattern that starts with '#' is escaped, since such a line is a comment.
         assertThat(OffCpuCorrelator.patternFile(
                         "--exclude-from",
@@ -1237,7 +1198,7 @@ class StackProfileTest {
         // A profile not grouped by kernel stacks cannot be filtered by them, and the summary says so.
         Path narrow = dir.resolve("narrow.pb");
         new StackProfile(
-                        new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of()),
+                        new StackProfile.Header(List.of(), List.of("reason"), false, null, "", List.of()),
                         entries.stream()
                                 .map(entry -> new StackProfile.Entry(
                                         entry.javaStack(),
@@ -1253,12 +1214,12 @@ class StackProfileTest {
                 .write(narrow);
         Path narrowSummary = dir.resolve("narrow.json");
         stacks(narrow, dir.resolve("narrow.collapsed"), "--exclude", "ep_poll", "--summary", narrowSummary.toString());
-        JsonObject narrowCounts = summaryOf(narrowSummary);
-        assertThat(narrowCounts.getAsJsonObject("filtered").get("intervals").getAsString())
+        AnalysisProto.SliceSummary narrowCounts = summaryOf(narrowSummary);
+        assertThat(narrowCounts.getFiltered().getIntervals())
                 .as("Nothing to match: %s", narrowCounts)
-                .isEqualTo("0");
-        assertThat(narrowCounts.getAsJsonArray("filterScope").toString())
+                .isZero();
+        assertThat(narrowCounts.getFilterScopeList())
                 .as("Scope must show what was searched: %s", narrowCounts)
-                .isEqualTo("[\"java\"]");
+                .containsExactly("java");
     }
 }

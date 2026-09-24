@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.file.Path;
@@ -21,11 +20,11 @@ import java.util.Map;
  * again, which is the whole point of the second pass.
  */
 interface AnalysisOutput {
-    JsonObject analysisInputs();
+    CaptureProto.AnalysisInputs analysisInputs();
 
-    JsonObject sourceCounters();
+    ReportProto.SourceCounters sourceCounters();
 
-    String apStoppedAtNanos();
+    Long apStoppedAtNanos();
 
     int sourceRows();
 
@@ -45,7 +44,7 @@ interface AnalysisOutput {
 
     int identityUnverified();
 
-    String selectedObservedDurationNanos();
+    long selectedObservedDurationNanos();
 
     /** The unscaled selected observed duration of the kept subsample, before any thinning reweight. */
     long observedKeptDurationNanos();
@@ -53,14 +52,14 @@ interface AnalysisOutput {
     /** {@link Thinning#NONE} unless a correlation-time thinning stage was applied. */
     Thinning thinning();
 
-    String submittedButNotParsed();
+    Long submittedButNotParsed();
 
     /** Collapsed weights by root-first stack key, only for stacks with positive selected duration. */
     Map<String, String> collapsedNanos();
 
-    JsonObject jfrSelection();
+    ReportProto.JfrSelection jfrSelection();
 
-    OfflineCorrelator.PopulationEstimate populationEstimate();
+    ReportProto.PopulationEstimate populationEstimate();
 
     /** Every matched pair's delivery delay, ascending, for the report's percentiles. */
     long[] sortedHandlerDelays();
@@ -90,13 +89,13 @@ interface AnalysisOutput {
         throw new UnsupportedOperationException("Per-reason collapsed stacks need the streamed view");
     }
 
-    /** The report's switch-out reason accounting, or null for a capture without classification. */
-    default JsonObject offCpuReasons() {
+    /** The report's switch-out reason accounting, or null when the view cannot produce it. */
+    default ReportProto.OffCpuReasons offCpuReasons() {
         return null;
     }
 
     /** The stack profile of this analysis, or null when the view cannot produce one. */
-    default StackProfile stackProfile(String reportJson) throws IOException {
+    default StackProfile stackProfile() throws IOException {
         return null;
     }
 
@@ -104,17 +103,17 @@ interface AnalysisOutput {
     static AnalysisOutput of(OfflineCorrelator.Analysis analysis) {
         return new AnalysisOutput() {
             @Override
-            public JsonObject analysisInputs() {
+            public CaptureProto.AnalysisInputs analysisInputs() {
                 return analysis.analysisInputs();
             }
 
             @Override
-            public JsonObject sourceCounters() {
+            public ReportProto.SourceCounters sourceCounters() {
                 return analysis.sourceCounters();
             }
 
             @Override
-            public String apStoppedAtNanos() {
+            public Long apStoppedAtNanos() {
                 return analysis.apStoppedAtNanos();
             }
 
@@ -141,8 +140,9 @@ interface AnalysisOutput {
             @Override
             public long sourceRowsWithoutSelectedJfrSample() {
                 return analysis.records().stream()
-                        .filter(row -> "source".equals(row.stream())
-                                && "sample-not-present-in-selected-jfr".equals(row.reason()))
+                        .filter(row -> row.hasSource()
+                                && row.getReason()
+                                        == ReportProto.RowReason.ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR)
                         .count();
             }
 
@@ -167,13 +167,13 @@ interface AnalysisOutput {
             }
 
             @Override
-            public String selectedObservedDurationNanos() {
+            public long selectedObservedDurationNanos() {
                 return analysis.selectedObservedDurationNanos();
             }
 
             @Override
             public long observedKeptDurationNanos() {
-                return Long.parseLong(analysis.selectedObservedDurationNanos());
+                return analysis.selectedObservedDurationNanos();
             }
 
             @Override
@@ -182,7 +182,7 @@ interface AnalysisOutput {
             }
 
             @Override
-            public String submittedButNotParsed() {
+            public Long submittedButNotParsed() {
                 return analysis.submittedButNotParsed();
             }
 
@@ -192,12 +192,12 @@ interface AnalysisOutput {
             }
 
             @Override
-            public JsonObject jfrSelection() {
+            public ReportProto.JfrSelection jfrSelection() {
                 return analysis.jfrSelection();
             }
 
             @Override
-            public OfflineCorrelator.PopulationEstimate populationEstimate() {
+            public ReportProto.PopulationEstimate populationEstimate() {
                 return analysis.populationEstimate();
             }
 
@@ -218,30 +218,12 @@ interface AnalysisOutput {
 
             @Override
             public void writeClassifiedRecords(BufferedWriter writer) throws IOException {
-                Gson gson = new GsonBuilder().serializeNulls().create();
-                for (var row : analysis.records()) {
-                    gson.toJson(row, writer);
-                    writer.newLine();
-                }
+                for (var row : analysis.records()) line(writer, row);
             }
 
             @Override
             public void writeMatches(BufferedWriter writer) throws IOException {
-                Gson gson = new GsonBuilder().serializeNulls().create();
-                for (var match : analysis.matches()) {
-                    JsonObject row = new JsonObject();
-                    row.addProperty(
-                            "correlationId",
-                            match.observation().get("correlationId").getAsString());
-                    row.addProperty("fromNanos", match.fromNanos().toString());
-                    row.addProperty("toNanos", match.toNanos().toString());
-                    row.addProperty("durationNanos", match.durationNanos().toString());
-                    row.addProperty(
-                            "handlerDelayNanos", match.handlerDelayNanos().toString());
-                    row.addProperty("threadIdentityVerified", match.threadIdentityVerified());
-                    gson.toJson(row, writer);
-                    writer.newLine();
-                }
+                for (var match : analysis.matches()) line(writer, match.pair());
             }
 
             @Override
@@ -274,21 +256,17 @@ interface AnalysisOutput {
                 + (narrowedToNanos == null ? "" : "[INCOMPLETE capture: window narrowed to " + narrowedToNanos + "];");
         return new AnalysisOutput() {
             @Override
-            public JsonObject analysisInputs() {
+            public CaptureProto.AnalysisInputs analysisInputs() {
                 return result.capture().inputs;
             }
 
             @Override
-            public JsonObject sourceCounters() {
-                // captureEnd's "counters" object is already validated (as a nested object) while
-                // reading the capture, so no second checked validation is needed here.
-                return result.capture().end == null
-                        ? null
-                        : result.capture().end.getAsJsonObject("counters");
+            public ReportProto.SourceCounters sourceCounters() {
+                return OfflineCorrelator.sourceCounters(result.capture());
             }
 
             @Override
-            public String apStoppedAtNanos() {
+            public Long apStoppedAtNanos() {
                 return result.capture().apStoppedAtNanos;
             }
 
@@ -338,10 +316,10 @@ interface AnalysisOutput {
             }
 
             @Override
-            public String selectedObservedDurationNanos() {
+            public long selectedObservedDurationNanos() {
                 return result.thinning()
                         .scale(result.selectedObservedDurationNanos())
-                        .toString();
+                        .longValueExact();
             }
 
             @Override
@@ -355,7 +333,7 @@ interface AnalysisOutput {
             }
 
             @Override
-            public String submittedButNotParsed() {
+            public Long submittedButNotParsed() {
                 return result.submittedButNotParsed();
             }
 
@@ -374,12 +352,12 @@ interface AnalysisOutput {
             }
 
             @Override
-            public JsonObject jfrSelection() {
+            public ReportProto.JfrSelection jfrSelection() {
                 return result.selectionMetadata();
             }
 
             @Override
-            public OfflineCorrelator.PopulationEstimate populationEstimate() {
+            public ReportProto.PopulationEstimate populationEstimate() {
                 return result.populationEstimate();
             }
 
@@ -403,36 +381,32 @@ interface AnalysisOutput {
 
             @Override
             public void writeClassifiedRecords(BufferedWriter writer) throws IOException {
-                Gson gson = new GsonBuilder().serializeNulls().create();
                 AuditPass.run(result, source, jfr, selection, new AuditPass.Sink() {
                     @Override
-                    public void source(int row, int slot, String classification, String reason, JsonObject value)
-                            throws IOException {
-                        emit(gson, writer, "source", row, classification, reason, value);
+                    public void source(int slot, ReportProto.ClassifiedRecord record) throws IOException {
+                        line(writer, record);
                     }
 
                     @Override
-                    public void jfr(int row, int slot, String classification, String reason, JsonObject value)
-                            throws IOException {
-                        emit(gson, writer, "jfr", row, classification, reason, value);
+                    public void jfr(int slot, ReportProto.ClassifiedRecord record) throws IOException {
+                        line(writer, record);
                     }
                 });
             }
 
             @Override
             public void writeMatches(BufferedWriter writer) throws IOException {
-                Gson gson = new GsonBuilder().serializeNulls().create();
                 for (int slot = 0; slot < result.sources().size(); slot++) {
                     if (result.sources().outcome(slot) != Outcome.MATCHED) continue;
-                    JsonObject row = new JsonObject();
-                    row.addProperty("correlationId", result.correlationId(slot));
-                    row.addProperty("fromNanos", Long.toString(result.fromNanos(slot)));
-                    row.addProperty("toNanos", Long.toString(result.toNanos(slot)));
-                    row.addProperty("durationNanos", Long.toString(result.durationNanos(slot)));
-                    row.addProperty("handlerDelayNanos", Long.toString(result.handlerDelayNanos(slot)));
-                    row.addProperty("threadIdentityVerified", result.sources().verified(slot));
-                    gson.toJson(row, writer);
-                    writer.newLine();
+                    ReportProto.Pair.Builder row = ReportProto.Pair.newBuilder()
+                            .setCorrelationId(result.correlationId(slot))
+                            .setFromNanos(result.fromNanos(slot))
+                            .setToNanos(result.toNanos(slot))
+                            .setDurationNanos(result.durationNanos(slot))
+                            .setThreadIdentityVerified(result.sources().verified(slot));
+                    Long delay = result.handlerDelayNanos(slot);
+                    if (delay != null) row.setHandlerDelayNanos(delay);
+                    line(writer, row.build());
                 }
             }
 
@@ -470,17 +444,13 @@ interface AnalysisOutput {
             }
 
             @Override
-            public JsonObject offCpuReasons() {
-                if (!result.sampling().classified()) return null;
-                JsonObject value = new JsonObject();
-                value.addProperty(
-                        "semantics",
-                        "switch-out reason: why the scheduler took the thread off the CPU. Each reason's time is"
-                                + " further split into sleeping (a blocked interval before its wakeup) and runqueue"
-                                + " (waiting for a CPU) when the capture recorded run-queue readings; see timeSplit.");
-                com.google.gson.JsonArray selected = new com.google.gson.JsonArray();
-                for (OffCpuReason reason : result.sampling().reasons()) selected.add(reason.label());
-                value.add("selected", selected);
+            public ReportProto.OffCpuReasons offCpuReasons() {
+                ReportProto.OffCpuReasons.Builder value = ReportProto.OffCpuReasons.newBuilder()
+                        .setSemantics("switch-out reason: why the scheduler took the thread off the CPU. Each reason's"
+                                + " time is further split into sleeping (a blocked interval before its wakeup) and"
+                                + " runqueue (waiting for a CPU) when the capture recorded run-queue readings; see"
+                                + " timeSplit.");
+                for (OffCpuReason reason : result.sampling().reasons()) value.addSelected(reason.proto());
                 int reasons = OffCpuReason.values().length;
                 long[] intervals = new long[reasons];
                 long[] nanos = new long[reasons];
@@ -497,93 +467,62 @@ interface AnalysisOutput {
                         split[reason][part] = Math.addExact(split[reason][part], parts[part]);
                     }
                 }
-                JsonObject matched = new JsonObject();
                 for (OffCpuReason reason : result.sampling().reasons()) {
-                    JsonObject counts = new JsonObject();
-                    counts.addProperty("intervals", Long.toString(intervals[reason.ordinal()]));
-                    counts.addProperty("observedNanos", Long.toString(nanos[reason.ordinal()]));
-                    for (TimeSplit.Part part : TimeSplit.Part.values()) {
-                        counts.addProperty(
-                                part.label() + "Nanos", Long.toString(split[reason.ordinal()][part.ordinal()]));
-                    }
-                    matched.add(reason.label(), counts);
+                    int index = reason.ordinal();
+                    value.addMatched(ReportProto.ReasonTotals.newBuilder()
+                            .setReason(reason.proto())
+                            .setIntervals(intervals[index])
+                            .setObservedNanos(nanos[index])
+                            .setSleepingNanos(split[index][TimeSplit.Part.SLEEPING.ordinal()])
+                            .setRunqueueNanos(split[index][TimeSplit.Part.RUNQUEUE.ordinal()])
+                            .setUnsplitNanos(split[index][TimeSplit.Part.UNSPLIT.ordinal()]));
                 }
-                value.add("matched", matched);
-                TimeSplit.Source source = result.timeSplit();
-                JsonObject timeSplit = new JsonObject();
-                timeSplit.addProperty("source", source.label());
-                timeSplit.addProperty("available", source.available());
-                timeSplit.addProperty(
-                        "rule",
-                        "runqueue is the growth of the scheduler's sched_info.run_delay across the interval. A"
-                                + " blocked interval sleeps for its duration minus that and then waits that long for"
-                                + " a CPU; a runnable or preempted interval is runqueue throughout. An interval"
-                                + " without a reading, or a blocked one whose reading exceeds its duration, is"
-                                + " unsplit.");
-                JsonObject unsplit = new JsonObject();
-                unsplit.addProperty(
-                        "withoutReading", Long.toString(unsplitIntervals[TimeSplit.Outcome.NO_READING.ordinal()]));
-                unsplit.addProperty(
-                        "readingExceedsInterval",
-                        Long.toString(unsplitIntervals[TimeSplit.Outcome.EXCEEDS_INTERVAL.ordinal()]));
-                timeSplit.add("unsplitIntervals", unsplit);
-                JsonObject counters = result.capture().end == null
-                        ? null
-                        : result.capture().end.getAsJsonObject("counters").getAsJsonObject("kernel");
-                com.google.gson.JsonElement inversions = counters == null ? null : counters.get("runqueueInversions");
-                timeSplit.add(
-                        "runqueueInversions", inversions == null ? com.google.gson.JsonNull.INSTANCE : inversions);
-                value.add("timeSplit", timeSplit);
                 // The kernel counts every switch-out by reason before its filter, so a blocked-only capture
                 // still shows how often its threads were preempted.
-                JsonObject kernel = result.capture().end == null
-                        ? null
-                        : result.capture().end.getAsJsonObject("counters").getAsJsonObject("kernel");
-                JsonObject switchOuts = new JsonObject();
-                for (String reason : List.of("blocked", "runnable", "preempted")) {
-                    String key = "switchOuts" + Character.toUpperCase(reason.charAt(0)) + reason.substring(1);
-                    switchOuts.add(reason, kernel == null ? com.google.gson.JsonNull.INSTANCE : kernel.get(key));
-                }
-                value.add("kernelSwitchOuts", switchOuts);
-                for (String key : List.of("reasonRejections", "reasonRejectedDurationMicros")) {
-                    value.add(key, kernel == null ? com.google.gson.JsonNull.INSTANCE : kernel.get(key));
-                }
-                return value;
+                CaptureProto.KernelCounters kernel = result.capture().end == null
+                        ? CaptureProto.KernelCounters.getDefaultInstance()
+                        : result.capture().end.getKernelCounters();
+                TimeSplit.Source source = result.timeSplit();
+                value.setTimeSplit(ReportProto.TimeSplitReport.newBuilder()
+                        .setSource(source.proto())
+                        .setAvailable(source.available())
+                        .setRule("runqueue is the growth of the scheduler's sched_info.run_delay across the"
+                                + " interval. A blocked interval sleeps for its duration minus that and then waits"
+                                + " that long for a CPU; a runnable or preempted interval is runqueue throughout. An"
+                                + " interval without a reading, or a blocked one whose reading exceeds its duration,"
+                                + " is unsplit.")
+                        .setUnsplitIntervals(ReportProto.UnsplitIntervals.newBuilder()
+                                .setWithoutReading(unsplitIntervals[TimeSplit.Outcome.NO_READING.ordinal()])
+                                .setReadingExceedsInterval(
+                                        unsplitIntervals[TimeSplit.Outcome.EXCEEDS_INTERVAL.ordinal()]))
+                        .setRunqueueInversions(kernel.getRunqueueInversions()));
+                value.setKernelSwitchOuts(ReportProto.KernelSwitchOuts.newBuilder()
+                        .setBlocked(kernel.getSwitchOutsBlocked())
+                        .setRunnable(kernel.getSwitchOutsRunnable())
+                        .setPreempted(kernel.getSwitchOutsPreempted()));
+                value.setReasonRejections(kernel.getReasonRejections());
+                value.setReasonRejectedDurationMicros(kernel.getReasonRejectedDurationMicros());
+                return value.build();
             }
 
             @Override
-            public StackProfile stackProfile(String reportJson) throws IOException {
-                OfflineCorrelator.PopulationEstimate estimate = result.populationEstimate();
+            public StackProfile stackProfile() throws IOException {
+                ReportProto.PopulationEstimate estimate = result.populationEstimate();
                 return StackProfile.of(
                         result,
-                        reportJson,
                         label,
                         result.capture().sourceDigest,
                         result.capture().jfrDigest,
                         estimate != null
-                                && "available".equals(estimate.status())
+                                && estimate.getStatus() == ReportProto.EstimateStatus.ESTIMATE_STATUS_AVAILABLE
                                 && !result.thinning().active());
             }
         };
     }
 
-    /** Reproduces the field order Gson gives a {@link OfflineCorrelator.ClassifiedRecord} today. */
-    private static void emit(
-            Gson gson,
-            BufferedWriter writer,
-            String stream,
-            int row,
-            String classification,
-            String reason,
-            JsonObject value)
-            throws IOException {
-        JsonObject line = new JsonObject();
-        line.addProperty("stream", stream);
-        line.addProperty("row", row);
-        line.addProperty("classification", classification);
-        line.addProperty("reason", reason);
-        line.add("record", value);
-        gson.toJson(line, writer);
+    /** One message as one line of JSON Lines. */
+    private static void line(BufferedWriter writer, com.google.protobuf.Message message) throws IOException {
+        writer.write(ProtoJson.line(message));
         writer.newLine();
     }
 }

@@ -4,9 +4,12 @@ package io.github.lhotari.jonoffcpu.offline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.CaptureFixtures;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TopResult;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TopRow;
+import io.github.lhotari.jonoffcpu.profile.ProfileProto;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,7 +36,14 @@ class TopTest {
         return new StackProfile.Entry(stack, null, null, OffCpuReason.BLOCKED, 1, thread, intervals, nanos, nanos * 2);
     }
 
-    private static Path profile(Path dir, String name, String sampling, boolean estimate) throws IOException {
+    private static Path profile(Path dir, String name, CaptureProto.Sampling sampling, boolean estimate)
+            throws IOException {
+        return profile(dir, name, sampling, estimate, null);
+    }
+
+    private static Path profile(
+            Path dir, String name, CaptureProto.Sampling sampling, boolean estimate, ReportProto.Report report)
+            throws IOException {
         List<StackProfile.Entry> entries = List.of(
                 // The boundary is the deepest application frame, past interleaved library frames.
                 entry(
@@ -67,10 +77,15 @@ class TopTest {
         Path path = dir.resolve(name + ".pb");
         new StackProfile(
                         new StackProfile.Header(
-                                List.of(new StackProfile.Provenance(name, 1, "", "", sampling, "1", 0, 0, 0, "")),
+                                List.of(ProfileProto.Provenance.newBuilder()
+                                        .setSessionId(name)
+                                        .setCaptureEpoch(1)
+                                        .setSampling(sampling)
+                                        .setThinningProbability("1")
+                                        .build()),
                                 List.of("reason", "thread"),
                                 estimate,
-                                "{}",
+                                report,
                                 "",
                                 List.of()),
                         entries)
@@ -78,30 +93,24 @@ class TopTest {
         return path;
     }
 
-    static final String PROPORTIONAL =
-            "{\"reasons\":[\"blocked\"],\"admission\":{\"policy\":\"proportional\",\"recordAllAboveMicros\":10000}}";
-    static final String NONE = "{\"reasons\":[\"blocked\"],\"admission\":{\"policy\":\"none\"}}";
+    static final CaptureProto.Sampling PROPORTIONAL =
+            CaptureFixtures.proportionalSampling(10000, CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED);
+    static final CaptureProto.Sampling NONE = CaptureProto.Sampling.newBuilder()
+            .addReasons(CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED)
+            .setNone(CaptureProto.NoAdmission.getDefaultInstance())
+            .build();
 
-    private static JsonObject json(String... args) throws Exception {
+    private static TopResult json(String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of("top", "--format", "json"));
         command.addAll(List.of(args));
         CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code()).as("top failed: %s", invocation).isZero();
-        return JsonParser.parseString(invocation.out()).getAsJsonObject();
+        return CorrelationFixture.parse(invocation.out(), TopResult.newBuilder())
+                .build();
     }
 
-    private static JsonObject row(JsonObject result, String table, int index) {
-        return result.getAsJsonArray(table).get(index).getAsJsonObject();
-    }
-
-    private static List<String> column(JsonObject result, String table, String field) {
-        return result.getAsJsonArray(table).asList().stream()
-                .map(row -> row.getAsJsonObject().get(field).getAsString())
-                .toList();
-    }
-
-    private static String value(JsonObject object) {
-        return object.get("value").getAsBigDecimal().toPlainString();
+    private static List<String> keys(List<TopRow> rows) {
+        return rows.stream().map(TopRow::getKey).toList();
     }
 
     private static List<String> common(Path profile) {
@@ -111,78 +120,71 @@ class TopTest {
     @Test
     void boundaryTable(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
-        JsonObject boundary = json(common(profile).toArray(String[]::new));
-        JsonObject first = row(boundary, "rows", 0);
+        TopResult boundary = json(common(profile).toArray(String[]::new));
+        TopRow first = boundary.getRows(0);
         String boundaryMessage = "Boundary past a library frame, with its blocker: " + first;
-        assertThat(first.get("boundary").getAsString()).as(boundaryMessage).isEqualTo("x.B.o");
-        assertThat(first.get("blocker").getAsString())
-                .as(boundaryMessage)
-                .isEqualTo("java.util.concurrent.locks.ReentrantLock.lock");
-        assertThat(value(first)).as(boundaryMessage).isEqualTo("3.000");
-        assertThat(first.get("intervals").getAsInt()).as(boundaryMessage).isEqualTo(3);
-        assertThat(first.get("caller").getAsString()).as(boundaryMessage).isEqualTo("x.A.m");
-        assertThat(row(boundary, "rows", 1).get("blocker").getAsString())
+        assertThat(first.getKey()).as(boundaryMessage).isEqualTo("x.B.o");
+        assertThat(first.getBlocker()).as(boundaryMessage).isEqualTo("java.util.concurrent.locks.ReentrantLock.lock");
+        assertThat(first.getValue()).as(boundaryMessage).isEqualTo("3.000");
+        assertThat(first.getIntervals()).as(boundaryMessage).isEqualTo(3);
+        assertThat(first.getCaller()).as(boundaryMessage).isEqualTo("x.A.m");
+        assertThat(first.getReason()).as(boundaryMessage).isEqualTo(CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED);
+        assertThat(boundary.getRows(1).getBlocker())
                 .as("A monitor wait's blocker")
                 .isEqualTo("C2 Runtime complete_monitor_locking");
-        assertThat(row(boundary, "noApplicationFrame", 0).get("pool").getAsString())
+        assertThat(boundary.getNoApplicationFrame(0).getKey())
                 .as("No application frame goes to the pool table: %s", boundary)
                 .isEqualTo("ZDriverMinor");
-        assertThat(column(boundary, "idle", "boundary"))
+        assertThat(keys(boundary.getIdleList()))
                 .as("The idle entry is listed as idle")
                 .containsExactly("x.A.loop");
-        JsonObject totals = boundary.getAsJsonObject("totals");
+        AnalysisProto.TopTotals totals = boundary.getTotals();
         String totalsMessage =
                 "Totals add up: busy and idle make the selection, rows and pools make the busy: " + totals;
-        assertThat(value(totals.getAsJsonObject("selected"))).as(totalsMessage).isEqualTo("11.750");
-        assertThat(value(totals.getAsJsonObject("idle"))).as(totalsMessage).isEqualTo("7.000");
-        assertThat(value(totals.getAsJsonObject("busy"))).as(totalsMessage).isEqualTo("4.750");
-        assertThat(value(totals.getAsJsonObject("busyApplication")))
-                .as(totalsMessage)
-                .isEqualTo("4.250");
-        assertThat(value(totals.getAsJsonObject("busyNoApplicationFrame")))
+        assertThat(totals.getSelected().getValue()).as(totalsMessage).isEqualTo("11.750");
+        assertThat(totals.getIdle().getValue()).as(totalsMessage).isEqualTo("7.000");
+        assertThat(totals.getBusy().getValue()).as(totalsMessage).isEqualTo("4.750");
+        assertThat(totals.getBusyApplication().getValue()).as(totalsMessage).isEqualTo("4.250");
+        assertThat(totals.getBusyNoApplicationFrame().getValue())
                 .as(totalsMessage)
                 .isEqualTo("0.500");
-        assertThat(totals.getAsJsonObject("overExclusion").get("entries").getAsInt())
-                .as(totalsMessage)
-                .isEqualTo(1);
-        assertThat(column(boundary, "rows", "boundary"))
+        assertThat(totals.getOverExclusion().getEntries()).as(totalsMessage).isEqualTo(1);
+        assertThat(keys(boundary.getRowsList()))
                 .as("An idle entry is never busy")
                 .doesNotContain("x.A.loop");
-        assertThat(row(boundary, "rows", 0).has("estimated"))
+        assertThat(boundary.getRows(0).hasEstimated())
                 .as("No estimate column without an estimate")
                 .isFalse();
+        assertThat(boundary.getSelection().getProfile()).isEqualTo(profile.toString());
         CommandLineFixture.usageError("--by boundary needs --app", "top", "--profile", profile.toString());
     }
 
     @Test
     void otherGroupings(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
-        JsonObject method = json("--profile", profile.toString(), "--by", "method", "--idle", "getTask$");
-        for (var element : method.getAsJsonArray("rows")) {
-            JsonObject row = element.getAsJsonObject();
-            if (row.get("key").getAsString().equals("x.R.r")) {
-                assertThat(row.get("intervals").getAsInt())
+        TopResult method = json("--profile", profile.toString(), "--by", "method", "--idle", "getTask$");
+        for (TopRow row : method.getRowsList()) {
+            if (row.getKey().equals("x.R.r")) {
+                assertThat(row.getIntervals())
                         .as("Recursion counts once: %s", row)
                         .isEqualTo(4);
-                assertThat(value(row)).as("Recursion counts once: %s", row).isEqualTo("0.250");
+                assertThat(row.getValue()).as("Recursion counts once: %s", row).isEqualTo("0.250");
             }
         }
-        JsonObject classes = json("--profile", profile.toString(), "--by", "class", "--limit", "50");
-        assertThat(column(classes, "rows", "key"))
+        TopResult classes = json("--profile", profile.toString(), "--by", "class", "--limit", "50");
+        assertThat(keys(classes.getRowsList()))
                 .as("--by class counts Java frames only")
                 .noneMatch(key -> key.startsWith("libjvm"));
-        JsonObject self = json(
+        TopResult self = json(
                 "--profile", profile.toString(), "--by", "self", "--collapse-leaf-from", "preset:jvm-wait-machinery");
-        assertThat(column(self, "rows", "key"))
+        assertThat(keys(self.getRowsList()))
                 .as("--by self uses the collapsed leaf")
                 .satisfiesAnyOf(
                         keys -> assertThat(keys.get(0)).isEqualTo("x.A.loop"),
                         keys -> assertThat(List.<String>copyOf(keys))
                                 .contains("java.util.concurrent.locks.ReentrantLock.lock"));
-        JsonObject pools = json("--profile", profile.toString(), "--by", "pool", "--idle", "getTask$");
-        assertThat(row(pools, "rows", 0).get("key").getAsString())
-                .as("Pools: %s", pools)
-                .isEqualTo("pool-#-thread-#");
+        TopResult pools = json("--profile", profile.toString(), "--by", "pool", "--idle", "getTask$");
+        assertThat(pools.getRows(0).getKey()).as("Pools: %s", pools).isEqualTo("pool-#-thread-#");
     }
 
     /** Every format carries the same rows. */
@@ -190,13 +192,14 @@ class TopTest {
     void formats(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
         List<String> common = common(profile);
-        JsonObject boundary = json(common.toArray(String[]::new));
+        TopResult boundary = json(common.toArray(String[]::new));
         List<String> mdArgs = new ArrayList<>(List.of("top", "--format", "md"));
         mdArgs.addAll(common);
         String markdown =
                 CommandLineFixture.invoke(mdArgs.toArray(String[]::new)).out();
         assertThat(markdown)
                 .contains("| 1 | `x.B.o` | `java.util.concurrent.locks.ReentrantLock.lock` | 3.000 |")
+                .contains("| blocked |")
                 .contains("Reproduce: `java -jar jonoffcpu-correlator.jar top --format md --profile ");
         List<String> csvArgs = new ArrayList<>(List.of("top", "--format", "csv"));
         csvArgs.addAll(common);
@@ -206,11 +209,10 @@ class TopTest {
                 .toList();
         assertThat(csv)
                 .as("CSV")
-                .hasSize(1
-                        + boundary.getAsJsonArray("rows").size()
-                        + boundary.getAsJsonArray("noApplicationFrame").size()
-                        + boundary.getAsJsonArray("idle").size());
-        assertThat(csv.get(1)).startsWith("rows,1,x.B.o,java.util.concurrent.locks.ReentrantLock.lock,3.000,");
+                .hasSize(1 + boundary.getRowsCount() + boundary.getNoApplicationFrameCount() + boundary.getIdleCount());
+        assertThat(csv.get(1))
+                .startsWith("rows,1,x.B.o,java.util.concurrent.locks.ReentrantLock.lock,3.000,")
+                .contains(",blocked,");
     }
 
     /** Estimated weights need the estimate; a comparison of sampled runs without estimates warns. */
@@ -224,7 +226,7 @@ class TopTest {
                 .hasMessageContaining("estimate is unavailable");
         Path sampled = profile(dir, "sampled", PROPORTIONAL, false);
         Path baseline = profile(dir, "baseline", PROPORTIONAL, false);
-        JsonObject compared = json(
+        TopResult compared = json(
                 "--profile",
                 sampled.toString(),
                 "--baseline",
@@ -237,17 +239,15 @@ class TopTest {
                 "^x\\.",
                 "--idle",
                 "getTask$");
-        JsonObject top = row(compared, "comparison", 0);
-        assertThat(top.get("boundary").getAsString())
-                .as("Seconds per unit: %s", top)
-                .isEqualTo("x.B.o");
-        assertThat(value(top)).as("Seconds per unit: %s", top).isEqualTo("2.000");
-        assertThat(top.get("baseline").getAsBigDecimal().toPlainString())
-                .as("Seconds per unit: %s", top)
-                .isEqualTo("1.000");
-        assertThat(compared.getAsJsonArray("warnings").toString())
+        AnalysisProto.ComparedRow top = compared.getComparison(0);
+        assertThat(top.getBoundary()).as("Seconds per unit: %s", top).isEqualTo("x.B.o");
+        assertThat(top.getValue()).as("Seconds per unit: %s", top).isEqualTo("2.000");
+        assertThat(top.getBaseline()).as("Seconds per unit: %s", top).isEqualTo("1.000");
+        assertThat(compared.getUnit()).isEqualTo("seconds per unit");
+        assertThat(compared.getSelection().getBaseline().getProfile()).isEqualTo(baseline.toString());
+        assertThat(compared.getWarningsList())
                 .as("Sampled runs without estimates warn")
-                .contains("length-biased");
+                .anyMatch(warning -> warning.contains("length-biased"));
         Path estimated = profile(dir, "estimated", PROPORTIONAL, true);
         Path estimatedBaseline = profile(dir, "estimated-baseline", PROPORTIONAL, true);
         CommandLineFixture.usageError(
@@ -261,7 +261,7 @@ class TopTest {
                 "^x\\.");
     }
 
-    /** The digest: written from its JSON, byte-stable, and with the reproduce commands. */
+    /** The digest: written from its message, byte-stable, and with the reproduce commands. */
     @Test
     void digest(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
@@ -277,19 +277,81 @@ class TopTest {
                     .as("%s must be byte-stable", name)
                     .hasSameBinaryContentAs(secondDigest.resolve(name));
         }
-        JsonObject digest = JsonParser.parseString(Files.readString(firstDigest.resolve(OutputFiles.SUMMARY_JSON)))
-                .getAsJsonObject();
+        AnalysisProto.Digest digest = CorrelationFixture.parse(
+                        firstDigest.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+                .build();
         String markdown = Files.readString(firstDigest.resolve(OutputFiles.SUMMARY_MD));
         assertThat(Digest.markdown(digest))
                 .as("The Markdown must be rendered from the JSON")
                 .isEqualTo(markdown);
-        assertThat(digest.get("schemaVersion").getAsInt())
-                .as("Digest schema version")
-                .isEqualTo(1);
-        JsonArray idleRows = digest.getAsJsonObject("idle").getAsJsonArray("rows");
-        assertThat(idleRows.asList())
+        assertThat(digest.hasCapture())
+                .as("A profile without a report has no capture section")
+                .isFalse();
+        assertThat(digest.getIdle().getRowsList())
                 .as("The default idle preset recognises getTask")
                 .hasSize(1);
         assertThat(markdown).as("The digest says how to reproduce each table").contains("## How to reproduce");
+    }
+
+    private static ReportProto.Report report(String session, long sourceRows) {
+        return ReportProto.Report.newBuilder()
+                .setAnalysisInputs(CaptureProto.AnalysisInputs.newBuilder()
+                        .setSessionId(session)
+                        .setSampling(CaptureFixtures.uniformSampling()))
+                .setSourceRows(sourceRows)
+                .setMatched(sourceRows - 1)
+                .build();
+    }
+
+    /** summarize takes the capture section from the report the profile carries, or from a strictly parsed file. */
+    @Test
+    void summarizeReport(@TempDir Path dir) throws Exception {
+        Path profile = profile(dir, "run", NONE, false, report("embedded-session", 7));
+        Path embedded = dir.resolve("embedded");
+        assertThat(CommandLineFixture.invoke(
+                                "summarize", "--profile", profile.toString(), "--output-dir", embedded.toString())
+                        .code())
+                .isZero();
+        AnalysisProto.Digest digest = CorrelationFixture.parse(
+                        embedded.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+                .build();
+        assertThat(digest.getCapture().getSessionId())
+                .as("The profile's own report is the default")
+                .isEqualTo("embedded-session");
+        assertThat(digest.getCapture().getSourceRows()).isEqualTo(7);
+        assertThat(Files.readString(embedded.resolve(OutputFiles.SUMMARY_MD))).contains("- Source rows 7, matched 6");
+
+        Path file = dir.resolve("other-report.json");
+        Files.writeString(file, ProtoJson.pretty(report("file-session", 3)));
+        Path explicit = dir.resolve("explicit");
+        assertThat(CommandLineFixture.invoke(
+                                "summarize",
+                                "--profile",
+                                profile.toString(),
+                                "--report",
+                                file.toString(),
+                                "--output-dir",
+                                explicit.toString())
+                        .code())
+                .isZero();
+        assertThat(CorrelationFixture.parse(
+                                explicit.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+                        .getCapture()
+                        .getSessionId())
+                .as("--report overrides the embedded report")
+                .isEqualTo("file-session");
+
+        Path notReport = dir.resolve("not-a-report.json");
+        Files.writeString(notReport, "{\"entries\": 3}");
+        assertThatThrownBy(() -> CommandLineFixture.invoke(
+                        "summarize",
+                        "--profile",
+                        profile.toString(),
+                        "--report",
+                        notReport.toString(),
+                        "--output-dir",
+                        dir.resolve("refused").toString()))
+                .as("A file that is not a report is refused, not summarised as empty")
+                .isInstanceOf(IOException.class);
     }
 }

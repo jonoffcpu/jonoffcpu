@@ -1,26 +1,19 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.number;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.object;
 import static io.github.lhotari.jonoffcpu.offline.CaptureInput.require;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.text;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * The capture's resolved sampling policy as the agent recorded it in {@code captureStart.sampling}: the
+ * The capture's resolved sampling policy as the agent recorded it in {@code capture_start.sampling}: the
  * switch-out reasons the kernel kept, optional strict duration bounds in microseconds, and the admission policy
- * the kernel applied to eligible intervals. The per-row {@code admissionThreshold} is recomputed from this policy
+ * the kernel applied to eligible intervals. The per-row {@code admission_threshold} is recomputed from this policy
  * exactly as the collector computes it.
- *
- * <p>{@code reasons} is null for a schemaVersion 2 capture, which predates the classification and kept every
- * interval regardless of why it left the CPU.
  */
 record SamplingPolicy(
         List<OffCpuReason> reasons,
@@ -31,54 +24,41 @@ record SamplingPolicy(
     static final BigInteger CERTAIN_ADMISSION = BigInteger.ONE.shiftLeft(32);
     private static final BigInteger THOUSAND = BigInteger.valueOf(1000);
 
-    static SamplingPolicy parse(JsonObject sampling) throws IOException {
-        boolean classified = sampling.has("reasons");
-        require(
-                sampling.keySet()
-                        .equals(
-                                classified
-                                        ? java.util.Set.of("reasons", "minOffCpuMicros", "maxOffCpuMicros", "admission")
-                                        : java.util.Set.of("minOffCpuMicros", "maxOffCpuMicros", "admission")),
-                "Unexpected sampling policy shape");
-        List<OffCpuReason> reasons = classified ? reasons(sampling.get("reasons")) : null;
-        BigInteger minimum = optionalBound(sampling, "minOffCpuMicros");
-        BigInteger maximum = optionalBound(sampling, "maxOffCpuMicros");
+    static SamplingPolicy parse(CaptureProto.Sampling sampling) throws IOException {
+        List<OffCpuReason> reasons = reasons(sampling);
+        BigInteger minimum = sampling.hasMinOffCpuMicros() ? bound(sampling.getMinOffCpuMicros()) : null;
+        BigInteger maximum = sampling.hasMaxOffCpuMicros() ? bound(sampling.getMaxOffCpuMicros()) : null;
         require(minimum == null || maximum == null || minimum.compareTo(maximum) < 0, "Invalid duration policy bounds");
-        JsonObject admission = object(sampling, "admission");
-        String policy = text(admission, "policy");
+        String policy;
         long parameter;
-        switch (policy) {
-            case "uniform" -> {
-                require(
-                        admission.keySet().equals(java.util.Set.of("policy", "probability", "probabilityThreshold")),
-                        "Unexpected uniform admission shape");
-                require(text(admission, "probability").matches("(?:0|1)(?:\\.[0-9]+)?"), "Invalid probability");
-                parameter = number(admission, "probabilityThreshold");
+        switch (sampling.getAdmissionCase()) {
+            case UNIFORM -> {
+                CaptureProto.UniformAdmission uniform = sampling.getUniform();
+                policy = "uniform";
+                require(uniform.getProbability().matches("(?:0|1)(?:\\.[0-9]+)?"), "Invalid probability");
+                parameter = uniform.getProbabilityThreshold();
                 require(
                         parameter >= 1 && parameter <= CERTAIN_ADMISSION.longValueExact(),
                         "Invalid probability threshold");
             }
-            case "proportional" -> {
-                require(
-                        admission.keySet().equals(java.util.Set.of("policy", "recordAllAboveMicros")),
-                        "Unexpected proportional admission shape");
-                long micros = number(admission, "recordAllAboveMicros");
+            case PROPORTIONAL -> {
+                policy = "proportional";
+                long micros = sampling.getProportional().getRecordAllAboveMicros();
                 require(micros >= 1 && micros <= Long.MAX_VALUE / 1000, "Invalid recordAllAboveMicros");
                 parameter = micros * 1000;
             }
-            default -> throw new IOException("Unsupported admission policy: " + policy);
+            case NONE -> throw new IOException("Unsupported admission policy: none");
+            default -> throw new IOException("Missing admission policy");
         }
         return new SamplingPolicy(reasons, minimum, maximum, policy, parameter);
     }
 
     /** A non-empty list of distinct reasons in the canonical order blocked, runnable, preempted. */
-    private static List<OffCpuReason> reasons(JsonElement value) throws IOException {
-        require(value != null && value.isJsonArray(), "Invalid sampling reasons");
+    private static List<OffCpuReason> reasons(CaptureProto.Sampling sampling) throws IOException {
         List<OffCpuReason> reasons = new ArrayList<>();
-        for (JsonElement item : value.getAsJsonArray()) {
-            require(item.isJsonPrimitive() && item.getAsJsonPrimitive().isString(), "Invalid sampling reason");
-            OffCpuReason reason = OffCpuReason.parse(item.getAsString());
-            require(reason != OffCpuReason.UNSPECIFIED, "Invalid sampling reason");
+        for (int value : sampling.getReasonsValueList()) {
+            OffCpuReason reason = OffCpuReason.fromWire(value);
+            require(reason != null && reason != OffCpuReason.UNSPECIFIED, "Invalid sampling reason");
             require(
                     reasons.isEmpty() || reasons.get(reasons.size() - 1).compareTo(reason) < 0,
                     "Sampling reasons must be distinct and canonical");
@@ -88,23 +68,15 @@ record SamplingPolicy(
         return List.copyOf(reasons);
     }
 
-    /** Whether the capture classifies its intervals by switch-out reason. */
-    boolean classified() {
-        return reasons != null;
+    /** A strict bound in microseconds, which must still fit signed nanoseconds. */
+    private static BigInteger bound(long micros) throws IOException {
+        require(micros >= 0 && micros <= Long.MAX_VALUE / 1000, "Duration policy overflows nanoseconds");
+        return BigInteger.valueOf(micros).multiply(THOUSAND);
     }
 
     /** Whether the kernel's reason filter would have kept an interval of this reason. */
     boolean selects(OffCpuReason reason) {
-        return reasons == null ? reason == OffCpuReason.UNSPECIFIED : reasons.contains(reason);
-    }
-
-    private static BigInteger optionalBound(JsonObject sampling, String key) throws IOException {
-        JsonElement value = sampling.get(key);
-        require(value != null, "Missing source bound: " + key);
-        if (value.isJsonNull()) return null;
-        long micros = number(sampling, key);
-        require(micros <= Long.MAX_VALUE / 1000, "Duration policy overflows nanoseconds");
-        return BigInteger.valueOf(micros).multiply(THOUSAND);
+        return reasons.contains(reason);
     }
 
     /** Whether the kernel would have found this duration eligible under the strict bounds. */

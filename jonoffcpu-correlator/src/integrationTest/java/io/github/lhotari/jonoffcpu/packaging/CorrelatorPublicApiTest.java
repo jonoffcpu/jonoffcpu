@@ -26,7 +26,7 @@ class CorrelatorPublicApiTest {
     @ValueSource(
             strings = {
                 "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator",
-                "io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter"
+                "io.github.lhotari.jonoffcpu.offline.SignalJfrExporter"
             })
     void publicApiHidesRelocatedTypes(String name) throws Exception {
         List<String> leaked = new ArrayList<>();

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: MIT
 
-package io.github.lhotari.jonoffcpu.jfr;
+package io.github.lhotari.jonoffcpu.offline;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIOException;
 
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.IOException;
 import java.io.StringWriter;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
 import jdk.jfr.Event;
 import jdk.jfr.Name;
@@ -78,10 +81,16 @@ class SignalJfrExporterTest {
         return path;
     }
 
-    private static String export(Path input) throws IOException {
+    /** The exported JSON Lines, each parsed back strictly into its record. */
+    private static List<SignalProto.SignalRecord> export(Path input) throws IOException {
         StringWriter output = new StringWriter();
         SignalJfrExporter.export(input, output);
-        return output.toString();
+        List<SignalProto.SignalRecord> records = new ArrayList<>();
+        for (String line : output.toString().split("\n")) {
+            records.add(
+                    ProtoJson.parse(line, SignalProto.SignalRecord.newBuilder()).build());
+        }
+        return records;
     }
 
     private static void invalid(Path input, String expected) {
@@ -90,15 +99,19 @@ class SignalJfrExporterTest {
                 .as("Expected invalid recording: " + expected)
                 .isThrownBy(() -> SignalJfrExporter.export(input, output))
                 .withMessageContaining(expected);
-        assertThat(output.toString()).as("Invalid stream marked complete").doesNotContain("\"parseComplete\":true");
+        assertThat(output.toString())
+                .as("Invalid stream marked complete")
+                .doesNotContain("\"parseComplete\":true")
+                .doesNotContain("\"end\"");
     }
 
     @Test
     void valid(@TempDir Path dir) throws IOException {
         String originalName = Thread.currentThread().getName();
-        String output;
+        String name = "quoted\"\\\n\t\u0001Ω";
+        List<SignalProto.SignalRecord> records;
         try {
-            Thread.currentThread().setName("quoted\"\\\n\t\u0001Ω");
+            Thread.currentThread().setName(name);
             Path valid = record(dir, "valid", () -> {
                 new Capture().commit();
                 new Sample().commit();
@@ -107,33 +120,47 @@ class SignalJfrExporterTest {
                 // JFR buffer serialization can place samples after terminal stats.
                 new Sample().commit();
             });
-            output = export(valid);
+            records = export(valid);
         } finally {
             Thread.currentThread().setName(originalName);
         }
-        assertThat(output)
-                .as("Cookie bits lost")
-                .contains("\"correlationId\":\"80000001abcdef01\"")
+        List<SignalProto.SignalSample> samples = records.stream()
+                .filter(SignalProto.SignalRecord::hasSample)
+                .map(SignalProto.SignalRecord::getSample)
+                .toList();
+        assertThat(samples).hasSize(2);
+        SignalProto.SignalSample sample = samples.get(0);
+        assertThat(sample.getCorrelationId()).as("Cookie bits lost").isEqualTo(COOKIE);
+        assertThat(Long.toUnsignedString(sample.getMonotonicTimeNanos()))
                 .as("Unsigned nanos lost")
-                .contains("\"monotonicTimeNanos\":\"18446744073709551615\"")
-                .as("JSON escaping incorrect")
-                .contains("quoted\\\"\\\\\\n\\t\\u0001Ω")
-                // The sample's stack ends in the lambda that committed it.
+                .isEqualTo("18446744073709551615");
+        assertThat(sample.getThreadName()).as("JSON escaping incorrect").isEqualTo(name);
+        // The sample's stack ends in the lambda that committed it.
+        assertThat(sample.getFramesList())
                 .as("Sample stack missing")
-                .contains("\"methodName\":\"lambda$valid$")
-                .as("OS thread identity missing")
-                .contains("\"osThreadId\":")
+                .anyMatch(frame -> frame.getMethodName().startsWith("lambda$valid$"));
+        assertThat(sample.hasOsThreadId()).as("OS thread identity missing").isTrue();
+        assertThat(records.get(records.size() - 1).getEnd())
                 .as("Missing clean end record")
-                .endsWith("\"parseComplete\":true,\"captures\":\"2\",\"samples\":\"2\",\"stats\":\"1\"}\n");
+                .isEqualTo(SignalProto.SignalEnd.newBuilder()
+                        .setParseComplete(true)
+                        .setCaptures(2)
+                        .setSamples(2)
+                        .setStats(1)
+                        .build());
     }
 
     @Test
     void zeroSamples(@TempDir Path dir) throws IOException {
-        String zeroSamples = export(record(dir, "zero", () -> {
+        List<SignalProto.SignalRecord> zeroSamples = export(record(dir, "zero", () -> {
             new Capture().commit();
             new Stats().commit();
         }));
-        assertThat(zeroSamples).as("Valid zero-sample capture rejected").contains("\"samples\":\"0\"");
+        SignalProto.SignalRecord end = zeroSamples.get(zeroSamples.size() - 1);
+        assertThat(end.getEnd().getParseComplete())
+                .as("Valid zero-sample capture rejected")
+                .isTrue();
+        assertThat(end.getEnd().getSamples()).isZero();
     }
 
     @Test

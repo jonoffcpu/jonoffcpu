@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.FileAlreadyExistsException;
@@ -102,7 +102,7 @@ final class CompatibilityJfrWriter {
     /** A retained analysis, for the existing fixture that builds matches by hand. */
     public static Result write(OfflineCorrelator.Analysis analysis, Path output, Options options) throws IOException {
         Objects.requireNonNull(analysis, "analysis");
-        if (analysis.schemaVersion() != 1 || analysis.matches() == null || analysis.analysisInputs() == null) {
+        if (analysis.matches() == null || analysis.analysisInputs() == null) {
             throw new IOException("Unsupported or incomplete correlation analysis");
         }
         return write(SyntheticJfrSource.of(analysis), output, options);
@@ -189,7 +189,7 @@ final class CompatibilityJfrWriter {
             intervals.add(new Planned(interval, divided[0].longValueExact()));
         });
 
-        BigInteger declared = parseUnsigned(source.selectedObservedDurationNanos(), "selected duration");
+        BigInteger declared = BigInteger.valueOf(source.selectedObservedDurationNanos());
         if (!declared.equals(totals.exact))
             throw new IOException("Analysis selected duration does not match intervals");
         BigInteger represented = totals.eventCount.multiply(quantum);
@@ -317,13 +317,11 @@ final class CompatibilityJfrWriter {
     private static void writeMetadata(
             Recording recording, JfrTypes types, SyntheticJfrSource source, Options options, Plan plan)
             throws IOException {
-        JsonObject inputs = source.analysisInputs();
-        JsonObject sourceArtifact = requiredObject(inputs, "sourceArtifact");
-        JsonObject jfrArtifact = requiredObject(inputs, "jfrArtifact");
-        String session = requiredString(inputs, "sessionId");
-        long epoch = requiredLong(inputs, "captureEpoch");
-        String sourceHash = requiredString(sourceArtifact, "rawSha256");
-        String jfrHash = requiredString(jfrArtifact, "sha256");
+        CaptureProto.AnalysisInputs inputs = source.analysisInputs();
+        String session = inputs.getSessionId();
+        long epoch = Integer.toUnsignedLong(inputs.getCaptureEpoch());
+        String sourceHash = inputs.getSourceArtifact().getRawSha256();
+        String jfrHash = inputs.getJfrArtifact().getSha256();
         recording.writeEvent(types.metadata()
                 .asValue(value -> value.putField("startTime", 1L)
                         .putField("schemaVersion", 1)
@@ -424,15 +422,8 @@ final class CompatibilityJfrWriter {
         }
     }
 
-    private static BigInteger signedOffset(JsonObject inputs) throws IOException {
-        String text = requiredString(inputs, "monotonicOffsetNanos");
-        if (!text.matches("0|-?[1-9][0-9]{0,19}")) throw new IOException("Invalid monotonic offset");
-        return new BigInteger(text);
-    }
-
-    private static BigInteger parseUnsigned(String text, String label) throws IOException {
-        if (text == null || !text.matches("0|[1-9][0-9]*")) throw new IOException("Invalid " + label);
-        return new BigInteger(text);
+    private static BigInteger signedOffset(CaptureProto.AnalysisInputs inputs) {
+        return BigInteger.valueOf(inputs.getVerifiedIdentity().getMonotonicOffsetNanos());
     }
 
     private static long checkedLong(BigInteger value, String label) throws IOException {
@@ -440,28 +431,6 @@ final class CompatibilityJfrWriter {
             return value.longValueExact();
         } catch (ArithmeticException e) {
             throw new IOException(label + " does not fit signed 64-bit JFR time", e);
-        }
-    }
-
-    private static JsonObject requiredObject(JsonObject object, String field) throws IOException {
-        com.google.gson.JsonElement value = object.get(field);
-        if (value == null || !value.isJsonObject()) throw new IOException("Missing object: " + field);
-        return value.getAsJsonObject();
-    }
-
-    private static String requiredString(JsonObject object, String field) throws IOException {
-        com.google.gson.JsonElement value = object.get(field);
-        if (value == null || value.isJsonNull() || !value.isJsonPrimitive()) {
-            throw new IOException("Missing string: " + field);
-        }
-        return value.getAsString();
-    }
-
-    private static long requiredLong(JsonObject object, String field) throws IOException {
-        try {
-            return object.get(field).getAsLong();
-        } catch (RuntimeException e) {
-            throw new IOException("Invalid integer: " + field, e);
         }
     }
 }

@@ -206,7 +206,7 @@ Capture, written by the agent next to `correlationOutput` (the examples assume
 
 | File | Contents | Name comes from |
 | --- | --- | --- |
-| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as NDJSON | `correlationOutput` |
+| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as JSON Lines, one record per line | `correlationOutput` |
 | `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
 | `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
 
@@ -214,7 +214,7 @@ Analysis, written by the correlator into `--output`:
 
 | File | Contents |
 | --- | --- |
-| `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate |
+| `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate. Defined by `Report` in [`jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto) |
 | `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto) |
@@ -223,6 +223,18 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
 | `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
 | `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
+
+Every JSON file the correlator writes, and everything it prints as JSON, is a
+protobuf message printed in the
+[proto3 JSON mapping](https://protobuf.dev/programming-guides/json/): the report,
+the audit rows, the markers and the partial-mode files are defined in
+[`jonoffcpu-report.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto),
+and the digest, `stacks --summary`, `top --format json` and `export --format
+jsonl` in [`jonoffcpu-analysis.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-analysis.proto).
+Names are lowerCamelCase, 64-bit integers are decimal strings, exact decimals
+such as shares and probabilities are decimal strings, enums print their value
+names (`OFF_CPU_REASON_BLOCKED`), and a field that is unset is left out. The
+`.json` files are indented; the `.jsonl` files hold one message per line.
 
 `--audit` defaults to `matches`, so `jonoffcpu-classified-records.jsonl` is no
 longer written unless `--audit full` is passed — this is a backward-incompatible
@@ -704,8 +716,8 @@ java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
-`runnable`, `preempted` and `unspecified` (a capture recorded before
-classification); a slice with more than one reason starts each line with its
+`runnable`, `preempted` and `unspecified` (which no current capture records);
+a slice with more than one reason starts each line with its
 `[offcpu: <reason>]` frame unless `--reason-frame never` is given. `--stack` is
 `java` (the default), `kernel`, `user`, `java+kernel` or `java+user+kernel`;
 native frames are shown without their `+0x` offsets, kernel frames carry the
@@ -862,7 +874,8 @@ java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
 ## Analyzing with AI agents
 
 Give an agent the digest first: `jonoffcpu-summary.md` in the analysis
-directory (or `summarize --profile … --report …`). It is bounded in size,
+directory (or `summarize --profile …`, which takes the capture section from the
+report the profile carries). It is bounded in size,
 states the capture's coverage and losses, and holds the ranked tables with the
 exact command that reproduces each one, so the agent can drill down with
 `top --format json` or `stacks` instead of reading raw stacks. For custom
@@ -876,10 +889,12 @@ when the runs are not comparable.
 ## Analyzing with SQL
 
 `export --format jsonl` writes one row per profile entry that
-[DuckDB](https://duckdb.org/) reads without a schema: the stacks as arrays
-(`javaFrames`, `kernelFrames`, `userFrames`), counters as numbers, the thread's
-pool, a canonical stack that joins across runs, and on every row the `run` and
-whether its estimated columns are valid. Rank the busy waits by application
+[DuckDB](https://duckdb.org/) reads directly: the stacks as arrays
+(`javaFrames`, `kernelFrames`, `userFrames`), the counters, the thread's pool,
+a canonical stack that joins across runs, and on every row the `run` and
+whether its estimated columns are valid. The 64-bit counters are decimal
+strings, as the proto3 JSON mapping writes them, so cast them to `UBIGINT` (or
+declare the column types in `read_json`). Rank the busy waits by application
 boundary:
 
 ```sh
@@ -890,7 +905,7 @@ java -jar jonoffcpu-correlator.jar export \
 
 ```sql
 CREATE TEMP TABLE entries AS
-SELECT javaFrames AS frames, observedNanos AS nanos, intervals
+SELECT javaFrames AS frames, observedNanos::UBIGINT AS nanos, intervals::UBIGINT AS intervals
 FROM read_json('broker-offcpu.jsonl', format = 'newline_delimited');
 
 SELECT coalesce(list_filter(frames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1],
@@ -906,7 +921,8 @@ On a Pulsar broker this returns `internalConsumerFlow` with 11.982 s in 4,245
 intervals and `GrowableBatchedArrayBlockingQueue.offer` with 4.946 s in 1,565
 as the top application rows, as `top` does. To compare runs, export each with
 its own `--run-label` and load them into one table; `--run-metadata FILE`
-writes each profile's provenance and totals as one JSON object to join on
+writes each profile's provenance and totals as one JSON object (a
+`RunMetadata` message) to join on
 `run`. Seconds per million measured messages and share of busy application
 time, for two runs of 5 million messages each:
 
@@ -915,7 +931,7 @@ CREATE TEMP TABLE e AS
 SELECT 5.0 AS mmsgs, * FROM read_json(['alpine.jsonl', 'wolfi.jsonl'], format = 'newline_delimited');
 
 WITH b AS (
-  SELECT run, mmsgs, observedNanos AS nanos,
+  SELECT run, mmsgs, observedNanos::UBIGINT AS nanos,
          list_filter(javaFrames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1] AS boundary
   FROM e
   WHERE NOT list_bool_or(list_transform(javaFrames, lambda f: regexp_matches(f, '<idle patterns>'))))
@@ -954,7 +970,7 @@ is what `top --baseline` restricts itself to.
 `kernelFrames`, `userFrames`), the stack without generated-class addresses
 (`canonicalJavaStack`), the thread's pool (`threadPool`), a `run` column
 (`--run-label`), and on every row whether the estimated columns are valid
-(`estimateAvailable`); its counters are JSON numbers. `--run-metadata FILE`
+(`estimateAvailable`); its 64-bit counters are decimal strings. `--run-metadata FILE`
 writes the profile's provenance and totals as one JSON object. The columns
 are listed in [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#stack-profile).
 

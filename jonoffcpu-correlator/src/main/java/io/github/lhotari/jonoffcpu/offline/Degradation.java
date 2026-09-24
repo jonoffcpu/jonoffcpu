@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -50,7 +48,7 @@ final class Degradation {
     private final Policy policy;
     private final long budgetBytes;
     private final RetentionEstimate estimate;
-    private final List<JsonObject> steps = new ArrayList<>();
+    private final List<ReportProto.DegradationStep> steps = new ArrayList<>();
     private final AuditLevel requestedAudit;
     private final Thinning requestedThinning;
     private AuditLevel audit;
@@ -78,11 +76,11 @@ final class Degradation {
             if (!chosen.equals("1")) {
                 thinning = Thinning.of(chosen, requestedThinning.seed());
                 thinningRung = indexOf(chosen);
-                record("thin-source", detail -> {
-                    detail.addProperty("q", chosen);
-                    detail.addProperty("reason", "estimated retention exceeds the budget before decoding");
-                    detail.addProperty("estimatedRetainedBytes", Long.toString(estimate.retainedBytes()));
-                });
+                record(ReportProto.DegradationStep.newBuilder()
+                        .setReason("estimated retention exceeds the budget before decoding")
+                        .setThinSource(ReportProto.ThinSource.newBuilder()
+                                .setQ(chosen)
+                                .setEstimatedRetainedBytes(estimate.retainedBytes())));
             }
         }
     }
@@ -114,33 +112,31 @@ final class Degradation {
                 AuditLevel next = audit == AuditLevel.FULL ? AuditLevel.MATCHES : AuditLevel.NONE;
                 AuditLevel from = audit;
                 audit = next;
-                record("drop-audit-outputs", detail -> {
-                    detail.addProperty("from", from.text());
-                    detail.addProperty("to", next.text());
-                    detail.addProperty("reason", "the audit outputs cost the most and are not in the flame graph");
-                });
+                record(ReportProto.DegradationStep.newBuilder()
+                        .setReason("the audit outputs cost the most and are not in the flame graph")
+                        .setDropAuditOutputs(ReportProto.DropAuditOutputs.newBuilder()
+                                .setFrom(from.text())
+                                .setTo(next.text())));
             }
         }
         if (policy == Policy.DEGRADE && thinningRung + 1 < THINNING_LADDER.length) {
             String next = THINNING_LADDER[++thinningRung];
             thinning = Thinning.of(next, requestedThinning.seed());
-            record("thin-source", detail -> {
-                detail.addProperty("q", next);
-                detail.addProperty("reason", "retained bytes reached the budget during the pass");
-                detail.addProperty("retainedBytes", Long.toString(limit.retainedBytes()));
-            });
+            record(ReportProto.DegradationStep.newBuilder()
+                    .setReason("retained bytes reached the budget during the pass")
+                    .setThinSource(
+                            ReportProto.ThinSource.newBuilder().setQ(next).setRetainedBytes(limit.retainedBytes())));
             return true;
         }
         if (limit.lastObservationEndNanos() != null) {
             long cut = limit.lastObservationEndNanos();
             narrowedToNanos = narrowedToNanos == null ? cut : Math.min(narrowedToNanos, cut);
             long effective = narrowedToNanos;
-            record("narrow-window", detail -> {
-                detail.addProperty("effectiveToNanos", Long.toString(effective));
-                detail.addProperty("clock", "source CLOCK_MONOTONIC; no wall-time translation");
-                detail.addProperty(
-                        "reason", "analysing a prefix completely rather than the whole window approximately");
-            });
+            record(ReportProto.DegradationStep.newBuilder()
+                    .setReason("analysing a prefix completely rather than the whole window approximately")
+                    .setNarrowWindow(ReportProto.NarrowWindow.newBuilder()
+                            .setEffectiveToNanos(effective)
+                            .setClock("source CLOCK_MONOTONIC; no wall-time translation")));
             return true;
         }
         return false;
@@ -164,18 +160,18 @@ final class Degradation {
     }
 
     void quantumRaised(long from, long to) {
-        record("coarsen-synthetic-quantum", detail -> {
-            detail.addProperty("fromNanos", Long.toString(from));
-            detail.addProperty("toNanos", Long.toString(to));
-            detail.addProperty("reason", "the requested quantum would have exceeded the synthetic event limit");
-        });
+        record(ReportProto.DegradationStep.newBuilder()
+                .setReason("the requested quantum would have exceeded the synthetic event limit")
+                .setCoarsenSyntheticQuantum(ReportProto.CoarsenSyntheticQuantum.newBuilder()
+                        .setFromNanos(from)
+                        .setToNanos(to)));
     }
 
     /** Records that the synthetic JFR was omitted because even a coarser quantum could not fit. */
     void syntheticOmitted(String reason) {
-        record("omit-synthetic-jfr", detail -> {
-            detail.addProperty("reason", reason);
-        });
+        record(ReportProto.DegradationStep.newBuilder()
+                .setReason(reason)
+                .setOmitSyntheticJfr(ReportProto.OmitSyntheticJfr.getDefaultInstance()));
     }
 
     /** The message a refusal carries: the limit, what was already tried, and what would allow more. */
@@ -217,29 +213,24 @@ final class Degradation {
         return message.toString();
     }
 
-    JsonObject report(long peakRetainedBytes) {
-        JsonObject value = new JsonObject();
-        value.addProperty("policy", policy.text());
-        value.addProperty("requestedAudit", requestedAudit.text());
-        value.addProperty("audit", audit.text());
-        value.addProperty("retainedBytesLimit", Long.toString(budgetBytes));
-        value.addProperty("estimatedRetainedBytes", Long.toString(estimate.retainedBytes()));
-        value.addProperty("peakRetainedBytes", Long.toString(peakRetainedBytes));
+    ReportProto.DegradationReport report(long peakRetainedBytes) {
+        ReportProto.DegradationReport.Builder value = ReportProto.DegradationReport.newBuilder()
+                .setPolicy(policy.text())
+                .setRequestedAudit(requestedAudit.text())
+                .setAudit(audit.text())
+                .setRetainedBytesLimit(budgetBytes)
+                .setEstimatedRetainedBytes(estimate.retainedBytes())
+                .setPeakRetainedBytes(peakRetainedBytes)
+                .setAttempts(attempts)
+                .addAllStepsApplied(steps);
         // Symmetric with peakRetainedBytes: a consumer reading only the top-level object, not scanning
         // stepsApplied for the narrow-window entries and taking their minimum, still learns the window.
-        value.addProperty("narrowedToNanos", narrowedToNanos == null ? null : Long.toString(narrowedToNanos));
-        value.addProperty("attempts", attempts);
-        JsonArray applied = new JsonArray();
-        steps.forEach(applied::add);
-        value.add("stepsApplied", applied);
-        return value;
+        if (narrowedToNanos != null) value.setNarrowedToNanos(narrowedToNanos);
+        return value.build();
     }
 
-    private void record(String step, java.util.function.Consumer<JsonObject> detail) {
-        JsonObject entry = new JsonObject();
-        entry.addProperty("step", step);
-        detail.accept(entry);
-        steps.add(entry);
+    private void record(ReportProto.DegradationStep.Builder step) {
+        steps.add(step.build());
     }
 
     private static int indexOf(String probability) {

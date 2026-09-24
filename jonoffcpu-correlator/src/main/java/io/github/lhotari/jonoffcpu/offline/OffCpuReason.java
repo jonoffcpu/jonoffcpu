@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.util.Locale;
 
@@ -9,8 +10,8 @@ import java.util.Locale;
  * the switch-out reason, not a split of the interval's time: a {@link #BLOCKED} interval also contains the
  * run-queue delay between its wakeup and its switch-in.
  *
- * <p>The ordinal is the capture schema's enum number. {@link #UNSPECIFIED} is a schemaVersion 2 capture,
- * which predates the classification. Not to be confused with {@link Reason}, the row-invalidity vocabulary.
+ * <p>The ordinal is the capture schema's enum number. {@link #UNSPECIFIED} is never a valid switch-out: the kernel
+ * always classifies. Not to be confused with {@link Reason}, the row-invalidity vocabulary.
  */
 enum OffCpuReason {
     UNSPECIFIED,
@@ -37,6 +38,11 @@ enum OffCpuReason {
     /** The reason a wire value names, or null for a value outside the schema. */
     static OffCpuReason fromWire(int value) {
         return value >= 0 && value < VALUES.length ? VALUES[value] : null;
+    }
+
+    /** The capture schema's value for this reason. */
+    CaptureProto.OffCpuReason proto() {
+        return CaptureProto.OffCpuReason.forNumber(ordinal());
     }
 
     static OffCpuReason parse(String label) throws IOException {

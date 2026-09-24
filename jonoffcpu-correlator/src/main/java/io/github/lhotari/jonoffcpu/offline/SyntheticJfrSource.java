@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * What the compatibility JFR writer needs from a correlation: the matched intervals in a fixed
@@ -22,7 +18,7 @@ import java.util.Map;
  */
 interface SyntheticJfrSource {
     record Interval(
-            String correlationId,
+            long correlationId,
             long fromNanos,
             long toNanos,
             long durationNanos,
@@ -35,9 +31,9 @@ interface SyntheticJfrSource {
         void accept(Interval interval) throws IOException;
     }
 
-    JsonObject analysisInputs();
+    CaptureProto.AnalysisInputs analysisInputs();
 
-    String selectedObservedDurationNanos();
+    long selectedObservedDurationNanos();
 
     int intervalCount();
 
@@ -64,13 +60,13 @@ interface SyntheticJfrSource {
         sort(order, result);
         return new SyntheticJfrSource() {
             @Override
-            public JsonObject analysisInputs() {
+            public CaptureProto.AnalysisInputs analysisInputs() {
                 return result.capture().inputs;
             }
 
             @Override
-            public String selectedObservedDurationNanos() {
-                return Long.toString(result.selectedObservedDurationNanos());
+            public long selectedObservedDurationNanos() {
+                return result.selectedObservedDurationNanos();
             }
 
             @Override
@@ -128,38 +124,21 @@ interface SyntheticJfrSource {
         long[] stackNanos = new long[analysis.matches().size()];
         for (OfflineCorrelator.Match match : analysis.matches()) {
             validateMatch(match);
-            JsonObject sample = match.sample();
-            JsonArray frames = requiredArray(sample, "frames");
-            List<Map<String, Object>> raw = new ArrayList<>(frames.size());
-            for (JsonElement element : frames) {
-                if (!element.isJsonObject()) throw new IOException("Invalid frame in matched sample");
-                JsonObject frame = element.getAsJsonObject();
-                Map<String, Object> converted = new LinkedHashMap<>();
-                for (String field : List.of("type", "className", "methodName", "descriptor")) {
-                    JsonElement value = frame.get(field);
-                    converted.put(field, value == null || value.isJsonNull() ? null : value.getAsString());
-                }
-                for (String field : List.of("lineNumber", "bytecodeIndex")) {
-                    JsonElement value = frame.get(field);
-                    converted.put(field, value == null || value.isJsonNull() ? 0 : value.getAsInt());
-                }
-                raw.add(converted);
-            }
-            JsonElement truncated = sample.get("stackTruncated");
+            SignalProto.SignalSample sample = match.sample();
             int stackId = dictionaries.internStack(
-                    raw, truncated != null && !truncated.isJsonNull() && truncated.getAsBoolean(), Integer.MAX_VALUE);
+                    sample.getFramesList(),
+                    sample.hasStackTruncated() && sample.getStackTruncated(),
+                    Integer.MAX_VALUE);
             int threadId = dictionaries.internThread(
-                    optionalPositiveLong(sample, "osThreadId"),
-                    optionalPositiveLong(sample, "javaThreadId"),
-                    sample.has("threadName") && !sample.get("threadName").isJsonNull()
-                            ? sample.get("threadName").getAsString()
-                            : null);
+                    optionalPositive(sample.hasOsThreadId(), sample.getOsThreadId(), "osThreadId"),
+                    optionalPositive(sample.hasJavaThreadId(), sample.getJavaThreadId(), "javaThreadId"),
+                    sample.hasThreadName() ? sample.getThreadName() : null);
             long durationNanos = checkedLong(match.durationNanos(), "durationNanos");
             if (stackId >= stackNanos.length) stackNanos = java.util.Arrays.copyOf(stackNanos, stackId * 2 + 1);
             stackNanos[stackId] = Math.addExact(stackNanos[stackId], durationNanos);
-            BigInteger epochOffset = epochNanos(sample).subtract(decimal(sample, "monotonicTimeNanos"));
+            BigInteger epochOffset = epochNanos(sample).subtract(U64.big(sample.getMonotonicTimeNanos()));
             intervals.add(new Interval(
-                    requiredString(match.observation(), "correlationId"),
+                    match.observation().getCorrelationId(),
                     checkedLong(match.fromNanos(), "fromNanos"),
                     checkedLong(match.toNanos(), "toNanos"),
                     durationNanos,
@@ -169,17 +148,17 @@ interface SyntheticJfrSource {
         }
         intervals.sort(Comparator.comparingLong(Interval::fromNanos)
                 .thenComparingLong(Interval::toNanos)
-                .thenComparing(Interval::correlationId));
+                .thenComparing(Interval::correlationId, Long::compareUnsigned));
         long[] weights = java.util.Arrays.copyOf(stackNanos, dictionaries.stackCount());
         List<Interval> ordered = List.copyOf(intervals);
         return new SyntheticJfrSource() {
             @Override
-            public JsonObject analysisInputs() {
+            public CaptureProto.AnalysisInputs analysisInputs() {
                 return analysis.analysisInputs();
             }
 
             @Override
-            public String selectedObservedDurationNanos() {
+            public long selectedObservedDurationNanos() {
                 return analysis.selectedObservedDurationNanos();
             }
 
@@ -239,50 +218,16 @@ interface SyntheticJfrSource {
         }
     }
 
-    private static Long optionalPositiveLong(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
-        if (value == null || value.isJsonNull()) return null;
-        try {
-            long parsed = value.getAsLong();
-            if (parsed <= 0) throw new IOException("Invalid positive integer: " + field);
-            return parsed;
-        } catch (NumberFormatException e) {
-            throw new IOException("Invalid integer: " + field, e);
-        }
+    private static Long optionalPositive(boolean present, long value, String field) throws IOException {
+        if (!present) return null;
+        if (value <= 0) throw new IOException("Invalid positive integer: " + field);
+        return value;
     }
 
-    private static BigInteger epochNanos(JsonObject sample) throws IOException {
-        try {
-            java.time.Instant instant = java.time.Instant.parse(requiredString(sample, "startTime"));
-            return BigInteger.valueOf(instant.getEpochSecond())
-                    .multiply(BigInteger.valueOf(1_000_000_000L))
-                    .add(BigInteger.valueOf(instant.getNano()));
-        } catch (java.time.format.DateTimeParseException | ArithmeticException error) {
-            throw new IOException("Invalid sample start time", error);
-        }
-    }
-
-    private static JsonArray requiredArray(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
-        if (value == null || !value.isJsonArray()) throw new IOException("Missing array: " + field);
-        return value.getAsJsonArray();
-    }
-
-    private static String requiredString(JsonObject object, String field) throws IOException {
-        JsonElement value = object.get(field);
-        if (value == null || value.isJsonNull() || !value.isJsonPrimitive()) {
-            throw new IOException("Missing string: " + field);
-        }
-        return value.getAsString();
-    }
-
-    private static BigInteger decimal(JsonObject object, String field) throws IOException {
-        return parseUnsigned(requiredString(object, field), field);
-    }
-
-    private static BigInteger parseUnsigned(String text, String label) throws IOException {
-        if (text == null || !text.matches("0|[1-9][0-9]*")) throw new IOException("Invalid " + label);
-        return new BigInteger(text);
+    private static BigInteger epochNanos(SignalProto.SignalSample sample) {
+        return BigInteger.valueOf(sample.getStartTime().getSeconds())
+                .multiply(BigInteger.valueOf(1_000_000_000L))
+                .add(BigInteger.valueOf(sample.getStartTime().getNanos()));
     }
 
     private static long checkedLong(BigInteger value, String label) throws IOException {
@@ -295,8 +240,7 @@ interface SyntheticJfrSource {
 
     /**
      * A stable three-key merge sort over slot indices; 1.1 M boxed comparators are not worth it. The
-     * cookie comparison is unsigned, which is the same order as comparing the sixteen lowercase hex
-     * digits {@code HexFormat.toHexDigits} produces.
+     * cookie comparison is unsigned, as the retained view's is.
      */
     private static void sort(int[] order, CorrelationResult result) {
         int[] buffer = new int[order.length];
