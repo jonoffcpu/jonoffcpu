@@ -122,7 +122,8 @@ smallest relevant layer before running privileged end-to-end tests.
   published: the agent and the correlator embed it through `embeddedRuntime`
   and relocate its protobuf runtime.
 - `jonoffcpu-correlator`: Java 21 bytecode, offline correlation library and CLI,
-  including synthetic compatibility JFR output.
+  including the collapsed stacks, the stack profile and the analysis
+  subcommands built on it.
 - `jonoffcpu-jfr-converter`: Java 21 build of async-profiler's converter
   straight from the submodule's `src/converter` sources, mirroring
   `async-profiler/pom-converter.xml`. It holds no sources of its own; converter

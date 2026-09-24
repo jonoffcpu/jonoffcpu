@@ -171,8 +171,8 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
 5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/correlator/OffCpuCorrelator.java)
    runs offline. It joins each `SignalSample` to its
    observation by key, weights the Java stack by the kernel-measured duration,
-   and writes a report, a collapsed-stack file, a stack profile from which
-   other slices can be rendered later, and a synthetic JFR.
+   and writes a report, a collapsed-stack file, and a stack profile from which
+   other slices can be rendered later.
 
 ### Why two files?
 
@@ -219,7 +219,6 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto) |
 | `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: coverage and losses, where the time went, ranked busy and idle tables, the heaviest transformed stacks, and the command that reproduces each table. The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
-| `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
 | `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
 | `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
@@ -244,10 +243,9 @@ correlator invocation. The library API (`OffCpuCorrelator.correlate`) is
 unaffected and keeps writing both.
 
 When the retained-bytes budget is reached, `--on-limit degrade` (the default)
-trades away thinner outputs before it trades away coverage: it coarsens the
-synthetic JFR quantum, drops the audit outputs, then thins the source with an
-exact inverse-probability reweighting, and only as a last resort narrows the
-analysis window. Thinning still analyses the whole requested window — with
+trades away thinner outputs before it trades away coverage: it drops the
+audit outputs, then thins the source with an exact inverse-probability
+reweighting, and only as a last resort narrows the analysis window. Thinning still analyses the whole requested window — with
 ordinary output names, `jonoffcpu-complete.json`, and exit status 0 — because it
 is a stated estimator over what was asked for. Narrowing the window instead
 analyses a shorter window *completely*, and is labelled as visibly incomplete:
@@ -547,7 +545,7 @@ instead of the latest one.
 | JAR | What it is | When you use it |
 | --- | --- | --- |
 | `jonoffcpu-agent.jar` | The Java agent. Bundles the eBPF collector, the JNI bridge, and the patched async-profiler for Linux x86-64 and arm64, and drives the whole capture lifecycle. | Attached to the JVM being profiled with `-javaagent`. |
-| `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation stream, verifies integrity, and writes derived outputs such as collapsed stacks and a synthetic JFR. | Run after the capture, on any machine with Java 21+. |
+| `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation stream, verifies integrity, and writes derived outputs such as collapsed stacks and the stack profile. | Run after the capture, on any machine with Java 21+. |
 | `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the pinned fork so that it understands the `profiler.Signal*` events and accepts `--units` to label the flame graph in microseconds. | Renders the correlator's collapsed stacks as an off-CPU flame graph whose widths are microseconds of off-CPU time. |
 
 The examples below assume all three JARs are in the current directory.
@@ -602,8 +600,7 @@ lower probability.
 
 The output directory then holds `jonoffcpu-report.json`,
 `jonoffcpu-offcpu-stacks.collapsed`, `jonoffcpu-offcpu-profile.pb`, the digest
-`jonoffcpu-summary.md`, `jonoffcpu-offcpu-synthetic.jfr`, the row-level audit
-files, and `jonoffcpu-complete.json` as the last file written;
+`jonoffcpu-summary.md`, the row-level audit files, and `jonoffcpu-complete.json` as the last file written;
 [Files jonoffcpu writes](#files-jonoffcpu-writes) describes each one.
 
 ### 4. Render the flame graph
@@ -624,9 +621,6 @@ render the slice from the stack profile with `--include`/`--exclude` (step 5),
 which also matches frames the graph does not show. Any tool that reads the collapsed-stack
 format, such as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph)
 with `--countname=µs`, works on the same file.
-
-The synthetic JFR opens directly in
-[JDK Mission Control](https://jdk.java.net/jmc/) and other JFR viewers.
 
 ### Other views of the same recording
 
@@ -881,7 +875,7 @@ exact command that reproduces each one, so the agent can drill down with
 `top --format json` or `stacks` instead of reading raw stacks. For custom
 questions, `export --format jsonl` gives one row per profile entry, frames as
 arrays (see [Analyzing with SQL](#analyzing-with-sql)). Do not hand an agent
-the capture stream, the JFR or the synthetic JFR: they are large, binary, and
+the capture stream or the JFR: they are large, binary, and
 the correlator has already extracted what they contain. When comparing runs,
 give it `top --baseline` output, which normalizes per unit of work and warns
 when the runs are not comparable.
@@ -1145,11 +1139,10 @@ The generated help is the reference: `java -jar jonoffcpu-correlator.jar help
 | `--from-ns`, `--to-ns` | Clip matched intervals to a window in the source monotonic clock. |
 | `--estimate-population true` | Add a `populationEstimate` to the report: the total off-CPU time of every eligible interval, reweighted by each row's admission threshold. See [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md). |
 | `--max-accounted-loss <f>` | Largest fraction of selected intervals that counted sequence contention may drop before the population estimate is refused (`accounted-loss-above-limit`). Below it the estimate is scaled for the loss and reports it in `accountedLoss`. Default `0.01`. |
-| `--format collapsed\|jfr` | Produce only one of the two derived outputs. |
 | `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
-| `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json` or the synthetic JFR. |
+| `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json`. |
 | `--audit full\|matches\|none` | How much per-row audit output to write. Default `matches`: `jonoffcpu-matches.jsonl` but not `jonoffcpu-classified-records.jsonl`. |
-| `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: coarsen the synthetic quantum, drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses immediately, like earlier releases. `truncate` skips thinning and narrows the window directly. |
+| `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses immediately, like earlier releases. `truncate` skips thinning and narrows the window directly. |
 | `--thinning <q>` | Keep each recorded interval with probability `q` and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
 | `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
 | `--collapsed-reason-frame auto\|always\|never` | Whether each line of `jonoffcpu-offcpu-stacks.collapsed` starts with its `[offcpu: <reason>]` frame. Default `auto`: only when the capture mixes reasons. |

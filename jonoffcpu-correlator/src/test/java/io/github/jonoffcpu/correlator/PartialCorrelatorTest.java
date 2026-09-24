@@ -525,9 +525,6 @@ class PartialCorrelatorTest {
         assertThat(output.resolve(OutputFiles.COMPLETE))
                 .as("Partial publication resembles complete output")
                 .doesNotExist();
-        assertThat(output.resolve(OutputFiles.SYNTHETIC_JFR))
-                .as("Partial publication resembles complete output")
-                .doesNotExist();
         assertThat(output.resolve(OutputFiles.COLLAPSED))
                 .as("Partial publication resembles complete output")
                 .doesNotExist();
@@ -538,7 +535,7 @@ class PartialCorrelatorTest {
         assertThat(marker.getCoverageComplete())
                 .as("Partial marker promoted completion")
                 .isFalse();
-        // Parsed strictly: a partial report has no field for a population estimate or a synthetic JFR at all.
+        // Parsed strictly: a partial report has no field for a population estimate at all.
         ReportProto.PartialReport report = CorrelationFixture.parse(
                         output.resolve(OutputFiles.INCOMPLETE_REPORT), ReportProto.PartialReport.newBuilder())
                 .build();
@@ -568,14 +565,20 @@ class PartialCorrelatorTest {
     }
 
     @ParameterizedTest(name = "{0} {1}")
-    @CsvSource({"--format, jfr", "--format, both", "--estimate-population, true", "--quantum-ns, 1"})
-    void unsupportedPartialOutput(String option, String value, @TempDir Path dir) throws Exception {
+    @CsvSource({
+        "--estimate-population, true, Partial mode supports",
+        "--thinning, 0.5, Partial mode supports",
+        "--audit, none, Partial mode supports",
+        "--format, jfr, 'expected one of collapsed, diagnostics'",
+        "--format, both, 'expected one of collapsed, diagnostics'"
+    })
+    void unsupportedPartialOutput(String option, String value, String message, @TempDir Path dir) throws Exception {
         Fixture fixture = fixture(dir);
         Path source = fixture.source();
         Files.write(source, prefix(fixture.complete(), RecordCase.OBSERVATION));
         Path rejected = dir.resolve("rejected-output");
         CommandLineFixture.usageError(
-                "Partial mode supports",
+                message,
                 "--source",
                 source.toString(),
                 "--jfr",

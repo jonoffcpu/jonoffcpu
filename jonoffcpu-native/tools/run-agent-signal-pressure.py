@@ -165,7 +165,7 @@ def exact_cookie_check(records, allow_delay_rejections):
     return reasons, delay_pairs
 
 
-def analyze_case(module, ap, jdk, case, delivery, signo):
+def analyze_case(module, jdk, case, delivery, signo):
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
     run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.agent.MixedRecordingCheck",
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
@@ -219,13 +219,6 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
     if int(mask_audit["blockedThreads"]) < 1 or audit_tid not in mask_audit["blockedTidExamples"]:
         raise RuntimeError("Terminal mask audit did not observe the deliberately blocked Java thread")
 
-    converted = case / "analysis-exact/compatibility-view.collapsed"
-    run([ap / "build/bin/jfrconv", "--cpu", case / "analysis-exact/jonoffcpu-offcpu-synthetic.jfr", converted],
-        case / "converter.log")
-    converted_count = sum(int(line.rsplit(" ", 1)[1]) for line in converted.read_text().splitlines())
-    if converted_count != int(exact["syntheticJfr"]["syntheticEvents"]):
-        raise RuntimeError("AP converter lost synthetic compatibility events")
-
     ap_stats = exact["analysisInputs"]["apStats"]
     selected = int(kernel["selectedIntervals"])
     signal_failures = int(kernel["signalFailures"])
@@ -270,8 +263,6 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
         "apStats": ap_stats,
         "exactCookieShiftedJoins": 0,
         "identityMismatchReasons": 0,
-        "syntheticEvents": exact["syntheticJfr"]["syntheticEvents"],
-        "converterEvents": converted_count,
         "interpretation": (
             "Handler delay is source interval end to native AP handler entry. Unmatched source rows "
             "show absent cookie events after exact joining; the kernel helper cannot report deferred "
@@ -300,7 +291,7 @@ def main():
     jdk = args.java_home.resolve(strict=True)
     output = args.output.resolve()
     required = (ap / "build/lib/libasyncProfiler.so", ap / "build/jar/async-profiler.jar",
-                ap / "build/bin/jfrconv", jdk / "bin/java", jdk / "bin/javac")
+                jdk / "bin/java", jdk / "bin/javac")
     for file in required:
         if not file.is_file():
             parser.error(f"Missing required artifact: {file}")
@@ -356,7 +347,7 @@ def main():
         (case / "process-exit.json").write_text(json.dumps({"returnCode": return_code}) + "\n")
         if return_code != 0:
             raise RuntimeError(f"{delivery} pressure process exited with {return_code}")
-        summaries.append(analyze_case(module, ap, jdk, case, delivery, signals[delivery]))
+        summaries.append(analyze_case(module, jdk, case, delivery, signals[delivery]))
 
     (output / "summary.json").write_text(json.dumps({
         "schemaVersion": 1,

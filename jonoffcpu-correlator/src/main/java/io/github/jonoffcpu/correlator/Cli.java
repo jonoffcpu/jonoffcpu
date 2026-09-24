@@ -214,23 +214,10 @@ final class Cli {
                 names = "--format",
                 paramLabel = "FORMAT",
                 converter = FormatConverter.class,
-                description = "Which derived outputs to write: both, collapsed or jfr; with --partial true,"
-                        + " diagnostics or collapsed. Default: both, or diagnostics with --partial true.")
+                description = "Which derived outputs to write: collapsed, the only choice for a complete analysis;"
+                        + " with --partial true, diagnostics or collapsed. Default: collapsed, or diagnostics"
+                        + " with --partial true.")
         String format;
-
-        @Option(
-                names = "--quantum-ns",
-                paramLabel = "N",
-                defaultValue = "1000000",
-                description = "Off-CPU time one synthetic JFR event represents. Default: ${DEFAULT-VALUE}.")
-        long quantumNs;
-
-        @Option(
-                names = "--max-synthetic-events",
-                paramLabel = "N",
-                defaultValue = "10000000",
-                description = "Most synthetic JFR events; the quantum is raised to fit. Default: ${DEFAULT-VALUE}.")
-        long maxSyntheticEvents;
 
         @Option(
                 names = "--estimate-population",
@@ -615,7 +602,7 @@ final class Cli {
                 "",
                 "Writes into the output directory: " + OutputFiles.REPORT + ", " + OutputFiles.COLLAPSED + ", "
                         + OutputFiles.PROFILE + ", the digest " + OutputFiles.SUMMARY_MD + " and "
-                        + OutputFiles.SUMMARY_JSON + ", " + OutputFiles.SYNTHETIC_JFR + " and, last, "
+                        + OutputFiles.SUMMARY_JSON + " and, last, "
                         + OutputFiles.COMPLETE + "; " + OutputFiles.CLASSIFIED_RECORDS + " is written only for"
                         + " --audit full and " + OutputFiles.MATCHES + " for --audit full or matches; --partial"
                         + " true writes " + OutputFiles.INCOMPLETE_PREFIX + "* files and " + OutputFiles.PARTIAL
@@ -686,12 +673,10 @@ final class Cli {
         if (options.estimatePopulation && options.thinning != null) {
             throw options.usage("Population estimates require the unthinned source");
         }
-        String format = options.format != null ? options.format : options.partial ? "diagnostics" : "both";
+        String format = options.format != null ? options.format : options.partial ? "diagnostics" : "collapsed";
         if (options.partial) {
             if (!Set.of("diagnostics", "collapsed").contains(format)
                     || options.estimatePopulation
-                    || options.given("--quantum-ns")
-                    || options.given("--max-synthetic-events")
                     || options.given("--audit")
                     || options.given("--thinning")
                     || options.given("--collapsed-reason-frame")
@@ -701,7 +686,7 @@ final class Cli {
                     || options.given("--summary-output")
                     || options.given("--max-accounted-loss")) {
                 throw options.usage("Partial mode supports diagnostics or labelled collapsed output;"
-                        + " synthetic JFR and population estimates require complete analysis");
+                        + " the other outputs and population estimates require complete analysis");
             }
             var result = OfflineCorrelator.correlatePartial(options.source, options.jfr, limits);
             OffCpuCorrelator.writePartial(result, options.output, format.equals("collapsed"));
@@ -712,7 +697,7 @@ final class Cli {
                     + " provisional prefix pairs; coverage is incomplete");
             return NARROWED;
         }
-        if (!Set.of("both", "collapsed", "jfr").contains(format)) {
+        if (!format.equals("collapsed")) {
             throw options.usage("Invalid output format: " + format + " (only with --partial true)");
         }
         ProfileAccumulator.Options profileOptions;
@@ -732,8 +717,6 @@ final class Cli {
                 options.from,
                 options.to,
                 options.partialJfr,
-                format,
-                new CompatibilityJfrWriter.Options(options.quantumNs, options.maxSyntheticEvents),
                 options.estimatePopulation,
                 options.audit,
                 thinning,
@@ -1506,7 +1489,7 @@ final class Cli {
     static final class FormatConverter implements ITypeConverter<String> {
         @Override
         public String convert(String text) {
-            return choice(text, new String[] {"both", "collapsed", "jfr", "diagnostics"}, Function.identity());
+            return choice(text, new String[] {"collapsed", "diagnostics"}, Function.identity());
         }
     }
 

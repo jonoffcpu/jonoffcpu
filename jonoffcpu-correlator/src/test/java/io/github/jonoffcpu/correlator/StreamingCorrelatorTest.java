@@ -11,9 +11,6 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import jdk.jfr.Recording;
-import jdk.jfr.consumer.RecordedEvent;
-import jdk.jfr.consumer.RecordingFile;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -119,11 +116,6 @@ class StreamingCorrelatorTest {
                 .as("the streamed run writes a stack profile")
                 .isRegularFile();
         for (ReportProto.Report.Builder report : List.of(streamedReport, retainedReport)) {
-            report.getSyntheticJfrBuilder()
-                    .clearQuantumNanos()
-                    .clearRequestedQuantumNanos()
-                    .clearObservedQuantumNanos()
-                    .clearQuantumRaisedForEventLimit();
             // The streamed path builds a real ladder from the CLI's own limits and pre-decode estimate
             // (one settings() call even when nothing was needed); the retained/library path's
             // OutputOptions.defaults() ladder is inert (Degradation.none()), with no limit or estimate
@@ -136,7 +128,7 @@ class StreamingCorrelatorTest {
                     .clearEstimatedRetainedBytes();
         }
         assertThat(streamedReport.build())
-                .as("reports beyond the synthetic quantum and degradation-measurement fields")
+                .as("reports beyond the degradation-measurement fields")
                 .isEqualTo(retainedReport.build());
     }
 
@@ -168,116 +160,6 @@ class StreamingCorrelatorTest {
                     .as("the report records the audit level")
                     .isEqualTo(level);
         }
-    }
-
-    /** The synthetic view is built from interned stacks, not from retained sample documents. */
-    @Test
-    void syntheticFromColumns(@TempDir Path dir) throws Exception {
-        Path jfr = CorrelationFixture.recording(dir, 1);
-        Path source = capture(dir, jfr, sampleThreadId(jfr), 3);
-        var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
-        Path fromAnalysis = dir.resolve("synthetic-analysis.jfr");
-        var viaAnalysis = CompatibilityJfrWriter.write(
-                analysis, fromAnalysis, new CompatibilityJfrWriter.Options(1000L, 1_000_000L));
-        Path fromColumns = dir.resolve("synthetic-columns.jfr");
-        var result = CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
-        var viaColumns = CompatibilityJfrWriter.write(
-                SyntheticJfrSource.of(result), fromColumns, new CompatibilityJfrWriter.Options(1000L, 1_000_000L));
-        assertThat(viaColumns.syntheticEvents()).isEqualTo(viaAnalysis.syntheticEvents());
-        assertThat(viaColumns.canonicalStacks()).isEqualTo(viaAnalysis.canonicalStacks());
-        assertThat(viaColumns.representedNanos()).isEqualTo(viaAnalysis.representedNanos());
-        assertThat(viaColumns.omittedRemainderNanos()).isEqualTo(viaAnalysis.omittedRemainderNanos());
-
-        // The count/total equality above says nothing about *when* the events land: a dropped or
-        // sign-flipped epoch offset would shift every synthetic timestamp by a constant and still pass
-        // it. The matched sample's real JFR startTime (wall clock) and monotonicTimeNanos (JVM-relative
-        // nanoTime) are naturally an astronomically large, non-zero distance apart, so a broken offset
-        // formula lands far outside any plausible epoch and this check catches it.
-        List<Long> analysisTimestamps = executionSampleEpochNanos(fromAnalysis);
-        List<Long> columnsTimestamps = executionSampleEpochNanos(fromColumns);
-        assertThat(analysisTimestamps)
-                .as("the fixture produces at least one synthetic event")
-                .isNotEmpty();
-        assertThat(columnsTimestamps)
-                .as("synthetic event timestamps of the column-backed and retained plans")
-                .isEqualTo(analysisTimestamps);
-        // Sanity-check that the offset is genuinely distinctive (a real wall-clock epoch, not a
-        // near-1970 artifact of a dropped/zeroed offset).
-        assertThat(analysisTimestamps.get(0) / 1_000_000L)
-                .as("a synthetic event timestamp that looks like a real wall-clock epoch, in milliseconds")
-                .isGreaterThan(1_600_000_000_000L);
-    }
-
-    private static List<Long> executionSampleEpochNanos(Path file) throws IOException {
-        List<Long> timestamps = new ArrayList<>();
-        try (RecordingFile recording = new RecordingFile(file)) {
-            while (recording.hasMoreEvents()) {
-                RecordedEvent event = recording.readEvent();
-                if (event.getEventType().getName().equals("jdk.ExecutionSample")) {
-                    timestamps.add(event.getStartTime().getEpochSecond() * 1_000_000_000L
-                            + event.getStartTime().getNano());
-                }
-            }
-        }
-        return timestamps;
-    }
-
-    /**
-     * Two matched intervals with identical {@code fromNanos}/{@code toNanos} but different cookies,
-     * inserted in descending-cookie source order. The column-backed and retained plans must both sort
-     * them ascending by cookie, exercising the tie-break the sequential test fixtures never force.
-     */
-    @Test
-    void syntheticOrderTiesBreakOnCookie(@TempDir Path dir) throws Exception {
-        Path jfr = recordingWithSequentialCorrelationIds(dir, 2);
-        long tid = sampleThreadId(jfr);
-        CaptureProto.Observation second = CorrelationFixture.observation(tid)
-                .setCorrelationId(0x8000000100000002L)
-                .build();
-        CaptureProto.Observation first = CorrelationFixture.observation(tid)
-                .setCorrelationId(0x8000000100000001L)
-                .build();
-        // Source-file order deliberately puts the higher cookie first: preserving capture order instead
-        // of sorting by cookie would still pass without this check.
-        Path source = CorrelationFixture.source(dir, jfr, List.of(second, first));
-        var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
-        assertThat(analysis.matched())
-                .as("the tie-break fixture matches both intervals")
-                .isEqualTo(2);
-        var result = CorrelationEngine.correlate(source, jfr, OfflineCorrelator.Limits.defaults(), null, false);
-
-        List<Long> viaAnalysisOrder = new ArrayList<>();
-        SyntheticJfrSource.of(analysis).forEachInterval(interval -> viaAnalysisOrder.add(interval.correlationId()));
-        List<Long> viaColumnsOrder = new ArrayList<>();
-        SyntheticJfrSource.of(result).forEachInterval(interval -> viaColumnsOrder.add(interval.correlationId()));
-        assertThat(viaAnalysisOrder)
-                .as("the tie-break sorts ascending by cookie")
-                .containsExactly(0x8000000100000001L, 0x8000000100000002L);
-        assertThat(viaColumnsOrder)
-                .as("the column-backed tie-break order matches the retained one")
-                .isEqualTo(viaAnalysisOrder);
-    }
-
-    private static Path recordingWithSequentialCorrelationIds(Path dir, int count) throws IOException {
-        Path file = dir.resolve("sequential-" + count + ".jfr");
-        try (Recording recording = new Recording()) {
-            recording.enable(CorrelationFixture.Capture.class);
-            recording.enable(CorrelationFixture.Sample.class).withStackTrace();
-            recording.enable(CorrelationFixture.Stats.class);
-            recording.start();
-            new CorrelationFixture.Capture().commit();
-            for (int i = 0; i < count; i++) {
-                CorrelationFixture.Sample sample = new CorrelationFixture.Sample();
-                sample.correlationId = (sample.correlationId & 0xffffffff00000000L) | (i + 1);
-                sample.commit();
-            }
-            CorrelationFixture.Stats stats = new CorrelationFixture.Stats();
-            stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = count;
-            stats.commit();
-            recording.stop();
-            recording.dump(file);
-        }
-        return file;
     }
 
     /** Spec acceptance 7: thinning is usable only if the towers keep their proportions. */

@@ -21,11 +21,8 @@ public final class OffCpuCorrelator {
             "signal-delivery stack; not guaranteed to match the eBPF scheduler-exit stack";
 
     record OutputOptions(
-            boolean collapsed,
-            boolean compatibilityJfr,
             boolean populationEstimate,
             AuditLevel audit,
-            CompatibilityJfrWriter.Options jfrOptions,
             String prefix,
             Degradation ladder,
             boolean stackProfile,
@@ -33,26 +30,15 @@ public final class OffCpuCorrelator {
             boolean digest) {
         public OutputOptions {
             if (reasonFrame == null) throw new IllegalArgumentException("Missing reason frame mode");
-            if (!collapsed && !compatibilityJfr)
-                throw new IllegalArgumentException("Select at least one output format");
             if (audit == null) throw new IllegalArgumentException("Missing audit level");
-            if (jfrOptions == null) throw new IllegalArgumentException("Missing compatibility JFR options");
             if (prefix == null) throw new IllegalArgumentException("Missing output name prefix");
             if (ladder == null) throw new IllegalArgumentException("Missing degradation ladder");
         }
 
-        /** True when {@code --format jfr} was asked for explicitly: an unfittable synthetic JFR must abort. */
-        boolean jfrOnly() {
-            return compatibilityJfr && !collapsed;
-        }
-
         public static OutputOptions defaults() {
             return new OutputOptions(
-                    true,
-                    true,
                     false,
                     AuditLevel.FULL,
-                    CompatibilityJfrWriter.Options.defaults(),
                     OutputFiles.PREFIX,
                     Degradation.none(),
                     true,
@@ -157,8 +143,6 @@ public final class OffCpuCorrelator {
             String from,
             String to,
             boolean partialJfr,
-            String format,
-            CompatibilityJfrWriter.Options jfrOptions,
             boolean estimatePopulation,
             AuditLevel audit,
             Thinning requestedThinning,
@@ -196,16 +180,7 @@ public final class OffCpuCorrelator {
                 AnalysisOutput.of(result, sourcePath, jfr, selection, settings.narrowedToNanos()),
                 output,
                 new OutputOptions(
-                        !format.equals("jfr"),
-                        !format.equals("collapsed"),
-                        estimatePopulation,
-                        ladder.audit(),
-                        jfrOptions,
-                        prefix,
-                        ladder,
-                        stackProfile,
-                        reasonFrame,
-                        digest),
+                        estimatePopulation, ladder.audit(), prefix, ladder, stackProfile, reasonFrame, digest),
                 () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
         System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + output
@@ -260,44 +235,14 @@ public final class OffCpuCorrelator {
         List<OffCpuReason> reasonsPresent = output.reasonsPresent();
         boolean reasonFrames =
                 !reasonsPresent.isEmpty() && options.reasonFrame().applies(reasonsPresent.size());
-        if (options.collapsed()) {
-            writeCollapsed(
-                    directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)),
-                    reasonFrames ? output.collapsedNanos(null) : output.collapsedNanos());
-            if (reasonsPresent.size() > 1) {
-                for (OffCpuReason reason : reasonsPresent) {
-                    writeCollapsed(
-                            directory.resolve(OutputFiles.collapsedForReason(prefix, reason)),
-                            output.collapsedNanos(reason));
-                }
-            }
-        }
-        // The synthetic JFR keeps its observed scale: thinning shrinks the quantum an event consumes so
-        // that, once reweighted by the caller, one event still represents one requested quantum of
-        // estimated time.
-        CompatibilityJfrWriter.Options requestedJfrOptions = options.jfrOptions();
-        CompatibilityJfrWriter.Options effectiveJfrOptions = output.thinning().active()
-                ? new CompatibilityJfrWriter.Options(
-                        output.thinning().scaleQuantum(requestedJfrOptions.quantumNanos()),
-                        requestedJfrOptions.maxSyntheticEvents(),
-                        requestedJfrOptions.onEventLimit())
-                : requestedJfrOptions;
-        CompatibilityJfrWriter.Result compatibility = null;
-        if (options.compatibilityJfr()) {
-            try {
-                compatibility = CompatibilityJfrWriter.write(
-                        output.synthetic(),
-                        directory.resolve(OutputFiles.name(prefix, OutputFiles.SYNTHETIC_SUFFIX)),
-                        effectiveJfrOptions);
-            } catch (IOException unfittable) {
-                // Spec §3: a quantum that cannot be coarsened to fit degrades to collapsed-only output
-                // instead of discarding an otherwise-complete analysis; only an explicit --format jfr
-                // still aborts, since then there is nothing else to publish.
-                if (options.jfrOnly()) throw unfittable;
-                options.ladder().syntheticOmitted(unfittable.getMessage());
-            }
-            if (compatibility != null && compatibility.quantumRaised()) {
-                options.ladder().quantumRaised(compatibility.requestedQuantumNanos(), compatibility.quantumNanos());
+        writeCollapsed(
+                directory.resolve(OutputFiles.name(prefix, OutputFiles.COLLAPSED_SUFFIX)),
+                reasonFrames ? output.collapsedNanos(null) : output.collapsedNanos());
+        if (reasonsPresent.size() > 1) {
+            for (OffCpuReason reason : reasonsPresent) {
+                writeCollapsed(
+                        directory.resolve(OutputFiles.collapsedForReason(prefix, reason)),
+                        output.collapsedNanos(reason));
             }
         }
         if (options.audit() == AuditLevel.FULL) {
@@ -343,21 +288,6 @@ public final class OffCpuCorrelator {
             report.setPopulationEstimate(output.populationEstimate());
         }
         report.setHandlerDelayNanos(handlerDelays(output.sortedHandlerDelays()));
-        if (compatibility != null) {
-            // quantumNanos is the requested quantum at estimated scale (what one reweighted event
-            // represents); observedQuantumNanos is the actual, possibly thinning-shrunk and
-            // event-limit-raised, quantum of observed time an event was built from.
-            report.setSyntheticJfr(ReportProto.SyntheticJfr.newBuilder()
-                    .setPath(compatibility.output().getFileName().toString())
-                    .setQuantumNanos(requestedJfrOptions.quantumNanos())
-                    .setRequestedQuantumNanos(compatibility.requestedQuantumNanos())
-                    .setObservedQuantumNanos(compatibility.quantumNanos())
-                    .setQuantumRaisedForEventLimit(compatibility.quantumRaised())
-                    .setSyntheticEvents(compatibility.syntheticEvents())
-                    .setRepresentedNanos(Long.parseLong(compatibility.representedNanos()))
-                    .setQuantizationErrorNanos(Long.parseLong(compatibility.quantizationErrorNanos()))
-                    .setOmittedRemainderNanos(Long.parseLong(compatibility.omittedRemainderNanos())));
-        }
         ReportProto.OffCpuReasons offCpuReasons = output.offCpuReasons();
         if (offCpuReasons != null) report.setOffCpuReasons(offCpuReasons);
         // Always present, with an empty stepsApplied when nothing was needed, so a consumer can see that

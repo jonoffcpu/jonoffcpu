@@ -67,20 +67,6 @@ record Thinning(long threshold, long seed, String probability) {
                 .divide(denominator);
     }
 
-    /**
-     * The observed nanoseconds one synthetic event should consume so that it still represents
-     * {@code requestedQuantumNanos} of estimated time. At least one, so a quantum never vanishes.
-     */
-    long scaleQuantum(long requestedQuantumNanos) {
-        if (!active()) return requestedQuantumNanos;
-        return Math.max(
-                1L,
-                BigInteger.valueOf(requestedQuantumNanos)
-                        .multiply(realisedNumerator())
-                        .shiftRight(64)
-                        .longValueExact());
-    }
-
     ReportProto.SourceThinning report() {
         return ReportProto.SourceThinning.newBuilder()
                 .setQ(probability)

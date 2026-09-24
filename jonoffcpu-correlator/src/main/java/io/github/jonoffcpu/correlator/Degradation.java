@@ -13,11 +13,10 @@ import java.util.List;
  * them means anything, and it still aborts. A volume failure means the answer is expensive, not
  * wrong, and the ladder trades precision or coverage for it and says which.
  *
- * <p>Steps one and two are not choices: streaming and interning are unconditional, and the
- * synthetic quantum is planned before any event is written. What is left is to drop the audit
- * outputs, which cost the most and contribute nothing to the flame graph; to thin the source and
- * reweight, which keeps the whole window at lower precision; and to narrow the window, which keeps
- * full precision over less of it. The first two keep the ordinary output names and exit zero,
+ * <p>Streaming and interning are not choices: they are unconditional. What is left is to drop the
+ * audit outputs, which cost the most and contribute nothing to the flame graph; to thin the source
+ * and reweight, which keeps the whole window at lower precision; and to narrow the window, which
+ * keeps full precision over less of it. The first two keep the ordinary output names and exit zero,
  * because a stated estimator over the window that was asked for still answers the question. The
  * third does not, so it takes the INCOMPLETE names and exits two.
  */
@@ -157,21 +156,6 @@ final class Degradation {
 
     AuditLevel audit() {
         return audit;
-    }
-
-    void quantumRaised(long from, long to) {
-        record(ReportProto.DegradationStep.newBuilder()
-                .setReason("the requested quantum would have exceeded the synthetic event limit")
-                .setCoarsenSyntheticQuantum(ReportProto.CoarsenSyntheticQuantum.newBuilder()
-                        .setFromNanos(from)
-                        .setToNanos(to)));
-    }
-
-    /** Records that the synthetic JFR was omitted because even a coarser quantum could not fit. */
-    void syntheticOmitted(String reason) {
-        record(ReportProto.DegradationStep.newBuilder()
-                .setReason(reason)
-                .setOmitSyntheticJfr(ReportProto.OmitSyntheticJfr.getDefaultInstance()));
     }
 
     /** The message a refusal carries: the limit, what was already tried, and what would allow more. */

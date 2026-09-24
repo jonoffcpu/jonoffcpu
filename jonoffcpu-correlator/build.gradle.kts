@@ -8,12 +8,6 @@ jonoffcpuPublication {
     description = "Offline correlation and analysis tools for jonoffcpu recordings."
 }
 
-val jmcWriterSources =
-    configurations.create("jmcWriterSources") {
-        isTransitive = false
-        isCanBeConsumed = false
-    }
-
 dependencies {
     embeddedRuntime(project(":jonoffcpu-capture-codec"))
     embeddedRuntime(libs.protobuf.java)
@@ -21,15 +15,11 @@ dependencies {
     // Not used by the correlator's own code: protobuf-java-util's JsonFormat, which prints and parses every JSON
     // output, needs it at run time.
     embeddedRuntime(libs.gson)
-    embeddedRuntime(libs.jmc.flightrecorder.writer)
     embeddedRuntime(libs.picocli)
-    jmcWriterSources(variantOf(libs.jmc.flightrecorder.writer) { classifier("sources") })
     testFixturesApi(testFixtures(project(":jonoffcpu-capture-codec")))
 }
 
 val rootDirectory = isolated.rootProject.projectDirectory
-val asyncProfilerDir = rootDirectory.dir("async-profiler")
-val asyncProfilerConverter = asyncProfilerDir.file("build/bin/jfrconv")
 
 // The build version and the async-profiler fork commit, for --version.
 val asyncProfilerCommit =
@@ -65,69 +55,24 @@ sourceSets {
     }
 }
 
-val buildAsyncProfilerConverter =
-    tasks.register<Exec>("buildAsyncProfilerConverter") {
-        group = "native build"
-        description = "Builds jfrconv for compatibility validation."
-        workingDir(asyncProfilerDir)
-        commandLine("make", "build/bin/jfrconv")
-        inputs.files(fileTree(asyncProfilerDir.dir("src/converter")), asyncProfilerDir.file("src/launcher/launcher.sh"))
-        outputs.file(asyncProfilerConverter)
-    }
-
-// Two classes of the JMC writer, patched for compatibility with JFR readers, compiled ahead of the writer's own.
-val jmcPatchSourceDir = layout.buildDirectory.dir("generated/jmc-writer-patch/src")
-val extractJmcWriterSources =
-    tasks.register<Sync>("extractJmcWriterSources") {
-        from(provider { zipTree(jmcWriterSources.singleFile) }) {
-            include("org/openjdk/jmc/flightrecorder/writer/ConstantPool.java")
-            include("org/openjdk/jmc/flightrecorder/writer/TypesImpl.java")
-        }
-        into(jmcPatchSourceDir)
-    }
-
-val applyJmcWriterPatch =
-    tasks.register<Exec>("applyJmcWriterPatch") {
-        dependsOn(extractJmcWriterSources)
-        val patch = layout.projectDirectory.file("third-party/jmc-flightrecorder-writer-9.1.2-compat.patch")
-        workingDir(jmcPatchSourceDir)
-        environment("JMC_WRITER_PATCH", patch.asFile)
-        commandLine("bash", "-ceu", "patch --batch --forward -p1 < \"\$JMC_WRITER_PATCH\"; touch .applied")
-        inputs.file(patch)
-        outputs.file(jmcPatchSourceDir.map { it.file(".applied") })
-    }
-
-val compileJmcWriterPatch =
-    tasks.register<JavaCompile>("compileJmcWriterPatch") {
-        dependsOn(applyJmcWriterPatch)
-        source(fileTree(jmcPatchSourceDir) { include("**/*.java") })
-        classpath = files(configurations.named("embeddedRuntime"))
-        destinationDirectory = layout.buildDirectory.dir("classes/jmc-writer-patch")
-    }
-val jmcWriterPatchClasses = compileJmcWriterPatch.flatMap { it.destinationDirectory }
-
 tasks.shadowJar {
     relocate("com.google.protobuf", "io.github.jonoffcpu.correlator.internal.shaded.protobuf")
     relocate("com.google.gson", "io.github.jonoffcpu.correlator.internal.shaded.gson")
-    relocate("org.openjdk.jmc", "io.github.jonoffcpu.correlator.internal.shaded.jmc")
     relocate("picocli", "io.github.jonoffcpu.correlator.internal.shaded.picocli")
     manifest {
         attributes("Main-Class" to "io.github.jonoffcpu.correlator.OffCpuCorrelator")
     }
-    from(jmcWriterPatchClasses)
 }
 val correlatorJar = tasks.shadowJar.flatMap { it.archiveFile }
 
 val verifyRuntimeJar =
     tasks.register<VerifyJarContents>("verifyRuntimeJar") {
-        description = "Checks the self-contained offline JAR and retained dependency licenses."
+        description = "Checks the self-contained offline JAR and its license."
         jar = correlatorJar
         label = "Correlator JAR"
         requiredEntries =
             listOf(
                 "META-INF/LICENSE",
-                "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-LICENSE.txt",
-                "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-THIRD_PARTY_LICENSES.txt",
                 "io/github/jonoffcpu/correlator/OffCpuCorrelator.class",
                 "io/github/jonoffcpu/correlator/SignalJfrExporter.class",
                 "io/github/jonoffcpu/correlator/ReportProto.class",
@@ -136,13 +81,11 @@ val verifyRuntimeJar =
                 // Every JSON output is printed by JsonFormat, which parses with the relocated Gson.
                 "io/github/jonoffcpu/correlator/internal/shaded/protobuf/util/JsonFormat.class",
                 "io/github/jonoffcpu/correlator/internal/shaded/gson/JsonParser.class",
-                "io/github/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
-                "io/github/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class",
                 "io/github/jonoffcpu/correlator/internal/shaded/picocli/CommandLine.class",
             )
         // Unrelocated dependencies, and the agent's classes.
         forbiddenPrefixes =
-            listOf("com/google/gson/", "org/openjdk/jmc/", "com/google/protobuf/", "picocli/", "io/github/jonoffcpu/agent/")
+            listOf("com/google/gson/", "com/google/protobuf/", "picocli/", "io/github/jonoffcpu/agent/")
     }
 tasks.check {
     dependsOn(verifyRuntimeJar)
@@ -159,9 +102,7 @@ tasks.withType<Test>().configureEach {
     )
 }
 
-// The patched JMC writer classes come first, so that they replace the writer's own.
 tasks.test {
-    classpath = files(jmcWriterPatchClasses) + classpath
     maxHeapSize = "1g"
     // The README's option tables are checked against the parser, so documentation and help cannot drift.
     val readme = rootDirectory.file("README.md")
@@ -170,10 +111,7 @@ tasks.test {
 }
 
 tasks.named<Test>("integrationTest") {
-    dependsOn(buildAsyncProfilerConverter)
-    classpath = files(jmcWriterPatchClasses) + classpath + files(correlatorJar)
-    inputs.file(asyncProfilerConverter).withPropertyName("jfrconv").withPathSensitivity(PathSensitivity.NONE)
-    systemProperty("jonoffcpu.jfrconv", asyncProfilerConverter.asFile.absolutePath)
+    classpath = classpath + files(correlatorJar)
     // The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
     systemProperty("jonoffcpu.fixtures", providers.gradleProperty("jonoffcpuFixtures").getOrElse(""))
     (options as JUnitPlatformOptions).excludeTags("scale")
@@ -187,7 +125,7 @@ val scaleTest =
         group = "verification"
         description = "Checks that correlation retention tracks distinct stacks, not intervals, under a capped heap."
         testClassesDirs = files(integrationTestSourceSet.map { it.output.classesDirs })
-        classpath = files(jmcWriterPatchClasses) + files(integrationTestSourceSet.map { it.runtimeClasspath })
+        classpath = files(integrationTestSourceSet.map { it.runtimeClasspath })
         useJUnitPlatform { includeTags("scale") }
         systemProperty("jonoffcpu.scaleRows", providers.gradleProperty("scaleRows").getOrElse(""))
         maxHeapSize = providers.gradleProperty("scaleHeap").getOrElse("128m")
