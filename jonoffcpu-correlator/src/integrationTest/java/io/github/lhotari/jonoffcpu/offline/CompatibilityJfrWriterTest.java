@@ -4,8 +4,8 @@ package io.github.lhotari.jonoffcpu.offline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
+import com.google.protobuf.Timestamp;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
@@ -15,7 +15,6 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
@@ -34,35 +33,35 @@ class CompatibilityJfrWriterTest {
     private static final String SESSION = UUID.randomUUID().toString();
     private static final String EXECUTION_SAMPLE = "jdk.ExecutionSample";
 
-    private static JsonObject frame(String className, String methodName, String type, int line, int bci) {
-        JsonObject frame = new JsonObject();
-        frame.addProperty("type", type);
-        frame.addProperty("className", className);
-        frame.addProperty("methodName", methodName);
-        frame.addProperty("descriptor", "()V");
-        frame.addProperty("lineNumber", line);
-        frame.addProperty("bytecodeIndex", bci);
-        return frame;
+    private static SignalProto.JfrFrame frame(String className, String methodName, String type, int line, int bci) {
+        return SignalProto.JfrFrame.newBuilder()
+                .setType(type)
+                .setClassName(className)
+                .setMethodName(methodName)
+                .setMethodDescriptor("()V")
+                .setLineNumber(line)
+                .setBytecodeIndex(bci)
+                .build();
     }
 
     private static OfflineCorrelator.Match match(
-            long sequence, long from, long duration, String thread, boolean truncated, JsonObject... frames) {
-        JsonObject observation = new JsonObject();
-        observation.addProperty("correlationId", String.format("80000001%08x", sequence));
-        JsonObject sample = new JsonObject();
+            long sequence, long from, long duration, String thread, boolean truncated, SignalProto.JfrFrame... frames) {
+        CaptureProto.Observation observation = CaptureProto.Observation.newBuilder()
+                .setCorrelationId(0x80000001L << 32 | sequence)
+                .build();
         long sampleMonotonic = from + duration + 100;
-        sample.addProperty("monotonicTimeNanos", Long.toString(sampleMonotonic));
-        sample.addProperty(
-                "startTime",
-                Instant.ofEpochSecond(0, BASE_EPOCH + sampleMonotonic - BASE_MONOTONIC)
-                        .toString());
-        sample.addProperty("osThreadId", 40 + sequence);
-        sample.addProperty("javaThreadId", 400 + sequence);
-        sample.addProperty("threadName", thread);
-        sample.addProperty("stackTruncated", truncated);
-        JsonArray stack = new JsonArray();
-        for (JsonObject frame : frames) stack.add(frame);
-        sample.add("frames", stack);
+        Instant start = Instant.ofEpochSecond(0, BASE_EPOCH + sampleMonotonic - BASE_MONOTONIC);
+        SignalProto.SignalSample sample = SignalProto.SignalSample.newBuilder()
+                .setMonotonicTimeNanos(sampleMonotonic)
+                .setStartTime(Timestamp.newBuilder()
+                        .setSeconds(start.getEpochSecond())
+                        .setNanos(start.getNano()))
+                .setOsThreadId(40 + sequence)
+                .setJavaThreadId(400 + sequence)
+                .setThreadName(thread)
+                .setStackTruncated(truncated)
+                .addAllFrames(List.of(frames))
+                .build();
         return new OfflineCorrelator.Match(
                 observation,
                 sample,
@@ -75,11 +74,12 @@ class CompatibilityJfrWriterTest {
 
     /** Three matches of 2, 4 and 1 quanta: a truncated JIT frame, an interpreted native frame, and no stack. */
     private static List<OfflineCorrelator.Match> matches() {
-        JsonObject alpha = frame("test.Alpha", "alpha", "JIT compiled", 11, 3);
-        JsonObject beta = frame("test.Beta", "beta", "Interpreted", 22, 7);
+        SignalProto.JfrFrame alpha = frame("test.Alpha", "alpha", "JIT compiled", 11, 3);
         // Native frames commonly lack a descriptor. AP requires even this empty Symbol
         // constant to use the ordinary inline UTF encoding.
-        beta.addProperty("descriptor", "");
+        SignalProto.JfrFrame beta = frame("test.Beta", "beta", "Interpreted", 22, 7).toBuilder()
+                .setMethodDescriptor("")
+                .build();
         return List.of(
                 match(1, BASE_MONOTONIC, 2 * QUANTUM, "alpha-thread", true, alpha),
                 match(2, BASE_MONOTONIC + 10 * QUANTUM, 4 * QUANTUM, "beta-thread", false, beta),
@@ -87,23 +87,21 @@ class CompatibilityJfrWriterTest {
     }
 
     private static OfflineCorrelator.Analysis analysis(List<OfflineCorrelator.Match> matches) {
-        BigInteger exact =
-                matches.stream().map(OfflineCorrelator.Match::durationNanos).reduce(BigInteger.ZERO, BigInteger::add);
-        JsonObject inputs = new JsonObject();
-        inputs.addProperty("sessionId", SESSION);
-        inputs.addProperty("captureEpoch", 0x80000001L);
-        inputs.addProperty("monotonicOffsetNanos", "0");
-        JsonObject source = new JsonObject();
-        source.addProperty("rawSha256", "11".repeat(32));
-        inputs.add("sourceArtifact", source);
-        JsonObject jfr = new JsonObject();
-        jfr.addProperty("sha256", "22".repeat(32));
-        inputs.add("jfrArtifact", jfr);
+        long exact = matches.stream()
+                .map(OfflineCorrelator.Match::durationNanos)
+                .reduce(BigInteger.ZERO, BigInteger::add)
+                .longValueExact();
+        CaptureProto.AnalysisInputs inputs = CaptureProto.AnalysisInputs.newBuilder()
+                .setSessionId(SESSION)
+                .setCaptureEpoch(0x80000001)
+                .setVerifiedIdentity(CaptureProto.VerifiedIdentity.newBuilder().setMonotonicOffsetNanos(0))
+                .setSourceArtifact(CaptureProto.SourceArtifact.newBuilder().setRawSha256("11".repeat(32)))
+                .setJfrArtifact(CaptureProto.FileArtifact.newBuilder().setSha256("22".repeat(32)))
+                .build();
         return new OfflineCorrelator.Analysis(
-                1,
                 inputs,
-                new JsonObject(),
-                "0",
+                null,
+                0L,
                 matches.size(),
                 matches.size(),
                 matches.size(),
@@ -112,9 +110,9 @@ class CompatibilityJfrWriterTest {
                 0,
                 0,
                 0,
-                exact.toString(),
-                "0",
-                Map.of(),
+                exact,
+                0L,
+                java.util.Map.of(),
                 List.of(),
                 List.copyOf(matches),
                 null,
@@ -225,10 +223,10 @@ class CompatibilityJfrWriterTest {
     /** Per-stack carry makes 1.5q + 0.5q exactly two events, with the second timestamp in the later interval. */
     @Test
     void carriesRemainderPerStack(@TempDir Path directory) throws Exception {
-        JsonObject carryFrame = frame("test.Carry", "carry", "Interpreted", 33, 1);
+        SignalProto.JfrFrame carryFrame = frame("test.Carry", "carry", "Interpreted", 33, 1);
         List<OfflineCorrelator.Match> carryMatches = List.of(
                 match(4, BASE_MONOTONIC + 30 * QUANTUM, 1_500, "carry-one", false, carryFrame),
-                match(5, BASE_MONOTONIC + 40 * QUANTUM, 500, "carry-two", false, carryFrame.deepCopy()));
+                match(5, BASE_MONOTONIC + 40 * QUANTUM, 500, "carry-two", false, carryFrame));
         Path carryFile = directory.resolve("carry.jfr");
         var carry = CompatibilityJfrWriter.write(
                 analysis(carryMatches), carryFile, new CompatibilityJfrWriter.Options(QUANTUM, 10));

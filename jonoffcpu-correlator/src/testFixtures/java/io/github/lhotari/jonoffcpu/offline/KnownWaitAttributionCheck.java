@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.protobuf.ListValue;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.IOException;
-import java.io.Reader;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -19,7 +19,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
-/** Acceptance check that keeps scheduler intervals separate from delivery-stack evidence. */
+/**
+ * Acceptance check that keeps scheduler intervals separate from delivery-stack evidence. The workload's JSON and the
+ * check's report are free-form, so they are read and written as protobuf {@code Struct}s through {@code ProtoJson}.
+ */
 public final class KnownWaitAttributionCheck {
     private static final Set<String> REQUIRED_THREADS = Set.of(
             "jonoffcpu-known-sleep",
@@ -31,7 +34,7 @@ public final class KnownWaitAttributionCheck {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 4) {
-            throw new IllegalArgumentException("Expected source NDJSON, original JFR, workload JSON, and report JSON");
+            throw new IllegalArgumentException("Expected capture stream, original JFR, workload JSON, and report JSON");
         }
         Path source = Path.of(args[0]);
         Path jfr = Path.of(args[1]);
@@ -53,39 +56,39 @@ public final class KnownWaitAttributionCheck {
             summary.fixtureRequestedNanos = summary.fixtureRequestedNanos.add(operation.requested());
             summary.fixtureActualNanos = summary.fixtureActualNanos.add(operation.actual());
         }
-        for (OfflineCorrelator.ClassifiedRecord classified : analysis.records()) {
-            if (!classified.stream().equals("source")
-                    || classified.classification().equals("invalid")) continue;
-            JsonObject row = classified.record();
-            ThreadSummary summary = summaries.get(row.get("targetTid").getAsLong());
+        for (ReportProto.ClassifiedRecord classified : analysis.records()) {
+            if (!classified.hasSource()
+                    || classified.getClassification() == ReportProto.Classification.CLASSIFICATION_INVALID) continue;
+            CaptureProto.Observation row = classified.getSource().getObservation();
+            ThreadSummary summary = summaries.get(Integer.toUnsignedLong(row.getTargetTid()));
             if (summary == null) continue;
-            BigInteger start = decimal(row, "startMonotonicNanos");
-            BigInteger end = decimal(row, "endMonotonicNanos");
+            BigInteger start = U64.big(row.getStartMonotonicNanos());
+            BigInteger end = U64.big(row.getEndMonotonicNanos());
             BigInteger overlap = fixture.overlap(summary.tid, start, end);
             if (overlap.signum() > 0) {
                 summary.sourceRows++;
                 summary.sourceIntervalNanos = summary.sourceIntervalNanos.add(end.subtract(start));
                 summary.sourceFixtureOverlapNanos = summary.sourceFixtureOverlapNanos.add(overlap);
                 // A known wait is a sleep, a park or a blocking JNI call: the kernel must classify it blocked.
-                String reason =
-                        row.has("offCpuReason") ? row.get("offCpuReason").getAsString() : "unspecified";
+                OffCpuReason switchOut = OffCpuReason.fromWire(row.getReasonValue());
+                String reason = switchOut == null ? "unspecified" : switchOut.label();
                 summary.overlapByReason.merge(reason, overlap, BigInteger::add);
             }
         }
         for (OfflineCorrelator.Match match : analysis.matches()) {
             ThreadSummary summary =
-                    summaries.get(match.observation().get("targetTid").getAsLong());
+                    summaries.get(Integer.toUnsignedLong(match.observation().getTargetTid()));
             if (summary == null) continue;
             summary.matchedRows++;
             summary.matchedIntervalNanos = summary.matchedIntervalNanos.add(match.durationNanos());
             summary.handlerDelays.add(match.handlerDelayNanos());
             summary.deliveryStacks.merge(stack(match.sample()), 1, Integer::sum);
             BigInteger handlerTime =
-                    decimal(match.observation(), "endMonotonicNanos").add(match.handlerDelayNanos());
+                    U64.big(match.observation().getEndMonotonicNanos()).add(match.handlerDelayNanos());
             if (fixture.insidePhase(summary.tid, "reblock", handlerTime)) summary.deliveredDuringReblock++;
         }
 
-        JsonObject threads = new JsonObject();
+        Struct.Builder threads = Struct.newBuilder();
         for (ThreadSummary summary : summaries.values().stream()
                 .sorted(java.util.Comparator.comparing(item -> item.name))
                 .toList()) {
@@ -104,73 +107,87 @@ public final class KnownWaitAttributionCheck {
                                     .compareTo(summary.sourceFixtureOverlapNanos.multiply(BigInteger.valueOf(95)))
                             >= 0,
                     "Known waits must be classified blocked for " + summary.name + ": " + summary.overlapByReason);
-            JsonObject row = new JsonObject();
-            row.addProperty("targetTid", summary.tid);
-            row.addProperty("fixtureOperations", summary.fixtureOperations);
-            row.addProperty("fixtureRequestedNanos", summary.fixtureRequestedNanos.toString());
-            row.addProperty("fixtureActualNanos", summary.fixtureActualNanos.toString());
-            row.addProperty("sourceRowsOverlappingFixture", summary.sourceRows);
-            row.addProperty("sourceObservedIntervalNanos", summary.sourceIntervalNanos.toString());
-            row.addProperty("sourceOverlapWithFixtureNanos", summary.sourceFixtureOverlapNanos.toString());
-            JsonObject byReason = new JsonObject();
+            Struct.Builder row = Struct.newBuilder()
+                    .putFields("targetTid", number(summary.tid))
+                    .putFields("fixtureOperations", number(summary.fixtureOperations))
+                    .putFields("fixtureRequestedNanos", text(summary.fixtureRequestedNanos.toString()))
+                    .putFields("fixtureActualNanos", text(summary.fixtureActualNanos.toString()))
+                    .putFields("sourceRowsOverlappingFixture", number(summary.sourceRows))
+                    .putFields("sourceObservedIntervalNanos", text(summary.sourceIntervalNanos.toString()))
+                    .putFields("sourceOverlapWithFixtureNanos", text(summary.sourceFixtureOverlapNanos.toString()));
+            Struct.Builder byReason = Struct.newBuilder();
             new TreeMap<>(summary.overlapByReason)
-                    .forEach((reason, nanos) -> byReason.addProperty(reason, nanos.toString()));
-            row.add("sourceOverlapWithFixtureNanosByOffCpuReason", byReason);
-            row.addProperty("matchedDeliveryRows", summary.matchedRows);
-            row.addProperty("matchedDeliveryWeightedNanos", summary.matchedIntervalNanos.toString());
-            row.add("handlerDelayNanos", delaySummary(summary.handlerDelays));
-            row.add(
+                    .forEach((reason, nanos) -> byReason.putFields(reason, text(nanos.toString())));
+            row.putFields(
+                    "sourceOverlapWithFixtureNanosByOffCpuReason",
+                    Value.newBuilder().setStructValue(byReason).build());
+            row.putFields("matchedDeliveryRows", number(summary.matchedRows));
+            row.putFields("matchedDeliveryWeightedNanos", text(summary.matchedIntervalNanos.toString()));
+            row.putFields(
+                    "handlerDelayNanos",
+                    Value.newBuilder()
+                            .setStructValue(delaySummary(summary.handlerDelays))
+                            .build());
+            Struct.Builder stacks = Struct.newBuilder();
+            new TreeMap<>(summary.deliveryStacks).forEach((stack, count) -> stacks.putFields(stack, number(count)));
+            row.putFields(
                     "signalDeliveryStacks",
-                    new GsonBuilder().create().toJsonTree(new TreeMap<>(summary.deliveryStacks)));
+                    Value.newBuilder().setStructValue(stacks).build());
             if (summary.name.equals("jonoffcpu-known-rapid-reblock")) {
-                row.addProperty("deliveriesWhoseTranslatedHandlerTimeWasDuringReblock", summary.deliveredDuringReblock);
+                row.putFields(
+                        "deliveriesWhoseTranslatedHandlerTimeWasDuringReblock", number(summary.deliveredDuringReblock));
             }
-            threads.add(summary.name, row);
+            threads.putFields(
+                    summary.name, Value.newBuilder().setStructValue(row).build());
         }
 
-        JsonObject report = new JsonObject();
-        report.addProperty("schemaVersion", 1);
-        report.addProperty("result", "pass");
-        report.addProperty("sourceTimingSemantics", "scheduler off-CPU intervals on Linux CLOCK_MONOTONIC");
-        report.addProperty("stackTimingSemantics", "post-resumption signal-delivery stack");
-        report.addProperty(
-                "handlerDelaySemantics", "source interval end to translated async-profiler handler timestamp");
-        report.addProperty("blockingStackIdentityClaimed", false);
-        report.addProperty("sourceRows", analysis.sourceRows());
-        report.addProperty("matchedRows", analysis.matched());
-        report.add("threads", threads);
-        Files.writeString(output, new GsonBuilder().setPrettyPrinting().create().toJson(report) + "\n");
+        Struct report = Struct.newBuilder()
+                .putFields("result", text("pass"))
+                .putFields("sourceTimingSemantics", text("scheduler off-CPU intervals on Linux CLOCK_MONOTONIC"))
+                .putFields("stackTimingSemantics", text("post-resumption signal-delivery stack"))
+                .putFields(
+                        "handlerDelaySemantics",
+                        text("source interval end to translated async-profiler handler timestamp"))
+                .putFields(
+                        "blockingStackIdentityClaimed",
+                        Value.newBuilder().setBoolValue(false).build())
+                .putFields("sourceRows", number(analysis.sourceRows()))
+                .putFields("matchedRows", number(analysis.matched()))
+                .putFields("threads", Value.newBuilder().setStructValue(threads).build())
+                .build();
+        Files.writeString(output, ProtoJson.pretty(report) + "\n");
         System.out.println("Known-wait attribution check passed: " + output);
     }
 
     private static Fixture readFixture(Path path) throws IOException {
-        JsonObject root;
-        try (Reader reader = Files.newBufferedReader(path)) {
-            root = JsonParser.parseReader(reader).getAsJsonObject();
-        }
-        check(root.get("schemaVersion").getAsInt() == 1, "Unsupported fixture schema");
-        check(root.get("clock").getAsString().equals("Linux CLOCK_MONOTONIC"), "Unexpected fixture clock");
+        Struct root =
+                ProtoJson.parse(Files.readString(path), Struct.newBuilder()).build();
+        check(integer(root, "schemaVersion").intValueExact() == 1, "Unsupported fixture schema");
+        check(string(root, "clock").equals("Linux CLOCK_MONOTONIC"), "Unexpected fixture clock");
         Map<String, Long> tids = new TreeMap<>();
-        for (var entry : root.getAsJsonObject("targetTids").entrySet()) {
-            tids.put(entry.getKey(), entry.getValue().getAsLong());
+        for (var entry : root.getFieldsOrThrow("targetTids")
+                .getStructValue()
+                .getFieldsMap()
+                .entrySet()) {
+            tids.put(entry.getKey(), integer(entry.getValue()).longValueExact());
         }
         check(tids.keySet().equals(REQUIRED_THREADS), "Fixture thread set is incomplete");
         check(new HashSet<>(tids.values()).size() == REQUIRED_THREADS.size(), "Fixture TIDs are not unique");
-        int iterations = root.get("iterations").getAsInt();
+        int iterations = integer(root, "iterations").intValueExact();
         Map<String, String> expectedKinds = Map.of(
                 "jonoffcpu-known-sleep", "sleep",
                 "jonoffcpu-known-park", "park",
                 "jonoffcpu-known-native-wait", "native-wait",
                 "jonoffcpu-known-rapid-reblock", "rapid-reblock");
         List<Operation> operations = new ArrayList<>();
-        JsonArray array = root.getAsJsonArray("operations");
-        for (JsonElement element : array) {
-            JsonObject row = element.getAsJsonObject();
+        ListValue array = root.getFieldsOrThrow("operations").getListValue();
+        for (Value element : array.getValuesList()) {
+            Struct row = element.getStructValue();
             Operation operation = new Operation(
-                    row.get("threadName").getAsString(),
-                    row.get("targetTid").getAsLong(),
-                    row.get("waitKind").getAsString(),
-                    row.get("phase").getAsString(),
+                    string(row, "threadName"),
+                    integer(row, "targetTid").longValueExact(),
+                    string(row, "waitKind"),
+                    string(row, "phase"),
                     decimal(row, "requestedDurationNanos"),
                     decimal(row, "startMonotonicNanos"),
                     decimal(row, "requestedEndMonotonicNanos"),
@@ -210,14 +227,14 @@ public final class KnownWaitAttributionCheck {
         return new Fixture(tids, operations);
     }
 
-    private static JsonObject delaySummary(List<BigInteger> values) {
+    private static Struct delaySummary(List<BigInteger> values) {
         values.sort(BigInteger::compareTo);
-        JsonObject result = new JsonObject();
-        result.addProperty("count", values.size());
-        result.addProperty("p50", percentile(values, 50).toString());
-        result.addProperty("p99", percentile(values, 99).toString());
-        result.addProperty("max", values.get(values.size() - 1).toString());
-        return result;
+        return Struct.newBuilder()
+                .putFields("count", number(values.size()))
+                .putFields("p50", text(percentile(values, 50).toString()))
+                .putFields("p99", text(percentile(values, 99).toString()))
+                .putFields("max", text(values.get(values.size() - 1).toString()))
+                .build();
     }
 
     private static BigInteger percentile(List<BigInteger> values, int percentile) {
@@ -225,26 +242,44 @@ public final class KnownWaitAttributionCheck {
         return values.get(rank - 1);
     }
 
-    private static String stack(JsonObject sample) {
-        JsonArray frames = sample.getAsJsonArray("frames");
+    private static String stack(SignalProto.SignalSample sample) {
+        List<SignalProto.JfrFrame> frames = sample.getFramesList();
         if (frames.isEmpty()) return "[stack unavailable]";
         List<String> names = new ArrayList<>();
         for (int index = frames.size() - 1; index >= 0; index--) {
-            JsonObject frame = frames.get(index).getAsJsonObject();
-            String type = text(frame, "className", "");
-            String method = text(frame, "methodName", "[unresolved]");
+            SignalProto.JfrFrame frame = frames.get(index);
+            String type = frame.hasClassName() ? frame.getClassName() : "";
+            String method = frame.hasMethodName() ? frame.getMethodName() : "[unresolved]";
             names.add((type.isEmpty() ? method : type + "." + method).replace(';', ':'));
         }
         return String.join(";", names);
     }
 
-    private static String text(JsonObject row, String key, String fallback) {
-        JsonElement value = row.get(key);
-        return value == null || value.isJsonNull() ? fallback : value.getAsString();
+    private static Value text(String value) {
+        return Value.newBuilder().setStringValue(value).build();
     }
 
-    private static BigInteger decimal(JsonObject row, String key) {
-        return new BigInteger(row.get(key).getAsString());
+    private static Value number(long value) {
+        return Value.newBuilder().setNumberValue(value).build();
+    }
+
+    private static String string(Struct row, String key) {
+        return row.getFieldsOrThrow(key).getStringValue();
+    }
+
+    /** An integer the workload wrote as a JSON number or as a decimal string. */
+    private static BigInteger integer(Value value) {
+        return value.hasStringValue()
+                ? new BigInteger(value.getStringValue())
+                : new BigDecimal(value.getNumberValue()).toBigIntegerExact();
+    }
+
+    private static BigInteger integer(Struct row, String key) {
+        return integer(row.getFieldsOrThrow(key));
+    }
+
+    private static BigInteger decimal(Struct row, String key) {
+        return integer(row, key);
     }
 
     private static void check(boolean condition, String message) {

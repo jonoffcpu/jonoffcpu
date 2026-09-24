@@ -4,9 +4,6 @@ package io.github.lhotari.jonoffcpu.offline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIOException;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -47,10 +44,6 @@ class DegradationLadderTest {
     @TempDir
     static Path inputs;
 
-    private static JsonObject json(Path file) throws IOException {
-        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
-    }
-
     private static int correlate(String... args) throws Exception {
         String[] withWatermark = java.util.Arrays.copyOf(args, args.length + 2);
         withWatermark[args.length] = "--watermark-rows";
@@ -69,10 +62,9 @@ class DegradationLadderTest {
                             "--format", "collapsed",
                             "--audit", "none"))
                     .isZero();
-            long peak = json(unconstrained.resolve(OutputFiles.REPORT))
-                    .getAsJsonObject("degradation")
-                    .get("peakRetainedBytes")
-                    .getAsLong();
+            long peak = CorrelationFixture.report(unconstrained.resolve(OutputFiles.REPORT))
+                    .getDegradation()
+                    .getPeakRetainedBytes();
             budgetBytes = (long) (peak * BUDGET_SHARE);
         }
         return budgetBytes;
@@ -101,18 +93,18 @@ class DegradationLadderTest {
         assertThat(Files.size(thinnedOnly.resolve(OutputFiles.COLLAPSED)))
                 .as("a degraded run still produces a flame graph")
                 .isPositive();
-        JsonObject report = json(thinnedOnly.resolve(OutputFiles.REPORT));
-        List<String> steps = new ArrayList<>();
-        report.getAsJsonObject("degradation")
-                .getAsJsonArray("stepsApplied")
-                .forEach(step -> steps.add(step.getAsJsonObject().get("step").getAsString()));
-        assertThat(steps).as("the report names every ladder step applied").contains("thin-source");
-        assertThat(report.has("sourceThinning"))
+        ReportProto.Report report = CorrelationFixture.report(thinnedOnly.resolve(OutputFiles.REPORT));
+        assertThat(report.getDegradation().getStepsAppliedList())
+                .as("the report names every ladder step applied")
+                .extracting(ReportProto.DegradationStep::getStepCase)
+                .contains(ReportProto.DegradationStep.StepCase.THIN_SOURCE);
+        assertThat(report.hasSourceThinning())
                 .as("a thinned analysis states its estimator")
                 .isTrue();
-        assertThat(report.getAsJsonObject("degradation").get("narrowedToNanos").isJsonNull())
+        assertThat(report.getSourceThinning().getEstimator()).isEqualTo("inverse-probability");
+        assertThat(report.getDegradation().hasNarrowedToNanos())
                 .as("a thinned-only run reports no narrowed window")
-                .isTrue();
+                .isFalse();
 
         // The case above never leaves Degradation's constructor: the pre-decode estimate already picks
         // a rung that fits, so the retry loop's own thin-source rung (advance(), triggered by a
@@ -135,19 +127,17 @@ class DegradationLadderTest {
                         budget))
                 .as("a watermark-driven thin-source retry is still a complete analysis")
                 .isZero();
-        JsonObject reactiveDegradation =
-                json(reactiveThinned.resolve(OutputFiles.REPORT)).getAsJsonObject("degradation");
-        assertThat(reactiveDegradation.get("attempts").getAsInt())
+        ReportProto.DegradationReport reactiveDegradation = CorrelationFixture.report(
+                        reactiveThinned.resolve(OutputFiles.REPORT))
+                .getDegradation();
+        assertThat(reactiveDegradation.getAttempts())
                 .as("a too-loose --thinning forces a watermark-driven retry, not just the constructor's"
                         + " pre-decode pick: " + reactiveDegradation)
                 .isGreaterThan(1);
         List<String> reactiveThinSourceReasons = new ArrayList<>();
-        reactiveDegradation.getAsJsonArray("stepsApplied").forEach(step -> {
-            JsonObject entry = step.getAsJsonObject();
-            if (entry.get("step").getAsString().equals("thin-source")) {
-                reactiveThinSourceReasons.add(entry.get("reason").getAsString());
-            }
-        });
+        for (ReportProto.DegradationStep step : reactiveDegradation.getStepsAppliedList()) {
+            if (step.hasThinSource()) reactiveThinSourceReasons.add(step.getReason());
+        }
         assertThat(reactiveThinSourceReasons)
                 .as("the watermark-driven rung records the watermark reason, not the pre-decode one")
                 .contains("retained bytes reached the budget during the pass");
@@ -176,6 +166,14 @@ class DegradationLadderTest {
         assertThat(narrowed.resolve(OutputFiles.NARROWED))
                 .as("a narrowed window takes the INCOMPLETE names and its own marker")
                 .isRegularFile();
+        ReportProto.Marker marker = CorrelationFixture.marker(narrowed.resolve(OutputFiles.NARROWED));
+        assertThat(marker.getState()).isEqualTo(ReportProto.MarkerState.MARKER_STATE_NARROWED);
+        assertThat(marker.getCoverageComplete()).isFalse();
+        assertThat(marker.getEffectiveToNanos())
+                .as("the marker names where the narrowed window ends")
+                .isEqualTo(CorrelationFixture.report(narrowed.resolve(OutputFiles.INCOMPLETE_REPORT))
+                        .getDegradation()
+                        .getNarrowedToNanos());
 
         Path refused = dir.resolve("ladder-fail");
         assertThatIOException()
@@ -249,17 +247,14 @@ class DegradationLadderTest {
                         Long.toString(budget(input))))
                 .as("a narrowed full audit still reports an incomplete window")
                 .isEqualTo(2);
-        JsonObject narrowedReport = json(narrowed.resolve(OutputFiles.INCOMPLETE_REPORT));
-        assertThat(narrowedReport
-                        .getAsJsonObject("degradation")
-                        .get("narrowedToNanos")
-                        .isJsonNull())
+        ReportProto.Report narrowedReport = CorrelationFixture.report(narrowed.resolve(OutputFiles.INCOMPLETE_REPORT));
+        assertThat(narrowedReport.getDegradation().hasNarrowedToNanos())
                 .as("the truncate sub-case must actually narrow, or it proves nothing about the audit pass")
-                .isFalse();
-        assertThat(narrowedReport.get("audit").getAsString())
+                .isTrue();
+        assertThat(narrowedReport.getAudit())
                 .as("truncate must not quietly drop the requested audit level")
                 .isEqualTo("full");
-        assertThat(narrowedReport.get("sourceRows").getAsInt())
+        assertThat(narrowedReport.getSourceRows())
                 .as("a narrowed run must have dropped source rows, or the audit mapping is untested")
                 .isLessThan(LADDER_ROWS);
         checkAuditMatchesColumns(
@@ -276,34 +271,36 @@ class DegradationLadderTest {
      */
     private static void checkAuditMatchesColumns(Path output, String reportName, String recordsName, String matchesName)
             throws Exception {
-        JsonObject report = json(output.resolve(reportName));
-        int sourceRows = report.get("sourceRows").getAsInt();
-        int jfrSamples = report.get("jfrSamples").getAsInt();
-        int matched = report.get("matched").getAsInt();
-        int unmatchedSource = report.get("unmatchedSource").getAsInt();
-        int invalidSource = report.get("invalidSource").getAsInt();
+        ReportProto.Report report = CorrelationFixture.report(output.resolve(reportName));
+        long sourceRows = report.getSourceRows();
+        long jfrSamples = report.getJfrSamples();
+        long matched = report.getMatched();
+        long unmatchedSource = report.getUnmatchedSource();
+        long invalidSource = report.getInvalidSource();
         assertThat(List.of(sourceRows, jfrSamples, matched))
                 .as("something was kept, so something is being checked")
                 .allMatch(count -> count > 0);
 
-        int sourceLines = 0;
-        int jfrLines = 0;
-        int matchedSourceLines = 0;
-        Set<String> auditMatchedCookies = new HashSet<>();
-        Set<String> auditSourceCookies = new HashSet<>();
-        for (String line : Files.readAllLines(output.resolve(recordsName))) {
-            JsonObject entry = JsonParser.parseString(line).getAsJsonObject();
-            String cookie = entry.getAsJsonObject("record").get("correlationId").getAsString();
-            if (entry.get("stream").getAsString().equals("source")) {
+        long sourceLines = 0;
+        long jfrLines = 0;
+        long matchedSourceLines = 0;
+        Set<Long> auditMatchedCookies = new HashSet<>();
+        Set<Long> auditSourceCookies = new HashSet<>();
+        for (ReportProto.ClassifiedRecord entry : CorrelationFixture.classifiedRecords(output.resolve(recordsName))) {
+            if (entry.hasSource()) {
+                long cookie = entry.getSource().getObservation().getCorrelationId();
                 sourceLines++;
                 assertThat(auditSourceCookies.add(cookie))
-                        .as("the audit pass emitted the same source row twice: " + cookie)
+                        .as("the audit pass emitted the same source row twice: " + Long.toHexString(cookie))
                         .isTrue();
-                if (entry.get("classification").getAsString().equals("matched")) {
+                if (entry.getClassification() == ReportProto.Classification.CLASSIFICATION_MATCHED) {
                     matchedSourceLines++;
                     auditMatchedCookies.add(cookie);
                 }
             } else {
+                assertThat(entry.hasJfr())
+                        .as("every audit row is a source row or a JFR row")
+                        .isTrue();
                 jfrLines++;
             }
         }
@@ -316,12 +313,9 @@ class DegradationLadderTest {
                 .isEqualTo(matched + unmatchedSource + invalidSource);
         assertThat(matchedSourceLines).as("audit matched source lines").isEqualTo(matched);
 
-        Set<String> matchesCookies = new HashSet<>();
-        for (String line : Files.readAllLines(output.resolve(matchesName))) {
-            matchesCookies.add(JsonParser.parseString(line)
-                    .getAsJsonObject()
-                    .get("correlationId")
-                    .getAsString());
+        Set<Long> matchesCookies = new HashSet<>();
+        for (ReportProto.Pair pair : CorrelationFixture.pairs(output.resolve(matchesName))) {
+            matchesCookies.add(pair.getCorrelationId());
         }
         assertThat(auditMatchedCookies)
                 .as("the audit pass classifies as matched exactly the cookies the matches file names")

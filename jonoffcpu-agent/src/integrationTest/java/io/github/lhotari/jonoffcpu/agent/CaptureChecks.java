@@ -3,9 +3,18 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Manifest;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ManifestState;
+import io.github.lhotari.jonoffcpu.capture.CaptureFormat;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureFinalized;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.FinalizedState;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Record;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
+import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
 import java.io.PrintStream;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -85,47 +94,94 @@ final class CaptureChecks {
         return run.output();
     }
 
-    static JsonObject json(Path file) throws Exception {
+    /**
+     * A JSON file the correlator wrote, as a generic tree: its formats are the correlator's own messages, printed in
+     * the proto3 JSON mapping, so 64-bit integers are decimal strings and enums their value names.
+     */
+    static Struct json(Path file) throws Exception {
         assertThat(file).isRegularFile();
-        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+        return jsonLine(Files.readString(file));
     }
 
-    static JsonObject manifest(Path out) throws Exception {
-        return json(out.resolve(MANIFEST));
+    static Struct jsonLine(String json) throws Exception {
+        return ProtoJson.parse(json, Struct.newBuilder()).build();
+    }
+
+    /** The value at a path of field names, which must exist. */
+    static Value value(Struct object, String... path) {
+        Value value = Value.newBuilder().setStructValue(object).build();
+        for (String name : path) {
+            assertThat(value.hasStructValue()).as("an object holds %s", name).isTrue();
+            assertThat(value.getStructValue().getFieldsMap())
+                    .as("the fields around %s", name)
+                    .containsKey(name);
+            value = value.getStructValue().getFieldsOrThrow(name);
+        }
+        return value;
+    }
+
+    static Struct object(Struct object, String... path) {
+        return value(object, path).getStructValue();
+    }
+
+    static String string(Struct object, String... path) {
+        return value(object, path).getStringValue();
+    }
+
+    /** An integer, which the proto3 JSON mapping prints as a string when it has 64 bits and as a number otherwise. */
+    static long number(Struct object, String... path) {
+        Value value = value(object, path);
+        return value.hasStringValue() ? Long.parseLong(value.getStringValue()) : (long) value.getNumberValue();
+    }
+
+    static Manifest manifest(Path out) throws Exception {
+        Path file = out.resolve(MANIFEST);
+        assertThat(file).isRegularFile();
+        return ProtoJson.parse(Files.readString(file), Manifest.newBuilder()).build();
     }
 
     /** The manifest says the capture completed. */
-    static JsonObject completeManifest(Path out) throws Exception {
-        JsonObject manifest = manifest(out);
-        assertThat(manifest.get("complete").getAsBoolean())
-                .as("manifest complete: %s", manifest)
-                .isTrue();
-        assertThat(manifest.get("state").getAsString()).as("manifest state").isEqualTo("complete");
+    static Manifest completeManifest(Path out) throws Exception {
+        Manifest manifest = manifest(out);
+        assertThat(manifest.getComplete()).as("manifest complete: %s", manifest).isTrue();
+        assertThat(manifest.getState()).as("manifest state").isEqualTo(ManifestState.MANIFEST_STATE_COMPLETE);
         return manifest;
     }
 
-    /** The capture stream as JSON rows, through the correlator's dump. */
-    static List<JsonObject> captureRows(Path out) throws Exception {
-        List<JsonObject> rows = new ArrayList<>();
-        for (String line : correlate("dump", "--source", out.resolve(SOURCE).toString())
-                .lines()
-                .toList()) {
-            if (line.startsWith("{")) rows.add(JsonParser.parseString(line).getAsJsonObject());
+    /**
+     * The capture stream's records, read with the capture codec. A truncated final record, which only an abrupt
+     * exit leaves, is dropped when {@code allowTruncatedTail} says so and is a failure otherwise.
+     */
+    static List<Record> captureRecords(Path out, boolean allowTruncatedTail) throws Exception {
+        List<Record> records = new ArrayList<>();
+        try (InputStream input = new BufferedInputStream(Files.newInputStream(out.resolve(SOURCE)))) {
+            CaptureFormat.readHeader(input);
+            CaptureFormat.Framed framed;
+            while ((framed = CaptureFormat.next(input, 1024 * 1024)) != null) {
+                if (framed.truncated()) {
+                    assertThat(allowTruncatedTail)
+                            .as("the stream ends inside a record")
+                            .isTrue();
+                    break;
+                }
+                records.add(framed.record());
+            }
         }
-        return rows;
+        return records;
     }
 
     /** The capture ends in exactly one complete footer, which it returns. */
-    static JsonObject completeFooter(Path out) throws Exception {
-        List<JsonObject> rows = captureRows(out);
-        List<JsonObject> footers = rows.stream()
-                .filter(row -> row.has("recordType")
-                        && row.get("recordType").getAsString().equals("captureFinalized"))
-                .toList();
-        assertThat(footers).as("captureFinalized rows").hasSize(1);
-        JsonObject footer = footers.get(0);
-        assertThat(rows.get(rows.size() - 1)).as("the footer is the last row").isSameAs(footer);
-        assertThat(footer.get("state").getAsString()).as("footer state").isEqualTo("complete");
+    static CaptureFinalized completeFooter(Path out) throws Exception {
+        List<Record> records = captureRecords(out, false);
+        assertThat(records.stream().filter(Record::hasCaptureFinalized))
+                .as("captureFinalized records")
+                .hasSize(1);
+        Record last = records.get(records.size() - 1);
+        assertThat(last.hasCaptureFinalized())
+                .as("the footer is the last record")
+                .isTrue();
+        CaptureFinalized footer = last.getCaptureFinalized();
+        assertThat(footer.getState()).as("footer state").isEqualTo(FinalizedState.FINALIZED_STATE_COMPLETE);
         return footer;
     }
 
@@ -163,23 +219,17 @@ final class CaptureChecks {
     }
 
     /** Correlates the capture into {@code analysis} and checks that it verified off-CPU matches. */
-    static JsonObject correlateVerified(Path out, Path analysis, String... extra) throws Exception {
+    static Struct correlateVerified(Path out, Path analysis, String... extra) throws Exception {
         List<String> args = new ArrayList<>(List.of(
                 "--source", out.resolve(SOURCE).toString(),
                 "--jfr", out.resolve(JFR).toString(),
                 "--output", analysis.toString()));
         args.addAll(List.of(extra));
         correlate(args.toArray(String[]::new));
-        JsonObject report = json(analysis.resolve("jonoffcpu-report.json"));
-        assertThat(report.get("matched").getAsLong())
-                .as("matched off-CPU samples")
-                .isPositive();
-        assertThat(report.get("invalidSource").getAsLong())
-                .as("invalid source rows")
-                .isZero();
-        assertThat(report.get("invalidJfr").getAsLong())
-                .as("invalid JFR samples")
-                .isZero();
+        Struct report = json(analysis.resolve("jonoffcpu-report.json"));
+        assertThat(number(report, "matched")).as("matched off-CPU samples").isPositive();
+        assertThat(number(report, "invalidSource")).as("invalid source rows").isZero();
+        assertThat(number(report, "invalidJfr")).as("invalid JFR samples").isZero();
         return report;
     }
 }

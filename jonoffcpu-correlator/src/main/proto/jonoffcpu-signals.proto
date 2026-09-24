@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: MIT
+//
+// async-profiler's signal-cookie JFR events as the correlator reads them through the public JDK JFR
+// API: one `SignalRecord` per `profiler.SignalCapture`, `profiler.SignalSample` and
+// `profiler.SignalCaptureStats` event, and a final `end` once the whole recording was parsed. These
+// are the rows the correlator joins, the JFR side of the classified records, and what
+// `SignalJfrExporter` prints as JSON Lines. The JFR itself stays the authoritative artifact; this
+// schema only defines the typed view of it.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.signals.v1;
+
+import "google/protobuf/timestamp.proto";
+import "jonoffcpu-capture.proto";
+
+option java_package = "io.github.lhotari.jonoffcpu.offline";
+option java_outer_classname = "SignalProto";
+
+message SignalRecord {
+  oneof record {
+    SignalCapture capture = 1;
+    SignalSample sample = 2;
+    SignalCaptureStats stats = 3;
+    SignalEnd end = 4;
+  }
+}
+
+// The capture context async-profiler negotiated, from `profiler.SignalCapture`.
+message SignalCapture {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  google.protobuf.Timestamp start_time = 3;
+  int32 signal = 4;
+  io.github.lhotari.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 5;
+  uint64 process_id = 6;
+  int64 process_start_time_millis = 7;
+}
+
+// One Java stack the signal handler captured, from `profiler.SignalSample`.
+message SignalSample {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  // The exact 64-bit cookie: the capture epoch in the high half and a nonzero sequence in the low.
+  fixed64 correlation_id = 3;
+  // The handler's CLOCK_MONOTONIC in the target's time namespace.
+  uint64 monotonic_time_nanos = 4;
+  google.protobuf.Timestamp start_time = 5;
+  // Unset when the event has no thread, or the JFR reports no positive id.
+  optional uint64 os_thread_id = 6;
+  optional uint64 java_thread_id = 7;
+  // The Java thread name, else the OS thread name; unset without a thread.
+  optional string thread_name = 8;
+  // Unset when the event has no stack trace.
+  optional bool stack_truncated = 9;
+  // Leaf first, as JFR orders them.
+  repeated JfrFrame frames = 10;
+}
+
+message JfrFrame {
+  // async-profiler's frame type, such as "Interpreted", "JIT compiled" or "Native"; unset when absent.
+  optional string type = 1;
+  // Unset, all three, when the frame has no method.
+  optional string class_name = 2;
+  optional string method_name = 3;
+  optional string method_descriptor = 4;
+  int32 line_number = 5;
+  int32 bytecode_index = 6;
+}
+
+// async-profiler's terminal counters, from `profiler.SignalCaptureStats`.
+message SignalCaptureStats {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  google.protobuf.Timestamp start_time = 3;
+  io.github.lhotari.jonoffcpu.capture.v1.AsyncProfilerStats counters = 4;
+}
+
+// Written once the whole recording was read: the parse completed, with these event counts.
+message SignalEnd {
+  bool parse_complete = 1;
+  uint64 captures = 2;
+  uint64 samples = 3;
+  uint64 stats = 4;
+}

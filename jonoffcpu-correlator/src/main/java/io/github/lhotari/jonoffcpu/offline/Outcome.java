@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import io.github.lhotari.jonoffcpu.offline.ReportProto.RowReason;
+
 /**
  * What happened to a row that is not invalid: it matched, or it did not and there is a reason to
  * report. {@code UNRESOLVED} is an unmatched row with nothing more to say, which classifies as
@@ -9,19 +11,20 @@ package io.github.lhotari.jonoffcpu.offline;
 enum Outcome {
     UNRESOLVED(null),
     MATCHED(null),
-    AFTER_AP_STOP("source-interval-after-ap-stop"),
-    NOT_IN_SELECTED_JFR("sample-not-present-in-selected-jfr");
+    AFTER_AP_STOP(RowReason.ROW_REASON_SOURCE_INTERVAL_AFTER_AP_STOP),
+    NOT_IN_SELECTED_JFR(RowReason.ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR);
 
     private static final Outcome[] VALUES = values();
 
-    private final String text;
+    private final RowReason proto;
 
-    Outcome(String text) {
-        this.text = text;
+    Outcome(RowReason proto) {
+        this.proto = proto;
     }
 
-    String text() {
-        return text;
+    /** The classified records' reason, or null when there is none to report. */
+    RowReason proto() {
+        return proto;
     }
 
     static Outcome of(byte ordinal) {

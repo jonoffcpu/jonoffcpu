@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonObject;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.RoundingMode;
@@ -82,14 +81,14 @@ record Thinning(long threshold, long seed, String probability) {
                         .longValueExact());
     }
 
-    JsonObject report() {
-        JsonObject value = new JsonObject();
-        value.addProperty("q", probability);
-        value.addProperty("realisedProbabilityNumerator", realisedNumerator().toString());
-        value.addProperty("realisedProbabilityDenominator", TWO_64.toString());
-        value.addProperty("seed", Long.toString(seed));
-        value.addProperty("estimator", "inverse-probability");
-        return value;
+    ReportProto.SourceThinning report() {
+        return ReportProto.SourceThinning.newBuilder()
+                .setQ(probability)
+                .setRealisedProbabilityNumerator(realisedNumerator().toString())
+                .setRealisedProbabilityDenominator(TWO_64.toString())
+                .setSeed(seed)
+                .setEstimator("inverse-probability")
+                .build();
     }
 
     /** SplitMix64's finalizer: the cookie's low half is a sequence number, so the raw bits cluster. */

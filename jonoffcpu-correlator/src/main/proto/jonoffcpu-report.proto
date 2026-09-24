@@ -1,0 +1,470 @@
+// SPDX-License-Identifier: MIT
+//
+// What a correlation writes into its output directory, other than the collapsed stacks, the stack
+// profile and the synthetic JFR: the report, the per-row audit files, the partial-mode diagnostics and
+// the markers. This schema is their single definition. Every file is this schema's proto3 JSON mapping,
+// printed by protobuf's JsonFormat (`ProtoJson`): lowerCamelCase names, 64-bit integers as decimal
+// strings, exact decimals (probabilities, fractions) as decimal strings, enums by their value names,
+// every field without presence printed even at its default, and a field with presence (a message, an
+// `optional` scalar) left out when it is unset. The `.json` files are indented; the `.jsonl` files hold
+// one compact message per line.
+//
+// Values that echo a command-line option (the audit level, the degradation policy) keep the option's
+// own spelling as a string, so they can be pasted back into a command.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.report.v1;
+
+import "jonoffcpu-capture.proto";
+import "jonoffcpu-signals.proto";
+
+option java_package = "io.github.lhotari.jonoffcpu.offline";
+option java_outer_classname = "ReportProto";
+
+// ---------------------------------------------------------------------------------------------------
+// jonoffcpu-report.json
+
+message Report {
+  string stack_semantics = 1;
+  // The audit level the run ended with: "full", "matches" or "none".
+  string audit = 2;
+  string weight_semantics = 3;
+  // Set when a correlation-time thinning stage was applied; the counts below then describe the kept
+  // subsample and the durations are inverse-probability estimates.
+  SourceThinning source_thinning = 4;
+  // Set with `source_thinning`.
+  optional uint64 kept_source_rows = 5;
+  optional uint64 observed_kept_duration_nanos = 6;
+  // The footer's copy, verbatim.
+  io.github.lhotari.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 7;
+  SourceCounters source_counters = 8;
+  // async-profiler's `stopped-at`, from its stop reply.
+  uint64 ap_stopped_at_nanos = 9;
+  uint64 source_rows = 10;
+  uint64 jfr_samples = 11;
+  uint64 matched = 12;
+  uint64 unmatched_source = 13;
+  uint64 source_rows_without_selected_jfr_sample = 14;
+  uint64 orphan_jfr = 15;
+  uint64 invalid_source = 16;
+  uint64 invalid_jfr = 17;
+  uint64 identity_unverified = 18;
+  // Clipped to the analysis window; under thinning, the inverse-probability estimate.
+  uint64 selected_observed_duration_nanos = 19;
+  // Samples async-profiler submitted that the JFR does not hold; unset for a selected JFR.
+  optional uint64 submitted_but_not_parsed = 20;
+  // Set when samples were selected by JFR time or the JFR was deliberately cut.
+  JfrSelection jfr_selection = 21;
+  // Set with --estimate-population true.
+  PopulationEstimate population_estimate = 22;
+  HandlerDelays handler_delay_nanos = 23;
+  // Set when the synthetic JFR was written.
+  SyntheticJfr synthetic_jfr = 24;
+  OffCpuReasons off_cpu_reasons = 25;
+  // Always set, with no steps when nothing needed to degrade.
+  DegradationReport degradation = 26;
+  // Set when the stack profile was written.
+  StackProfileSummary stack_profile = 27;
+  // Set when the digest was asked for.
+  DigestFiles digest = 28;
+}
+
+message SourceCounters {
+  io.github.lhotari.jonoffcpu.capture.v1.KernelCounters kernel = 1;
+  io.github.lhotari.jonoffcpu.capture.v1.UserspaceCounters userspace = 2;
+}
+
+message SourceThinning {
+  // The requested probability, exact decimal text.
+  string q = 1;
+  // The realised probability is numerator / denominator, both decimal integers; the denominator is 2^64.
+  string realised_probability_numerator = 2;
+  string realised_probability_denominator = 3;
+  int64 seed = 4;
+  string estimator = 5;
+}
+
+message JfrSelection {
+  bool partial_input = 1;
+  // The half-open window of JFR event start times; both unset when only --partial-jfr was given.
+  optional string from = 2;
+  optional string to = 3;
+  string boundary_semantics = 4;
+  string artifact_identity_verification = 5;
+  bool capture_context_present = 6;
+  bool terminal_stats_present = 7;
+  bool missing_source_matches_expected = 8;
+}
+
+enum EstimateStatus {
+  ESTIMATE_STATUS_UNSPECIFIED = 0;
+  ESTIMATE_STATUS_AVAILABLE = 1;
+  ESTIMATE_STATUS_UNAVAILABLE = 2;
+}
+
+// The inverse-probability estimate of the completed, duration-eligible source interval population.
+message PopulationEstimate {
+  string method = 1;
+  EstimateStatus status = 2;
+  string scope = 3;
+  // "uniform" or "proportional", the admission policy in effect.
+  string admission_policy = 4;
+  uint64 source_selected_observed_duration_nanos = 5;
+  uint64 matched_selected_observed_duration_nanos = 6;
+  uint64 source_rows_used = 7;
+  // Unset when unavailable.
+  optional uint64 estimated_duration_nanos = 8;
+  bool source_coverage_complete = 9;
+  bool stack_delivery_correction_applied = 10;
+  // Sorted, distinct: why the estimate is unavailable.
+  repeated string unavailable_reasons = 11;
+  AccountedLoss accounted_loss = 12;
+  repeated string assumptions = 13;
+}
+
+// Kernel-selected intervals that never reached the capture but that the kernel counted exactly.
+message AccountedLoss {
+  uint64 intervals = 1;
+  // intervals / selectedIntervals to six significant digits, as decimal text.
+  string fraction = 2;
+  // "sequence-contention".
+  string reason = 3;
+}
+
+// Signal delivery delay: the handler's timestamp minus the interval end and the verified clock offset.
+message HandlerDelays {
+  uint64 count = 1;
+  string scope = 2;
+  // Unset when there is no matched pair.
+  optional int64 p50 = 3;
+  optional int64 p90 = 4;
+  optional int64 p99 = 5;
+  optional int64 max = 6;
+}
+
+message SyntheticJfr {
+  string path = 1;
+  // The requested quantum at estimated scale: what one reweighted event represents.
+  uint64 quantum_nanos = 2;
+  uint64 requested_quantum_nanos = 3;
+  // The quantum of observed time an event was actually built from.
+  uint64 observed_quantum_nanos = 4;
+  bool quantum_raised_for_event_limit = 5;
+  uint64 synthetic_events = 6;
+  uint64 represented_nanos = 7;
+  // Represented minus exact; never positive.
+  int64 quantization_error_nanos = 8;
+  uint64 omitted_remainder_nanos = 9;
+}
+
+message OffCpuReasons {
+  string semantics = 1;
+  // The reasons the kernel kept, from the capture's sampling.
+  repeated io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason selected = 2;
+  // One entry per selected reason, in the canonical order.
+  repeated ReasonTotals matched = 3;
+  TimeSplitReport time_split = 4;
+  // The kernel's switch-outs by reason, counted before its reason filter.
+  KernelSwitchOuts kernel_switch_outs = 5;
+  uint64 reason_rejections = 6;
+  uint64 reason_rejected_duration_micros = 7;
+}
+
+message ReasonTotals {
+  io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reason = 1;
+  uint64 intervals = 2;
+  uint64 observed_nanos = 3;
+  uint64 sleeping_nanos = 4;
+  uint64 runqueue_nanos = 5;
+  uint64 unsplit_nanos = 6;
+}
+
+message TimeSplitReport {
+  io.github.lhotari.jonoffcpu.capture.v1.TimeSplitSource source = 1;
+  bool available = 2;
+  string rule = 3;
+  UnsplitIntervals unsplit_intervals = 4;
+  uint64 runqueue_inversions = 5;
+}
+
+message UnsplitIntervals {
+  uint64 without_reading = 1;
+  uint64 reading_exceeds_interval = 2;
+}
+
+message KernelSwitchOuts {
+  uint64 blocked = 1;
+  uint64 runnable = 2;
+  uint64 preempted = 3;
+}
+
+message DegradationReport {
+  // The --on-limit policy: "degrade", "fail" or "truncate".
+  string policy = 1;
+  string requested_audit = 2;
+  string audit = 3;
+  uint64 retained_bytes_limit = 4;
+  // From the input sizes, before decoding.
+  uint64 estimated_retained_bytes = 5;
+  uint64 peak_retained_bytes = 6;
+  // Set when the window was narrowed.
+  optional uint64 narrowed_to_nanos = 7;
+  uint32 attempts = 8;
+  repeated DegradationStep steps_applied = 9;
+}
+
+// One ladder step actually taken.
+message DegradationStep {
+  string reason = 1;
+  oneof step {
+    ThinSource thin_source = 2;
+    DropAuditOutputs drop_audit_outputs = 3;
+    NarrowWindow narrow_window = 4;
+    CoarsenSyntheticQuantum coarsen_synthetic_quantum = 5;
+    OmitSyntheticJfr omit_synthetic_jfr = 6;
+  }
+}
+
+message ThinSource {
+  string q = 1;
+  // Set when the thinning was chosen before decoding.
+  optional uint64 estimated_retained_bytes = 2;
+  // Set when the budget was reached during a pass.
+  optional uint64 retained_bytes = 3;
+}
+
+message DropAuditOutputs {
+  string from = 1;
+  string to = 2;
+}
+
+message NarrowWindow {
+  uint64 effective_to_nanos = 1;
+  string clock = 2;
+}
+
+message CoarsenSyntheticQuantum {
+  uint64 from_nanos = 1;
+  uint64 to_nanos = 2;
+}
+
+message OmitSyntheticJfr {}
+
+message StackProfileSummary {
+  string path = 1;
+  uint64 entries = 2;
+  repeated string dimensions = 3;
+  repeated string dimensions_dropped = 4;
+  bool estimate_available = 5;
+  bool time_split_available = 6;
+}
+
+message DigestFiles {
+  // The Markdown and the JSON digest, when they were written.
+  string path = 1;
+  string json = 2;
+  // Why the digest could not be written; the correlation still succeeded.
+  string error = 3;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// jonoffcpu-classified-records.jsonl: one row per kept source row, in capture order, then one per kept
+// JFR sample, in recording order.
+
+message ClassifiedRecord {
+  // The row's number in its input: capture rows count from 2, JFR samples from 1.
+  uint32 row = 1;
+  Classification classification = 2;
+  // Why the row is invalid or unmatched; unset for a match and for a plain unmatched or orphan row.
+  optional RowReason reason = 3;
+  oneof record {
+    ClassifiedObservation source = 4;
+    io.github.lhotari.jonoffcpu.signals.v1.SignalSample jfr = 5;
+  }
+}
+
+// An observation with both of its interned native stacks expanded, so the row is self-contained.
+message ClassifiedObservation {
+  io.github.lhotari.jonoffcpu.capture.v1.Observation observation = 1;
+  // Empty when the observation carries the stack's error instead.
+  repeated io.github.lhotari.jonoffcpu.capture.v1.Frame kernel_frames = 2;
+  repeated io.github.lhotari.jonoffcpu.capture.v1.Frame user_frames = 3;
+}
+
+enum Classification {
+  CLASSIFICATION_UNSPECIFIED = 0;
+  CLASSIFICATION_MATCHED = 1;
+  CLASSIFICATION_UNMATCHED = 2;
+  CLASSIFICATION_ORPHAN = 3;
+  CLASSIFICATION_INVALID = 4;
+  // Partial mode: a pair found in the recovered prefix, which an unread suffix could still invalidate.
+  CLASSIFICATION_PROVISIONAL_MATCH = 5;
+  CLASSIFICATION_UNMATCHED_PREFIX = 6;
+  CLASSIFICATION_ORPHAN_PREFIX = 7;
+}
+
+// The vocabulary operators and the proof tools match on.
+enum RowReason {
+  ROW_REASON_UNSPECIFIED = 0;
+  ROW_REASON_INVALID_COOKIE_OR_CAPTURE_IDENTITY = 1;
+  ROW_REASON_NEGATIVE_SOURCE_DURATION = 2;
+  ROW_REASON_SOURCE_INTERVAL_OUTSIDE_CAPTURE = 3;
+  ROW_REASON_SOURCE_POLICY_OR_TARGET_MISMATCH = 4;
+  ROW_REASON_DURATION_POLICY_MISMATCH = 5;
+  ROW_REASON_DUPLICATE_COOKIE = 6;
+  ROW_REASON_INVALID_PAIR = 7;
+  ROW_REASON_SAMPLE_FOR_SOURCE_AFTER_AP_STOP = 8;
+  ROW_REASON_THREAD_IDENTITY_MISMATCH = 9;
+  ROW_REASON_SAMPLE_FOR_FAILED_SIGNAL_REQUEST = 10;
+  ROW_REASON_INVALID_HANDLER_DELAY = 11;
+  ROW_REASON_HANDLER_DELAY_LIMIT_EXCEEDED = 12;
+  // Not invalid: the interval ended after async-profiler stopped, so no sample could follow.
+  ROW_REASON_SOURCE_INTERVAL_AFTER_AP_STOP = 13;
+  // Not invalid: the selected or cut JFR does not hold this row's sample.
+  ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR = 14;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// jonoffcpu-matches.jsonl and, in partial mode, INCOMPLETE-jonoffcpu-pairs.jsonl: one row per matched
+// source interval, in capture order.
+
+message Pair {
+  fixed64 correlation_id = 1;
+  // The interval clipped to the analysis window, in the source's CLOCK_MONOTONIC.
+  uint64 from_nanos = 2;
+  uint64 to_nanos = 3;
+  uint64 duration_nanos = 4;
+  // Unset when no verified clock offset relates the two clocks (partial mode without a footer).
+  optional int64 handler_delay_nanos = 5;
+  bool thread_identity_verified = 6;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Partial mode: INCOMPLETE-jonoffcpu-report.json.
+
+message PartialReport {
+  // Always false: a recovered prefix never promotes to a complete analysis.
+  bool coverage_complete = 1;
+  string pair_finality = 2;
+  string stack_semantics = 3;
+  string weight_semantics = 4;
+  repeated IncompleteCause incomplete_reasons = 5;
+  SourceParse source_parse = 6;
+  ObservedArtifacts observed_artifacts = 7;
+  ArtifactVerification artifact_verification = 8;
+  FooterVerification clock_verification = 9;
+  FooterVerification ap_stop_verification = 10;
+  io.github.lhotari.jonoffcpu.capture.v1.CaptureStart observed_source_capture = 11;
+  // Each set when the prefix holds it.
+  io.github.lhotari.jonoffcpu.capture.v1.CaptureEnd observed_source_end = 12;
+  io.github.lhotari.jonoffcpu.capture.v1.CaptureFinalized observed_finalization = 13;
+  io.github.lhotari.jonoffcpu.signals.v1.SignalCapture observed_jfr_capture = 14;
+  io.github.lhotari.jonoffcpu.signals.v1.SignalCaptureStats observed_ap_stats = 15;
+  JfrParse jfr_parse = 16;
+  Window window = 17;
+  uint64 source_rows = 18;
+  uint64 jfr_samples = 19;
+  uint64 provisional_pairs = 20;
+  uint64 unmatched_source = 21;
+  uint64 orphan_jfr = 22;
+  uint64 invalid_source = 23;
+  uint64 invalid_jfr = 24;
+  uint64 identity_unverified = 25;
+  uint64 source_selected_observed_duration_nanos = 26;
+  uint64 paired_selected_observed_duration_nanos = 27;
+  // Unset when the terminal stats are missing: not zero.
+  optional uint64 submitted_but_not_parsed = 28;
+}
+
+// Why a result covers less than a complete capture.
+enum IncompleteCause {
+  INCOMPLETE_CAUSE_UNSPECIFIED = 0;
+  INCOMPLETE_CAUSE_UNTERMINATED_SOURCE_TAIL = 1;
+  INCOMPLETE_CAUSE_MISSING_CAPTURE_END = 2;
+  INCOMPLETE_CAUSE_MISSING_CAPTURE_FINALIZED = 3;
+  INCOMPLETE_CAUSE_SOURCE_CAPTURE_INCOMPLETE = 4;
+  INCOMPLETE_CAUSE_SOURCE_DRAIN_TIMED_OUT = 5;
+  INCOMPLETE_CAUSE_SELECTED_JFR_DIFFERS_FROM_FINALIZED_ARTIFACT = 6;
+  INCOMPLETE_CAUSE_JFR_SHORTER_THAN_FINALIZED_ARTIFACT = 7;
+  INCOMPLETE_CAUSE_UNREADABLE_JFR_TAIL = 8;
+  INCOMPLETE_CAUSE_MISSING_AP_CONTEXT = 9;
+  INCOMPLETE_CAUSE_MISSING_AP_STATS = 10;
+  // Nothing was missing, but partial mode was asked for, and it never promotes to complete.
+  INCOMPLETE_CAUSE_EXPLICIT_PARTIAL_MODE = 11;
+}
+
+message SourceParse {
+  bool clean_eof = 1;
+  // A final record cut short, whose bytes were not decoded.
+  uint64 ignored_trailing_bytes = 2;
+  bool capture_end_present = 3;
+  bool capture_finalized_present = 4;
+}
+
+message ObservedArtifacts {
+  ObservedArtifact source = 1;
+  ObservedArtifact jfr = 2;
+}
+
+message ObservedArtifact {
+  uint64 bytes = 1;
+  // Lowercase hex.
+  string sha256 = 2;
+}
+
+enum ArtifactVerification {
+  ARTIFACT_VERIFICATION_UNSPECIFIED = 0;
+  ARTIFACT_VERIFICATION_VERIFIED_FINALIZED_INPUTS = 1;
+  ARTIFACT_VERIFICATION_UNVERIFIED_INCOMPLETE = 2;
+}
+
+enum FooterVerification {
+  FOOTER_VERIFICATION_UNSPECIFIED = 0;
+  FOOTER_VERIFICATION_VERIFIED_FOOTER = 1;
+  FOOTER_VERIFICATION_UNAVAILABLE = 2;
+}
+
+message JfrParse {
+  bool clean_eof = 1;
+  bool context_present = 2;
+  bool terminal_stats_present = 3;
+  uint64 captures = 4;
+  uint64 samples = 5;
+  // The JFR reader's failure at the unread tail, bounded.
+  optional string read_failure = 6;
+}
+
+// The --from-ns/--to-ns clip, in the source's own clock.
+message Window {
+  optional uint64 from_nanos = 1;
+  optional uint64 to_nanos = 2;
+  string clock = 3;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// The markers, published last: jonoffcpu-complete.json, jonoffcpu-narrowed.json, jonoffcpu-partial.json.
+
+message Marker {
+  MarkerState state = 1;
+  bool coverage_complete = 2;
+  // A narrowed run: where its window ends.
+  optional uint64 effective_to_nanos = 3;
+  // A partial run: why it is incomplete.
+  repeated IncompleteCause incomplete_reasons = 4;
+}
+
+enum MarkerState {
+  MARKER_STATE_UNSPECIFIED = 0;
+  MARKER_STATE_COMPLETE = 1;
+  MARKER_STATE_NARROWED = 2;
+  MARKER_STATE_INCOMPLETE = 3;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// `dump`: the capture's records as they are, one per line, then this line when the stream ends in a
+// record cut short.
+
+message TruncatedTail {
+  uint64 truncated_tail_bytes = 1;
+}

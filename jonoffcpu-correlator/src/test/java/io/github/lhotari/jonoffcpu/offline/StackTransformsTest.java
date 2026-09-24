@@ -4,8 +4,6 @@ package io.github.lhotari.jonoffcpu.offline;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -182,8 +180,14 @@ class StackTransformsTest {
         return Files.readString(output);
     }
 
-    private static JsonObject json(Path file) throws IOException {
-        return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+    private static AnalysisProto.SliceSummary json(Path file) throws IOException {
+        return CorrelationFixture.parse(file, AnalysisProto.SliceSummary.newBuilder())
+                .build();
+    }
+
+    private static AnalysisProto.CollapsedSliceSummary collapsedJson(Path file) throws IOException {
+        return CorrelationFixture.parse(file, AnalysisProto.CollapsedSliceSummary.newBuilder())
+                .build();
     }
 
     /** The transforms through the command line: merging, totals, the filter order, presets and summaries. */
@@ -205,7 +209,7 @@ class StackTransformsTest {
                 entry(java("x.Other$$Lambda.0x00000000819ed250.run", "x.App.n"), "worker-2", 1, 1500));
         Path profile = dir.resolve("profile.pb");
         new StackProfile(
-                        new StackProfile.Header(List.of(), List.of("reason", "thread"), false, "{}", "", List.of()),
+                        new StackProfile.Header(List.of(), List.of("reason", "thread"), false, null, "", List.of()),
                         entries)
                 .write(profile);
         String untransformed = stacks(dir, "plain", "--profile", profile.toString());
@@ -226,22 +230,13 @@ class StackTransformsTest {
                 "--include",
                 "x\\.App\\.park");
         assertThat(trimmed).as("Prefixes must merge").isEqualTo("x.App.m;x.App.park 5\n");
-        JsonObject transforms = json(summary).getAsJsonObject("transforms");
+        AnalysisProto.Transforms transforms = json(summary).getTransforms();
         String summaryMessage = "The summary must report 2 lines becoming 1 and keep the totals: " + json(summary);
-        assertThat(transforms.get("linesBefore").getAsInt()).as(summaryMessage).isEqualTo(2);
-        assertThat(transforms.get("linesAfter").getAsInt()).as(summaryMessage).isEqualTo(1);
-        assertThat(json(summary).get("intervals").getAsString())
-                .as(summaryMessage)
-                .isEqualTo("5");
-        assertThat(json(summary).get("totalNanos").getAsString())
-                .as(summaryMessage)
-                .isEqualTo("5000");
-        assertThat(transforms
-                        .getAsJsonArray("trimRoot")
-                        .get(0)
-                        .getAsJsonObject()
-                        .get("source")
-                        .getAsString())
+        assertThat(transforms.getLinesBefore()).as(summaryMessage).isEqualTo(2);
+        assertThat(transforms.getLinesAfter()).as(summaryMessage).isEqualTo(1);
+        assertThat(json(summary).getIntervals()).as(summaryMessage).isEqualTo(5);
+        assertThat(json(summary).getTotalNanos()).as(summaryMessage).isEqualTo("5000");
+        assertThat(transforms.getTrimRoot(0).getSource())
                 .as("Each pattern names its source: %s", transforms)
                 .isEqualTo("inline");
 
@@ -273,11 +268,12 @@ class StackTransformsTest {
         assertThat(rooted)
                 .as("--root-at must re-root and bucket")
                 .isEqualTo("[no application frame] 7\nx.App.m;x.App.park 5\nx.App.n 3\n");
-        JsonObject bucket = json(rootSummary).getAsJsonObject("transforms").getAsJsonObject("noApplicationFrame");
-        assertThat(bucket.get("weight").getAsString())
+        AnalysisProto.NoApplicationFrame bucket =
+                json(rootSummary).getTransforms().getNoApplicationFrame();
+        assertThat(bucket.getWeight())
                 .as("The bucket's weight and share: %s", bucket)
                 .isEqualTo("7000");
-        assertThat(bucket.get("share").getAsString())
+        assertThat(bucket.getShare())
                 .as("The bucket's weight and share: %s", bucket)
                 .isEqualTo("0.482759");
 
@@ -319,17 +315,17 @@ class StackTransformsTest {
                 "category",
                 "--summary",
                 all.toString());
-        assertThat(json(all).get("totalNanos").getAsString())
+        assertThat(json(all).getTotalNanos())
                 .as("Transforms never change totals: %s", json(all))
                 .isEqualTo("14500");
-        assertThat(json(all).get("intervals").getAsString())
+        assertThat(json(all).getIntervals())
                 .as("Transforms never change totals: %s", json(all))
-                .isEqualTo("12");
+                .isEqualTo(12);
 
         // A thread frame needs the thread dimension.
         Path narrow = dir.resolve("narrow.pb");
         new StackProfile(
-                        new StackProfile.Header(List.of(), List.of("reason"), false, "{}", "", List.of()),
+                        new StackProfile.Header(List.of(), List.of("reason"), false, null, "", List.of()),
                         entries.stream()
                                 .map(entry -> entry(entry.javaStack(), null, entry.intervals(), entry.observedNanos()))
                                 .toList())
@@ -376,11 +372,9 @@ class StackTransformsTest {
                 .isEqualTo("java.lang.Thread.run;io.netty.Y.run 3\n"
                         + "java.lang.Thread.run;org.apache.X.m;I2C/C2I adapters 2.5\n"
                         + "java.lang.Thread.run;org.apache.X.m;__schedule_[k] 5\n");
-        assertThat(json(summary).get("input").getAsString())
-                .as("The summary keeps the input's unit: %s", json(summary))
-                .isEqualTo("collapsed");
-        assertThat(json(summary).get("totalWeight").getAsString())
-                .as("The summary keeps the input's unit: %s", json(summary))
+        // A collapsed input's summary is its own message, which the strict parse proves.
+        assertThat(collapsedJson(summary).getTotalWeight())
+                .as("The summary keeps the input's unit: %s", collapsedJson(summary))
                 .isEqualTo("10.5");
         String rooted = stacks(
                 dir,

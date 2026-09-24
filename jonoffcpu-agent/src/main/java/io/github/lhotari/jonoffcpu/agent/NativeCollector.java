@@ -3,7 +3,11 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import java.nio.file.Path;
 
-/** Thin JNI access to the single registry owned by {@code libjonoffcpu_native}. */
+/**
+ * Thin JNI access to the single registry owned by {@code libjonoffcpu_native}. Requests and replies are encoded
+ * {@code jonoffcpu-collector.proto} messages: {@code prepare} takes a {@code PrepareRequest} and {@code enable} an
+ * {@code EnableRequest}, and every call returns a {@code CollectorReply}.
+ */
 public final class NativeCollector {
     private static Path loadedPath;
 
@@ -19,11 +23,11 @@ public final class NativeCollector {
         }
     }
 
-    public static native String prepare(String configJson);
+    public static native byte[] prepare(byte[] prepareRequest);
 
-    public static native String enable(long handle, String captureJson);
+    public static native byte[] enable(long handle, byte[] enableRequest);
 
-    public static native String stop(long handle, long timeoutMillis);
+    public static native byte[] stop(long handle, long timeoutMillis);
 
-    public static native String close(long handle);
+    public static native byte[] close(long handle);
 }

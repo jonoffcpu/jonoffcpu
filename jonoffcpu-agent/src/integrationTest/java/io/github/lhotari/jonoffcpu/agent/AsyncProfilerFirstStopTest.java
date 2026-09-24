@@ -5,8 +5,8 @@ import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.JFR;
 import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.SOURCE;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.protobuf.Struct;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureFinalized;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -75,11 +75,10 @@ class AsyncProfilerFirstStopTest {
             runtime.makeReadable(out);
         }
 
-        JsonObject footer = CaptureChecks.completeFooter(out);
-        String receipt = footer.get("apStopResponse").getAsString();
+        CaptureFinalized footer = CaptureChecks.completeFooter(out);
+        String receipt = footer.getApStopResponse();
         assertThat(receipt).as("the retained async-profiler receipt").contains(" reason=" + mode, " finalized=true ");
-        JsonObject manifest = CaptureChecks.completeManifest(out);
-        assertThat(manifest.getAsJsonObject("asyncProfilerStop").get("response").getAsString())
+        assertThat(CaptureChecks.completeManifest(out).getAsyncProfilerStop().getResponse())
                 .as("the footer and the audit manifest retain the same receipt")
                 .isEqualTo(receipt.strip());
         var counts = CaptureChecks.checkMixedRecording(out.resolve(JFR));
@@ -93,26 +92,24 @@ class AsyncProfilerFirstStopTest {
                 "--jfr", out.resolve(JFR).toString(),
                 "--output", analysis.toString(),
                 "--audit", "full");
-        JsonObject report = CaptureChecks.json(analysis.resolve("jonoffcpu-report.json"));
-        assertThat(report.get("matched").getAsLong()
-                        + report.get("unmatchedSource").getAsLong()
-                        + report.get("invalidSource").getAsLong())
+        Struct report = CaptureChecks.json(analysis.resolve("jonoffcpu-report.json"));
+        assertThat(CaptureChecks.number(report, "matched")
+                        + CaptureChecks.number(report, "unmatchedSource")
+                        + CaptureChecks.number(report, "invalidSource"))
                 .as("source classifications reconcile")
-                .isEqualTo(report.get("sourceRows").getAsLong());
-        assertThat(report.get("matched").getAsLong()
-                        + report.get("orphanJfr").getAsLong()
-                        + report.get("invalidJfr").getAsLong())
+                .isEqualTo(CaptureChecks.number(report, "sourceRows"));
+        assertThat(CaptureChecks.number(report, "matched")
+                        + CaptureChecks.number(report, "orphanJfr")
+                        + CaptureChecks.number(report, "invalidJfr"))
                 .as("JFR classifications reconcile")
-                .isEqualTo(report.get("jfrSamples").getAsLong());
-        long cutoff = Long.parseLong(report.get("apStoppedAtNanos").getAsString());
-        List<JsonObject> afterCutoff = new ArrayList<>();
+                .isEqualTo(CaptureChecks.number(report, "jfrSamples"));
+        long cutoff = CaptureChecks.number(report, "apStoppedAtNanos");
+        List<Struct> afterCutoff = new ArrayList<>();
         for (String line : Files.readAllLines(analysis.resolve("jonoffcpu-classified-records.jsonl"))) {
-            JsonObject row = JsonParser.parseString(line).getAsJsonObject();
-            if (row.get("stream").getAsString().equals("source")
-                    && Long.parseLong(row.getAsJsonObject("record")
-                                    .get("endMonotonicNanos")
-                                    .getAsString())
-                            > cutoff) {
+            Struct row = CaptureChecks.jsonLine(line);
+            // A source row carries the observation it classifies; a JFR row carries the sample instead.
+            if (row.getFieldsMap().containsKey("source")
+                    && CaptureChecks.number(row, "source", "observation", "endMonotonicNanos") > cutoff) {
                 afterCutoff.add(row);
             }
         }
@@ -122,8 +119,9 @@ class AsyncProfilerFirstStopTest {
         assertThat(afterCutoff)
                 .as("every post-cutoff source row is explicitly unmatched")
                 .allSatisfy(row -> {
-                    assertThat(row.get("classification").getAsString()).isEqualTo("unmatched");
-                    assertThat(row.get("reason").getAsString()).isEqualTo("source-interval-after-ap-stop");
+                    assertThat(CaptureChecks.string(row, "classification")).isEqualTo("CLASSIFICATION_UNMATCHED");
+                    assertThat(CaptureChecks.string(row, "reason"))
+                            .isEqualTo("ROW_REASON_SOURCE_INTERVAL_AFTER_AP_STOP");
                 });
     }
 }

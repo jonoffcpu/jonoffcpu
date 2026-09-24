@@ -1,5 +1,5 @@
-// A codec generated from the module's src/main/proto, in the lite runtime: it has no descriptors or reflection, which
-// the formats do not need.
+// A codec generated from the module's src/main/proto for the full protobuf runtime, whose descriptors let JsonFormat
+// print and parse every message in the proto3 JSON mapping.
 plugins {
     id("jonoffcpu.java-conventions")
     id("com.google.protobuf")
@@ -15,14 +15,5 @@ val protoc =
 protobuf {
     protoc {
         artifact = "${protoc.module}:${protoc.versionConstraint.requiredVersion}"
-    }
-    generateProtoTasks {
-        all().configureEach {
-            builtins {
-                named("java") {
-                    option("lite")
-                }
-            }
-        }
     }
 }

@@ -1,57 +1,41 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplit;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplitSource;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * Where each interval's run-queue part comes from. It changes what is measured, not which intervals are kept, so
- * it is a block of its own beside {@link SamplingConfig}; like it, {@link #json()} is the single representation sent
- * to the native collector, echoed by it, written into the capture stream and manifest, and compared structurally.
+ * Resolves the configuration's {@code timeSplit} block into the {@link TimeSplit} message: where each interval's
+ * run-queue part comes from. It changes what is measured, not which intervals are kept, so it is a block of its own
+ * beside {@link SamplingConfig}; like it, the resolved message is sent to the native collector, echoed by it, written
+ * into the capture stream and manifest, and compared as a message. The configuration spells the source {@code off}
+ * or {@code schedInfo}.
  */
-record TimeSplitConfig(Source source) {
+final class TimeSplitConfig {
     private static final Set<String> KEYS = Set.of("source");
     /** The scheduler's own accounting: cheap, and present on mainstream kernels. */
-    static final TimeSplitConfig DEFAULT = new TimeSplitConfig(Source.SCHED_INFO);
+    static final TimeSplit DEFAULT = of(TimeSplitSource.TIME_SPLIT_SOURCE_SCHED_INFO);
 
-    enum Source {
-        /** Nothing is read; intervals carry no run-queue part. For kernels without {@code CONFIG_SCHED_INFO}. */
-        OFF("off"),
-        /** The growth of {@code task_struct.sched_info.run_delay} across the interval. */
-        SCHED_INFO("schedInfo");
+    private TimeSplitConfig() {}
 
-        private final String json;
-
-        Source(String json) {
-            this.json = json;
-        }
-
-        String json() {
-            return json;
-        }
-
-        static Source parse(String value) {
-            for (Source source : values()) {
-                if (source.json.equals(value)) return source;
-            }
-            throw new IllegalArgumentException("Unknown timeSplit source: " + value);
-        }
+    static TimeSplit of(TimeSplitSource source) {
+        return TimeSplit.newBuilder().setSource(source).build();
     }
 
-    TimeSplitConfig {
-        if (source == null) throw new IllegalArgumentException("timeSplit.source is required");
+    static TimeSplit parse(Map<?, ?> value) {
+        ConfigValues.requireKeys(value, KEYS, "timeSplit");
+        return of(parseSource(ConfigValues.requireString(value, "source")));
     }
 
-    static TimeSplitConfig parse(JsonObject value) {
-        for (String key : value.keySet()) {
-            if (!KEYS.contains(key)) throw new IllegalArgumentException("Unknown timeSplit key: " + key);
-        }
-        return new TimeSplitConfig(Source.parse(JsonSupport.requireString(value, "source")));
-    }
-
-    JsonObject json() {
-        JsonObject value = new JsonObject();
-        value.addProperty("source", source.json());
-        return value;
+    static TimeSplitSource parseSource(String value) {
+        return switch (value) {
+            // Nothing is read; intervals carry no run-queue part. For kernels without CONFIG_SCHED_INFO.
+            case "off" -> TimeSplitSource.TIME_SPLIT_SOURCE_OFF;
+            // The growth of task_struct.sched_info.run_delay across the interval.
+            case "schedInfo" -> TimeSplitSource.TIME_SPLIT_SOURCE_SCHED_INFO;
+            default -> throw new IllegalArgumentException("Unknown timeSplit source: " + value);
+        };
     }
 }

@@ -85,19 +85,35 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Compiles the capture stream schema with protox, a pure-Rust protobuf compiler, so the pinned
-/// build containers need no protoc.
+/// Compiles the capture stream and collector protocol schemas with protox, a pure-Rust protobuf
+/// compiler, so the pinned build containers need no protoc. prost generates the messages and
+/// pbjson-build their proto3 JSON mapping, which the proof tools print. The imported
+/// `google/protobuf/timestamp.proto` comes from protox's bundled well-known types and maps to
+/// pbjson-types, whose `Timestamp` is a prost message that also has the proto3 JSON mapping.
 fn generate_capture_codec(out: &std::path::Path) -> Result<()> {
-    let schema = PathBuf::from("../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto");
-    let descriptors = protox::compile([&schema], ["../jonoffcpu-capture-codec/src/main/proto"])
-        .context("compile capture schema")?;
+    const PROTO_DIR: &str = "../jonoffcpu-capture-codec/src/main/proto";
+    const SCHEMAS: [&str; 2] = ["jonoffcpu-capture.proto", "jonoffcpu-collector.proto"];
+    let mut compiler = protox::Compiler::new([PROTO_DIR]).context("configure protox")?;
+    compiler.include_imports(true);
+    compiler
+        .open_files(SCHEMAS)
+        .context("compile capture and collector schemas")?;
+    let encoded = compiler.encode_file_descriptor_set();
     prost_build::Config::new()
         .out_dir(out)
-        .compile_fds(descriptors)
+        .extern_path(".google.protobuf.Timestamp", "::pbjson_types::Timestamp")
+        .compile_fds(compiler.file_descriptor_set())
         .context("generate capture codec")?;
-    println!(
-        "cargo:rerun-if-changed=../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto"
-    );
+    pbjson_build::Builder::new()
+        .register_descriptors(&encoded)
+        .context("register schema descriptors for pbjson")?
+        .out_dir(out)
+        .extern_path(".google.protobuf.Timestamp", "::pbjson_types::Timestamp")
+        .build(&[".io.github.lhotari.jonoffcpu.capture.v1"])
+        .context("generate proto3 JSON mapping")?;
+    for schema in SCHEMAS {
+        println!("cargo:rerun-if-changed={PROTO_DIR}/{schema}");
+    }
     Ok(())
 }
 

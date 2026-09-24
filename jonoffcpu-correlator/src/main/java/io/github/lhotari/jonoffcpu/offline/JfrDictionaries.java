@@ -20,20 +20,12 @@ import java.util.Set;
  * CompatibilityJfrWriter.canonicalStack} would give them the same key — the truncation flag and
  * every frame's type, class, method, descriptor, line and bytecode index.
  *
- * <p>{@code canonicalStack} collapses a missing key, a JSON {@code null}, and a present-but-empty
- * string to the same {@code ""} segment, and likewise collapses a missing numeric field to {@code
- * ""}. This interner's {@code Frame} record does not: it distinguishes a null field from an empty
- * one, and (in principle) a missing numeric field from an explicit zero. That distinction is never
- * exercised. The sole producer of these frame maps is {@code SignalJfrExporter.frame(RecordedFrame)},
- * which unconditionally populates all six keys for every frame — {@code type}, {@code lineNumber}
- * and {@code bytecodeIndex} straight from {@code RecordedFrame}, and {@code className}, {@code
- * methodName} and {@code descriptor} all set together from one {@code RecordedMethod} (or all three
- * left null together when the method itself is null). {@code RecordedMethod} never reports an empty
- * string for any of them. So a missing key never occurs, and null and {@code ""} are never both in
- * play for the same field: wherever the two keying schemes could disagree, this interner is strictly
- * <em>finer</em> than {@code canonicalStack} — it would intern separately what the canonical key
- * would merge, never the reverse. That direction can only split what should stay one stack, never
- * merge two genuinely distinct ones, which is the property the golden outputs depend on.
+ * <p>A frame's type, class, method and descriptor are each either set or absent in {@code SignalProto.JfrFrame},
+ * and this interner keeps an absent field (null) apart from an empty one. The sole producer of these frames, {@code
+ * SignalJfrExporter}, sets the class, method and descriptor together from one {@code RecordedMethod} or leaves all
+ * three absent, and {@code RecordedMethod} never reports an empty string, so the distinction is never exercised; where
+ * it could be, this interner is strictly finer than the collapsed key: it can only split what should stay one stack,
+ * never merge two genuinely distinct ones, which is the property the golden outputs depend on.
  *
  * <p>Interning is done without materializing a key per sample: a 64-bit hash is folded over the raw
  * frame list, and a hash hit is confirmed by comparing the raw list against the stored frames. Only
@@ -70,11 +62,8 @@ final class JfrDictionaries {
     private long javaFlagBytes;
 
     /** Interns the frame list of one sample and returns its stack id. */
-    int internStack(List<?> rawFrames, boolean truncated, int maxFrames) throws IOException {
+    int internStack(List<SignalProto.JfrFrame> rawFrames, boolean truncated, int maxFrames) throws IOException {
         CaptureInput.require(rawFrames.size() <= maxFrames, "Stack frame count limit exceeded");
-        for (Object raw : rawFrames) {
-            CaptureInput.require(raw instanceof Map<?, ?>, "Invalid stack frame");
-        }
         long hash = hash(rawFrames, truncated);
         int[] candidates = stacksByHash.get(hash);
         if (candidates != null) {
@@ -84,14 +73,14 @@ final class JfrDictionaries {
         }
         Frame[] frames = new Frame[rawFrames.size()];
         for (int index = 0; index < frames.length; index++) {
-            Map<?, ?> raw = (Map<?, ?>) rawFrames.get(index);
+            SignalProto.JfrFrame raw = rawFrames.get(index);
             frames[index] = new Frame(
-                    pool(text(raw, "type")),
-                    pool(text(raw, "className")),
-                    pool(text(raw, "methodName")),
-                    pool(text(raw, "descriptor")),
-                    number(raw, "lineNumber"),
-                    number(raw, "bytecodeIndex"));
+                    pool(type(raw)),
+                    pool(className(raw)),
+                    pool(methodName(raw)),
+                    pool(descriptor(raw)),
+                    raw.getLineNumber(),
+                    raw.getBytecodeIndex());
         }
         int id = stackFrames.size();
         stackFrames.add(frames);
@@ -225,34 +214,33 @@ final class JfrDictionaries {
         return value;
     }
 
-    private boolean matches(int stackId, List<?> rawFrames, boolean truncated) {
+    private boolean matches(int stackId, List<SignalProto.JfrFrame> rawFrames, boolean truncated) {
         Frame[] frames = stackFrames.get(stackId);
         if (frames.length != rawFrames.size() || stackTruncated.get(stackId) != truncated) return false;
         for (int index = 0; index < frames.length; index++) {
-            Map<?, ?> raw = (Map<?, ?>) rawFrames.get(index);
+            SignalProto.JfrFrame raw = rawFrames.get(index);
             Frame frame = frames[index];
-            if (!Objects.equals(frame.type(), text(raw, "type"))
-                    || !Objects.equals(frame.className(), text(raw, "className"))
-                    || !Objects.equals(frame.methodName(), text(raw, "methodName"))
-                    || !Objects.equals(frame.descriptor(), text(raw, "descriptor"))
-                    || frame.lineNumber() != number(raw, "lineNumber")
-                    || frame.bytecodeIndex() != number(raw, "bytecodeIndex")) {
+            if (!Objects.equals(frame.type(), type(raw))
+                    || !Objects.equals(frame.className(), className(raw))
+                    || !Objects.equals(frame.methodName(), methodName(raw))
+                    || !Objects.equals(frame.descriptor(), descriptor(raw))
+                    || frame.lineNumber() != raw.getLineNumber()
+                    || frame.bytecodeIndex() != raw.getBytecodeIndex()) {
                 return false;
             }
         }
         return true;
     }
 
-    private static long hash(List<?> rawFrames, boolean truncated) {
+    private static long hash(List<SignalProto.JfrFrame> rawFrames, boolean truncated) {
         long hash = truncated ? 0x9e3779b97f4a7c15L : 0x165667b19e3779f9L;
-        for (Object raw : rawFrames) {
-            Map<?, ?> frame = (Map<?, ?>) raw;
-            hash = fold(hash, Objects.hashCode(text(frame, "type")));
-            hash = fold(hash, Objects.hashCode(text(frame, "className")));
-            hash = fold(hash, Objects.hashCode(text(frame, "methodName")));
-            hash = fold(hash, Objects.hashCode(text(frame, "descriptor")));
-            hash = fold(hash, number(frame, "lineNumber"));
-            hash = fold(hash, number(frame, "bytecodeIndex"));
+        for (SignalProto.JfrFrame frame : rawFrames) {
+            hash = fold(hash, Objects.hashCode(type(frame)));
+            hash = fold(hash, Objects.hashCode(className(frame)));
+            hash = fold(hash, Objects.hashCode(methodName(frame)));
+            hash = fold(hash, Objects.hashCode(descriptor(frame)));
+            hash = fold(hash, frame.getLineNumber());
+            hash = fold(hash, frame.getBytecodeIndex());
         }
         return hash;
     }
@@ -261,13 +249,19 @@ final class JfrDictionaries {
         return (hash ^ value) * 0xff51afd7ed558ccdL;
     }
 
-    private static String text(Map<?, ?> frame, String key) {
-        Object value = frame.get(key);
-        return value == null ? null : value.toString();
+    private static String type(SignalProto.JfrFrame frame) {
+        return frame.hasType() ? frame.getType() : null;
     }
 
-    private static int number(Map<?, ?> frame, String key) {
-        Object value = frame.get(key);
-        return value instanceof Number found ? found.intValue() : 0;
+    private static String className(SignalProto.JfrFrame frame) {
+        return frame.hasClassName() ? frame.getClassName() : null;
+    }
+
+    private static String methodName(SignalProto.JfrFrame frame) {
+        return frame.hasMethodName() ? frame.getMethodName() : null;
+    }
+
+    private static String descriptor(SignalProto.JfrFrame frame) {
+        return frame.hasMethodDescriptor() ? frame.getMethodDescriptor() : null;
     }
 }

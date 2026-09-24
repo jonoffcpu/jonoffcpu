@@ -15,7 +15,7 @@ docker run --rm --privileged \
   -v /sys/kernel/btf:/sys/kernel/btf:ro \
   -v /sys/kernel/debug:/sys/kernel/debug \
   -v /sys/kernel/tracing:/sys/kernel/tracing \
-  -e JONOFFCPU_SMOKE_OUTPUT=/evidence/jonoffcpu-native-collector-musl-source.ndjson \
+  -e JONOFFCPU_SMOKE_OUTPUT=/evidence/jonoffcpu-native-collector-musl-source.pb \
   -w /work/jonoffcpu-native \
   "$image" \
   target-musl/release/jonoffcpu-native-collector-smoke

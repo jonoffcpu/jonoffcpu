@@ -1,44 +1,55 @@
 // SPDX-License-Identifier: MIT
 use anyhow::{Result, bail};
-use jonoffcpu_native::{JonoffcpuResult, jonoffcpu_collector_prepare, jonoffcpu_result_free};
-use serde_json::{Value, json};
+use jonoffcpu_native::capture::{self, collector_reply::Result as Reply};
+use jonoffcpu_native::{call_collector, jonoffcpu_collector_prepare};
+use prost::Message;
 
 fn main() -> Result<()> {
-    let path = format!("/tmp/jonoffcpu-time-namespace-negative-{}.ndjson", unsafe {
+    let path = format!("/tmp/jonoffcpu-time-namespace-negative-{}.pb", unsafe {
         libc::getpid()
     });
-    let input = json!({
-        "targetPid":unsafe { libc::getpid() },
-        "outputPath":path,
-        "sampling": {
-            "reasons": ["blocked", "runnable", "preempted"],
-            "minOffCpuMicros": null,
-            "maxOffCpuMicros": null,
-            "admission": {
-                "policy": "uniform",
-                "probability": "0.0000000003",
-                "probabilityThreshold": 1,
-            },
-        },
-        "timeSplit": {"source": "schedInfo"},
-    })
-    .to_string();
-    let mut result = JonoffcpuResult::default();
-    let status =
-        unsafe { jonoffcpu_collector_prepare(input.as_ptr().cast(), input.len(), &mut result) };
-    let response: Value = serde_json::from_slice(unsafe {
-        std::slice::from_raw_parts(result.json.cast::<u8>(), result.json_len)
-    })?;
-    unsafe { jonoffcpu_result_free(&mut result) };
-    if status == 0
-        || response["error"]["code"] != "invalid_config"
-        || !response["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("nonzero monotonic time namespace offset")
-    {
-        bail!("collector did not reject nonzero time namespace offset: {response}");
+    let request = capture::PrepareRequest {
+        target_pid: unsafe { libc::getpid() } as u32,
+        output_path: path,
+        sampling: Some(capture::Sampling {
+            reasons: vec![
+                capture::OffCpuReason::Blocked as i32,
+                capture::OffCpuReason::Runnable as i32,
+                capture::OffCpuReason::Preempted as i32,
+            ],
+            min_off_cpu_micros: None,
+            max_off_cpu_micros: None,
+            admission: Some(capture::sampling::Admission::Uniform(
+                capture::UniformAdmission {
+                    probability: "0.0000000003".to_string(),
+                    probability_threshold: 1,
+                },
+            )),
+        }),
+        time_split: Some(capture::TimeSplit {
+            source: capture::TimeSplitSource::SchedInfo as i32,
+        }),
+        exclude_calling_thread: false,
     }
-    println!("{}", serde_json::to_string_pretty(&response)?);
+    .encode_to_vec();
+    let (status, reply) = call_collector(|out| unsafe {
+        jonoffcpu_collector_prepare(request.as_ptr(), request.len(), out)
+    })?;
+    let rejected = match &reply.result {
+        Some(Reply::Error(error)) => {
+            error.code() == capture::CollectorErrorCode::InvalidConfig
+                && error
+                    .message
+                    .contains("nonzero monotonic time namespace offset")
+        }
+        _ => false,
+    };
+    if status == 0 || !rejected {
+        bail!(
+            "collector did not reject nonzero time namespace offset: {}",
+            serde_json::to_string(&reply)?
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&reply)?);
     Ok(())
 }

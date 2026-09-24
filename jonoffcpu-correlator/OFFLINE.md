@@ -8,18 +8,20 @@ No separate manifest or exporter subprocess is required. Stored artifact paths
 are advisory, so recordings can be moved together or supplied from new locations.
 
 The stream is defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto):
-a 12-byte header, then length-delimited protobuf records. A capture holds a
-`captureStart`, a `stack` record for each distinct native stack, one
-`observation` per recorded off-CPU interval, a `captureEnd`, and the
-`captureFinalized` footer. The three control records carry the JSON object they
-have always carried, at `schemaVersion` 4 (3 for captures recorded before the
-sleeping/run-queue split, and 2 for captures recorded before switch-out reasons
-were classified, both still read), and that JSON is still read with the strict
-parser; observations and stacks are native protobuf.
-All control records of one capture carry the same version. Read a capture with
+a 12-byte header (format version 2), then length-delimited protobuf records. A
+capture holds a `captureStart`, a `stack` record for each distinct native stack,
+one `observation` per recorded off-CPU interval, a `captureEnd`, and the
+`captureFinalized` footer. Every record is a typed message; there is one format
+version and no older record shape is read. The correlator validates the control
+records as messages: the `sampling`, `timeSplit` and `verifiedIdentity` copies in
+`captureStart` and the footer's `analysisInputs` must be equal, and a missing or
+unspecified value (an unset sampling policy or time split, an unknown enum
+value) is refused rather than defaulted. Read a capture with
 `java -jar jonoffcpu-correlator.jar dump --source <file>` (formerly `--dump --source`,
-still accepted), which prints one
-JSON object per record with each observation's stacks expanded.
+still accepted), which prints one record per line in the schema's proto3 JSON
+mapping (`{"captureStart":{...}}`, `{"stack":{...}}`, `{"observation":{...}}`, …),
+and a final `{"truncatedTailBytes":"N"}` line when the stream ends in a record
+cut short.
 
 Stacks are interned: an observation names its two stacks through
 `kernelStackId`/`userStackId`, and a stack record always precedes the first
@@ -31,17 +33,17 @@ so an audit row remains self-contained.
 
 ## Switch-out reasons
 
-A `schemaVersion` 3 capture records why the scheduler took each thread off the
-CPU. `captureStart.sampling.reasons` lists the reasons the kernel kept, in the
-canonical order `blocked`, `runnable`, `preempted`, and every observation carries
+A capture records why the scheduler took each thread off the CPU.
+`captureStart.sampling.reasons` lists the reasons the kernel kept, distinct and in
+the canonical order `OFF_CPU_REASON_BLOCKED`, `OFF_CPU_REASON_RUNNABLE`,
+`OFF_CPU_REASON_PREEMPTED`; an empty list is refused. Every observation carries
 its `reason` together with the two raw `sched_switch` arguments it was derived
 from, `prevTaskState` and `preempted`. The correlator recomputes the reason from
 those arguments — `preempted` wins, then a zero task state is `runnable`, and any
-other state is `blocked` — and marks a row whose reason disagrees, or is not one
-the capture selected, `source-policy-or-target-mismatch`, exactly as it treats a
-disagreeing admission threshold. A version 3 capture without `reasons`, a version
-2 capture with them, and a version 2 observation that carries any of the three
-fields are rejected the same way. Version 2 intervals read back as `unspecified`.
+other state is `blocked` — and marks a row whose reason disagrees, is
+unspecified, or is not one the capture selected
+`ROW_REASON_SOURCE_POLICY_OR_TARGET_MISMATCH`, exactly as it treats a
+disagreeing admission threshold.
 
 The reason describes the switch-out. `runnable` is how a user-space thread
 preempted by the scheduler tick appears (it is switched out at an ordinary
@@ -50,9 +52,10 @@ the kernel; both are time spent waiting for a CPU. A `blocked` interval's durati
 includes its run-queue delay between wakeup and switch-in; the next section splits
 the two.
 
-The report's `offCpuReasons` object, present for classified captures, lists the
-selected reasons, the matched intervals, observed nanoseconds and their
-sleeping/run-queue split for each, the kernel's per-reason switch-out counts — taken before its reason filter, so a
+The report's `offCpuReasons` object lists the selected reasons, and in
+`matched` one entry per selected reason with its matched intervals, observed
+nanoseconds and their sleeping/run-queue split, then the kernel's per-reason
+switch-out counts — taken before its reason filter, so a
 blocked-only capture still shows how often its threads were preempted — and the
 count and total duration of intervals the filter rejected. The population
 estimate covers the selected reasons only, since the kernel's eligibility counters
@@ -60,10 +63,10 @@ are taken after the reason filter.
 
 ## Sleeping and run-queue time
 
-A `schemaVersion` 4 capture names where each interval's run-queue part comes from
-in `captureStart.timeSplit` — `{"source": "schedInfo"}` or `{"source": "off"}` —
-and the same object in the manifest and in the footer's `analysisInputs`, all
-compared structurally. It is a block of its own beside `sampling` because it
+A capture names where each interval's run-queue part comes from in
+`captureStart.timeSplit` — `TIME_SPLIT_SOURCE_SCHED_INFO` or
+`TIME_SPLIT_SOURCE_OFF` — and the same message in the manifest and in the
+footer's `analysisInputs`, all compared as messages. It is a block of its own beside `sampling` because it
 changes what is measured, not which intervals are kept. Under `schedInfo` every
 observation carries `runqueueNanos`: the growth of the scheduler's
 `task_struct.sched_info.run_delay` between switch-out and switch-in, which the
@@ -72,8 +75,8 @@ schedstats are switched on. The collector refuses `schedInfo` at prepare on a
 kernel whose BTF has no such field; there is no silent fallback to `off`. The
 kernel drops a reading only when the counter went backwards
 (`runqueueInversions` in the `captureEnd` kernel counters). A row carrying
-`runqueueNanos` under `off`, and a version 3 or older capture with a `timeSplit`
-block or a version 4 one without it, are rejected.
+`runqueueNanos` under `off` is invalid, and a capture without a `timeSplit`
+source is rejected.
 
 The correlator applies one rule, and the report, the profile and every slice
 share it:
@@ -85,14 +88,14 @@ share it:
   time throughout, whatever the reading. The scheduler's clock can lag a few
   microseconds when a running task departs, so such a reading may slightly
   exceed the duration;
-- an interval without a reading (a version 2 or 3 capture, `off`, or a dropped
-  reading), or a `blocked` one whose reading exceeds its duration, is **unsplit**.
+- an interval without a reading (`off`, or a dropped reading), or a `blocked`
+  one whose reading exceeds its duration, is **unsplit**.
   Nothing is guessed or clamped.
 
 Each part is clipped to the `--from-ns`/`--to-ns` window separately, so sleeping,
 run-queue and unsplit time add up exactly to every interval's clipped duration.
-`offCpuReasons.matched` gives `sleepingNanos`, `runqueueNanos` and `unsplitNanos`
-per reason, and `offCpuReasons.timeSplit` names the `source`, whether the split is
+Each `offCpuReasons.matched` entry gives `sleepingNanos`, `runqueueNanos` and
+`unsplitNanos` for its reason, and `offCpuReasons.timeSplit` names the `source`, whether the split is
 `available`, the rule, the unsplit intervals by cause (`withoutReading`,
 `readingExceedsInterval`) and the kernel's `runqueueInversions`. The default
 collapsed files, the audit files and the synthetic JFR carry the whole interval
@@ -101,16 +104,16 @@ as before; the split reaches the stack profile and the `stacks --time` slices.
 A record's length prefix is checked against the record limit before any bytes
 are read, so a corrupt length cannot drive an allocation. A truncated final
 record is the partial-mode tail: its bytes are reported as
-`ignoredTrailingBytes` and the prefix before it is analyzed; in complete mode it
-is an error.
+`sourceParse.ignoredTrailingBytes` and the prefix before it is analyzed; in
+complete mode it is an error.
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
   --source jonoffcpu-capture.pb --jfr jonoffcpu-capture.jfr --output analysis
 ```
 
-A stream whose only row is a `captureFinalized` footer with
-`state: "profilerOnly"` comes from an agent run with
+A stream whose only record is a `captureFinalized` footer with
+`state: FINALIZED_STATE_PROFILER_ONLY` comes from an agent run with
 `sampling.admission.policy: none`.
 The correlator rejects it with an explicit message: no eBPF source ran, so the
 JFR is an ordinary async-profiler recording with nothing to correlate.
@@ -125,7 +128,7 @@ By default, the JFR must match the size and SHA-256 digest stored by the
 finalized capture. Use `--partial-jfr true` only for an intentionally cut JFR.
 That mode permits missing capture-context and terminal-stat events, validates
 each retained sample against the source capture epoch, and reports source rows
-whose JFR sample was cut away as `sample-not-present-in-selected-jfr`.
+whose JFR sample was cut away as `ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR`.
 
 The output directory must not exist. Every file is named `jonoffcpu-…` so it is
 recognisable wherever the directory ends up. A successful run writes:
@@ -139,7 +142,32 @@ recognisable wherever the directory ends up. A successful run writes:
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, restricted to one switch-out reason, without the reason frame | as above, and only when more than one reason contributes |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile; see **Stack profile** | `--profile-output true` (default) |
 | `jonoffcpu-offcpu-synthetic.jfr` | An explicitly synthetic CPU-compatible view, using duration-quantized `jdk.ExecutionSample` events | `--format both` (default) or `jfr` |
-| `jonoffcpu-complete.json` | Completion marker | last; a directory without it is not a complete analysis, and it is never written for a narrowed run (see **Degradation**) |
+| `jonoffcpu-complete.json` | Completion marker, `{"state":"MARKER_STATE_COMPLETE","coverageComplete":true,...}` | last; a directory without it is not a complete analysis, and it is never written for a narrowed run (see **Degradation**) |
+
+Every JSON output is a protobuf message printed in the proto3 JSON mapping by
+protobuf's `JsonFormat`: the report, the audit rows, the partial-mode files and
+the markers are defined in
+[`src/main/proto/jonoffcpu-report.proto`](src/main/proto/jonoffcpu-report.proto)
+(`Report`, `ClassifiedRecord`, `Pair`, `PartialReport`, `Marker`), the JFR rows in
+[`src/main/proto/jonoffcpu-signals.proto`](src/main/proto/jonoffcpu-signals.proto),
+and what the profile subcommands print in
+[`src/main/proto/jonoffcpu-analysis.proto`](src/main/proto/jonoffcpu-analysis.proto).
+Field names are lowerCamelCase; 64-bit integers are decimal strings; exact
+decimals (probabilities, fractions, shares, seconds) are decimal strings; enums
+print their value names (`OFF_CPU_REASON_BLOCKED`, `CLASSIFICATION_MATCHED`); a
+field without presence is always printed, even at its default, and a message or
+`optional` field that is unset is left out, never `null`. Values that echo a
+command-line option (`audit`, `policy`, `stack`, `weights`, …) keep the option's
+spelling. A reader should parse a file into its message rather than match text.
+
+A classified record is `{"row":N,"classification":"CLASSIFICATION_…","reason":"ROW_REASON_…","source":{…}}`
+for a capture row, whose `source` holds the `observation` exactly as the stream
+recorded it with its `kernelFrames` and `userFrames` expanded from the interned
+stacks, or `"jfr":{…}` with the `SignalSample` for a JFR row. `reason` is left
+out for a match and for a plain unmatched or orphan row. A match row
+(`jonoffcpu-matches.jsonl`) is a `Pair`: the `correlationId`, the clipped
+`fromNanos`/`toNanos`/`durationNanos`, `handlerDelayNanos` and
+`threadIdentityVerified`.
 
 The original combined JFR is never rewritten. CPU, allocation, lock, wall and JVM
 events in it remain available to other tools. Both derived formats are produced by default. Use `--format collapsed` or
@@ -197,19 +225,20 @@ valid source row with `duration * 2^32 / admissionThreshold`, where
 `2^32` at and above `recordAllAboveMicros` and `duration * 2^32 / reference`
 below it). The correlator recomputes that threshold from the `captureStart`
 `sampling` object and the row's own duration and marks a disagreeing row
-`source-policy-or-target-mismatch`, so the weights are the policy's, never the
+`ROW_REASON_SOURCE_POLICY_OR_TARGET_MISMATCH`, so the weights are the policy's, never the
 producer's word alone. The sum is accumulated in exact fixed-point arithmetic and
 reported as `estimatedDurationNanos`, truncated to whole nanoseconds (at most one
 nanosecond low); nothing passes through floating point, and the estimate never
-scales the collapsed stacks or synthetic JFR. `admissionPolicy` names the policy
+scales the collapsed stacks or synthetic JFR. `status` is
+`ESTIMATE_STATUS_AVAILABLE` or `ESTIMATE_STATUS_UNAVAILABLE`, and `admissionPolicy` names the policy
 in effect. The report also keeps the durable source duration and the smaller
 stack-matched duration separate, because missing or delayed Java stack delivery
 does not erase a valid source interval.
 
-The estimate is marked `available` only when source rows and the kernel/userspace
+The estimate is marked available only when source rows and the kernel/userspace
 selection, receipt and write counters prove complete coverage and the capture did
 not report source-loss conditions. Otherwise the observed source duration remains
-visible, `estimatedDurationNanos` is null and `unavailableReasons` says which
+visible, `estimatedDurationNanos` is left out and `unavailableReasons` says which
 coverage proof failed.
 
 One loss is accounted for instead of disqualifying: sequence contention. When
@@ -217,9 +246,9 @@ the kernel selects an interval but cannot allocate its correlation sequence, it
 drops the interval and counts it in `sequenceContentions`. If
 `selectedIntervals - sequenceContentions` equals the source rows and the
 received and written counts, every other failure counter is zero and nothing
-else fails, the estimate is `available` with an `accountedLoss` object
-(`intervals`, `fraction` of `selectedIntervals` to six significant digits,
-`reason: "sequence-contention"`),
+else fails, the estimate is available with an `accountedLoss` object
+(`intervals`, `fraction` of `selectedIntervals` to six significant digits as a
+decimal string, `reason: "sequence-contention"`),
 `sourceCoverageComplete` is false, and the sum is scaled by
 `selectedIntervals / receivedObservations` in the same exact fixed-point
 arithmetic. That scaling is unbiased only if contention is independent of an
@@ -258,10 +287,13 @@ otherwise (`Native`, `C++`, `Kernel`, or no type): a frame such as
 package-qualified Java name. Stacks that differ only in a frame's type share a
 collapsed key, so a frame position is `JAVA` only when every such stack agrees.
 The kind changes no name, so the collapsed key and every rendered line stay the
-same. `JFR_NATIVE` arrived with `schema_version` 2; a schema 1 profile tags every
-Java-stack frame `JAVA` and still reads, and a reader that predates schema 2
-refuses a newer profile with `Unsupported stack profile schema` rather than
-render it.
+same.
+
+`profile_start` carries `schema_version` 3, and the reader refuses any other
+schema with `Unsupported stack profile schema` rather than render it: each
+source's `Provenance` holds the capture's `sampling` and `time_split` as the
+capture messages, and `report` is the producing run's `Report`, the message
+`jonoffcpu-report.json` prints (unset for a merged profile).
 
 An entry is keyed by the Java stack (at the collapsed file's class-and-method
 granularity) and the switch-out reason with its raw task state, and by default
@@ -280,8 +312,8 @@ reads as all unsplit.
 Past `--max-profile-entries` (default 2,000,000) the thread, then the user stack,
 then the kernel stack are dropped from the key; that merges entries without
 changing any total, and `profile_end` and the report's `stackProfile` object name
-what was dropped. The profile embeds the run's report and the label frames its
-collapsed lines start with. Partial mode writes no profile.
+what was dropped. The profile embeds the run's report as a typed message and the
+label frames its collapsed lines start with. Partial mode writes no profile.
 
 The reader validates the header, the reference order and the end record's totals,
 and refuses a truncated or foreign file. Three subcommands use it:
@@ -303,7 +335,7 @@ java -jar jonoffcpu-correlator.jar stacks --collapsed-input C --output F [filter
 java -jar jonoffcpu-correlator.jar stacks --list-presets
 java -jar jonoffcpu-correlator.jar merge --profiles A,B,... --output M
 java -jar jonoffcpu-correlator.jar export --profile P --format csv|jsonl --output E
-    [--run-label TEXT] [--run-metadata R] [--numbers number|string]
+    [--run-label TEXT] [--run-metadata R]
 ```
 
 `stacks` with its defaults reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for
@@ -318,7 +350,9 @@ each line in a `[sleeping]`, `[runqueue]` or `[unsplit]` frame. Every mode but
 `total` refuses a profile without the split. `--reason-frame auto` counts a
 reason only when it contributes to the selected part. The `--summary` file names
 the `time` part and carries `unsplitNanos`, the kept entries' unsplit time, which
-a `sleeping` or `runqueue` slice leaves out.
+a `sleeping` or `runqueue` slice leaves out. The summary is a `SliceSummary` message (a
+`CollapsedSliceSummary` for `--collapsed-input`), with the reasons as
+`OFF_CPU_REASON_…` values.
 
 ### Transforms
 
@@ -417,33 +451,45 @@ cannot make a native frame rewritable.
 `export` writes one row per entry with expanded stacks, the six split columns and
 `java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack frame's
 kind, `java` or `native`, joined with `;` like `java_stack`. It is for tools such
-as DuckDB. Since 0.5.0 these columns are followed, in this order, by:
+as DuckDB. A JSON Lines row is an `ExportRow` message. These columns are followed,
+in this order, by:
 
 | JSON Lines | CSV | Contents |
 | --- | --- | --- |
-| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first, as the joined columns render them; `null` for an absent stack. CSV stays flat. |
+| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first, as the joined columns render them; empty for an absent stack, whose joined column is left out. CSV stays flat. |
 | `canonicalJavaStack` | `canonical_java_stack` | `javaStack` without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
 | `threadPool` | `thread_pool` | The thread name with every digit run replaced by `#` |
 | `run` | `run` | `--run-label`, by default the profile's label, else its first source's session id |
 | `estimateAvailable` | `estimate_available` | Whether the estimated columns may be used, from the profile header |
 
-In JSON Lines the counters are numbers while they are at most 2^53-1, so that
-a double holds them exactly and DuckDB infers `BIGINT`, and decimal strings
-beyond that; `--numbers string` writes them all as strings, as before 0.5.0.
-CSV counters are unsigned decimals, as before.
+In JSON Lines `reason` is the enum value name (`OFF_CPU_REASON_BLOCKED`, where
+the CSV has `blocked`), `taskState` is a number, and the 64-bit counters
+(`intervals` and every `…Nanos` column) are decimal strings, as the proto3 JSON
+mapping writes every 64-bit integer, so no counter loses precision in a double.
+CSV counters are unsigned decimals. DuckDB reads the string counters as
+`VARCHAR`, the frame arrays as `VARCHAR[]`, `estimateAvailable` as `BOOLEAN` and
+`taskState` as a number; cast the counters once in a view:
 
-`--run-metadata FILE` also writes one JSON object describing the profile, to load
-into its own table and join to the rows on `run`:
-
-```json
-{"schemaVersion": 1, "run": "...", "label": "...",
- "sources": [{"sessionId": "...", "captureEpoch": 1, "windowFromNanos": 0, "windowToNanos": 0,
-              "samplingJson": "{...}", "thinningProbability": "1", "timeSplitJson": "{...}"}],
- "dimensions": ["reason", "kernel", "user", "thread"], "estimateAvailable": false,
- "timeSplitAvailable": false, "entries": 2791, "intervals": 308777, "observedNanos": 8519334220784}
+```sql
+CREATE VIEW entries AS SELECT * REPLACE (intervals::UBIGINT AS intervals,
+  observedNanos::UBIGINT AS observedNanos, estimatedNanos::UBIGINT AS estimatedNanos)
+FROM read_json('entries.jsonl', format = 'newline_delimited');
 ```
 
-Its counters follow the same number rule.
+The other `…Nanos` columns cast the same way.
+
+`--run-metadata FILE` also writes one `RunMetadata` message describing the
+profile, to load into its own table and join to the rows on `run`:
+
+```json
+{"run": "...", "label": "...",
+ "sources": [{"sessionId": "...", "captureEpoch": "1", "sourceSha256": "...", "originalJfrSha256": "...",
+              "thinningProbability": "1", "thinningSeed": "0", "windowFromNanos": "0", "windowToNanos": "0",
+              "sampling": {"reasons": ["OFF_CPU_REASON_BLOCKED"], "proportional": {"recordAllAboveMicros": "10000"}},
+              "timeSplit": {"source": "TIME_SPLIT_SOURCE_SCHED_INFO"}}],
+ "dimensions": ["reason", "kernel", "user", "thread"], "estimateAvailable": false,
+ "timeSplitAvailable": true, "entries": "2791", "intervals": "308777", "observedNanos": "8519334220784"}
+```
 
 ## Ranked tables and the digest
 
@@ -495,18 +541,22 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
   unresolved native frames (`/lib/…` paths) differ by more than 10 points of
   busy time, since their time without an application frame is then not
   comparable.
-- **Formats.** `json` is the source: `schemaVersion` 1, `command` (the
+- **Formats.** `json` is the source, a `TopResult` message: `command` (the
   reproduce command), `by`, `unit`, `selection` (every option, with the
   patterns and their sources), `totals`, `rows`, `noApplicationFrame`, `idle`
-  (or `comparison`), and `warnings`. `md` and `csv` (one row per table row,
-  with a `table` column) are rendered from it.
+  (or `comparisonTotals` and `comparison`), and `warnings`. A row's `key` is
+  the boundary, the pool or the `--by` key; seconds and shares are decimal
+  strings, and `reason` an `OFF_CPU_REASON_…` value. `md` and `csv` (one row
+  per table row, with a `table` column) are rendered from it.
 
 Correlation writes the **digest**, `jonoffcpu-summary.json` and
 `jonoffcpu-summary.md`, next to the report unless `--summary-output false` is
 given, with `preset:jvm-idle`, `preset:jvm-wait-machinery`, canonical names and
-no application pattern; `summarize` rewrites it with `--app`. The report's
-`digest` object names the files, or holds the `error` when the digest could not
-be written, which never fails the correlation. The JSON, `schemaVersion` 1:
+no application pattern; `summarize` rewrites it with `--app`, taking the capture
+section from the report the profile carries, or from `--report FILE`, which is
+parsed strictly as a `Report`. The report's `digest` object names the files, or
+holds the `error` when the digest could not be written, which never fails the
+correlation. The JSON is a `Digest` message:
 
 | Field | Contents |
 | --- | --- |
@@ -514,9 +564,9 @@ be written, which never fails the correlation. The JSON, `schemaVersion` 1:
 | `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
 | `selection` | As in `top --format json` |
 | `whereTheTimeWent` | `top`'s totals: selected, idle, busy, busy with and without an application frame, over-exclusion |
-| `busy`, `idle` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, and the `rows` |
+| `busy`, `idle` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, and the `rows` of `top` |
 | `busyNoApplicationFrameByPool` | The pool table (with `--app`), or busy time by pool (without) |
-| `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines, and the `command` |
+| `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines (`top`), and the `command` |
 | `warnings` | As in `top` |
 
 Every table is limited to `--limit` rows (default 20), which keeps the Markdown
@@ -527,7 +577,7 @@ the JSON, so the two cannot disagree, and the same inputs give the same bytes.
 
 A profile is not an audit log. When a capture does not fit the retained-bytes budget,
 `--on-limit degrade` (the default) walks a ladder rather than refusing, and records
-every step in the report's `degradation` object:
+every step in the report's `degradation` object (a `DegradationReport`):
 
 1. **Coarsen the synthetic quantum.** The event count for a quantum is the sum of
    per-stack floors and is known before the first event is written, so the quantum is
@@ -584,10 +634,12 @@ to degrade, so a consumer can see that degradation was considered and declined. 
 carries `policy`, `requestedAudit`, `audit`, `retainedBytesLimit`,
 `estimatedRetainedBytes` (from `RetentionEstimate`, computed from the input file sizes
 before decoding), `peakRetainedBytes` (what the run actually held at its high-water
-mark), `attempts`, the top-level `narrowedToNanos` (`null` unless the window was
+mark), `attempts`, the top-level `narrowedToNanos` (left out unless the window was
 narrowed, mirroring `peakRetainedBytes` so a consumer that reads only the top-level
-object need not scan `stepsApplied` for the `narrow-window` entries), and `stepsApplied`:
-one object per ladder step actually taken, each with a `step` name and the reason.
+object need not scan `stepsApplied` for the `narrowWindow` entries), and `stepsApplied`:
+one entry per ladder step actually taken, with its `reason` and the step as the
+one key that names it — `thinSource`, `dropAuditOutputs`, `narrowWindow`,
+`coarsenSyntheticQuantum` or `omitSyntheticJfr` — holding the step's details.
 
 ## Interpretation
 
@@ -673,8 +725,10 @@ The output directory must not exist. Input files must already be closed and
 stable. Digests are checked before analysis and rechecked before returning.
 Advanced selection and recovery options are available through
 `OffCpuCorrelator.run(args)`, which returns the CLI status without terminating
-the calling JVM. Gson and the JMC writer are relocated implementation details and
-do not appear in public method signatures.
+the calling JVM. `SignalJfrExporter.export(Path, Writer)` prints a JFR's signal
+events as JSON Lines, one `SignalRecord` per line. Protobuf (with the Gson
+parser its `JsonFormat` uses), picocli and the JMC writer are relocated
+implementation details and do not appear in public method signatures.
 
 ## Explicit incomplete diagnostics
 
@@ -683,7 +737,7 @@ possibly truncated pair after abrupt termination, select the separate partial pa
 
 ```sh
 java -jar jonoffcpu-correlator.jar \
-  --source interrupted.jsonl --jfr interrupted.jfr --output incomplete-analysis \
+  --source interrupted.pb --jfr interrupted.jfr --output incomplete-analysis \
   --partial true
 ```
 
@@ -696,35 +750,33 @@ Its new output directory holds a visibly different file set:
 
 | File | Contents | Written when |
 | --- | --- | --- |
-| `INCOMPLETE-jonoffcpu-report.json` | Diagnostics for the observed prefix | always |
+| `INCOMPLETE-jonoffcpu-report.json` | Diagnostics for the observed prefix, a `PartialReport` | always |
 | `INCOMPLETE-jonoffcpu-classified-records.jsonl` | Classified source rows and JFR samples from the prefix | always |
-| `INCOMPLETE-jonoffcpu-pairs.jsonl` | Exact-cookie pairs found in the prefix, with null delivery delays where the clock could not be verified | always |
+| `INCOMPLETE-jonoffcpu-pairs.jsonl` | Exact-cookie pairs found in the prefix, as `Pair` rows without `handlerDelayNanos` where the clock could not be verified | always |
 | `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed` | Prefix stacks, each under an explicit incomplete root label that survives ordinary flame graph rendering | `--format collapsed` |
-| `jonoffcpu-partial.json` | Marker with `state: incomplete` and `coverageComplete: false` | last |
+| `jonoffcpu-partial.json` | Marker with `state: MARKER_STATE_INCOMPLETE`, `coverageComplete: false` and the `incompleteReasons` | last |
 
 There is never a `jonoffcpu-complete.json` or a synthetic JFR in partial mode.
 
-Only fully decoded records are retained. A final source row without its newline
-is discarded and its byte count reported; a malformed complete row remains an
-error. Missing source end/footer or AP terminal stats, and a JFR decoding failure
+Only fully decoded records are retained. A final record cut short is discarded
+and its byte count reported; a malformed complete record remains an error. Missing source end/footer or AP terminal stats, and a JFR decoding failure
 at the unread tail, are reported explicitly. An unread suffix could contain a late
 duplicate, so even coherent exact-cookie pairs are **provisional within the
 recovered records**. Recovered duplicates invalidate every received copy. Counts
 of missing/orphan samples describe the recovered prefix, not final delivery loss.
 
-Unknown schemas, conflicting capture contexts, inconsistent final counters,
+An unknown format version, conflicting capture contexts, inconsistent final counters,
 resource limits, same-size hash mismatches and changing input files remain hard
 errors. A JFR shorter than an observed footer declares may be inspected, but its
 full-file hash is not marked verified. The report retains actual input byte counts,
 digests, observed terminal evidence and its verification state.
 
 A missing footer does not establish a shared clock or a zero offset. Such results
-have null handler delays and reject `--max-handler-delay-ns`; missing AP final
-submitted counts are null, not zero. Explicit `--from-ns`/`--to-ns` can still clip
+leave out handler delays and reject `--max-handler-delay-ns`; a missing AP final
+submitted count is left out, not zero. Explicit `--from-ns`/`--to-ns` can still clip
 observed source intervals in their own monotonic clock. No wall-time mapping is
 inferred. Population estimates and synthetic JFR output require the complete path
 and are rejected in partial mode.
 
-`SignalJfrExporter.visitPrefix` remains a lower-level, JDK-type-only parser API
-for recovery tooling. It exposes parser terminal evidence without emitting a
-successful end row; its strict `visit` and `export` methods are unchanged.
+The JFR prefix reader behind partial mode reports its parser evidence in the
+report's `jfrParse` object and never emits a successful end row.

@@ -6,11 +6,47 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatIOException;
 import static org.assertj.core.api.Assertions.assertThatIllegalArgumentException;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.protobuf.InvalidProtocolBufferException;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.CaptureMode;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.FailureCode;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Manifest;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ManifestState;
 import io.github.lhotari.jonoffcpu.agent.SignalCaptureController.State;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureEnd;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureFinalized;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureStart;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureState;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.FinalizedState;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.IncompleteReason;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.KernelCounters;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.NoAdmission;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Observation;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.OffCpuReason;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.ProportionalAdmission;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Record;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Sampling;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.SignalDelivery;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Stack;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplit;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplitSource;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.UniformAdmission;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.UserspaceCounters;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.VerifiedIdentity;
+import io.github.lhotari.jonoffcpu.capture.CaptureRecordFixture;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.Closed;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorError;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorErrorCode;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorReply;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorState;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.EnableRequest;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.Enabled;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.PrepareRequest;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.Prepared;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.Stopped;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Files;
@@ -74,33 +110,43 @@ class SignalCaptureControllerTest {
         assertThat(root.resolve("correlation.jfr"))
                 .as("JFR path was not reserved")
                 .isRegularFile();
-        Path manifest = controller.stop();
+        Manifest manifest = manifest(controller.stop());
         assertThat(controller.state()).as("capture did not complete").isEqualTo(State.COMPLETE);
-        JsonObject json = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
-        assertThat(json.get("complete").getAsBoolean())
-                .as("manifest not complete")
-                .isTrue();
-        assertThat(json.getAsJsonObject("analysisInputs").get("captureEpoch").getAsLong())
+        assertThat(manifest.getComplete()).as("manifest not complete").isTrue();
+        assertThat(manifest.getState()).isEqualTo(ManifestState.MANIFEST_STATE_COMPLETE);
+        assertThat(manifest.getMode()).isEqualTo(CaptureMode.CAPTURE_MODE_SIGNAL_CAPTURE);
+        assertThat(manifest.hasFailure())
+                .as("a completed manifest keeps no failure")
+                .isFalse();
+        assertThat(manifest.getAnalysisInputs().getCaptureEpoch())
                 .as("wrong epoch")
                 .isEqualTo(7);
-        assertThat(json.getAsJsonObject("analysisInputs")
-                        .getAsJsonObject("apStats")
-                        .get("submittedSamples")
-                        .getAsString())
+        assertThat(manifest.getAnalysisInputs().getApStats().getSubmittedSamples())
                 .as("AP counters missing")
-                .isEqualTo("0");
-        Path correlation = root.resolve("correlation.ndjson");
+                .isZero();
+        // The manifest records the collector's replies exactly as they were returned.
+        assertThat(manifest.getNativePrepare()).isEqualTo(source.prepareReply);
+        assertThat(manifest.getNativeEnable()).isEqualTo(source.enableReply);
+        assertThat(manifest.getNativeStop()).isEqualTo(source.stopReply);
+        assertThat(manifest.getNativeClose()).isEqualTo(source.closeReply);
+        assertThat(manifest.getSourceCaptureEnd()).isEqualTo(source.captureEnd);
+        Path correlation = root.resolve("correlation.pb");
         assertThat(correlation).as("source artifact missing").isRegularFile();
         assertThat(profiler.ordinaryStops).as("ordinary AP stop was used").isZero();
         assertThat(source.closeCalls).as("native handle was not closed once").isEqualTo(1);
-        List<JsonObject> rows = CaptureStreamFixture.rows(correlation);
-        JsonObject footer = rows.get(rows.size() - 1);
-        assertThat(footer.get("recordType").getAsString())
-                .as("final footer missing")
-                .isEqualTo("captureFinalized");
-        assertThat(footer.get("apStopResponse").getAsString())
-                .as("receipt not retained")
-                .contains("finalized=true");
+        List<Record> records = CaptureRecordFixture.read(correlation);
+        Record last = records.get(records.size() - 1);
+        assertThat(last.hasCaptureFinalized()).as("final footer missing").isTrue();
+        CaptureFinalized footer = last.getCaptureFinalized();
+        assertThat(footer.getState()).isEqualTo(FinalizedState.FINALIZED_STATE_COMPLETE);
+        assertThat(footer.getApStopResponse()).as("receipt not retained").contains("finalized=true");
+        assertThat(footer.getAnalysisInputs())
+                .as("the footer and the manifest carry the same analysis inputs")
+                .isEqualTo(manifest.getAnalysisInputs());
+        assertThat(footer.getAnalysisInputs().getSourceArtifact().getRawBytes())
+                .as("the footer covers the stream before it")
+                .isEqualTo(Files.size(correlation) - CaptureRecordFixture.encode(last).length);
+        assertThat(manifest.getCorrelationArtifact().getBytes()).isEqualTo(Files.size(correlation));
     }
 
     @Test
@@ -119,7 +165,7 @@ class SignalCaptureControllerTest {
         assertThat(profiler.active).as("AP is not running").isTrue();
         controller.pollProfiler();
         assertThat(controller.state()).as("poll must keep a running profile").isEqualTo(State.PROFILER_ONLY);
-        Path manifest = controller.stop();
+        Path manifestPath = controller.stop();
         assertThat(controller.state())
                 .as("profiler-only capture did not complete")
                 .isEqualTo(State.COMPLETE);
@@ -133,29 +179,29 @@ class SignalCaptureControllerTest {
         assertThat(source.enableCalls).as("eBPF source must never be enabled").isZero();
         assertThat(source.stopCalls).as("eBPF source must never be stopped").isZero();
         assertThat(source.closeCalls).as("eBPF source must never be closed").isZero();
-        JsonObject json = JsonParser.parseString(Files.readString(manifest)).getAsJsonObject();
-        assertThat(json.get("complete").getAsBoolean())
-                .as("manifest not complete")
-                .isTrue();
-        assertThat(json.get("mode").getAsString()).as("manifest mode missing").isEqualTo("profilerOnly");
-        assertThat(json.getAsJsonObject("analysisInputs").get("mode").getAsString())
-                .as("analysis inputs mode missing")
-                .isEqualTo("profilerOnly");
-        Path correlation = root.resolve("correlation.ndjson");
-        var rows = CaptureStreamFixture.rows(correlation);
-        assertThat(rows).as("profiler-only stream must hold exactly one record").hasSize(1);
-        JsonObject footer = rows.get(0);
-        assertThat(footer.get("recordType").getAsString()).as("footer missing").isEqualTo("captureFinalized");
-        assertThat(footer.get("state").getAsString())
-                .as("footer state must be profilerOnly")
-                .isEqualTo("profilerOnly");
-        assertThat(footer.get("sourceDisabled").getAsBoolean())
-                .as("footer must flag the disabled source")
-                .isTrue();
+        Manifest manifest = manifest(manifestPath);
+        assertThat(manifest.getComplete()).as("manifest not complete").isTrue();
+        assertThat(manifest.getMode()).as("manifest mode missing").isEqualTo(CaptureMode.CAPTURE_MODE_PROFILER_ONLY);
+        assertThat(manifest.hasNativePrepare())
+                .as("no collector reply in profiler-only mode")
+                .isFalse();
+        assertThat(manifest.getAnalysisInputs().hasSourceArtifact())
+                .as("profiler-only analysis inputs name no source")
+                .isFalse();
+        assertThat(manifest.getAnalysisInputs().getSampling()).isEqualTo(NONE);
+        List<Record> records = CaptureRecordFixture.read(root.resolve("correlation.pb"));
+        assertThat(records)
+                .as("profiler-only stream must hold exactly one record")
+                .hasSize(1);
+        CaptureFinalized footer = records.get(0).getCaptureFinalized();
+        assertThat(footer.getState())
+                .as("footer state must be profiler-only")
+                .isEqualTo(FinalizedState.FINALIZED_STATE_PROFILER_ONLY);
+        assertThat(footer.getAnalysisInputs()).isEqualTo(manifest.getAnalysisInputs());
         assertThat(Files.size(root.resolve("correlation.jfr")))
                 .as("JFR recording missing")
                 .isPositive();
-        assertThat(controller.stop()).as("repeated stop must be idempotent").isEqualTo(manifest);
+        assertThat(controller.stop()).as("repeated stop must be idempotent").isEqualTo(manifestPath);
     }
 
     @Test
@@ -163,8 +209,9 @@ class SignalCaptureControllerTest {
         FakeProfiler profiler = new FakeProfiler();
         FakeSource source = new FakeSource();
         // A zero uniform probability resolves to the explicit none policy.
-        SignalCaptureController controller = controller(
-                root, profiler, source, new SamplingConfig(null, null, null, SamplingConfig.uniform(BigDecimal.ZERO)));
+        Sampling.Builder zero = Sampling.newBuilder();
+        SamplingConfig.uniform(BigDecimal.ZERO, zero);
+        SignalCaptureController controller = controller(root, profiler, source, zero.build());
         controller.start();
         profiler.stopExternally();
         controller.pollProfiler();
@@ -174,11 +221,12 @@ class SignalCaptureControllerTest {
                 .isZero();
         assertThat(source.prepareCalls).as("eBPF source must stay untouched").isZero();
         assertThat(source.closeCalls).as("eBPF source must stay untouched").isZero();
-        JsonObject footer =
-                CaptureStreamFixture.rows(root.resolve("correlation.ndjson")).get(0);
-        assertThat(footer.get("state").getAsString())
+        assertThat(CaptureRecordFixture.read(root.resolve("correlation.pb"))
+                        .get(0)
+                        .getCaptureFinalized()
+                        .getState())
                 .as("footer missing after external stop")
-                .isEqualTo("profilerOnly");
+                .isEqualTo(FinalizedState.FINALIZED_STATE_PROFILER_ONLY);
     }
 
     @Test
@@ -187,7 +235,7 @@ class SignalCaptureControllerTest {
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("source.ndjson")
+                        + root.resolve("source.pb")
                         + ",jonoffcpudelivery=coalescing,sampling-policy=uniform,sampling-probability=1,asprofpath="
                         + ap
                         + ",event=cpu,file="
@@ -195,17 +243,17 @@ class SignalCaptureControllerTest {
                 nativeLibrary);
         assertThat(config.signalDelivery())
                 .as("Native delivery option not parsed")
-                .isEqualTo("coalescing");
+                .isEqualTo(SignalDelivery.SIGNAL_DELIVERY_COALESCING);
         SignalCaptureController controller =
                 new SignalCaptureController(config, new FakeProfiler(), new FakeSource(), millis -> {});
         controller.start();
         controller.stop();
         assertThat(controller.state()).as("Coalescing capture did not complete").isEqualTo(State.COMPLETE);
-        List<JsonObject> rows = CaptureStreamFixture.rows(root.resolve("source.ndjson"));
-        assertThat(rows.get(0).get("signalDelivery").getAsString())
+        List<Record> records = CaptureRecordFixture.read(root.resolve("source.pb"));
+        assertThat(records.get(0).getCaptureStart().getSignalDelivery())
                 .as("Delivery policy missing from source")
-                .isEqualTo("coalescing");
-        assertThat(rows.get(rows.size() - 1).get("apStopResponse").getAsString())
+                .isEqualTo(SignalDelivery.SIGNAL_DELIVERY_COALESCING);
+        assertThat(records.get(records.size() - 1).getCaptureFinalized().getApStopResponse())
                 .as("Delivery policy missing from footer/receipt")
                 .contains("delivery=coalescing");
     }
@@ -220,24 +268,44 @@ class SignalCaptureControllerTest {
         assertThat(controller.state())
                 .as("Missing native stack rejected complete source")
                 .isEqualTo(State.COMPLETE);
-        List<JsonObject> rows = CaptureStreamFixture.rows(root.resolve("correlation.ndjson"));
-        JsonObject observation = rows.stream()
-                .filter(row -> row.get("recordType").getAsString().equals("observation"))
-                .findFirst()
-                .orElseThrow();
-        assertThat(rows)
+        List<Record> records = CaptureRecordFixture.read(root.resolve("correlation.pb"));
+        assertThat(records)
                 .as("Native stack failure evidence not retained: stack record")
-                .anyMatch(row -> row.get("recordType").getAsString().equals("stack"));
-        assertThat(observation.get("userStackError").getAsString())
+                .anyMatch(Record::hasStack);
+        Observation observation = records.stream()
+                .filter(Record::hasObservation)
+                .findFirst()
+                .orElseThrow()
+                .getObservation();
+        assertThat(observation.getUserStackError())
                 .as("Native stack failure evidence not retained: userStackError")
                 .isEqualTo("bpf_stack_error_-7");
-        assertThat(rows.get(rows.size() - 2)
-                        .getAsJsonObject("counters")
-                        .getAsJsonObject("userspace")
-                        .get("symbolizationFailures")
-                        .getAsString())
+        assertThat(records.get(records.size() - 2)
+                        .getCaptureEnd()
+                        .getUserspaceCounters()
+                        .getSymbolizationFailures())
                 .as("Native stack failure evidence not retained: symbolizationFailures")
-                .isEqualTo("1");
+                .isEqualTo(1);
+    }
+
+    /** The verifier recomputes each observation's reason and threshold, and rejects a row the kernel would not write. */
+    @ParameterizedTest
+    @ValueSource(strings = {"reason", "threshold", "unselectedReason", "unannouncedStack", "cookie"})
+    void inconsistentObservationIsRejected(String defect, @TempDir Path root) throws Exception {
+        FakeSource source = new FakeSource();
+        source.nativeStackFailure = true;
+        source.observationDefect = defect;
+        FakeProfiler profiler = new FakeProfiler();
+        SignalCaptureController controller = controller(root, profiler, source);
+        controller.start();
+        assertThatThrownBy(controller::stop)
+                .as("an inconsistent observation must not be finalized: " + defect)
+                .isInstanceOfAny(IOException.class, IllegalStateException.class);
+        assertThat(controller.state()).isEqualTo(State.INCOMPLETE);
+        assertThat(CaptureRecordFixture.read(root.resolve("correlation.pb")))
+                .as("an unverified stream receives no footer")
+                .noneMatch(Record::hasCaptureFinalized);
+        assertThat(manifest(controller.manifestPath()).getComplete()).isFalse();
     }
 
     @Test
@@ -250,13 +318,22 @@ class SignalCaptureControllerTest {
         assertThatIllegalStateException()
                 .as("Expected native stop timeout")
                 .isThrownBy(controller::stop)
-                .withMessageContaining("stop_timeout");
+                .withMessageContaining("STOP_TIMEOUT");
         assertThat(profiler.active)
                 .as("AP stopped while native ownership was unsettled")
                 .isTrue();
         assertThat(source.closeCalls).as("timed-out native handle was freed").isZero();
+        Manifest interrupted = manifest(controller.manifestPath());
+        assertThat(interrupted.getState()).isEqualTo(ManifestState.MANIFEST_STATE_INCOMPLETE);
+        assertThat(interrupted.getFailure().getCode()).isEqualTo(FailureCode.FAILURE_CODE_COLLECTOR_ERROR);
+        assertThat(interrupted.getFailure().getCollectorError().getCode())
+                .isEqualTo(CollectorErrorCode.COLLECTOR_ERROR_CODE_STOP_TIMEOUT);
+        assertThat(interrupted.getNativeStop().getState()).isEqualTo(CollectorState.COLLECTOR_STATE_STOPPING);
         controller.stop();
         assertThat(controller.state()).as("retry did not complete").isEqualTo(State.COMPLETE);
+        assertThat(manifest(controller.manifestPath()).getNativeStop())
+                .as("the retried stop's reply replaces the timed-out one")
+                .isEqualTo(source.stopReply);
     }
 
     @Test
@@ -295,7 +372,7 @@ class SignalCaptureControllerTest {
         assertThatIllegalStateException()
                 .as("Expected native close timeout")
                 .isThrownBy(controller::stop)
-                .withMessageContaining("close_timeout");
+                .withMessageContaining("CLOSE_TIMEOUT");
         assertThat(profiler.active)
                 .as("AP stopped before native close ownership settled")
                 .isTrue();
@@ -324,7 +401,7 @@ class SignalCaptureControllerTest {
         assertThat(source.closeCalls)
                 .as("incomplete native source was not closed")
                 .isEqualTo(1);
-        assertThat(CaptureStreamFixture.rows(root.resolve("correlation.ndjson")))
+        assertThat(CaptureRecordFixture.read(root.resolve("correlation.pb")))
                 .as("incomplete native source received a success footer")
                 .hasSize(2);
     }
@@ -394,7 +471,7 @@ class SignalCaptureControllerTest {
                 .as("Expected AP finalization failure")
                 .isThrownBy(controller::stop)
                 .withMessageContaining("did not finalize");
-        assertThat(CaptureStreamFixture.rows(root.resolve("correlation.ndjson")))
+        assertThat(CaptureRecordFixture.read(root.resolve("correlation.pb")))
                 .as("incomplete AP capture received a success footer")
                 .hasSize(2);
         assertThat(source.closeCalls).as("settled native handle was not closed").isEqualTo(1);
@@ -436,11 +513,54 @@ class SignalCaptureControllerTest {
         assertThat(source.closeCalls)
                 .as("prepared native source was not closed")
                 .isEqualTo(1);
-        JsonObject manifest = JsonParser.parseString(Files.readString(controller.manifestPath()))
-                .getAsJsonObject();
-        assertThat(manifest.get("complete").getAsBoolean())
-                .as("failed start marked complete")
-                .isFalse();
+        Manifest manifest = manifest(controller.manifestPath());
+        assertThat(manifest.getComplete()).as("failed start marked complete").isFalse();
+        assertThat(manifest.getState()).isEqualTo(ManifestState.MANIFEST_STATE_FAILED);
+        assertThat(manifest.getFailure().getCode()).isEqualTo(FailureCode.FAILURE_CODE_INVALID_ARGUMENT);
+        assertThat(manifest.getNativeCleanupClose()).isEqualTo(source.closeReply);
+    }
+
+    /** The collector echoes the policy it was sent; an echo that differs as a message is a protocol error. */
+    @ParameterizedTest
+    @ValueSource(strings = {"prepare", "enable"})
+    void samplingEchoDriftIsRejected(String call, @TempDir Path root) throws Exception {
+        FakeProfiler profiler = new FakeProfiler();
+        FakeSource source = new FakeSource();
+        source.driftingEcho = call;
+        SignalCaptureController controller = controller(root, profiler, source);
+        assertThatIllegalStateException()
+                .as("a drifting sampling echo must fail the start")
+                .isThrownBy(controller::start)
+                .withMessageContaining("sampling mismatch");
+        assertThat(source.closeCalls)
+                .as("the prepared collector was not closed")
+                .isEqualTo(1);
+        assertThat(profiler.active).as("async-profiler was left running").isFalse();
+    }
+
+    @Test
+    void unsupportedCollectorAbiIsRejected(@TempDir Path root) throws Exception {
+        FakeSource source = new FakeSource();
+        source.abiVersion = 1;
+        SignalCaptureController controller = controller(root, new FakeProfiler(), source);
+        assertThatIllegalStateException()
+                .isThrownBy(controller::start)
+                .withMessageContaining("collector ABI version 1");
+        assertThat(source.enableCalls).isZero();
+    }
+
+    @Test
+    void preparedCollectorErrorIsRecorded(@TempDir Path root) throws Exception {
+        FakeSource source = new FakeSource();
+        source.prepareError = true;
+        SignalCaptureController controller = controller(root, new FakeProfiler(), source);
+        assertThatIllegalStateException()
+                .isThrownBy(controller::start)
+                .withMessageContaining("prepare failed [COLLECTOR_ERROR_CODE_BPF_UNSUPPORTED]");
+        Manifest manifest = manifest(controller.manifestPath());
+        assertThat(manifest.getNativePrepare()).isEqualTo(source.prepareReply);
+        assertThat(manifest.getFailure().getCollectorError()).isEqualTo(source.prepareReply.getError());
+        assertThat(source.closeCalls).as("no handle to close").isZero();
     }
 
     @Test
@@ -546,88 +666,69 @@ class SignalCaptureControllerTest {
         Path jfr = root.resolve("combined.jfr");
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("correlation.ndjson")
+                        + root.resolve("correlation.pb")
                         + ",sampling-policy=uniform,sampling-probability=0.1,min-off-cpu-micros=7,asprofpath="
                         + ap
                         + ",event=cpu,alloc=1m,jfrsync=profile,file="
                         + jfr,
                 nativeLibrary);
-        assertThat(config.sampling().admission()).isInstanceOf(SamplingConfig.Uniform.class);
-        SamplingConfig.Uniform uniform =
-                (SamplingConfig.Uniform) config.sampling().admission();
-        assertThat(uniform.probability().toPlainString())
-                .as("requested probability not retained")
-                .isEqualTo("0.1");
-        assertThat(uniform.probabilityThreshold())
-                .as("probability threshold was not rounded down")
-                .isEqualTo(429_496_729L);
-        JsonObject persisted = config.sampling().json();
-        assertThat(persisted.getAsJsonObject("admission").get("probability").getAsString())
-                .as("requested/effective sampling policy not persisted: %s", persisted)
-                .isEqualTo("0.1");
-        assertThat(persisted
-                        .getAsJsonObject("admission")
-                        .get("probabilityThreshold")
-                        .getAsLong())
-                .as("requested/effective sampling policy not persisted: %s", persisted)
-                .isEqualTo(429_496_729L);
-        assertThat(persisted.get("minOffCpuMicros").getAsLong())
-                .as("requested/effective sampling policy not persisted: %s", persisted)
-                .isEqualTo(7);
-        assertThat(persisted.get("maxOffCpuMicros").isJsonNull())
-                .as("requested/effective sampling policy not persisted: %s", persisted)
-                .isTrue();
-        assertThat(config.sampling().minOffCpuMicros())
-                .as("optional duration policy lost")
-                .isEqualTo(7);
-        assertThat(config.sampling().maxOffCpuMicros())
-                .as("optional duration policy lost")
-                .isNull();
+        assertThat(config.sampling())
+                .as("requested/effective sampling policy")
+                .isEqualTo(Sampling.newBuilder()
+                        .addReasons(OffCpuReason.OFF_CPU_REASON_BLOCKED)
+                        .setMinOffCpuMicros(7)
+                        // The probability's spelling is kept, and its threshold rounded down.
+                        .setUniform(UniformAdmission.newBuilder()
+                                .setProbability("0.1")
+                                .setProbabilityThreshold(429_496_729L))
+                        .build());
+        assertThat(config.sampling().hasMaxOffCpuMicros())
+                .as("an unset bound stays unset")
+                .isFalse();
         AgentConfig proportional = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("proportional.ndjson")
+                        + root.resolve("proportional.pb")
                         + ",sampling-policy=proportional,record-all-above-micros=250,asprofpath="
                         + ap
                         + ",event=cpu,file="
                         + root.resolve("proportional.jfr"),
                 nativeLibrary);
-        assertThat(proportional.sampling().admission())
+        assertThat(proportional.sampling())
                 .as("proportional native options not parsed")
-                .isEqualTo(new SamplingConfig.Proportional(250));
-        assertThat(config.sampling().reasons())
-                .as("native options must default to blocked intervals")
-                .isEqualTo(SamplingConfig.DEFAULT_REASONS);
+                .isEqualTo(proportional(250, OffCpuReason.OFF_CPU_REASON_BLOCKED));
         AgentConfig reasons = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("reasons.ndjson")
+                        + root.resolve("reasons.pb")
                         + ",sampling-policy=proportional,record-all-above-micros=250,"
                         + "sampling-reasons=runnable+blocked,asprofpath="
                         + ap
                         + ",event=cpu,file="
                         + root.resolve("reasons.jfr"),
                 nativeLibrary);
-        assertThat(reasons.sampling().orderedReasons())
-                .as("sampling-reasons native option not parsed: %s", reasons.sampling())
-                .isEqualTo(List.of(SamplingConfig.OffCpuReason.BLOCKED, SamplingConfig.OffCpuReason.RUNNABLE));
+        assertThat(reasons.sampling().getReasonsList())
+                .as("sampling-reasons native option not parsed into canonical order")
+                .containsExactly(OffCpuReason.OFF_CPU_REASON_BLOCKED, OffCpuReason.OFF_CPU_REASON_RUNNABLE);
         assertThat(config.timeSplit())
                 .as("native options must default to schedInfo")
                 .isEqualTo(TimeSplitConfig.DEFAULT);
         AgentConfig splitOff = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("split-off.ndjson")
+                        + root.resolve("split-off.pb")
                         + ",sampling-policy=proportional,record-all-above-micros=250,time-split=off,asprofpath="
                         + ap
                         + ",event=cpu,file="
                         + root.resolve("split-off.jfr"),
                 nativeLibrary);
-        assertThat(splitOff.timeSplit().json().toString())
-                .as("time-split native option not parsed: %s", splitOff.timeSplit())
-                .isEqualTo("{\"source\":\"off\"}");
+        assertThat(splitOff.timeSplit())
+                .as("time-split native option not parsed")
+                .isEqualTo(TimeSplit.newBuilder()
+                        .setSource(TimeSplitSource.TIME_SPLIT_SOURCE_OFF)
+                        .build());
         assertThatIllegalArgumentException()
                 .as("Expected unknown time-split source rejection")
                 .isThrownBy(() -> AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
-                                + root.resolve("split-wakeup.ndjson")
+                                + root.resolve("split-wakeup.pb")
                                 + ",sampling-policy=proportional,record-all-above-micros=250,time-split=wakeup,"
                                 + "asprofpath="
                                 + ap
@@ -642,7 +743,7 @@ class SignalCaptureControllerTest {
                 .as("Expected AP output pattern rejection")
                 .isThrownBy(() -> AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
-                                + root.resolve("pattern.ndjson")
+                                + root.resolve("pattern.pb")
                                 + ",sampling-policy=uniform,sampling-probability=1,asprofpath="
                                 + ap
                                 + ",event=cpu,file="
@@ -652,7 +753,7 @@ class SignalCaptureControllerTest {
 
         Path racedJfr = root.resolve("raced.jfr");
         AgentConfig raced = AgentConfig.parseNativeOptions(
-                "jonoffcpuoutput=" + root.resolve("raced.ndjson")
+                "jonoffcpuoutput=" + root.resolve("raced.pb")
                         + ",sampling-policy=uniform,sampling-probability=1,asprofpath=" + ap + ",event=cpu,file="
                         + racedJfr,
                 nativeLibrary);
@@ -677,7 +778,7 @@ class SignalCaptureControllerTest {
                 .as("Expected forwarded AP action rejection: " + action)
                 .isThrownBy(() -> AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
-                                + root.resolve("rejected-" + action + ".ndjson")
+                                + root.resolve("rejected-" + action + ".pb")
                                 + ",sampling-policy=uniform,sampling-probability=1,asprofpath="
                                 + ap
                                 + ","
@@ -706,26 +807,29 @@ class SignalCaptureControllerTest {
                     policy: uniform
                     probability: "0.125"
                 """.formatted(
-                        root.resolve("correlation.ndjson"), ap, nativeLibrary, root.resolve("combined.jfr")));
+                        root.resolve("correlation.pb"), ap, nativeLibrary, root.resolve("combined.jfr")));
         AgentConfig config = AgentConfig.parse(configFile.toString());
         assertThat(config.signalDelivery())
                 .as("YAML delivery policy not parsed")
-                .isEqualTo("coalescing");
+                .isEqualTo(SignalDelivery.SIGNAL_DELIVERY_COALESCING);
         assertThat(config.sampling())
-                .as("YAML sampling policy not parsed exactly: %s", config.sampling())
-                .isEqualTo(new SamplingConfig(
-                        SamplingConfig.DEFAULT_REASONS,
-                        10L,
-                        1000L,
-                        new SamplingConfig.Uniform(new BigDecimal("0.125"), 536_870_912L)));
+                .as("YAML sampling policy not parsed exactly")
+                .isEqualTo(Sampling.newBuilder()
+                        .addReasons(OffCpuReason.OFF_CPU_REASON_BLOCKED)
+                        .setMinOffCpuMicros(10)
+                        .setMaxOffCpuMicros(1000)
+                        .setUniform(UniformAdmission.newBuilder()
+                                .setProbability("0.125")
+                                .setProbabilityThreshold(536_870_912L))
+                        .build());
         assertThat(config.timeSplit())
                 .as("YAML must default to timeSplit schedInfo")
                 .isEqualTo(TimeSplitConfig.DEFAULT);
         AgentConfig splitOff =
                 AgentConfig.parse(splitBase(root, ap, nativeLibrary) + "timeSplit:\n  source: \"off\"\n");
-        assertThat(splitOff.timeSplit().source())
-                .as("YAML timeSplit not parsed: %s", splitOff.timeSplit())
-                .isEqualTo(TimeSplitConfig.Source.OFF);
+        assertThat(splitOff.timeSplit().getSource())
+                .as("YAML timeSplit not parsed")
+                .isEqualTo(TimeSplitSource.TIME_SPLIT_SOURCE_OFF);
         assertThatIllegalArgumentException()
                 .as("Expected unknown YAML key rejection")
                 .isThrownBy(() -> AgentConfig.parse("correlationOutput: /tmp/a\nunknownOption: true\n"))
@@ -752,7 +856,9 @@ class SignalCaptureControllerTest {
                 "timeSplit:\n  source: wakeup\n",
                 "timeSplit:\n  source: \"off\"\n  extra: 1\n",
                 "timeSplit: {}\n",
-                "timeSplit: \"off\"\n");
+                "timeSplit: \"off\"\n",
+                // The schema's enum names are not the configuration's spelling.
+                "timeSplit:\n  source: TIME_SPLIT_SOURCE_OFF\n");
     }
 
     private static String splitBase(Path root, Path ap, Path nativeLibrary) {
@@ -765,7 +871,7 @@ class SignalCaptureControllerTest {
                   admission:
                     policy: proportional
                     recordAllAboveMicros: 250
-                """.formatted(root.resolve("split.ndjson"), ap, nativeLibrary, root.resolve("split.jfr"));
+                """.formatted(root.resolve("split.pb"), ap, nativeLibrary, root.resolve("split.jfr"));
     }
 
     /** YAML snippets as parameterized cases, each named by a one-line rendering of the snippet. */
@@ -779,12 +885,12 @@ class SignalCaptureControllerTest {
 
     @ParameterizedTest
     @CsvSource({"0.0000000003, 1", "0.5, 2147483648", "1.000, 4294967296"})
-    void validSamplingProbabilityParsing(String probability, String threshold, @TempDir Path root) throws Exception {
+    void validSamplingProbabilityParsing(String probability, long threshold, @TempDir Path root) throws Exception {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("valid.ndjson")
+                        + root.resolve("valid.pb")
                         + ",sampling-policy=uniform,sampling-probability="
                         + probability
                         + ",asprofpath="
@@ -792,15 +898,12 @@ class SignalCaptureControllerTest {
                         + ",event=cpu,file="
                         + root.resolve("valid.jfr"),
                 nativeLibrary);
-        assertThat(config.sampling().admission()).isInstanceOf(SamplingConfig.Uniform.class);
-        SamplingConfig.Uniform uniform =
-                (SamplingConfig.Uniform) config.sampling().admission();
-        assertThat(uniform.probability().toPlainString())
-                .as("requested probability spelling was not retained: " + probability)
-                .isEqualTo(probability);
-        assertThat(Long.toString(uniform.probabilityThreshold()))
-                .as("wrong effective threshold for " + probability)
-                .isEqualTo(threshold);
+        assertThat(config.sampling().getUniform())
+                .as("requested probability spelling and effective threshold for " + probability)
+                .isEqualTo(UniformAdmission.newBuilder()
+                        .setProbability(probability)
+                        .setProbabilityThreshold(threshold)
+                        .build());
     }
 
     // Exactly zero is the explicit off switch; a positive value that rounds to no draws is a mistake.
@@ -811,7 +914,7 @@ class SignalCaptureControllerTest {
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         AgentConfig config = AgentConfig.parseNativeOptions(
                 "jonoffcpuoutput="
-                        + root.resolve("zero.ndjson")
+                        + root.resolve("zero.pb")
                         + ",sampling-policy=uniform,sampling-probability="
                         + zero
                         + ",asprofpath="
@@ -820,7 +923,7 @@ class SignalCaptureControllerTest {
                         + root.resolve("zero.jfr"),
                 nativeLibrary);
         assertThat(config.profilerOnly()).as("zero != none: " + zero).isTrue();
-        assertThat(config.sampling().admission()).as("zero != none: " + zero).isEqualTo(NONE.admission());
+        assertThat(config.sampling()).as("zero != none: " + zero).isEqualTo(NONE);
     }
 
     @ParameterizedTest
@@ -832,7 +935,7 @@ class SignalCaptureControllerTest {
                 .as("Expected invalid probability rejection: " + invalid)
                 .isThrownBy(() -> AgentConfig.parseNativeOptions(
                         "jonoffcpuoutput="
-                                + root.resolve("invalid.ndjson")
+                                + root.resolve("invalid.pb")
                                 + ",sampling-policy=uniform,sampling-probability="
                                 + invalid
                                 + ",asprofpath="
@@ -856,40 +959,42 @@ class SignalCaptureControllerTest {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         return SAMPLING_YAML_PREFIX.formatted(
-                        root.resolve("sampling.ndjson"), ap, nativeLibrary, root.resolve("sampling.jfr"))
+                        root.resolve("sampling.pb"), ap, nativeLibrary, root.resolve("sampling.jfr"))
                 + sampling;
     }
 
     @ParameterizedTest
     @MethodSource
-    void validSamplingConfigParsing(String sampling, String policy, @TempDir Path root) throws Exception {
+    void validSamplingConfigParsing(String sampling, Sampling.AdmissionCase policy, @TempDir Path root)
+            throws Exception {
         String yaml = samplingYaml(root, sampling);
         AgentConfig config = AgentConfig.parse(yaml);
-        assertThat(config.sampling().admission().policy())
+        assertThat(config.sampling().getAdmissionCase())
                 .as("policy not parsed: " + yaml)
                 .isEqualTo(policy);
-        assertThat(config.profilerOnly()).as("profiler-only mismatch: " + yaml).isEqualTo(policy.equals("none"));
+        assertThat(config.profilerOnly())
+                .as("profiler-only mismatch: " + yaml)
+                .isEqualTo(policy == Sampling.AdmissionCase.NONE);
     }
 
     static Stream<Arguments> validSamplingConfigParsing() {
         return Stream.of(
-                        new String[] {
-                            "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 10000\n",
-                            "proportional"
-                        },
-                        new String[] {
-                            "sampling:\n  minOffCpuMicros: 100\n  admission:\n    policy: proportional\n"
-                                    + "    recordAllAboveMicros: 1\n",
-                            "proportional"
-                        },
-                        new String[] {"sampling:\n  admission:\n    policy: none\n", "none"},
-                        new String[] {"sampling:\n  admission:\n    policy: uniform\n    probability: 1\n", "uniform"},
-                        new String[] {
-                            "sampling:\n  reasons: [preempted, blocked]\n  admission:\n    policy: uniform\n"
-                                    + "    probability: 1\n",
-                            "uniform"
-                        })
-                .map(c -> Arguments.of(Named.of(displayYaml(c[0]), c[0]), c[1]));
+                        Arguments.of(
+                                "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 10000\n",
+                                Sampling.AdmissionCase.PROPORTIONAL),
+                        Arguments.of(
+                                "sampling:\n  minOffCpuMicros: 100\n  admission:\n    policy: proportional\n"
+                                        + "    recordAllAboveMicros: 1\n",
+                                Sampling.AdmissionCase.PROPORTIONAL),
+                        Arguments.of("sampling:\n  admission:\n    policy: none\n", Sampling.AdmissionCase.NONE),
+                        Arguments.of(
+                                "sampling:\n  admission:\n    policy: uniform\n    probability: 1\n",
+                                Sampling.AdmissionCase.UNIFORM),
+                        Arguments.of(
+                                "sampling:\n  reasons: [preempted, blocked]\n  admission:\n    policy: uniform\n"
+                                        + "    probability: 1\n",
+                                Sampling.AdmissionCase.UNIFORM))
+                .map(c -> Arguments.of(Named.of(displayYaml((String) c.get()[0]), c.get()[0]), c.get()[1]));
     }
 
     @ParameterizedTest
@@ -910,6 +1015,8 @@ class SignalCaptureControllerTest {
                 "sampling:\n  admission:\n    policy: proportional\n",
                 "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 0\n",
                 "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 5\n    probability: 1\n",
+                "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: \"5\"\n",
+                "sampling:\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 5.0\n",
                 "sampling:\n  admission:\n    policy: uniform\n",
                 "sampling:\n  admission:\n    policy: uniform\n    probability: 1\n    recordAllAboveMicros: 5\n",
                 "sampling:\n  minOffCpuMicros: 1\n  admission:\n    policy: none\n",
@@ -920,50 +1027,52 @@ class SignalCaptureControllerTest {
                 "sampling:\n  reasons: []\n  admission:\n    policy: uniform\n    probability: 1\n",
                 "sampling:\n  reasons: [blocked, blocked]\n  admission:\n    policy: uniform\n    probability: 1\n",
                 "sampling:\n  reasons: [sleeping]\n  admission:\n    policy: uniform\n    probability: 1\n",
+                "sampling:\n  reasons: [OFF_CPU_REASON_BLOCKED]\n  admission:\n    policy: uniform\n"
+                        + "    probability: 1\n",
                 "sampling:\n  reasons: blocked\n  admission:\n    policy: uniform\n    probability: 1\n",
                 "sampling:\n  reasons: [blocked]\n  admission:\n    policy: none\n");
     }
 
+    /** The configuration's friendly spellings resolve to the schema's message, whose JSON uses the enum names. */
     @Test
-    void samplingConfigJson(@TempDir Path root) throws Exception {
+    void samplingConfigResolvesToTheMessage(@TempDir Path root) throws Exception {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         String prefix = SAMPLING_YAML_PREFIX;
         AgentConfig proportional = AgentConfig.parse(
-                prefix.formatted(root.resolve("p.ndjson"), ap, nativeLibrary, root.resolve("p.jfr"))
+                prefix.formatted(root.resolve("p.pb"), ap, nativeLibrary, root.resolve("p.jfr"))
                         + "sampling:\n  minOffCpuMicros: 100\n  admission:\n    policy: proportional\n    recordAllAboveMicros: 10000\n");
-        assertThat(proportional.sampling().json().toString())
+        assertThat(ProtoJson.line(proportional.sampling()))
                 .as("unexpected sampling JSON")
-                .isEqualTo("{\"reasons\":[\"blocked\"],\"minOffCpuMicros\":100,\"maxOffCpuMicros\":null,"
-                        + "\"admission\":{\"policy\":\"proportional\",\"recordAllAboveMicros\":10000}}");
-        // Reasons are serialized in canonical order whatever the order they were given in.
+                .isEqualTo("{\"reasons\":[\"OFF_CPU_REASON_BLOCKED\"],\"minOffCpuMicros\":\"100\","
+                        + "\"proportional\":{\"recordAllAboveMicros\":\"10000\"}}");
+        // Reasons are kept in canonical order whatever the order they were given in.
         AgentConfig everything =
-                AgentConfig.parse(prefix.formatted(root.resolve("r.ndjson"), ap, nativeLibrary, root.resolve("r.jfr"))
+                AgentConfig.parse(prefix.formatted(root.resolve("r.pb"), ap, nativeLibrary, root.resolve("r.jfr"))
                         + "sampling:\n  reasons: [preempted, blocked, runnable]\n  admission:\n"
                         + "    policy: uniform\n    probability: 1\n");
-        assertThat(everything.sampling().json().get("reasons").toString())
-                .as("reasons not canonical: %s", everything.sampling().json())
-                .isEqualTo("[\"blocked\",\"runnable\",\"preempted\"]");
-        assertThat(AgentConfig.parse(
-                                prefix.formatted(root.resolve("n.ndjson"), ap, nativeLibrary, root.resolve("n.jfr"))
-                                        + "sampling:\n  admission:\n    policy: none\n")
-                        .sampling()
-                        .json()
-                        .get("reasons")
-                        .isJsonNull())
-                .as("policy none must not select reasons")
-                .isTrue();
+        assertThat(everything.sampling().getReasonsList())
+                .as("reasons not canonical")
+                .containsExactly(
+                        OffCpuReason.OFF_CPU_REASON_BLOCKED,
+                        OffCpuReason.OFF_CPU_REASON_RUNNABLE,
+                        OffCpuReason.OFF_CPU_REASON_PREEMPTED);
+        assertThat(AgentConfig.parse(prefix.formatted(root.resolve("n.pb"), ap, nativeLibrary, root.resolve("n.jfr"))
+                                + "sampling:\n  admission:\n    policy: none\n")
+                        .sampling())
+                .as("policy none selects no reasons")
+                .isEqualTo(NONE);
     }
 
     @ParameterizedTest
     @CsvSource({
-        "/data/jonoffcpu-capture.ndjson, .manifest.json, /data/jonoffcpu-capture.manifest.json",
+        "/data/jonoffcpu-capture.pb,     .manifest.json, /data/jonoffcpu-capture.manifest.json",
         "/data/capture,                  .manifest.json, /data/capture.manifest.json",
         "/data/.hidden,                  .manifest.json, /data/.hidden.manifest.json",
         "/data/run.v1/capture,           .manifest.json, /data/run.v1/capture.manifest.json",
         "/data/capture.tar.gz,           .manifest.json, /data/capture.tar.manifest.json",
         // The default JFR sibling.
-        "/data/capture.ndjson,           .jfr,           /data/capture.jfr",
+        "/data/capture.pb,               .jfr,           /data/capture.jfr",
     })
     void siblingCaptureFileNames(String path, String suffix, String expected) {
         assertThat(ManifestStore.sibling(Path.of(path), suffix))
@@ -1004,19 +1113,26 @@ class SignalCaptureControllerTest {
         assertThat(SamplingConfig.admissionThreshold(-2L, -1L))
                 .as("u64 max reference")
                 .isEqualTo(certain);
-        SamplingConfig proportional =
-                new SamplingConfig(SamplingConfig.DEFAULT_REASONS, null, null, new SamplingConfig.Proportional(10_000));
-        assertThat(proportional.admissionThreshold(1_000_000))
+        assertThat(SamplingConfig.admissionThreshold(
+                        proportional(10_000, OffCpuReason.OFF_CPU_REASON_BLOCKED), 1_000_000))
                 .as("policy delegation")
                 .isEqualTo(certain / 10);
-        assertThat(new SamplingConfig(
-                                SamplingConfig.DEFAULT_REASONS,
-                                null,
-                                null,
-                                new SamplingConfig.Uniform(BigDecimal.ONE, certain))
-                        .admissionThreshold(1))
+        Sampling uniform = Sampling.newBuilder()
+                .setUniform(UniformAdmission.newBuilder().setProbability("1").setProbabilityThreshold(certain))
+                .build();
+        assertThat(SamplingConfig.admissionThreshold(uniform, 1))
                 .as("uniform ignores duration")
                 .isEqualTo(certain);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "false, 1, OFF_CPU_REASON_BLOCKED",
+        "false, 0, OFF_CPU_REASON_RUNNABLE",
+        "true, 1, OFF_CPU_REASON_PREEMPTED"
+    })
+    void switchOutClassification(boolean preempted, int prevTaskState, OffCpuReason reason) {
+        assertThat(SamplingConfig.classify(preempted, prevTaskState)).isEqualTo(reason);
     }
 
     @Test
@@ -1043,12 +1159,32 @@ class SignalCaptureControllerTest {
                         + " finalized=true stopped-at="
                         + max
                         + " reason=completed\n");
-        assertThat(stopped.manifestCounters()).as("u64 AP counter rejected").containsEntry("submittedSamples", max);
+        assertThat(Long.toUnsignedString(stopped.counters().getSubmittedSamples()))
+                .as("u64 AP counter rejected")
+                .isEqualTo(max);
+        assertThat(stopped.delivery()).isEqualTo(SignalDelivery.SIGNAL_DELIVERY_COALESCING);
     }
 
-    private static final SamplingConfig NONE = new SamplingConfig(null, null, null, new SamplingConfig.None());
-    private static final SamplingConfig SPARSE = new SamplingConfig(
-            SamplingConfig.DEFAULT_REASONS, null, null, SamplingConfig.uniform(new BigDecimal("0.0000000233")));
+    private static final Sampling NONE =
+            Sampling.newBuilder().setNone(NoAdmission.getDefaultInstance()).build();
+    private static final Sampling SPARSE = sparse();
+
+    private static Sampling sparse() {
+        Sampling.Builder sampling = Sampling.newBuilder().addAllReasons(SamplingConfig.DEFAULT_REASONS);
+        SamplingConfig.uniform(new BigDecimal("0.0000000233"), sampling);
+        return sampling.build();
+    }
+
+    private static Sampling proportional(long recordAllAboveMicros, OffCpuReason... reasons) {
+        return Sampling.newBuilder()
+                .addAllReasons(List.of(reasons))
+                .setProportional(ProportionalAdmission.newBuilder().setRecordAllAboveMicros(recordAllAboveMicros))
+                .build();
+    }
+
+    private static Manifest manifest(Path path) throws IOException {
+        return ProtoJson.parse(Files.readString(path), Manifest.newBuilder()).build();
+    }
 
     private static SignalCaptureController controller(Path root, FakeProfiler profiler, FakeSource source)
             throws IOException {
@@ -1056,17 +1192,17 @@ class SignalCaptureControllerTest {
     }
 
     private static SignalCaptureController controller(
-            Path root, FakeProfiler profiler, FakeSource source, SamplingConfig sampling) throws IOException {
+            Path root, FakeProfiler profiler, FakeSource source, Sampling sampling) throws IOException {
         Path ap = Files.createFile(root.resolve("libasyncProfiler.so"));
         Path nativeLibrary = Files.createFile(root.resolve("libjonoffcpu.so"));
         AgentConfig config = new AgentConfig(
-                root.resolve("correlation.ndjson"),
+                root.resolve("correlation.pb"),
                 ap,
                 nativeLibrary,
                 null,
                 ProcessHandle.current().pid(),
                 "event=cpu",
-                "queued",
+                SignalDelivery.SIGNAL_DELIVERY_QUEUED,
                 sampling,
                 TimeSplitConfig.DEFAULT,
                 50,
@@ -1178,273 +1314,277 @@ class SignalCaptureControllerTest {
         }
     }
 
+    /**
+     * The native collector's control protocol, in encoded messages as the JNI bridge passes them, writing the capture
+     * stream the real collector would. It keeps the last reply of each call for the tests to compare with the manifest.
+     */
     private static final class FakeSource implements SignalCaptureController.SourceClient {
-        private static final String HANDLE = "8000000000000001";
+        private static final long HANDLE = 0x8000000000000001L;
+        private static final VerifiedIdentity IDENTITY = VerifiedIdentity.newBuilder()
+                .setRegistrationToken(0x0123456789abcdefL)
+                .setProcessGenerationNanos(9)
+                .setPidNamespaceDevice(4)
+                .setPidNamespaceInode(43)
+                .setTimeNamespaceInode(42)
+                .setClockVerified(true)
+                .setMonotonicOffsetNanos(0)
+                .build();
+        private int abiVersion = SignalCaptureController.COLLECTOR_ABI_VERSION;
         private int prepareCalls;
         private int enableCalls;
         private int stopCalls;
         private int closeCalls;
+        private boolean prepareError;
         private boolean timeoutOnce;
         private boolean closeTimeoutOnce;
         private boolean incompleteStop;
         private boolean stopError;
         private boolean nativeStackFailure;
+        private String observationDefect;
+        private String driftingEcho;
         private Path source;
-        private JsonObject sampling;
-        private JsonObject timeSplit;
-        private long targetPid;
+        private Sampling sampling;
+        private TimeSplit timeSplit;
+        private int targetPid;
         private int signal;
         private String session;
-        private JsonObject captureEnd;
+        private CaptureEnd captureEnd;
+        private CollectorReply prepareReply;
+        private CollectorReply enableReply;
+        private CollectorReply stopReply;
+        private CollectorReply closeReply;
 
         @Override
-        public String prepare(String configJson) {
+        public byte[] prepare(byte[] prepareRequest) {
             prepareCalls++;
-            JsonObject config = JsonParser.parseString(configJson).getAsJsonObject();
-            source = Path.of(config.get("outputPath").getAsString());
-            sampling = config.getAsJsonObject("sampling");
-            timeSplit = config.getAsJsonObject("timeSplit");
-            targetPid = config.get("targetPid").getAsLong();
-            JsonObject result = success("prepared");
-            result.addProperty("handle", HANDLE);
-            result.addProperty("sourcePath", source.toString());
-            result.addProperty("targetPid", config.get("targetPid").getAsLong());
-            result.addProperty("hostTgid", config.get("targetPid").getAsLong());
-            result.add("sampling", sampling.deepCopy());
-            result.add("timeSplit", timeSplit.deepCopy());
-            JsonObject identity = new JsonObject();
-            identity.addProperty("registrationToken", "0123456789abcdef");
-            identity.addProperty("processGenerationNs", "9");
-            identity.addProperty("timeNamespaceInode", "42");
-            identity.addProperty("pidNamespaceDevice", "4");
-            identity.addProperty("pidNamespaceInode", "43");
-            identity.addProperty("clockVerified", true);
-            identity.addProperty("monotonicOffsetNanos", "0");
-            result.add("verifiedIdentity", identity);
-            return result.toString();
+            PrepareRequest request = parse(prepareRequest, PrepareRequest.parser());
+            if (prepareError) {
+                prepareReply = error(
+                        CollectorState.COLLECTOR_STATE_ERROR,
+                        CollectorErrorCode.COLLECTOR_ERROR_CODE_BPF_UNSUPPORTED,
+                        "no BTF");
+                return prepareReply.toByteArray();
+            }
+            source = Path.of(request.getOutputPath());
+            sampling = request.getSampling();
+            timeSplit = request.getTimeSplit();
+            targetPid = request.getTargetPid();
+            prepareReply = reply(CollectorState.COLLECTOR_STATE_PREPARED)
+                    .setPrepared(Prepared.newBuilder()
+                            .setHandle(HANDLE)
+                            .setSourcePath(source.toString())
+                            .setTargetPid(targetPid)
+                            .setHostTgid(targetPid)
+                            .setSampling(echo("prepare"))
+                            .setTimeSplit(timeSplit)
+                            .setVerifiedIdentity(IDENTITY))
+                    .build();
+            return prepareReply.toByteArray();
         }
 
         @Override
-        public String enable(long handle, String captureJson) {
+        public byte[] enable(long handle, byte[] enableRequest) {
             enableCalls++;
-            JsonObject capture = JsonParser.parseString(captureJson).getAsJsonObject();
-            session = capture.get("sessionId").getAsString();
-            signal = capture.get("signal").getAsInt();
-            JsonObject result = success("enabled");
-            result.addProperty("handle", HANDLE);
-            result.addProperty("sessionId", session);
-            result.addProperty("captureEpoch", 7);
-            result.addProperty("signal", signal);
-            result.addProperty("signalDelivery", signal >= 34 ? "queued" : "coalescing");
-            result.addProperty("sourcePath", source.toString());
-            result.addProperty("targetPid", targetPid);
-            result.addProperty("hostTgid", targetPid);
-            result.add("sampling", sampling.deepCopy());
-            result.add("timeSplit", timeSplit.deepCopy());
-            JsonObject identity = new JsonObject();
-            identity.addProperty("registrationToken", "0123456789abcdef");
-            identity.addProperty("processGenerationNs", "9");
-            identity.addProperty("timeNamespaceInode", "42");
-            identity.addProperty("pidNamespaceDevice", "4");
-            identity.addProperty("pidNamespaceInode", "43");
-            identity.addProperty("clockVerified", true);
-            identity.addProperty("monotonicOffsetNanos", "0");
-            result.add("verifiedIdentity", identity);
-            JsonObject start = new JsonObject();
-            start.addProperty("schemaVersion", 4);
-            start.addProperty("recordType", "captureStart");
-            start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
-            start.addProperty("sessionId", session);
-            start.addProperty("captureEpoch", 7);
-            start.addProperty("signal", signal);
-            start.addProperty("signalDelivery", signal >= 34 ? "queued" : "coalescing");
-            start.add("sampling", sampling.deepCopy());
-            start.add("timeSplit", timeSplit.deepCopy());
-            start.addProperty("startedMonotonicNanos", "9");
-            start.addProperty("hostTgid", targetPid);
-            start.addProperty("targetPid", targetPid);
-            start.addProperty("registrationToken", "0123456789abcdef");
-            start.addProperty("processGenerationNs", "9");
-            start.addProperty("timeNamespaceInode", "42");
-            start.addProperty("pidNamespaceDevice", "4");
-            start.addProperty("pidNamespaceInode", "43");
+            EnableRequest request = parse(enableRequest, EnableRequest.parser());
+            session = request.getSessionId();
+            signal = request.getSignal();
+            SignalDelivery delivery =
+                    signal >= 34 ? SignalDelivery.SIGNAL_DELIVERY_QUEUED : SignalDelivery.SIGNAL_DELIVERY_COALESCING;
+            enableReply = reply(CollectorState.COLLECTOR_STATE_ENABLED)
+                    .setEnabled(Enabled.newBuilder()
+                            .setSessionId(session)
+                            .setCaptureEpoch(7)
+                            .setSignal(signal)
+                            .setSignalDelivery(delivery)
+                            .setSourcePath(source.toString())
+                            .setTargetPid(targetPid)
+                            .setHostTgid(targetPid)
+                            .setSampling(echo("enable"))
+                            .setTimeSplit(timeSplit)
+                            .setVerifiedIdentity(IDENTITY))
+                    .build();
+            CaptureStart start = CaptureStart.newBuilder()
+                    .setSourceId(ArtifactVerifier.SOURCE_ID)
+                    .setSessionId(session)
+                    .setCaptureEpoch(7)
+                    .setSignal(signal)
+                    .setSignalDelivery(delivery)
+                    .setHostTgid(targetPid)
+                    .setTargetPid(targetPid)
+                    .setVerifiedIdentity(IDENTITY)
+                    .setStartedMonotonicNanos(9)
+                    .setSampling(sampling)
+                    .setTimeSplit(timeSplit)
+                    .build();
             try {
-                Files.write(source, CaptureStreamFixture.encode(List.of(start)));
+                Files.write(
+                        source,
+                        CaptureRecordFixture.encode(List.of(
+                                Record.newBuilder().setCaptureStart(start).build())));
             } catch (IOException error) {
                 throw new IllegalStateException(error);
             }
-            return result.toString();
+            return enableReply.toByteArray();
         }
 
         @Override
-        public String stop(long handle, long timeoutMillis) {
+        public byte[] stop(long handle, long timeoutMillis) {
             stopCalls++;
             if (timeoutOnce) {
                 timeoutOnce = false;
-                JsonObject result = failure("stopping", "stop_timeout", "test timeout");
-                result.addProperty("handle", HANDLE);
-                return result.toString();
+                stopReply = error(
+                        CollectorState.COLLECTOR_STATE_STOPPING,
+                        CollectorErrorCode.COLLECTOR_ERROR_CODE_STOP_TIMEOUT,
+                        "test timeout");
+                return stopReply.toByteArray();
             }
-            if (stopError)
-                return failure("error", "io_error", "test fsync failure").toString();
-            captureEnd = captureEnd(session, !incompleteStop);
+            if (stopError) {
+                stopReply = error(
+                        CollectorState.COLLECTOR_STATE_ERROR,
+                        CollectorErrorCode.COLLECTOR_ERROR_CODE_IO_ERROR,
+                        "test fsync failure");
+                return stopReply.toByteArray();
+            }
+            CaptureEnd.Builder end = captureEnd(session, !incompleteStop).toBuilder();
             try {
                 if (nativeStackFailure) {
-                    JsonObject observation = new JsonObject();
-                    observation.addProperty("schemaVersion", 4);
-                    observation.addProperty("recordType", "observation");
-                    observation.addProperty("sourceId", "jonoffcpu.offcpu.v1");
-                    observation.addProperty("sessionId", session);
-                    observation.addProperty("captureEpoch", 7);
-                    observation.addProperty("correlationId", "0000000700000001");
-                    observation.addProperty("hostTgid", targetPid);
-                    observation.addProperty("hostTid", targetPid);
-                    observation.addProperty("targetTgid", targetPid);
-                    observation.addProperty("targetTid", targetPid);
-                    observation.addProperty(
-                            "admissionThreshold",
-                            sampling.getAsJsonObject("admission")
-                                    .get("probabilityThreshold")
-                                    .getAsLong());
-                    observation.addProperty("processGenerationNs", "9");
-                    observation.addProperty("threadGenerationNs", "9");
-                    observation.addProperty("registrationToken", "0123456789abcdef");
-                    observation.addProperty("startMonotonicNanos", "9");
-                    observation.addProperty("endMonotonicNanos", "10");
-                    observation.addProperty("signalResult", 0);
-                    observation.addProperty("offCpuReason", "blocked");
-                    observation.addProperty("prevTaskState", 1);
-                    observation.addProperty("preempted", false);
-                    observation.addProperty("runqueueNanos", "1");
-                    observation.addProperty("comm", "fixture");
                     // One announced stack for the kernel side; the user side failed, so it has no record.
-                    JsonObject stack = new JsonObject();
-                    stack.addProperty("schemaVersion", 4);
-                    stack.addProperty("recordType", "stack");
-                    stack.addProperty("sourceId", "jonoffcpu.offcpu.v1");
-                    stack.addProperty("sessionId", session);
-                    stack.addProperty("captureEpoch", 7);
-                    stack.addProperty("stackId", 5);
-                    stack.add("frames", new com.google.gson.JsonArray());
-                    CaptureStreamFixture.append(source, stack);
-                    observation.addProperty("kernelStackId", 5);
-                    observation.addProperty("userStackId", -7);
-                    observation.addProperty("userStackError", "bpf_stack_error_-7");
-                    JsonObject userspace =
-                            captureEnd.getAsJsonObject("counters").getAsJsonObject("userspace");
-                    userspace.addProperty("receivedObservations", "1");
-                    userspace.addProperty("writtenObservations", "1");
-                    userspace.addProperty("symbolizationFailures", "1");
-                    CaptureStreamFixture.append(source, observation);
+                    append(Record.newBuilder()
+                            .setStack(Stack.newBuilder().setId(5))
+                            .build());
+                    append(Record.newBuilder().setObservation(observation()).build());
+                    end.setUserspaceCounters(end.getUserspaceCounters().toBuilder()
+                            .setReceivedObservations(1)
+                            .setWrittenObservations(1)
+                            .setSymbolizationFailures(1));
                 }
-                CaptureStreamFixture.append(source, captureEnd);
+                captureEnd = end.build();
+                append(Record.newBuilder().setCaptureEnd(captureEnd).build());
             } catch (IOException error) {
                 throw new IllegalStateException(error);
             }
-            JsonObject result = success(incompleteStop ? "incomplete" : "complete");
-            result.addProperty("handle", HANDLE);
-            result.addProperty("sourcePath", source.toString());
-            result.add("captureEnd", captureEnd);
-            return result.toString();
+            stopReply = reply(
+                            incompleteStop
+                                    ? CollectorState.COLLECTOR_STATE_INCOMPLETE
+                                    : CollectorState.COLLECTOR_STATE_COMPLETE)
+                    .setStopped(stopped())
+                    .build();
+            return stopReply.toByteArray();
         }
 
         @Override
-        public String close(long handle) {
+        public byte[] close(long handle) {
             closeCalls++;
             if (closeTimeoutOnce) {
                 closeTimeoutOnce = false;
-                JsonObject result = failure("closing", "close_timeout", "test close timeout");
-                result.addProperty("handle", HANDLE);
-                return result.toString();
+                closeReply = error(
+                        CollectorState.COLLECTOR_STATE_CLOSING,
+                        CollectorErrorCode.COLLECTOR_ERROR_CODE_CLOSE_TIMEOUT,
+                        "test close timeout");
+                return closeReply.toByteArray();
             }
             if (captureEnd == null && session != null) {
                 captureEnd = captureEnd(session, false);
                 try {
-                    CaptureStreamFixture.append(source, captureEnd);
+                    append(Record.newBuilder().setCaptureEnd(captureEnd).build());
                 } catch (IOException error) {
                     throw new IllegalStateException(error);
                 }
             }
-            JsonObject result = success("closed");
-            if (captureEnd != null) result.add("captureEnd", captureEnd);
-            return result.toString();
+            Closed.Builder closed = Closed.newBuilder().setHandle(handle);
+            if (captureEnd != null) closed.setStopped(stopped());
+            closeReply = reply(CollectorState.COLLECTOR_STATE_CLOSED)
+                    .setClosed(closed)
+                    .build();
+            return closeReply.toByteArray();
         }
 
-        private static JsonObject captureEnd(String session, boolean complete) {
-            JsonObject end = new JsonObject();
-            end.addProperty("schemaVersion", 4);
-            end.addProperty("recordType", "captureEnd");
-            end.addProperty("sourceId", "jonoffcpu.offcpu.v1");
-            end.addProperty("sessionId", session);
-            end.addProperty("captureEpoch", 7);
-            end.addProperty("state", complete ? "complete" : "incomplete");
-            end.addProperty("startedMonotonicNanos", "9");
-            end.addProperty("stoppedMonotonicNanos", "10");
-            end.addProperty("detachedMonotonicNanos", "11");
-            end.addProperty("drainCompletedMonotonicNanos", "12");
-            end.addProperty("drainTimedOut", false);
-            end.addProperty("targetExited", false);
-            JsonObject counters = new JsonObject();
-            JsonObject kernel = new JsonObject();
-            for (String key : new String[] {
-                "switchOuts",
-                "schedulerExitSwitches",
-                "schedulerExitNoSwitches",
-                "lifetimeRejections",
-                "eligibleIntervals",
-                "eligibleDurationMicros",
-                "admissionRejections",
-                "selectedIntervals",
-                "sequenceExhaustions",
-                "sequenceContentions",
-                "threadStateFailures",
-                "kernelStackFailures",
-                "userStackFailures",
-                "signalFailures",
-                "ringReserveFailures",
-                "targetNamespaceFailures",
-                "switchOutsBlocked",
-                "switchOutsRunnable",
-                "switchOutsPreempted",
-                "reasonRejections",
-                "reasonRejectedDurationMicros",
-                "runqueueInversions"
-            }) kernel.addProperty(key, "0");
-            JsonObject userspace = new JsonObject();
-            for (String key : new String[] {
-                "receivedObservations",
-                "writtenObservations",
-                "symbolizationFailures",
-                "writeFailures",
-                "pollFailures",
-                "drainTimedOut"
-            }) {
-                userspace.addProperty(key, "0");
+        private Sampling echo(String call) {
+            if (!call.equals(driftingEcho)) return sampling;
+            return sampling.toBuilder().setMinOffCpuMicros(1).build();
+        }
+
+        private Stopped stopped() {
+            return Stopped.newBuilder()
+                    .setSourcePath(source.toString())
+                    .setCaptureEnd(captureEnd)
+                    .build();
+        }
+
+        private Observation observation() {
+            Observation.Builder observation = Observation.newBuilder()
+                    .setCorrelationId(0x0000000700000001L)
+                    .setHostTgid(targetPid)
+                    .setHostTid(targetPid)
+                    .setTargetTgid(targetPid)
+                    .setTargetTid(targetPid)
+                    .setAdmissionThreshold(sampling.getUniform().getProbabilityThreshold())
+                    .setProcessGenerationNanos(9)
+                    .setThreadGenerationNanos(9)
+                    .setRegistrationToken(IDENTITY.getRegistrationToken())
+                    .setStartMonotonicNanos(9)
+                    .setEndMonotonicNanos(10)
+                    .setSignalResult(0)
+                    .setReason(OffCpuReason.OFF_CPU_REASON_BLOCKED)
+                    .setPrevTaskState(1)
+                    .setPreempted(false)
+                    .setRunqueueNanos(1)
+                    .setComm("fixture")
+                    .setKernelStackId(5)
+                    .setUserStackId(-7)
+                    .setUserStackError("bpf_stack_error_-7");
+            if (observationDefect != null) {
+                switch (observationDefect) {
+                    // The reason disagrees with the raw sched_switch arguments it was derived from.
+                    case "reason" -> observation.setReason(OffCpuReason.OFF_CPU_REASON_RUNNABLE);
+                    case "threshold" -> observation.setAdmissionThreshold(observation.getAdmissionThreshold() + 1);
+                    // A consistent reason that sampling.reasons did not select.
+                    case "unselectedReason" ->
+                        observation.setPrevTaskState(0).setReason(OffCpuReason.OFF_CPU_REASON_RUNNABLE);
+                    case "unannouncedStack" -> observation.setKernelStackId(6);
+                    case "cookie" -> observation.setCorrelationId(0x0000000800000001L);
+                    default -> throw new IllegalArgumentException(observationDefect);
+                }
             }
-            counters.add("kernel", kernel);
-            counters.add("userspace", userspace);
-            end.add("counters", counters);
-            return end;
+            return observation.build();
         }
-    }
 
-    private static JsonObject success(String state) {
-        JsonObject result = new JsonObject();
-        result.addProperty("schemaVersion", 1);
-        result.addProperty("abiVersion", 1);
-        result.addProperty("ok", true);
-        result.addProperty("state", state);
-        return result;
-    }
+        private void append(Record record) throws IOException {
+            CaptureRecordFixture.append(source, record);
+        }
 
-    private static JsonObject failure(String state, String code, String message) {
-        JsonObject result = success(state);
-        result.addProperty("ok", false);
-        JsonObject error = new JsonObject();
-        error.addProperty("code", code);
-        error.addProperty("message", message);
-        result.add("error", error);
-        return result;
+        private CollectorReply.Builder reply(CollectorState state) {
+            return CollectorReply.newBuilder().setAbiVersion(abiVersion).setState(state);
+        }
+
+        private CollectorReply error(CollectorState state, CollectorErrorCode code, String message) {
+            return reply(state)
+                    .setError(CollectorError.newBuilder().setCode(code).setMessage(message))
+                    .build();
+        }
+
+        private static CaptureEnd captureEnd(String session, boolean complete) {
+            CaptureEnd.Builder end = CaptureEnd.newBuilder()
+                    .setSessionId(session)
+                    .setCaptureEpoch(7)
+                    .setState(complete ? CaptureState.CAPTURE_STATE_COMPLETE : CaptureState.CAPTURE_STATE_INCOMPLETE)
+                    .setStartedMonotonicNanos(9)
+                    .setStoppedMonotonicNanos(10)
+                    .setDetachedMonotonicNanos(11)
+                    .setDrainCompletedMonotonicNanos(12)
+                    .setKernelCounters(KernelCounters.getDefaultInstance())
+                    .setUserspaceCounters(UserspaceCounters.getDefaultInstance());
+            if (!complete) end.setIncompleteReason(IncompleteReason.INCOMPLETE_REASON_SOURCE_WRITE_FAILURE);
+            return end.build();
+        }
+
+        private static <T> T parse(byte[] bytes, com.google.protobuf.Parser<T> parser) {
+            try {
+                return parser.parseFrom(bytes);
+            } catch (InvalidProtocolBufferException error) {
+                throw new IllegalArgumentException(error);
+            }
+        }
     }
 
     private static String option(String command, String name) {

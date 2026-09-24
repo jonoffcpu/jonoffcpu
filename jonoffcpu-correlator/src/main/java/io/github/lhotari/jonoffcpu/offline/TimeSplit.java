@@ -1,17 +1,14 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.require;
-
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
 import java.io.IOException;
 import java.util.Locale;
 
 /**
  * The sleeping/run-queue split of an off-CPU interval, and the one rule that applies it.
  *
- * <p>A schemaVersion 4 capture with {@code timeSplit.source} {@code schedInfo} records on each observation the
+ * <p>A capture with {@code time_split.source} {@code TIME_SPLIT_SOURCE_SCHED_INFO} records on each observation the
  * growth of the scheduler's own {@code sched_info.run_delay} across the interval: how long the thread waited on a
  * run queue. A blocked interval sleeps until its wakeup and then waits for a CPU, so its run-queue part is its tail
  * {@code [end - runqueue, end]} and the rest is sleeping. A runnable or preempted interval never left the run queue:
@@ -45,21 +42,19 @@ final class TimeSplit {
 
     /** Where a capture's run-queue readings come from. */
     enum Source {
-        /** A capture older than schemaVersion 4, recorded before the split existed. */
-        NOT_RECORDED("notRecorded"),
-        /** {@code timeSplit.source: off}: the capture was told not to read anything. */
-        OFF("off"),
-        /** {@code timeSplit.source: schedInfo}: each observation may carry its run-queue part. */
-        SCHED_INFO("schedInfo");
+        /** {@code TIME_SPLIT_SOURCE_OFF}: the capture was told not to read anything. */
+        OFF(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_OFF),
+        /** {@code TIME_SPLIT_SOURCE_SCHED_INFO}: each observation may carry its run-queue part. */
+        SCHED_INFO(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_SCHED_INFO);
 
-        private final String label;
+        private final CaptureProto.TimeSplitSource proto;
 
-        Source(String label) {
-            this.label = label;
+        Source(CaptureProto.TimeSplitSource proto) {
+            this.proto = proto;
         }
 
-        String label() {
-            return label;
+        CaptureProto.TimeSplitSource proto() {
+            return proto;
         }
 
         boolean available() {
@@ -76,18 +71,12 @@ final class TimeSplit {
         EXCEEDS_INTERVAL
     }
 
-    /** The capture's source, from {@code captureStart}; a capture without the block predates it. */
-    static Source source(JsonObject captureStart) throws IOException {
-        JsonElement element = captureStart.get("timeSplit");
-        if (element == null) return Source.NOT_RECORDED;
-        require(element.isJsonObject(), "Invalid timeSplit");
-        JsonObject value = element.getAsJsonObject();
-        require(value.keySet().equals(java.util.Set.of("source")), "Unexpected timeSplit shape");
-        String source = CaptureInput.text(value, "source");
-        return switch (source) {
-            case "off" -> Source.OFF;
-            case "schedInfo" -> Source.SCHED_INFO;
-            default -> throw new IOException("Unknown timeSplit source: " + source);
+    /** The capture's source, from {@code capture_start}; an unspecified source is refused, never guessed. */
+    static Source source(CaptureProto.TimeSplit timeSplit) throws IOException {
+        return switch (timeSplit.getSource()) {
+            case TIME_SPLIT_SOURCE_OFF -> Source.OFF;
+            case TIME_SPLIT_SOURCE_SCHED_INFO -> Source.SCHED_INFO;
+            default -> throw new IOException("Unknown timeSplit source: " + timeSplit.getSourceValue());
         };
     }
 

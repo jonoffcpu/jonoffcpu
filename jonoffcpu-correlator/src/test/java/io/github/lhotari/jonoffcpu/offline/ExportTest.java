@@ -5,27 +5,20 @@ import static io.github.lhotari.jonoffcpu.offline.ExportFixture.export;
 import static io.github.lhotari.jonoffcpu.offline.ExportFixture.frame;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.CaptureFixtures;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.profile.ProfileProto;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /**
- * The SQL-friendly export: frame arrays, canonical stacks, pools, the run column, numeric counters, run metadata. The
- * checks that DuckDB reads the export are in the integration test {@code ExportDuckDbTest}.
+ * The SQL-friendly export: frame arrays, canonical stacks, pools, the run column, counters, run metadata. The checks
+ * that DuckDB reads the export are in the integration test {@code ExportDuckDbTest}.
  */
 class ExportTest {
-    private static List<JsonObject> jsonl(Path file) throws Exception {
-        List<JsonObject> rows = new ArrayList<>();
-        for (String line : Files.readAllLines(file))
-            rows.add(JsonParser.parseString(line).getAsJsonObject());
-        return rows;
-    }
-
     /** Two entries: one with every stack and a lambda frame, one past 2^53 - 1 observed nanoseconds. */
     private static Path profile(Path dir) throws Exception {
         var java = StackProfile.Kind.JAVA;
@@ -53,15 +46,22 @@ class ExportTest {
                         1,
                         "[tid=12345]",
                         1,
-                        // Past 2^53 - 1, a JSON number would lose precision, so it stays a string.
+                        // Past 2^53 - 1: a double would lose it, which is why 64-bit counters are strings.
                         (1L << 53) + 1,
                         0));
         Path profile = dir.resolve("profile.pb");
-        List<StackProfile.Provenance> sources = List.of(
-                new StackProfile.Provenance("session-1", 7, "", "", "{\"reasons\":[\"blocked\"]}", "1", 0, 10, 20, ""));
+        List<ProfileProto.Provenance> sources = List.of(ProfileProto.Provenance.newBuilder()
+                .setSessionId("session-1")
+                .setCaptureEpoch(7)
+                .setSampling(CaptureFixtures.uniformSampling())
+                .setThinningProbability("1")
+                .setWindowFromNanos(10)
+                .setWindowToNanos(20)
+                .setTimeSplit(CaptureFixtures.timeSplit(CaptureProto.TimeSplitSource.TIME_SPLIT_SOURCE_OFF))
+                .build());
         new StackProfile(
                         new StackProfile.Header(
-                                sources, List.of("reason", "kernel", "user", "thread"), false, "{}", "", List.of()),
+                                sources, List.of("reason", "kernel", "user", "thread"), false, null, "", List.of()),
                         entries)
                 .write(profile);
         return profile;
@@ -69,65 +69,56 @@ class ExportTest {
 
     @Test
     void jsonlRows(@TempDir Path dir) throws Exception {
-        List<JsonObject> rows = jsonl(export(dir, "rows.jsonl", profile(dir), "--format", "jsonl"));
-        JsonObject first = rows.get(0);
-        JsonObject second = rows.get(1);
-        assertThat(first.getAsJsonArray("javaFrames").toString())
+        List<AnalysisProto.ExportRow> rows = CorrelationFixture.lines(
+                export(dir, "rows.jsonl", profile(dir), "--format", "jsonl"), AnalysisProto.ExportRow::newBuilder);
+        AnalysisProto.ExportRow first = rows.get(0);
+        AnalysisProto.ExportRow second = rows.get(1);
+        assertThat(first.getJavaFramesList())
                 .as("Java frames as an array: %s", first)
-                .isEqualTo("[\"a.B$$Lambda.0x0000000081a06030.run\",\"libjvm.so.Unsafe_Park\"]");
-        assertThat(first.getAsJsonArray("javaFrameKinds").toString())
-                .as("Kinds: %s", first)
-                .isEqualTo("[\"java\",\"native\"]");
-        assertThat(first.getAsJsonArray("kernelFrames").toString())
+                .containsExactly("a.B$$Lambda.0x0000000081a06030.run", "libjvm.so.Unsafe_Park");
+        assertThat(first.getJavaFrameKindsList()).as("Kinds: %s", first).containsExactly("java", "native");
+        assertThat(first.getKernelFramesList())
                 .as("Native frames as the joined columns render them: %s", first)
-                .isEqualTo("[\"__schedule\"]");
-        assertThat(first.getAsJsonArray("userFrames").toString())
+                .containsExactly("__schedule");
+        assertThat(first.getUserFramesList())
                 .as("Native frames as the joined columns render them: %s", first)
-                .isEqualTo("[\"futex_wait\"]");
-        assertThat(first.get("canonicalJavaStack").getAsString())
+                .containsExactly("futex_wait");
+        assertThat(first.getCanonicalJavaStack())
                 .as("Canonical stack: %s", first)
                 .isEqualTo("a.B$$Lambda.run;libjvm.so.Unsafe_Park");
-        assertThat(first.get("threadPool").getAsString()).as("Pool: %s", first).isEqualTo("pulsar-io-#-#");
-        assertThat(second.get("threadPool").getAsString())
-                .as("Pool of a thread id")
-                .isEqualTo("[tid=#]");
-        assertThat(first.get("observedNanos").getAsJsonPrimitive().isNumber())
-                .as("Counters are numbers: %s", first)
-                .isTrue();
-        assertThat(first.get("observedNanos").getAsLong())
-                .as("Counters are numbers: %s", first)
-                .isEqualTo(2000);
-        assertThat(second.get("observedNanos").getAsJsonPrimitive().isString())
-                .as("Past 2^53 - 1 a counter stays a string: %s", second)
-                .isTrue();
-        assertThat(second.get("observedNanos").getAsString())
-                .as("Past 2^53 - 1 a counter stays a string: %s", second)
-                .isEqualTo(Long.toString((1L << 53) + 1));
-        assertThat(first.get("run").getAsString())
+        assertThat(first.getThreadPool()).as("Pool: %s", first).isEqualTo("pulsar-io-#-#");
+        assertThat(second.getThreadPool()).as("Pool of a thread id").isEqualTo("[tid=#]");
+        assertThat(first.getReason()).isEqualTo(CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED);
+        assertThat(first.getObservedNanos()).as("Counters: %s", first).isEqualTo(2000);
+        assertThat(second.getObservedNanos())
+                .as("A counter past 2^53 - 1 stays exact: %s", second)
+                .isEqualTo((1L << 53) + 1);
+        assertThat(first.getRun())
                 .as("Run defaults to the first session: %s", first)
                 .isEqualTo("session-1");
-        assertThat(first.get("estimateAvailable").getAsBoolean())
+        assertThat(first.getEstimateAvailable())
                 .as("The estimate's validity is on every row: %s", first)
                 .isFalse();
-        assertThat(second.get("kernelFrames").isJsonNull())
-                .as("An absent stack is null")
-                .isTrue();
-        // Existing fields keep their names and order; the new ones follow them.
-        List<String> names = new ArrayList<>(first.keySet());
-        assertThat(names)
-                .as("Field order")
-                .startsWith("reason", "taskState", "thread")
-                .endsWith("estimateAvailable");
-        assertThat(names.indexOf("javaStackKinds")).as("Field order: %s", names).isEqualTo(15);
+        assertThat(second.hasKernelStack()).as("An absent stack is unset").isFalse();
+        assertThat(second.getKernelFramesList())
+                .as("An absent stack has no frames")
+                .isEmpty();
+        // proto3 JSON prints 64-bit integers as decimal strings.
+        String line = Files.readAllLines(dir.resolve("rows.jsonl")).get(1);
+        assertThat(line).contains("\"observedNanos\":\"" + ((1L << 53) + 1) + "\"");
     }
 
     @Test
-    void numbersAsStrings(@TempDir Path dir) throws Exception {
-        List<JsonObject> strings =
-                jsonl(export(dir, "strings.jsonl", profile(dir), "--format", "jsonl", "--numbers", "string"));
-        assertThat(strings.get(0).get("observedNanos").getAsJsonPrimitive().isString())
-                .as("--numbers string")
-                .isTrue();
+    void numbersOptionIsGone(@TempDir Path dir) throws Exception {
+        CommandLineFixture.usageError(
+                "Unknown options: '--numbers'",
+                "export",
+                "--profile",
+                profile(dir).toString(),
+                "--output",
+                dir.resolve("refused").toString(),
+                "--numbers",
+                "string");
     }
 
     @Test
@@ -139,35 +130,16 @@ class ExportTest {
         assertThat(csv.get(1))
                 .as("CSV row")
                 .endsWith(",a.B$$Lambda.run;libjvm.so.Unsafe_Park,pulsar-io-#-#,baseline,false");
-        JsonObject run = JsonParser.parseString(Files.readString(metadata)).getAsJsonObject();
-        JsonObject source = run.getAsJsonArray("sources").get(0).getAsJsonObject();
-        assertThat(run.get("run").getAsString()).as("Run metadata: %s", run).isEqualTo("baseline");
-        assertThat(run.get("entries").getAsInt()).as("Run metadata: %s", run).isEqualTo(2);
-        assertThat(run.get("intervals").getAsInt()).as("Run metadata: %s", run).isEqualTo(3);
-        assertThat(run.get("observedNanos").getAsString())
-                .as("Run metadata: %s", run)
-                .isEqualTo(Long.toString((1L << 53) + 2001));
-        assertThat(source.get("captureEpoch").getAsInt())
-                .as("Run metadata: %s", run)
-                .isEqualTo(7);
-        assertThat(source.get("windowToNanos").getAsLong())
-                .as("Run metadata: %s", run)
-                .isEqualTo(20);
-        assertThat(run.get("estimateAvailable").getAsBoolean())
-                .as("Run metadata: %s", run)
-                .isFalse();
-    }
-
-    @Test
-    void unknownNumbersIsAUsageError(@TempDir Path dir) throws Exception {
-        CommandLineFixture.usageError(
-                "expected one of number, string",
-                "export",
-                "--profile",
-                profile(dir).toString(),
-                "--output",
-                dir.resolve("refused").toString(),
-                "--numbers",
-                "text");
+        AnalysisProto.RunMetadata run = CorrelationFixture.parse(metadata, AnalysisProto.RunMetadata.newBuilder())
+                .build();
+        ProfileProto.Provenance source = run.getSources(0);
+        assertThat(run.getRun()).as("Run metadata: %s", run).isEqualTo("baseline");
+        assertThat(run.getEntries()).as("Run metadata: %s", run).isEqualTo(2);
+        assertThat(run.getIntervals()).as("Run metadata: %s", run).isEqualTo(3);
+        assertThat(run.getObservedNanos()).as("Run metadata: %s", run).isEqualTo(Long.toString((1L << 53) + 2001));
+        assertThat(source.getCaptureEpoch()).as("Run metadata: %s", run).isEqualTo(7);
+        assertThat(source.getWindowToNanos()).as("Run metadata: %s", run).isEqualTo(20);
+        assertThat(source.getSampling()).as("Run metadata: %s", run).isEqualTo(CaptureFixtures.uniformSampling());
+        assertThat(run.getEstimateAvailable()).as("Run metadata: %s", run).isFalse();
     }
 }

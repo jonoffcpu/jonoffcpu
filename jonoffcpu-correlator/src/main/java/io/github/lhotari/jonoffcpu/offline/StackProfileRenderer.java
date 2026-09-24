@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonNull;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -529,7 +525,7 @@ final class StackProfileRenderer {
         }
     }
 
-    static JsonObject summary(
+    static AnalysisProto.SliceSummary.Builder summary(
             Slice slice,
             StackProfile profile,
             Set<OffCpuReason> reasons,
@@ -538,64 +534,49 @@ final class StackProfileRenderer {
             Time time,
             Filter filter,
             PackageNames packages) {
-        JsonObject summary = new JsonObject();
-        summary.addProperty("schemaVersion", 1);
-        JsonArray selected = new JsonArray();
+        AnalysisProto.SliceSummary.Builder summary = AnalysisProto.SliceSummary.newBuilder();
         for (OffCpuReason reason : reasons == null ? EnumSet.allOf(OffCpuReason.class) : reasons) {
-            selected.add(reason.label());
+            summary.addReasons(reason.proto());
         }
-        summary.add("reasons", selected);
-        summary.addProperty("stack", kinds.text);
-        summary.addProperty("weights", weights.name().toLowerCase(java.util.Locale.ROOT));
-        summary.addProperty("time", time.label());
-        summary.addProperty("packageNames", packages.label());
-        summary.addProperty(
-                "reasonSemantics",
-                "switch-out reason; a blocked interval's time is split into sleeping before its wakeup and runqueue"
-                        + " after it, and runnable and preempted intervals are runqueue throughout, when the profile"
-                        + " has the split");
-        summary.addProperty("intervals", Long.toString(slice.intervals()));
-        summary.addProperty("lines", slice.nanos().size());
-        summary.addProperty("totalNanos", slice.totalNanos().toString());
-        // The kept entries' time without a split: part of a total or split slice, left out of sleeping and runqueue.
-        summary.addProperty("unsplitNanos", slice.unsplitNanos().toString());
-        summary.add("include", patterns(filter.include()));
-        summary.add("exclude", patterns(filter.exclude()));
-        JsonArray scope = new JsonArray();
-        if (filter.active()) Filter.scope(profile).forEach(scope::add);
-        summary.add("filterScope", scope);
+        summary.setStack(kinds.text)
+                .setWeights(weights.name().toLowerCase(java.util.Locale.ROOT))
+                .setTime(time.label())
+                .setPackageNames(packages.label())
+                .setReasonSemantics("switch-out reason; a blocked interval's time is split into sleeping before its"
+                        + " wakeup and runqueue after it, and runnable and preempted intervals are runqueue"
+                        + " throughout, when the profile has the split")
+                .setIntervals(slice.intervals())
+                .setLines(slice.nanos().size())
+                .setTotalNanos(slice.totalNanos().toString())
+                // The kept entries' time without a split: part of a total or split slice, left out of sleeping and
+                // runqueue.
+                .setUnsplitNanos(slice.unsplitNanos().toString())
+                .addAllInclude(patterns(filter.include()))
+                .addAllExclude(patterns(filter.exclude()));
+        if (filter.active()) summary.addAllFilterScope(Filter.scope(profile));
         // What the filter removed from the selected reasons: add it back to reconcile with an unfiltered slice.
-        JsonObject filtered = new JsonObject();
-        filtered.addProperty("intervals", Long.toString(slice.filteredIntervals()));
-        filtered.addProperty("totalNanos", slice.filteredNanos().toString());
-        summary.add("filtered", filtered);
-        summary.addProperty("label", profile.header().label());
-        summary.addProperty("sources", profile.header().sources().size());
+        summary.setFiltered(AnalysisProto.FilteredSlice.newBuilder()
+                .setIntervals(slice.filteredIntervals())
+                .setTotalNanos(slice.filteredNanos().toString()));
+        summary.setLabel(profile.header().label())
+                .setSources(profile.header().sources().size());
         return summary;
     }
 
-    static JsonArray patterns(List<Pattern> patterns) {
-        JsonArray array = new JsonArray();
-        for (Pattern pattern : patterns) array.add(pattern.pattern());
-        return array;
+    static List<String> patterns(List<Pattern> patterns) {
+        return patterns.stream().map(Pattern::pattern).toList();
     }
 
-    /**
-     * How {@link #export} writes a profile: the format, the {@code run} every row is tagged with, and whether counters
-     * are JSON strings as before 0.5.0 instead of numbers.
-     */
-    record Export(String format, String run, boolean numbersAsStrings) {}
-
-    /** The largest integer a JSON number carries exactly as an IEEE double, and DuckDB infers as BIGINT. */
-    private static final long MAX_SAFE_INTEGER = (1L << 53) - 1;
+    /** How {@link #export} writes a profile: the format, and the {@code run} every row is tagged with. */
+    record Export(String format, String run) {}
 
     /** A profile's default {@code run}: its label without the trailing separator, else its first source's session. */
     static String defaultRun(StackProfile profile) {
         String label = profile.header().label();
         while (label.endsWith(";")) label = label.substring(0, label.length() - 1);
         if (!label.isEmpty()) return label;
-        List<StackProfile.Provenance> sources = profile.header().sources();
-        return sources.isEmpty() ? "" : sources.get(0).sessionId();
+        var sources = profile.header().sources();
+        return sources.isEmpty() ? "" : sources.get(0).getSessionId();
     }
 
     /**
@@ -639,39 +620,37 @@ final class StackProfileRenderer {
                 }
             }
             case "jsonl" -> {
-                var gson = new GsonBuilder().serializeNulls().create();
-                boolean strings = options.numbersAsStrings();
                 for (StackProfile.Entry entry : profile.entries()) {
-                    JsonObject row = new JsonObject();
+                    AnalysisProto.ExportRow.Builder row = AnalysisProto.ExportRow.newBuilder();
                     String javaStack = joined(entry.javaStack(), false);
-                    row.addProperty("reason", entry.reason().label());
-                    row.addProperty("taskState", Integer.toUnsignedLong(entry.taskState()));
-                    row.addProperty("thread", entry.thread());
-                    row.addProperty("javaStack", javaStack);
-                    row.addProperty("kernelStack", joined(entry.kernelStack(), true));
-                    row.addProperty("userStack", joined(entry.userStack(), true));
-                    row.addProperty("intervals", entry.intervals());
-                    counter(row, "observedNanos", entry.observedNanos(), strings);
-                    counter(row, "estimatedNanos", entry.estimatedNanos(), strings);
+                    row.setReason(entry.reason().proto()).setTaskState(entry.taskState());
+                    if (entry.thread() != null) {
+                        row.setThread(entry.thread()).setThreadPool(StackTransforms.poolName(entry.thread()));
+                    }
+                    if (javaStack != null) {
+                        row.setJavaStack(javaStack)
+                                .setJavaStackKinds(javaKinds(entry.javaStack()))
+                                .setCanonicalJavaStack(StackTransforms.canonicalName(javaStack));
+                    }
+                    if (entry.kernelStack() != null) row.setKernelStack(joined(entry.kernelStack(), true));
+                    if (entry.userStack() != null) row.setUserStack(joined(entry.userStack(), true));
                     StackProfile.Split split = entry.split();
-                    counter(row, "sleepingNanos", split.sleeping(), strings);
-                    counter(row, "runqueueNanos", split.runqueue(), strings);
-                    counter(row, "unsplitNanos", split.unsplit(), strings);
-                    counter(row, "estimatedSleepingNanos", split.estimatedSleeping(), strings);
-                    counter(row, "estimatedRunqueueNanos", split.estimatedRunqueue(), strings);
-                    counter(row, "estimatedUnsplitNanos", split.estimatedUnsplit(), strings);
-                    row.addProperty("javaStackKinds", javaKinds(entry.javaStack()));
-                    row.add("javaFrames", names(entry.javaStack(), false));
-                    row.add("javaFrameKinds", kinds(entry.javaStack()));
-                    row.add("kernelFrames", names(entry.kernelStack(), true));
-                    row.add("userFrames", names(entry.userStack(), true));
-                    row.addProperty(
-                            "canonicalJavaStack", javaStack == null ? null : StackTransforms.canonicalName(javaStack));
-                    row.addProperty(
-                            "threadPool", entry.thread() == null ? null : StackTransforms.poolName(entry.thread()));
-                    row.addProperty("run", options.run());
-                    row.addProperty("estimateAvailable", estimateAvailable);
-                    gson.toJson(row, writer);
+                    row.setIntervals(entry.intervals())
+                            .setObservedNanos(entry.observedNanos())
+                            .setEstimatedNanos(entry.estimatedNanos())
+                            .setSleepingNanos(split.sleeping())
+                            .setRunqueueNanos(split.runqueue())
+                            .setUnsplitNanos(split.unsplit())
+                            .setEstimatedSleepingNanos(split.estimatedSleeping())
+                            .setEstimatedRunqueueNanos(split.estimatedRunqueue())
+                            .setEstimatedUnsplitNanos(split.estimatedUnsplit())
+                            .addAllJavaFrames(names(entry.javaStack(), false))
+                            .addAllJavaFrameKinds(kinds(entry.javaStack()))
+                            .addAllKernelFrames(names(entry.kernelStack(), true))
+                            .addAllUserFrames(names(entry.userStack(), true))
+                            .setRun(options.run())
+                            .setEstimateAvailable(estimateAvailable);
+                    writer.write(ProtoJson.line(row.build()));
                     writer.newLine();
                 }
             }
@@ -680,83 +659,48 @@ final class StackProfileRenderer {
     }
 
     /**
-     * An unsigned 64-bit counter: a JSON number while a double holds it exactly, which covers about 104 days of
-     * nanoseconds per entry, and a decimal string beyond that or when strings are asked for.
-     */
-    static void counter(JsonObject row, String name, long value, boolean strings) {
-        if (!strings && value >= 0 && value <= MAX_SAFE_INTEGER) {
-            row.addProperty(name, value);
-        } else {
-            row.addProperty(name, Long.toUnsignedString(value));
-        }
-    }
-
-    private static void counter(JsonObject row, String name, BigInteger value) {
-        if (value.signum() >= 0 && value.compareTo(BigInteger.valueOf(MAX_SAFE_INTEGER)) <= 0) {
-            row.addProperty(name, value.longValue());
-        } else {
-            row.addProperty(name, value.toString());
-        }
-    }
-
-    /**
-     * What {@code export --run-metadata} writes: one object describing the profile, joined to its rows on {@code
+     * What {@code export --run-metadata} writes: one message describing the profile, joined to its rows on {@code
      * run}, so the provenance, estimate validity and totals no longer need the header or the report beside them.
      */
-    static JsonObject runMetadata(StackProfile profile, String run) {
-        JsonObject metadata = new JsonObject();
-        metadata.addProperty("schemaVersion", 1);
-        metadata.addProperty("run", run);
-        metadata.addProperty("label", profile.header().label());
-        JsonArray sources = new JsonArray();
-        for (StackProfile.Provenance source : profile.header().sources()) {
-            JsonObject item = new JsonObject();
-            item.addProperty("sessionId", source.sessionId());
-            item.addProperty("captureEpoch", source.captureEpoch());
-            counter(item, "windowFromNanos", source.windowFromNanos(), false);
-            counter(item, "windowToNanos", source.windowToNanos(), false);
-            item.addProperty("samplingJson", source.samplingJson());
-            item.addProperty("thinningProbability", source.thinningProbability());
-            item.addProperty("timeSplitJson", source.timeSplitJson());
-            sources.add(item);
-        }
-        metadata.add("sources", sources);
-        JsonArray dimensions = new JsonArray();
-        profile.header().dimensions().forEach(dimensions::add);
-        metadata.add("dimensions", dimensions);
-        metadata.addProperty("estimateAvailable", profile.header().estimateAvailable());
-        metadata.addProperty("timeSplitAvailable", profile.header().timeSplitAvailable());
-        metadata.addProperty("entries", profile.entries().size());
+    static AnalysisProto.RunMetadata runMetadata(StackProfile profile, String run) {
         BigInteger observed = BigInteger.ZERO;
         long intervals = 0;
         for (StackProfile.Entry entry : profile.entries()) {
-            observed = observed.add(new BigInteger(Long.toUnsignedString(entry.observedNanos())));
+            observed = observed.add(U64.big(entry.observedNanos()));
             intervals = Math.addExact(intervals, entry.intervals());
         }
-        metadata.addProperty("intervals", intervals);
-        counter(metadata, "observedNanos", observed);
-        return metadata;
+        return AnalysisProto.RunMetadata.newBuilder()
+                .setRun(run)
+                .setLabel(profile.header().label())
+                .addAllSources(profile.header().sources())
+                .addAllDimensions(profile.header().dimensions())
+                .setEstimateAvailable(profile.header().estimateAvailable())
+                .setTimeSplitAvailable(profile.header().timeSplitAvailable())
+                .setEntries(profile.entries().size())
+                .setIntervals(intervals)
+                .setObservedNanos(observed.toString())
+                .build();
     }
 
-    /** A stack's frames as a JSON array, root first, as {@link #joined} renders them; null for an absent stack. */
-    private static JsonElement names(List<StackProfile.Frame> stack, boolean nativeFrames) {
-        if (stack == null) return JsonNull.INSTANCE;
-        JsonArray array = new JsonArray();
+    /** A stack's frames as a list, root first, as {@link #joined} renders them; empty for an absent stack. */
+    private static List<String> names(List<StackProfile.Frame> stack, boolean nativeFrames) {
+        if (stack == null) return List.of();
+        List<String> names = new ArrayList<>(stack.size());
         int end = nativeFrames && !stack.isEmpty() && stack.get(0).kind() == StackProfile.Kind.KERNEL
                 ? kernelEnd(stack)
                 : stack.size();
         for (int index = 0; index < end; index++) {
             StackProfile.Frame frame = stack.get(index);
-            array.add(nativeFrames ? escape(nativeName(frame)) : frame.name());
+            names.add(nativeFrames ? escape(nativeName(frame)) : frame.name());
         }
-        return array;
+        return names;
     }
 
-    private static JsonElement kinds(List<StackProfile.Frame> stack) {
-        if (stack == null) return JsonNull.INSTANCE;
-        JsonArray array = new JsonArray();
-        for (StackProfile.Frame frame : stack) array.add(frame.kind() == StackProfile.Kind.JAVA ? "java" : "native");
-        return array;
+    private static List<String> kinds(List<StackProfile.Frame> stack) {
+        if (stack == null) return List.of();
+        return stack.stream()
+                .map(frame -> frame.kind() == StackProfile.Kind.JAVA ? "java" : "native")
+                .toList();
     }
 
     private static String joined(List<StackProfile.Frame> stack, boolean nativeFrames) {

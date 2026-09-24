@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MIT
 use crate::bpf_sched_exit::JonoffcpuCookieSkelBuilder;
 use crate::capture;
+use crate::capture::{CollectorErrorCode as ErrorCode, CollectorReply, CollectorState};
 use anyhow::{Context, Result, anyhow, bail};
 #[cfg(test)]
 use libbpf_rs::TracepointCategory;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{Link, MapCore, MapFlags, RingBufferBuilder};
 use prost::Message;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Write};
 use std::mem::{MaybeUninit, size_of};
@@ -25,11 +25,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 const SOURCE_ID: &str = "jonoffcpu.offcpu.v1";
-/// Version 2 interns stacks: each distinct stack is one `stack` record and observations reference it.
-/// Version 3 classifies every observation by its switch-out reason and adds `sampling.reasons`.
-/// Version 4 adds `timeSplit` and each observation's run-queue part.
-const SCHEMA_VERSION: u32 = 4;
-const MAX_CONTROL_JSON: usize = 64 * 1024;
+const LOADER: &str = "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)";
+const HOOK: &str = "tp_btf/sched_exit_tp";
+const SWITCH_OUT_HOOK: &str = "tp_btf/sched_switch";
 const DRAIN_QUIET_POLLS: usize = 2;
 const MAX_RING_BATCH: usize = 1024;
 const OUTPUT_BUFFER_BYTES: usize = 256 * 1024;
@@ -41,55 +39,128 @@ const SIGNAL_DIAGNOSTIC_BUDGET: Duration = Duration::from_millis(100);
 const WALL_CLOCK_CALIBRATION_SAMPLES: usize = 9;
 const TARGET_EXIT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// A failure with the `CollectorErrorCode` the reply reports. It is attached as anyhow context at
+/// the point that knows what went wrong, so the code travels with the error instead of being
+/// guessed from its message; the outermost coded context in a chain decides the code.
+#[derive(Clone, Debug)]
+pub(crate) struct Failure {
+    pub(crate) code: ErrorCode,
+    pub(crate) message: String,
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Failure {}
+
+impl Failure {
+    /// Classifies an error by its outermost coded context; an uncoded error is an internal one.
+    pub(crate) fn of(error: &anyhow::Error) -> Self {
+        // anyhow's downcast sees through plain context layers to the outermost `Failure`, whether
+        // it was attached as context or is the error itself.
+        let code = error
+            .downcast_ref::<Failure>()
+            .map_or(ErrorCode::InternalError, |failure| failure.code);
+        Self {
+            code,
+            message: format!("{error:#}"),
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        anyhow::Error::new(self)
+    }
+}
+
+/// A new error that carries its code.
+pub(crate) fn fail(code: ErrorCode, message: impl Into<String>) -> anyhow::Error {
+    Failure {
+        code,
+        message: message.into(),
+    }
+    .into_error()
+}
+
+/// Adds coded context to a fallible result, as `anyhow::Context` adds plain context.
+pub(crate) trait Coded<T, E> {
+    fn coded(self, code: ErrorCode, message: impl Into<String>) -> Result<T>;
+}
+
+impl<T, E, R> Coded<T, E> for R
+where
+    R: Context<T, E>,
+{
+    fn coded(self, code: ErrorCode, message: impl Into<String>) -> Result<T> {
+        self.context(Failure {
+            code,
+            message: message.into(),
+        })
+    }
+}
+
+fn invalid_config(message: impl Into<String>) -> anyhow::Error {
+    fail(ErrorCode::InvalidConfig, message)
+}
+
+fn invalid_state(message: impl Into<String>) -> anyhow::Error {
+    fail(ErrorCode::InvalidState, message)
+}
+
+/// A validated `PrepareRequest`.
+#[derive(Debug)]
 pub(crate) struct PrepareConfig {
     target_pid: u32,
     output_path: PathBuf,
-    sampling: SamplingConfig,
-    time_split: TimeSplitConfig,
+    sampling: SamplingPolicy,
+    time_split: TimeSplitPolicy,
     /// The agent's controller thread calls prepare and later only polls the profiler; when set, that
     /// thread's own waits are left out of the capture like the collector's, so the profiler does not
     /// observe itself.
-    #[serde(default)]
     exclude_calling_thread: bool,
-    #[serde(skip)]
     calling_tid: u32,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
+/// A validated `EnableRequest`.
+#[derive(Debug, Clone)]
 pub(crate) struct EnableConfig {
     session_id: String,
     capture_epoch: u32,
     signal: i32,
-    #[serde(default)]
-    signal_delivery: Option<String>,
-    #[serde(default)]
-    sampling: Option<SamplingConfig>,
-    #[serde(default)]
-    time_split: Option<TimeSplitConfig>,
+    signal_delivery: capture::SignalDelivery,
+    sampling: capture::Sampling,
+    time_split: capture::TimeSplit,
 }
 
 /// Where each interval's run-queue part comes from. Echoed like `sampling`: it changes what is
 /// measured, not which intervals are kept, so it is a block of its own.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct TimeSplitConfig {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TimeSplitPolicy {
+    /// The message as the agent sent it, echoed unchanged.
+    message: capture::TimeSplit,
     source: TimeSplitSource,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TimeSplitSource {
     /// Nothing is read; observations carry no run-queue part.
-    #[serde(rename = "off")]
     Off,
     /// The growth of the scheduler's `task_struct.sched_info.run_delay` across the interval.
-    #[serde(rename = "schedInfo")]
     SchedInfo,
 }
 
-impl TimeSplitConfig {
+impl TimeSplitPolicy {
+    fn parse(message: capture::TimeSplit) -> Result<Self> {
+        let source = match capture::TimeSplitSource::try_from(message.source) {
+            Ok(capture::TimeSplitSource::Off) => TimeSplitSource::Off,
+            Ok(capture::TimeSplitSource::SchedInfo) => TimeSplitSource::SchedInfo,
+            _ => return Err(invalid_config("timeSplit.source must be OFF or SCHED_INFO")),
+        };
+        Ok(Self { message, source })
+    }
+
     /// The kernel's `JONOFFCPU_TIME_SPLIT_*` value.
     fn kernel_value(&self) -> u32 {
         match self.source {
@@ -97,16 +168,13 @@ impl TimeSplitConfig {
             TimeSplitSource::SchedInfo => 1,
         }
     }
-
-    fn json(&self) -> Value {
-        serde_json::to_value(self).expect("time split config serializes")
-    }
 }
 
 /// Whether the running kernel keeps `task_struct.sched_info.run_delay` (`CONFIG_SCHED_INFO`).
 fn run_delay_available() -> Result<bool> {
     use libbpf_rs::btf::types::Struct;
-    let btf = libbpf_rs::btf::Btf::from_vmlinux().context("load vmlinux BTF")?;
+    let btf =
+        libbpf_rs::btf::Btf::from_vmlinux().coded(ErrorCode::BpfUnsupported, "load vmlinux BTF")?;
     let Some(task) = btf.type_by_name::<Struct<'_>>("task_struct") else {
         return Ok(false);
     };
@@ -128,16 +196,14 @@ fn run_delay_available() -> Result<bool> {
         .any(|member| member.name.is_some_and(|name| name == "run_delay")))
 }
 
-/// The resolved sampling policy. The same object is echoed verbatim in every control reply and
-/// in the `captureStart` row, so the agent and the correlator can compare copies structurally.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct SamplingConfig {
+/// The resolved sampling policy. The message is echoed unchanged in every reply and in the
+/// `captureStart` record, so the agent and the correlator can compare copies structurally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SamplingPolicy {
+    message: capture::Sampling,
     /// The switch-out reasons whose intervals are eligible, in canonical order.
     reasons: Vec<OffCpuReason>,
-    #[serde(deserialize_with = "deserialize_optional_u64")]
     min_off_cpu_micros: Option<u64>,
-    #[serde(deserialize_with = "deserialize_optional_u64")]
     max_off_cpu_micros: Option<u64>,
     admission: Admission,
 }
@@ -147,8 +213,7 @@ pub(crate) struct SamplingConfig {
 /// (`TASK_RUNNING`) gives `Runnable` and any other state `Blocked`. A user-space thread preempted by
 /// the tick is switched out at an ordinary `schedule()` on its return to user mode, so it is
 /// `Runnable`; `Preempted` is preemption at a point inside the kernel.
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum OffCpuReason {
     Blocked,
     Runnable,
@@ -174,6 +239,10 @@ impl OffCpuReason {
         }
     }
 
+    fn from_message(value: i32) -> Option<Self> {
+        u8::try_from(value).ok().and_then(Self::from_kernel)
+    }
+
     /// The classification the BPF program applies, which the tests model.
     #[cfg(test)]
     pub(crate) fn classify(preempted: bool, prev_task_state: u32) -> Self {
@@ -189,21 +258,12 @@ impl OffCpuReason {
 
 /// Admission decides which duration-eligible intervals are recorded. The `none` policy never
 /// reaches the collector: the agent runs async-profiler alone in that case.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
-#[serde(
-    tag = "policy",
-    rename_all = "lowercase",
-    rename_all_fields = "camelCase",
-    deny_unknown_fields
-)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Admission {
-    /// Every eligible interval is admitted with the same probability `probabilityThreshold / 2^32`.
-    Uniform {
-        probability: String,
-        probability_threshold: u64,
-    },
-    /// An interval of at least `recordAllAboveMicros` is always admitted; a shorter one with
-    /// probability `duration / recordAllAboveMicros`.
+    /// Every eligible interval is admitted with the same probability `probability_threshold / 2^32`.
+    Uniform { probability_threshold: u64 },
+    /// An interval of at least `record_all_above_micros` is always admitted; a shorter one with
+    /// probability `duration / record_all_above_micros`.
     Proportional { record_all_above_micros: u64 },
 }
 
@@ -217,55 +277,84 @@ pub(crate) fn proportional_scale(record_all_above_ns: u64) -> (u64, u32) {
     (record_all_above_ns >> shift, shift)
 }
 
-impl SamplingConfig {
-    fn validate(&self) -> Result<()> {
-        if self.reasons.is_empty() {
-            bail!("reasons must name at least one switch-out reason");
+impl SamplingPolicy {
+    fn parse(message: capture::Sampling) -> Result<Self> {
+        let mut reasons = Vec::with_capacity(message.reasons.len());
+        for value in &message.reasons {
+            reasons.push(OffCpuReason::from_message(*value).ok_or_else(|| {
+                invalid_config(format!("sampling.reasons has an invalid reason {value}"))
+            })?);
         }
-        // Canonical order keeps the echoed object byte-identical to the one the agent sent.
-        if self.reasons.windows(2).any(|pair| pair[0] >= pair[1]) {
-            bail!("reasons must be distinct and in the order blocked, runnable, preempted");
+        if reasons.is_empty() {
+            return Err(invalid_config(
+                "sampling.reasons must name at least one switch-out reason",
+            ));
         }
-        let min_ns = self
+        // Canonical order keeps the echoed message equal to the one the agent sent.
+        if reasons.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(invalid_config(
+                "sampling.reasons must be distinct and in the order blocked, runnable, preempted",
+            ));
+        }
+        let min_ns = message
             .min_off_cpu_micros
             .map(|value| {
                 value
                     .checked_mul(1_000)
-                    .context("minOffCpuMicros overflows nanos")
+                    .ok_or_else(|| invalid_config("minOffCpuMicros overflows nanos"))
             })
             .transpose()?;
-        let max_ns = self
+        let max_ns = message
             .max_off_cpu_micros
             .map(|value| {
                 value
                     .checked_mul(1_000)
-                    .context("maxOffCpuMicros overflows nanos")
+                    .ok_or_else(|| invalid_config("maxOffCpuMicros overflows nanos"))
             })
             .transpose()?;
         if min_ns.zip(max_ns).is_some_and(|(min, max)| min >= max) {
-            bail!("minOffCpuMicros must be strictly below maxOffCpuMicros");
+            return Err(invalid_config(
+                "minOffCpuMicros must be strictly below maxOffCpuMicros",
+            ));
         }
-        match self.admission {
-            Admission::Uniform {
-                probability_threshold,
-                ..
-            } => {
-                if probability_threshold == 0 || probability_threshold > (1_u64 << 32) {
-                    bail!("probabilityThreshold must be in 1..=4294967296");
+        let admission = match &message.admission {
+            Some(capture::sampling::Admission::Uniform(uniform)) => {
+                let threshold = uniform.probability_threshold;
+                if threshold == 0 || threshold > (1_u64 << 32) {
+                    return Err(invalid_config(
+                        "probabilityThreshold must be in 1..=4294967296",
+                    ));
+                }
+                Admission::Uniform {
+                    probability_threshold: threshold,
                 }
             }
-            Admission::Proportional {
-                record_all_above_micros,
-            } => {
-                if record_all_above_micros == 0 {
-                    bail!("recordAllAboveMicros must be at least 1");
+            Some(capture::sampling::Admission::Proportional(proportional)) => {
+                let micros = proportional.record_all_above_micros;
+                if micros == 0 {
+                    return Err(invalid_config("recordAllAboveMicros must be at least 1"));
                 }
-                record_all_above_micros
+                micros
                     .checked_mul(1_000)
-                    .context("recordAllAboveMicros overflows nanos")?;
+                    .ok_or_else(|| invalid_config("recordAllAboveMicros overflows nanos"))?;
+                Admission::Proportional {
+                    record_all_above_micros: micros,
+                }
             }
-        }
-        Ok(())
+            Some(capture::sampling::Admission::None(_)) => {
+                return Err(invalid_config(
+                    "sampling.admission none runs no off-CPU source; the collector must not be prepared",
+                ));
+            }
+            None => return Err(invalid_config("sampling.admission must be set")),
+        };
+        Ok(Self {
+            reasons,
+            min_off_cpu_micros: message.min_off_cpu_micros,
+            max_off_cpu_micros: message.max_off_cpu_micros,
+            admission,
+            message,
+        })
     }
 
     /// Bit `1 << reason` for each selected reason, as the BPF program tests it.
@@ -286,27 +375,6 @@ impl SamplingConfig {
             .and_then(|value| value.checked_mul(1_000))
             .unwrap_or(0)
     }
-
-    fn json(&self) -> Value {
-        serde_json::to_value(self).expect("sampling config serializes")
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum U64Value {
-    Number(u64),
-    String(String),
-}
-
-fn deserialize_optional_u64<'de, D>(deserializer: D) -> std::result::Result<Option<u64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Option::<U64Value>::deserialize(deserializer)?.map_or(Ok(None), |value| match value {
-        U64Value::Number(value) => Ok(Some(value)),
-        U64Value::String(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
-    })
 }
 
 #[repr(C)]
@@ -383,31 +451,31 @@ impl KernelStats {
         }
     }
 
-    fn json(&self) -> Value {
-        json!({
-            "switchOuts": self.switch_outs.to_string(),
-            "schedulerExitSwitches": self.scheduler_exit_switches.to_string(),
-            "schedulerExitNoSwitches": self.scheduler_exit_no_switches.to_string(),
-            "lifetimeRejections": self.lifetime_rejections.to_string(),
-            "threadStateFailures": self.thread_state_failures.to_string(),
-            "eligibleIntervals": self.eligible_intervals.to_string(),
-            "eligibleDurationMicros": self.eligible_duration_us.to_string(),
-            "admissionRejections": self.admission_rejections.to_string(),
-            "selectedIntervals": self.selected_intervals.to_string(),
-            "sequenceExhaustions": self.sequence_exhaustions.to_string(),
-            "sequenceContentions": self.sequence_contentions.to_string(),
-            "kernelStackFailures": self.kernel_stack_failures.to_string(),
-            "userStackFailures": self.user_stack_failures.to_string(),
-            "signalFailures": self.signal_failures.to_string(),
-            "ringReserveFailures": self.ring_reserve_failures.to_string(),
-            "targetNamespaceFailures": self.target_namespace_failures.to_string(),
-            "switchOutsBlocked": self.switch_outs_blocked.to_string(),
-            "switchOutsRunnable": self.switch_outs_runnable.to_string(),
-            "switchOutsPreempted": self.switch_outs_preempted.to_string(),
-            "reasonRejections": self.reason_rejections.to_string(),
-            "reasonRejectedDurationMicros": self.reason_rejected_duration_us.to_string(),
-            "runqueueInversions": self.runqueue_inversions.to_string(),
-        })
+    fn message(&self) -> capture::KernelCounters {
+        capture::KernelCounters {
+            switch_outs: self.switch_outs,
+            scheduler_exit_switches: self.scheduler_exit_switches,
+            scheduler_exit_no_switches: self.scheduler_exit_no_switches,
+            lifetime_rejections: self.lifetime_rejections,
+            thread_state_failures: self.thread_state_failures,
+            eligible_intervals: self.eligible_intervals,
+            eligible_duration_micros: self.eligible_duration_us,
+            admission_rejections: self.admission_rejections,
+            selected_intervals: self.selected_intervals,
+            sequence_exhaustions: self.sequence_exhaustions,
+            sequence_contentions: self.sequence_contentions,
+            kernel_stack_failures: self.kernel_stack_failures,
+            user_stack_failures: self.user_stack_failures,
+            signal_failures: self.signal_failures,
+            ring_reserve_failures: self.ring_reserve_failures,
+            target_namespace_failures: self.target_namespace_failures,
+            switch_outs_blocked: self.switch_outs_blocked,
+            switch_outs_runnable: self.switch_outs_runnable,
+            switch_outs_preempted: self.switch_outs_preempted,
+            reason_rejections: self.reason_rejections,
+            reason_rejected_duration_micros: self.reason_rejected_duration_us,
+            runqueue_inversions: self.runqueue_inversions,
+        }
     }
 }
 
@@ -422,15 +490,15 @@ struct UserStats {
 }
 
 impl UserStats {
-    fn json(&self) -> Value {
-        json!({
-            "receivedObservations": self.received_observations.to_string(),
-            "writtenObservations": self.written_observations.to_string(),
-            "symbolizationFailures": self.symbolization_failures.to_string(),
-            "writeFailures": self.write_failures.to_string(),
-            "pollFailures": self.poll_failures.to_string(),
-            "drainTimedOut": self.drain_timed_out.to_string(),
-        })
+    fn message(&self) -> capture::UserspaceCounters {
+        capture::UserspaceCounters {
+            received_observations: self.received_observations,
+            written_observations: self.written_observations,
+            symbolization_failures: self.symbolization_failures,
+            write_failures: self.write_failures,
+            poll_failures: self.poll_failures,
+            drain_timed_out: self.drain_timed_out,
+        }
     }
 }
 
@@ -446,13 +514,34 @@ struct PreparedIdentity {
 }
 
 pub(crate) struct PreparedCollector {
+    /// Also in the reply; the tests address the collector by it directly.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) handle: u64,
-    pub(crate) response: Value,
+    pub(crate) reply: CollectorReply,
 }
 
+/// The frozen result of a stop: the terminal `captureEnd` as it was appended and how it got there.
+#[derive(Clone, Debug, PartialEq)]
+struct StopOutcome {
+    complete: bool,
+    stopped: capture::Stopped,
+}
+
+impl StopOutcome {
+    fn state(&self) -> CollectorState {
+        if self.complete {
+            CollectorState::Complete
+        } else {
+            CollectorState::Incomplete
+        }
+    }
+}
+
+type Reply<T> = std::result::Result<T, Failure>;
+
 enum Command {
-    Enable(EnableConfig, Sender<Result<Value, String>>),
-    Stop(Duration, Sender<Result<Value, String>>),
+    Enable(EnableConfig, Sender<Reply<capture::Enabled>>),
+    Stop(Duration, Sender<Reply<StopOutcome>>),
     Close,
 }
 
@@ -460,7 +549,8 @@ struct RegistryEntry {
     sender: Sender<Command>,
     join: Option<JoinHandle<()>>,
     close_requested: bool,
-    close_result: Arc<Mutex<Option<Result<Value, String>>>>,
+    /// Set by the worker before it exits: the stop a close performed, if any.
+    close_result: Arc<Mutex<Option<Reply<Option<StopOutcome>>>>>,
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<u64, RegistryEntry>>> = OnceLock::new();
@@ -475,74 +565,133 @@ fn closed_handles() -> &'static Mutex<HashSet<u64>> {
     CLOSED_HANDLES.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-pub(crate) fn parse_prepare(json: &str) -> Result<PrepareConfig> {
-    let config: PrepareConfig = serde_json::from_str(json).context("invalid prepare JSON")?;
-    if config.target_pid == 0 {
-        bail!("targetPid must be nonzero");
+/// A reply of the current C ABI version.
+pub(crate) fn reply(
+    state: CollectorState,
+    result: capture::collector_reply::Result,
+) -> CollectorReply {
+    CollectorReply {
+        abi_version: crate::ABI_VERSION,
+        state: state as i32,
+        result: Some(result),
     }
-    if config.output_path.as_os_str().is_empty() {
-        bail!("outputPath must be nonempty");
-    }
-    config.sampling.validate()?;
-    Ok(config)
 }
 
-pub(crate) fn parse_enable(json: &str) -> Result<EnableConfig> {
-    let config: EnableConfig = serde_json::from_str(json).context("invalid enable JSON")?;
-    if config.session_id.len() != 36
-        || config.session_id.as_bytes().get(8) != Some(&b'-')
-        || config.session_id.as_bytes().get(13) != Some(&b'-')
-        || config.session_id.as_bytes().get(18) != Some(&b'-')
-        || config.session_id.as_bytes().get(23) != Some(&b'-')
-        || !config
-            .session_id
-            .bytes()
-            .all(|byte| byte == b'-' || byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        bail!("sessionId must be a canonical lowercase UUID");
+/// The reply to a failed call. Only a timed-out stop or close may be retried, and says so in its
+/// state; every other failure leaves the call's effect undefined, which is `ERROR`.
+pub(crate) fn error_reply(code: ErrorCode, message: String) -> CollectorReply {
+    let state = match code {
+        ErrorCode::StopTimeout => CollectorState::Stopping,
+        ErrorCode::CloseTimeout => CollectorState::Closing,
+        _ => CollectorState::Error,
+    };
+    reply(
+        state,
+        capture::collector_reply::Result::Error(capture::CollectorError {
+            code: code as i32,
+            message,
+        }),
+    )
+}
+
+pub(crate) fn parse_prepare(bytes: &[u8]) -> Result<PrepareConfig> {
+    let request = capture::PrepareRequest::decode(bytes)
+        .coded(ErrorCode::InvalidConfig, "invalid PrepareRequest")?;
+    if request.target_pid == 0 {
+        return Err(invalid_config("targetPid must be nonzero"));
     }
-    if config.capture_epoch == 0
-        || config.signal <= 0
-        || config.signal > libc::SIGRTMAX()
-        || config.signal == libc::SIGKILL
-        || config.signal == libc::SIGSTOP
+    if request.output_path.is_empty() {
+        return Err(invalid_config("outputPath must be nonempty"));
+    }
+    let sampling = SamplingPolicy::parse(
+        request
+            .sampling
+            .ok_or_else(|| invalid_config("sampling must be set"))?,
+    )?;
+    let time_split = TimeSplitPolicy::parse(
+        request
+            .time_split
+            .ok_or_else(|| invalid_config("timeSplit must be set"))?,
+    )?;
+    Ok(PrepareConfig {
+        target_pid: request.target_pid,
+        output_path: PathBuf::from(request.output_path),
+        sampling,
+        time_split,
+        exclude_calling_thread: request.exclude_calling_thread,
+        calling_tid: 0,
+    })
+}
+
+pub(crate) fn parse_enable(bytes: &[u8]) -> Result<EnableConfig> {
+    let request = capture::EnableRequest::decode(bytes)
+        .coded(ErrorCode::InvalidConfig, "invalid EnableRequest")?;
+    let session = request.session_id.as_bytes();
+    if session.len() != 36
+        || [8, 13, 18, 23].iter().any(|index| session[*index] != b'-')
+        || !session
+            .iter()
+            .all(|byte| *byte == b'-' || byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+    {
+        return Err(invalid_config(
+            "sessionId must be a canonical lowercase UUID",
+        ));
+    }
+    let signal = request.signal;
+    if request.capture_epoch == 0
+        || signal <= 0
+        || signal > libc::SIGRTMAX()
+        || signal == libc::SIGKILL
+        || signal == libc::SIGSTOP
         // Linux kernel RT signals below libc's runtime minimum are reserved by libc.
-        || (32..libc::SIGRTMIN()).contains(&config.signal)
+        || (32..libc::SIGRTMIN()).contains(&signal)
     {
-        bail!("captureEpoch and signal must be valid nonzero values");
+        return Err(invalid_config(
+            "captureEpoch and signal must be valid nonzero values",
+        ));
     }
-    if config
-        .signal_delivery
-        .as_deref()
-        .is_some_and(|delivery| delivery != signal_delivery(config.signal))
-    {
-        bail!("signalDelivery does not match the selected signal category");
+    // Delivery is never inferred: an unspecified or mismatched policy is rejected, not replaced.
+    if request.signal_delivery != signal_delivery(signal) as i32 {
+        return Err(invalid_config(
+            "signalDelivery does not match the selected signal category",
+        ));
     }
-    Ok(config)
+    Ok(EnableConfig {
+        session_id: request.session_id,
+        capture_epoch: request.capture_epoch,
+        signal,
+        signal_delivery: signal_delivery(signal),
+        sampling: request
+            .sampling
+            .ok_or_else(|| invalid_config("sampling must be set"))?,
+        time_split: request
+            .time_split
+            .ok_or_else(|| invalid_config("timeSplit must be set"))?,
+    })
 }
 
-fn signal_delivery(signal: i32) -> &'static str {
+fn signal_delivery(signal: i32) -> capture::SignalDelivery {
     if signal >= libc::SIGRTMIN() && signal <= libc::SIGRTMAX() {
-        "queued"
+        capture::SignalDelivery::Queued
     } else {
-        "coalescing"
+        capture::SignalDelivery::Coalescing
     }
 }
 
 fn signal_environment_snapshot(
     identity: &PreparedIdentity,
     signal: i32,
-    phase: &'static str,
+    phase: capture::SnapshotPhase,
     outer_deadline: Option<Instant>,
-) -> Value {
+) -> capture::SignalEnvironment {
     let snapshot_started = Instant::now();
     let budget = outer_deadline.map_or(SIGNAL_DIAGNOSTIC_BUDGET, |outer| {
         (outer.saturating_duration_since(snapshot_started) / 4).min(SIGNAL_DIAGNOSTIC_BUDGET)
     });
     let deadline = snapshot_started + budget;
     let (observed_ns, clock_unavailable_reason) = match monotonic_ns() {
-        Ok(value) => (Some(value.to_string()), None),
-        Err(error) => (None, Some(diagnostic_reason(&error))),
+        Ok(value) => (Some(value), String::new()),
+        Err(error) => (None, diagnostic_reason(&error)),
     };
     let alive_before = !pidfd_exited(&identity.pidfd);
     let unavailable = if alive_before {
@@ -575,25 +724,27 @@ fn signal_environment_snapshot(
         };
         (rlimit, sigq, audit) = unavailable_signal_diagnostics(identity, signal, reason, false);
     }
-    let time_budget_exceeded = audit["timeBudgetExceeded"].as_bool().unwrap_or(false);
-    json!({
-        "snapshotPhase": phase,
-        "observedMonotonicNanos": observed_ns,
-        "clockUnavailableReason": clock_unavailable_reason,
-        "selectedSignal": signal,
-        "signalClass": if signal_delivery(signal) == "queued" { "realtime" } else { "standard" },
-        "signalDelivery": signal_delivery(signal),
-        "runtimeRealtimeMin": libc::SIGRTMIN(),
-        "runtimeRealtimeMax": libc::SIGRTMAX(),
-        "timeBudgetMillis": budget.as_millis(),
-        "maximumTimeBudgetMillis": SIGNAL_DIAGNOSTIC_BUDGET.as_millis(),
-        "timeBudgetExceeded": time_budget_exceeded,
-        "targetPidfdAliveBefore": alive_before,
-        "targetPidfdAliveAfter": alive_after,
-        "rlimitSigpending": rlimit,
-        "sigQ": sigq,
-        "threadMaskAudit": audit,
-    })
+    capture::SignalEnvironment {
+        phase: phase as i32,
+        observed_monotonic_nanos: observed_ns,
+        clock_unavailable_reason,
+        selected_signal: signal,
+        signal_delivery: signal_delivery(signal) as i32,
+        runtime_realtime_min: libc::SIGRTMIN(),
+        runtime_realtime_max: libc::SIGRTMAX(),
+        time_budget_millis: millis(budget),
+        maximum_time_budget_millis: millis(SIGNAL_DIAGNOSTIC_BUDGET),
+        time_budget_exceeded: audit.time_budget_exceeded,
+        target_pidfd_alive_before: alive_before,
+        target_pidfd_alive_after: alive_after,
+        rlimit_sigpending: Some(rlimit),
+        signal_queue: Some(sigq),
+        thread_mask_audit: Some(audit),
+    }
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn unavailable_signal_diagnostics(
@@ -601,21 +752,28 @@ fn unavailable_signal_diagnostics(
     signal: i32,
     reason: &str,
     timed_out: bool,
-) -> (Value, Value, Value) {
+) -> (
+    capture::SigpendingLimit,
+    capture::SignalQueue,
+    capture::ThreadMaskAudit,
+) {
     (
-        json!({
-            "status": "unavailable",
-            "soft": Value::Null,
-            "hard": Value::Null,
-            "unavailableReason": reason,
-            "scope": "target process; queued signals accounted per real user",
-        }),
+        unavailable_sigpending_limit(reason.to_string()),
         unavailable_sigq(reason, None),
         unavailable_thread_mask_audit(identity, signal, reason, timed_out),
     )
 }
 
-fn sigpending_limit_snapshot(target_pid: u32) -> Value {
+fn unavailable_sigpending_limit(reason: String) -> capture::SigpendingLimit {
+    capture::SigpendingLimit {
+        status: capture::DiagnosticStatus::Unavailable as i32,
+        soft: None,
+        hard: None,
+        unavailable_reason: reason,
+    }
+}
+
+fn sigpending_limit_snapshot(target_pid: u32) -> capture::SigpendingLimit {
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     let result = unsafe {
         libc::prlimit(
@@ -626,33 +784,33 @@ fn sigpending_limit_snapshot(target_pid: u32) -> Value {
         )
     };
     if result != 0 {
-        return json!({
-            "status": "unavailable",
-            "soft": Value::Null,
-            "hard": Value::Null,
-            "unavailableReason": diagnostic_reason(&std::io::Error::last_os_error()),
-            "scope": "target process; queued signals accounted per real user",
-        });
+        return unavailable_sigpending_limit(diagnostic_reason(&std::io::Error::last_os_error()));
     }
     let limit = unsafe { limit.assume_init() };
-    json!({
-        "status": "ok",
-        "soft": rlimit_json(limit.rlim_cur),
-        "hard": rlimit_json(limit.rlim_max),
-        "unavailableReason": Value::Null,
-        "scope": "target process; queued signals accounted per real user",
-    })
-}
-
-fn rlimit_json(value: libc::rlim_t) -> String {
-    if value == libc::RLIM_INFINITY {
-        "unlimited".to_string()
-    } else {
-        value.to_string()
+    capture::SigpendingLimit {
+        status: capture::DiagnosticStatus::Ok as i32,
+        soft: Some(rlimit_value(limit.rlim_cur)),
+        hard: Some(rlimit_value(limit.rlim_max)),
+        unavailable_reason: String::new(),
     }
 }
 
-fn sigq_snapshot(target_pid: u32, deadline: Instant) -> Value {
+fn rlimit_value(value: libc::rlim_t) -> capture::RlimitValue {
+    use capture::rlimit_value::Value;
+    capture::RlimitValue {
+        value: Some(if value == libc::RLIM_INFINITY {
+            Value::Unlimited(true)
+        } else {
+            #[allow(
+                clippy::useless_conversion,
+                reason = "rlim_t is not u64 on every target"
+            )]
+            Value::Limit(u64::from(value))
+        }),
+    }
+}
+
+fn sigq_snapshot(target_pid: u32, deadline: Instant) -> capture::SignalQueue {
     let status_path = format!("/proc/{target_pid}/status");
     let status = match read_proc_status(&status_path, deadline) {
         Ok(status) => status,
@@ -669,60 +827,46 @@ fn sigq_snapshot(target_pid: u32, deadline: Instant) -> Value {
         return unavailable_sigq(reason, Some(status.truncated));
     };
     let Some((used, limit)) = value.split_once('/') else {
-        return json!({
-            "status": "unavailable",
-            "used": Value::Null,
-            "limit": Value::Null,
-            "observedHeadroom": Value::Null,
-            "overLimit": Value::Null,
-            "unavailableReason": "invalid SigQ field in target status",
-            "scope": "shared real-user queued-signal accounting",
-            "capacityGuarantee": false,
-            "statusFileTruncated": status.truncated,
-        });
+        return unavailable_sigq(
+            "invalid SigQ field in target status",
+            Some(status.truncated),
+        );
     };
     let parsed = used.parse::<u64>().ok().zip(limit.parse::<u64>().ok());
     let Some((used, limit)) = parsed else {
-        return json!({
-            "status": "unavailable",
-            "used": Value::Null,
-            "limit": Value::Null,
-            "observedHeadroom": Value::Null,
-            "overLimit": Value::Null,
-            "unavailableReason": "non-decimal SigQ field in target status",
-            "scope": "shared real-user queued-signal accounting",
-            "capacityGuarantee": false,
-            "statusFileTruncated": status.truncated,
-        });
+        return unavailable_sigq(
+            "non-decimal SigQ field in target status",
+            Some(status.truncated),
+        );
     };
-    json!({
-        "status": "ok",
-        "used": used.to_string(),
-        "limit": limit.to_string(),
-        "observedHeadroom": limit.saturating_sub(used).to_string(),
-        "overLimit": used > limit,
-        "unavailableReason": Value::Null,
-        "scope": "shared real-user queued-signal accounting",
-        "capacityGuarantee": false,
-        "statusFileTruncated": status.truncated,
-    })
+    capture::SignalQueue {
+        status: capture::DiagnosticStatus::Ok as i32,
+        used: Some(used),
+        limit: Some(limit),
+        observed_headroom: Some(limit.saturating_sub(used)),
+        over_limit: Some(used > limit),
+        unavailable_reason: String::new(),
+        status_file_truncated: Some(status.truncated),
+    }
 }
 
-fn unavailable_sigq(reason: &str, status_file_truncated: Option<bool>) -> Value {
-    json!({
-        "status": "unavailable",
-        "used": Value::Null,
-        "limit": Value::Null,
-        "observedHeadroom": Value::Null,
-        "overLimit": Value::Null,
-        "unavailableReason": reason,
-        "scope": "shared real-user queued-signal accounting",
-        "capacityGuarantee": false,
-        "statusFileTruncated": status_file_truncated,
-    })
+fn unavailable_sigq(reason: &str, status_file_truncated: Option<bool>) -> capture::SignalQueue {
+    capture::SignalQueue {
+        status: capture::DiagnosticStatus::Unavailable as i32,
+        used: None,
+        limit: None,
+        observed_headroom: None,
+        over_limit: None,
+        unavailable_reason: reason.to_string(),
+        status_file_truncated,
+    }
 }
 
-fn thread_mask_audit(identity: &PreparedIdentity, signal: i32, deadline: Instant) -> Value {
+fn thread_mask_audit(
+    identity: &PreparedIdentity,
+    signal: i32,
+    deadline: Instant,
+) -> capture::ThreadMaskAudit {
     if Instant::now() >= deadline {
         return unavailable_thread_mask_audit(
             identity,
@@ -826,39 +970,31 @@ fn thread_mask_audit(identity: &PreparedIdentity, signal: i32, deadline: Instant
     }
     let audited = blocked + unblocked + unknown;
     let status = if truncated || enumeration_failures != 0 || unknown != 0 {
-        "partial"
+        capture::DiagnosticStatus::Partial
     } else {
-        "ok"
+        capture::DiagnosticStatus::Ok
     };
-    json!({
-        "status": status,
-        "selectedSignal": signal,
-        "maskField": "SigBlk",
-        "tidNamespace": "collectorProcfs",
-        "targetPidArgument": identity.target_pid,
-        "targetPidNamespaceInode": identity.pid_namespace_inode.to_string(),
-        "maxAuditedThreads": MAX_AUDITED_THREADS,
-        "auditedThreads": audited.to_string(),
-        "blockedThreads": blocked.to_string(),
-        "unblockedThreads": unblocked.to_string(),
-        "unknownThreads": unknown.to_string(),
-        "enumerationFailures": enumeration_failures.to_string(),
-        "enumerationTruncated": truncated,
-        "timeBudgetExceeded": timed_out,
-        "statusFilesTruncated": status_files_truncated.to_string(),
-        "unauditedThreadsKnownMinimum": if truncated || enumeration_failures != 0 {
-            Value::Null
-        } else {
-            json!("0")
-        },
-        "blockedTidExamples": blocked_examples,
-        "blockedExamplesTruncated": blocked as usize > MAX_TID_EXAMPLES,
-        "unknownExamples": unknown_examples,
-        "unknownExamplesTruncated": (unknown + enumeration_failures) as usize > MAX_TID_EXAMPLES,
-        "unavailableReason": Value::Null,
-        "remoteMasksModified": false,
-        "consistency": "bestEffortNonAtomic",
-    })
+    capture::ThreadMaskAudit {
+        status: status as i32,
+        selected_signal: signal,
+        target_pid_argument: identity.target_pid,
+        target_pid_namespace_inode: identity.pid_namespace_inode,
+        max_audited_threads: MAX_AUDITED_THREADS as u32,
+        audited_threads: audited,
+        blocked_threads: blocked,
+        unblocked_threads: unblocked,
+        unknown_threads: unknown,
+        enumeration_failures,
+        enumeration_truncated: truncated,
+        time_budget_exceeded: timed_out,
+        status_files_truncated,
+        unaudited_threads_known_minimum: (!truncated && enumeration_failures == 0).then_some(0),
+        blocked_tid_examples: blocked_examples,
+        blocked_examples_truncated: blocked as usize > MAX_TID_EXAMPLES,
+        unknown_examples,
+        unknown_examples_truncated: (unknown + enumeration_failures) as usize > MAX_TID_EXAMPLES,
+        unavailable_reason: String::new(),
+    }
 }
 
 fn unavailable_thread_mask_audit(
@@ -866,32 +1002,18 @@ fn unavailable_thread_mask_audit(
     signal: i32,
     reason: &str,
     timed_out: bool,
-) -> Value {
-    json!({
-        "status": "unavailable",
-        "selectedSignal": signal,
-        "maskField": "SigBlk",
-        "tidNamespace": "collectorProcfs",
-        "targetPidArgument": identity.target_pid,
-        "targetPidNamespaceInode": identity.pid_namespace_inode.to_string(),
-        "maxAuditedThreads": MAX_AUDITED_THREADS,
-        "auditedThreads": "0",
-        "blockedThreads": "0",
-        "unblockedThreads": "0",
-        "unknownThreads": "0",
-        "enumerationFailures": "0",
-        "enumerationTruncated": false,
-        "timeBudgetExceeded": timed_out,
-        "statusFilesTruncated": "0",
-        "unauditedThreadsKnownMinimum": Value::Null,
-        "blockedTidExamples": [],
-        "blockedExamplesTruncated": false,
-        "unknownExamples": [],
-        "unknownExamplesTruncated": false,
-        "unavailableReason": reason,
-        "remoteMasksModified": false,
-        "consistency": "bestEffortNonAtomic",
-    })
+) -> capture::ThreadMaskAudit {
+    capture::ThreadMaskAudit {
+        status: capture::DiagnosticStatus::Unavailable as i32,
+        selected_signal: signal,
+        target_pid_argument: identity.target_pid,
+        target_pid_namespace_inode: identity.pid_namespace_inode,
+        max_audited_threads: MAX_AUDITED_THREADS as u32,
+        time_budget_exceeded: timed_out,
+        unaudited_threads_known_minimum: None,
+        unavailable_reason: reason.to_string(),
+        ..capture::ThreadMaskAudit::default()
+    }
 }
 
 struct ProcStatus {
@@ -901,7 +1023,7 @@ struct ProcStatus {
 
 fn read_proc_status(path: &str, deadline: Instant) -> Result<ProcStatus> {
     if Instant::now() >= deadline {
-        bail!("signal-environment time budget exhausted before reading {path}");
+        anyhow::bail!("signal-environment time budget exhausted before reading {path}");
     }
     let file = File::open(path).with_context(|| format!("open {path}"))?;
     let mut bytes = Vec::with_capacity(MAX_PROC_STATUS_BYTES.min(4096));
@@ -950,16 +1072,23 @@ fn signal_is_blocked(mask: &str, signal: i32) -> std::result::Result<bool, Strin
 }
 
 fn push_unknown_example(
-    examples: &mut Vec<Value>,
+    examples: &mut Vec<capture::UnknownThread>,
     tid: Option<u32>,
     error: &dyn std::fmt::Display,
 ) {
     push_unknown_message(examples, tid, &diagnostic_reason(error));
 }
 
-fn push_unknown_message(examples: &mut Vec<Value>, tid: Option<u32>, reason: &str) {
+fn push_unknown_message(
+    examples: &mut Vec<capture::UnknownThread>,
+    tid: Option<u32>,
+    reason: &str,
+) {
     if examples.len() < MAX_TID_EXAMPLES {
-        examples.push(json!({"tid": tid, "reason": diagnostic_reason(&reason)}));
+        examples.push(capture::UnknownThread {
+            tid,
+            reason: diagnostic_reason(&reason),
+        });
     }
 }
 
@@ -1053,14 +1182,17 @@ fn prepare_internal(
             }));
             let failure = match outcome {
                 Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(format!("{error:#}")),
-                Err(_) => Some("collector worker panicked".to_string()),
+                Ok(Err(error)) => Some(Failure::of(&error)),
+                Err(_) => Some(Failure {
+                    code: ErrorCode::InternalError,
+                    message: "collector worker panicked".to_string(),
+                }),
             };
-            if let Some(message) = failure {
-                let _ = ready_tx.send(Err(message.clone()));
+            if let Some(failure) = failure {
+                let _ = ready_tx.send(Err(failure.clone()));
                 let mut result = worker_close_result.lock().unwrap();
                 if result.is_none() {
-                    *result = Some(Err(message));
+                    *result = Some(Err(failure));
                 }
             }
             #[cfg(test)]
@@ -1075,10 +1207,10 @@ fn prepare_internal(
         .context("collector prepare timed out")?;
     let prepared = match prepared_result {
         Ok(prepared) => prepared,
-        Err(message) => {
+        Err(failure) => {
             join.join()
                 .map_err(|_| anyhow!("collector worker panicked after prepare failure"))?;
-            return Err(anyhow!(message));
+            return Err(failure.into_error());
         }
     };
     registry().lock().unwrap().insert(
@@ -1090,33 +1222,31 @@ fn prepare_internal(
             close_result,
         },
     );
-    let response = control_success(json!({
-        "handle": format!("{handle:016x}"),
-        "state": "prepared",
-        "sourcePath": output_path,
-        "targetPid": prepared.target_pid,
-        "hostTgid": prepared.host_tgid,
-        "sampling": prepared.sampling.json(),
-        "timeSplit": prepared.time_split.json(),
-        "verifiedIdentity": {
-            "registrationToken": format!("{:016x}", prepared.registration_token),
-            "processGenerationNs": prepared.process_generation_ns.to_string(),
-            "pidNamespaceDevice": prepared.pid_namespace_device.to_string(),
-            "pidNamespaceInode": prepared.pid_namespace_inode.to_string(),
-            "timeNamespaceInode": prepared.time_namespace_inode.to_string(),
-            "clockVerified": true,
-            "monotonicOffsetNanos": "0"
-        }
-    }));
-    Ok(PreparedCollector { handle, response })
+    let reply = reply(
+        CollectorState::Prepared,
+        capture::collector_reply::Result::Prepared(capture::Prepared {
+            handle,
+            source_path: path_text(&output_path),
+            target_pid: prepared.target_pid,
+            host_tgid: prepared.host_tgid,
+            sampling: Some(prepared.sampling.message.clone()),
+            time_split: Some(prepared.time_split.message),
+            verified_identity: Some(prepared.verified_identity()),
+        }),
+    );
+    Ok(PreparedCollector { handle, reply })
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 #[derive(Clone)]
 struct PreparedReply {
     target_pid: u32,
     host_tgid: u32,
-    sampling: SamplingConfig,
-    time_split: TimeSplitConfig,
+    sampling: SamplingPolicy,
+    time_split: TimeSplitPolicy,
     registration_token: u64,
     pid_namespace_device: u64,
     pid_namespace_inode: u64,
@@ -1124,41 +1254,78 @@ struct PreparedReply {
     process_generation_ns: u64,
 }
 
-pub(crate) fn enable(handle: u64, config: EnableConfig) -> Result<Value> {
-    request(handle, |sender| {
+impl PreparedReply {
+    /// Prepare rejects a different time namespace and any monotonic offset, so the clock is
+    /// verified and the offset is zero.
+    fn verified_identity(&self) -> capture::VerifiedIdentity {
+        capture::VerifiedIdentity {
+            registration_token: self.registration_token,
+            process_generation_nanos: self.process_generation_ns,
+            pid_namespace_device: self.pid_namespace_device,
+            pid_namespace_inode: self.pid_namespace_inode,
+            time_namespace_inode: self.time_namespace_inode,
+            clock_verified: true,
+            monotonic_offset_nanos: 0,
+        }
+    }
+}
+
+pub(crate) fn enable(handle: u64, config: EnableConfig) -> Result<CollectorReply> {
+    let enabled = request(handle, |sender| {
         let (tx, rx) = mpsc::channel();
         sender
             .send(Command::Enable(config, tx))
             .map_err(|_| anyhow!("collector worker stopped"))?;
         rx.recv_timeout(Duration::from_secs(10))
             .context("collector enable timed out")?
-            .map_err(|message| anyhow!(message))
-    })
+            .map_err(Failure::into_error)
+    })?;
+    Ok(reply(
+        CollectorState::Enabled,
+        capture::collector_reply::Result::Enabled(enabled),
+    ))
 }
 
-pub(crate) fn stop(handle: u64, timeout: Duration) -> Result<Value> {
-    request(handle, |sender| {
+pub(crate) fn stop(handle: u64, timeout: Duration) -> Result<CollectorReply> {
+    let outcome = request(handle, |sender| {
         let (tx, rx) = mpsc::channel();
         sender
             .send(Command::Stop(timeout, tx))
             .map_err(|_| anyhow!("collector worker stopped"))?;
         rx.recv_timeout(timeout.saturating_add(Duration::from_secs(1)))
-            .context("collector stop timed out")?
-            .map_err(|message| anyhow!(message))
-    })
+            .coded(ErrorCode::StopTimeout, "collector stop timed out")?
+            .map_err(Failure::into_error)
+    })?;
+    Ok(reply(
+        outcome.state(),
+        capture::collector_reply::Result::Stopped(outcome.stopped),
+    ))
 }
 
-pub(crate) fn close(handle: u64) -> Result<Value> {
+fn closed_reply(
+    handle: u64,
+    idempotent: bool,
+    stopped: Option<capture::Stopped>,
+) -> CollectorReply {
+    reply(
+        CollectorState::Closed,
+        capture::collector_reply::Result::Closed(capture::Closed {
+            handle,
+            idempotent,
+            stopped,
+        }),
+    )
+}
+
+pub(crate) fn close(handle: u64) -> Result<CollectorReply> {
     if closed_handles().lock().unwrap().contains(&handle) {
-        return Ok(control_success(
-            json!({"state":"closed","handle":format!("{handle:016x}"),"idempotent":true}),
-        ));
+        return Ok(closed_reply(handle, true, None));
     }
     let (result_slot, deadline) = {
         let mut entries = registry().lock().unwrap();
         let entry = entries
             .get_mut(&handle)
-            .ok_or_else(|| anyhow!("invalid collector handle"))?;
+            .ok_or_else(|| fail(ErrorCode::InvalidHandle, "invalid collector handle"))?;
         if !entry.close_requested {
             // A worker failure publishes close_result before exiting. A failed
             // send is therefore still joinable and yields that bounded error.
@@ -1180,29 +1347,34 @@ pub(crate) fn close(handle: u64) -> Result<Value> {
                     }
                 }
             } else if closed_handles().lock().unwrap().contains(&handle) {
-                return Ok(control_success(
-                    json!({"state":"closed","handle":format!("{handle:016x}"),"idempotent":true}),
-                ));
+                return Ok(closed_reply(handle, true, None));
             }
         }
         if Instant::now() >= deadline {
-            bail!("close_timeout; collector ownership retained");
+            return Err(fail(
+                ErrorCode::CloseTimeout,
+                "close timed out; collector ownership retained",
+            ));
         }
         thread::sleep(Duration::from_millis(5));
     };
     let join_result = join
         .join()
         .map_err(|_| anyhow!("collector worker panicked"));
-    let response = result_slot
+    let outcome = result_slot
         .lock()
         .unwrap()
         .clone()
         .unwrap()
-        .map_err(|message| anyhow!(message));
+        .map_err(Failure::into_error);
     closed_handles().lock().unwrap().insert(handle);
     registry().lock().unwrap().remove(&handle);
     join_result?;
-    response
+    Ok(closed_reply(
+        handle,
+        false,
+        outcome?.map(|outcome| outcome.stopped),
+    ))
 }
 
 fn request<T>(handle: u64, operation: impl FnOnce(Sender<Command>) -> Result<T>) -> Result<T> {
@@ -1211,7 +1383,7 @@ fn request<T>(handle: u64, operation: impl FnOnce(Sender<Command>) -> Result<T>)
         .unwrap()
         .get(&handle)
         .map(|entry| entry.sender.clone())
-        .ok_or_else(|| anyhow!("invalid collector handle"))?;
+        .ok_or_else(|| fail(ErrorCode::InvalidHandle, "invalid collector handle"))?;
     operation(sender)
 }
 
@@ -1231,18 +1403,31 @@ fn allocate_handle() -> Result<u64> {
 }
 
 fn verify_identity(target_pid: u32) -> Result<PreparedIdentity> {
-    fs::metadata(format!("/proc/{target_pid}"))
-        .with_context(|| format!("target {target_pid} is not visible"))?;
-    let self_time = fs::metadata("/proc/self/ns/time")?.ino();
-    let target_time = fs::metadata(format!("/proc/{target_pid}/ns/time"))?.ino();
-    let target_pid_namespace_before =
-        fs::metadata(format!("/proc/{target_pid}/ns/pid")).context("read target PID namespace")?;
+    fs::metadata(format!("/proc/{target_pid}")).coded(
+        ErrorCode::IoError,
+        format!("target {target_pid} is not visible"),
+    )?;
+    let self_time = fs::metadata("/proc/self/ns/time")
+        .coded(ErrorCode::IoError, "read collector time namespace")?
+        .ino();
+    let target_time = fs::metadata(format!("/proc/{target_pid}/ns/time"))
+        .coded(ErrorCode::IoError, "read target time namespace")?
+        .ino();
+    let target_pid_namespace_before = fs::metadata(format!("/proc/{target_pid}/ns/pid"))
+        .coded(ErrorCode::IoError, "read target PID namespace")?;
     if self_time != target_time {
-        bail!("collector and target use different time namespaces");
+        return Err(invalid_config(
+            "collector and target use different time namespaces",
+        ));
     }
-    let monotonic_offset = monotonic_time_namespace_offset()?;
+    let monotonic_offset = monotonic_time_namespace_offset().coded(
+        ErrorCode::InvalidConfig,
+        "verify the collector's monotonic time namespace offset",
+    )?;
     if monotonic_offset != 0 {
-        bail!("unsupported nonzero monotonic time namespace offset: {monotonic_offset}ns");
+        return Err(invalid_config(format!(
+            "unsupported nonzero monotonic time namespace offset: {monotonic_offset}ns"
+        )));
     }
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, target_pid, 0) } as i32;
     if fd < 0 {
@@ -1250,7 +1435,10 @@ fn verify_identity(target_pid: u32) -> Result<PreparedIdentity> {
     }
     let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
     if pidfd_exited(&pidfd) {
-        bail!("target_exited while verifying PID namespace");
+        return Err(fail(
+            ErrorCode::TargetExited,
+            "target exited while verifying PID namespace",
+        ));
     }
     let target_pid_namespace_after = fs::metadata(format!("/proc/{target_pid}/ns/pid"))
         .context("recheck target PID namespace")?;
@@ -1328,34 +1516,42 @@ fn worker(
     config: PrepareConfig,
     mut identity: PreparedIdentity,
     commands: Receiver<Command>,
-    ready: mpsc::SyncSender<std::result::Result<PreparedReply, String>>,
-    close_result: Arc<Mutex<Option<Result<Value, String>>>>,
+    ready: mpsc::SyncSender<Reply<PreparedReply>>,
+    close_result: Arc<Mutex<Option<Reply<Option<StopOutcome>>>>>,
     #[cfg(test)] test_control: Option<PrepareTestControl>,
 ) -> Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&config.output_path)
-        .with_context(|| format!("create source artifact {}", config.output_path.display()))?;
+        .coded(
+            ErrorCode::IoError,
+            format!("create source artifact {}", config.output_path.display()),
+        )?;
     // Rows with symbolized stacks run to a few kilobytes; a large buffer keeps a drain batch to a
     // handful of write syscalls instead of one per row.
     let mut writer = BufWriter::with_capacity(OUTPUT_BUFFER_BYTES, file);
     writer
         .write_all(&capture::header())
-        .context("write source artifact header")?;
+        .coded(ErrorCode::IoError, "write source artifact header")?;
 
     // No silent fallback: a kernel without the accounting needs an explicit `off`.
     if config.time_split.source == TimeSplitSource::SchedInfo && !run_delay_available()? {
-        bail!(
-            "timeSplit.source schedInfo needs task_struct.sched_info.run_delay (CONFIG_SCHED_INFO), \
-             which this kernel lacks; set timeSplit.source to off"
-        );
+        return Err(fail(
+            ErrorCode::BpfUnsupported,
+            "timeSplit.source SCHED_INFO needs task_struct.sched_info.run_delay (CONFIG_SCHED_INFO), \
+             which this kernel lacks; set timeSplit.source to OFF",
+        ));
     }
     let mut object = MaybeUninit::uninit();
     let open = JonoffcpuCookieSkelBuilder::default()
         .open(&mut object)
-        .context("open scheduler-exit BPF skeleton")?;
-    let mut skel = open.load().context(
+        .coded(
+            ErrorCode::BpfUnsupported,
+            "open scheduler-exit BPF skeleton",
+        )?;
+    let mut skel = open.load().coded(
+        ErrorCode::BpfUnsupported,
         "load scheduler-exit BPF object (requires tp_btf/sched_exit_tp and the four-argument \
          tp_btf/sched_switch of Linux 5.18 or newer)",
     )?;
@@ -1392,7 +1588,7 @@ fn worker(
             &target_binding_bytes(identity.registration_token),
             MapFlags::ANY,
         )
-        .context("seed exact target task storage")?;
+        .coded(ErrorCode::BpfUnsupported, "seed exact target task storage")?;
 
     // The injected failure attaches the BTF program as a classic tracepoint of a name that does not
     // exist, so the kernel itself refuses it and the unwind path is the real one.
@@ -1408,13 +1604,13 @@ fn worker(
     } else {
         skel.progs.record_switch_out.attach()
     }
-    .context("attach sched_switch recorder")?;
+    .coded(ErrorCode::BpfUnsupported, "attach sched_switch recorder")?;
     #[cfg(not(test))]
     let switch_out = skel
         .progs
         .record_switch_out
         .attach()
-        .context("attach sched_switch recorder")?;
+        .coded(ErrorCode::BpfUnsupported, "attach sched_switch recorder")?;
 
     #[cfg(test)]
     if test_control
@@ -1431,11 +1627,10 @@ fn worker(
         return Err(std::io::Error::from_raw_os_error(libc::EPERM))
             .context("injected END attach failure");
     }
-    let switch_in = skel
-        .progs
-        .capture_switch_in
-        .attach()
-        .context("attach sched_exit_tp completion hook")?;
+    let switch_in = skel.progs.capture_switch_in.attach().coded(
+        ErrorCode::BpfUnsupported,
+        "attach sched_exit_tp completion hook",
+    )?;
 
     #[cfg(test)]
     if test_control
@@ -1467,8 +1662,13 @@ fn worker(
             }
             0
         })
-        .context("register observation ring callback")?;
-    let ring = ring_builder.build().context("build observation ring")?;
+        .coded(
+            ErrorCode::BpfUnsupported,
+            "register observation ring callback",
+        )?;
+    let ring = ring_builder
+        .build()
+        .coded(ErrorCode::BpfUnsupported, "build observation ring")?;
 
     let reply = PreparedReply {
         target_pid: identity.target_pid,
@@ -1569,7 +1769,10 @@ fn wait_for_kernel_identity(map: &impl MapCore, pidfd: &OwnedFd) -> Result<(u32,
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if pidfd_exited(pidfd) {
-            bail!("target_exited before kernel identity discovery");
+            return Err(fail(
+                ErrorCode::TargetExited,
+                "target exited before kernel identity discovery",
+            ));
         }
         if let Some(value) = map.lookup(&pidfd.as_raw_fd().to_ne_bytes(), MapFlags::ANY)? {
             if value.len() == 24 {
@@ -1600,11 +1803,11 @@ fn worker_loop(
     mut switch_out: Option<Link>,
     mut switch_in: Option<Link>,
     reply: PreparedReply,
-    close_result: Arc<Mutex<Option<Result<Value, String>>>>,
+    close_result: Arc<Mutex<Option<Reply<Option<StopOutcome>>>>>,
 ) -> Result<()> {
     let mut capture: Option<CaptureState> = None;
     let mut stopped = false;
-    let mut terminal_stop: Option<Value> = None;
+    let mut terminal_stop: Option<StopOutcome> = None;
     let mut terminal_publication = TerminalPublication::default();
     let mut automatic_stop_attempted = false;
     loop {
@@ -1658,7 +1861,7 @@ fn worker_loop(
         match command {
             Command::Enable(enable, response) => {
                 let result = if stopped || terminal_publication.started() {
-                    Err(anyhow!("collector capture already stopped"))
+                    Err(invalid_state("collector capture already stopped"))
                 } else {
                     enable_capture(
                         &config,
@@ -1670,7 +1873,7 @@ fn worker_loop(
                         &mut capture,
                     )
                 };
-                let _ = response.send(result.map_err(|error| format!("{error:#}")));
+                let _ = response.send(result.map_err(|error| Failure::of(&error)));
             }
             Command::Stop(timeout, response) => {
                 let result = if let Some(value) = &terminal_stop {
@@ -1698,11 +1901,11 @@ fn worker_loop(
                 if result.is_ok() {
                     terminal_stop = result.as_ref().ok().cloned();
                 }
-                let _ = response.send(result.map_err(|error| format!("{error:#}")));
+                let _ = response.send(result.map_err(|error| Failure::of(&error)));
             }
             Command::Close => {
                 let result = if let Some(value) = &terminal_stop {
-                    Ok(value.clone())
+                    Ok(Some(value.clone()))
                 } else if capture.is_some() || terminal_publication.started() {
                     stop_capture(
                         &config.output_path,
@@ -1719,22 +1922,16 @@ fn worker_loop(
                         pidfd_exited(&identity.pidfd),
                         false,
                     )
+                    .map(Some)
                 } else {
-                    Ok(control_success(json!({"state":"closed"})))
+                    Ok(None)
                 };
                 // Explicit drop order: disable/detach happens in stop; the
                 // links still remain valid during a prepared-only close.
                 skel.maps.bss_data.as_deref_mut().unwrap().enabled = 0;
                 switch_out.take();
                 switch_in.take();
-                *close_result.lock().unwrap() = Some(
-                    result
-                        .map(|mut value| {
-                            value["state"] = json!("closed");
-                            value
-                        })
-                        .map_err(|error| format!("{error:#}")),
-                );
+                *close_result.lock().unwrap() = Some(result.map_err(|error| Failure::of(&error)));
                 break;
             }
         }
@@ -1751,8 +1948,8 @@ struct CaptureState {
     /// Stack ids already written as their own record. The BPF stack map returns one id per distinct
     /// stack and is never cleared during a capture, so an id identifies the same frames throughout.
     emitted_stacks: HashSet<i64>,
-    post_detach_signal_environment: Option<Value>,
-    end_wall_clock_calibration: Option<WallClockCalibration>,
+    post_detach_signal_environment: Option<capture::SignalEnvironment>,
+    end_wall_clock_calibration: Option<capture::WallClockCalibration>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1769,7 +1966,8 @@ enum TerminalPublicationStage {
 #[derive(Default)]
 struct TerminalPublication {
     stage: TerminalPublicationStage,
-    response: Option<Value>,
+    /// The frozen stop result; its `captureEnd` is the record appended, once.
+    outcome: Option<StopOutcome>,
     automatic: bool,
     append_attempts: u32,
     flush_attempts: u32,
@@ -1782,27 +1980,34 @@ impl TerminalPublication {
         self.stage != TerminalPublicationStage::Open
     }
 
-    fn begin(&mut self, response: Value, automatic: bool) -> Result<()> {
+    fn begin(&mut self, outcome: StopOutcome, automatic: bool) -> Result<()> {
         if self.started() {
             bail!("terminal source publication already started");
         }
-        self.response = Some(response);
+        self.outcome = Some(outcome);
         self.automatic = automatic;
         self.stage = TerminalPublicationStage::AppendStarted;
         Ok(())
     }
 
-    fn advance(&mut self, sink: &mut impl TerminalSink) -> Result<Value> {
+    fn capture_end(&self) -> &capture::CaptureEnd {
+        self.outcome
+            .as_ref()
+            .and_then(|outcome| outcome.stopped.capture_end.as_ref())
+            .expect("a started terminal publication holds its captureEnd")
+    }
+
+    fn advance(&mut self, sink: &mut impl TerminalSink) -> Result<StopOutcome> {
         loop {
             match self.stage {
                 TerminalPublicationStage::Open => bail!("terminal source publication not started"),
                 TerminalPublicationStage::AppendStarted => {
                     self.append_attempts += 1;
-                    let end = self.response.as_ref().unwrap()["captureEnd"].clone();
+                    let end = self.capture_end().clone();
                     if let Err(error) = sink.append_terminal(&end) {
                         self.remember_error("append", &error);
                         self.stage = TerminalPublicationStage::Failed;
-                        return Err(anyhow!(self.stable_error().to_owned()));
+                        return Err(self.stable_error());
                     }
                     self.stage = TerminalPublicationStage::RowWritten;
                 }
@@ -1810,7 +2015,7 @@ impl TerminalPublication {
                     self.flush_attempts += 1;
                     if let Err(error) = sink.flush_terminal() {
                         self.remember_error("flush", &error);
-                        return Err(anyhow!(self.stable_error().to_owned()));
+                        return Err(self.stable_error());
                     }
                     self.stage = TerminalPublicationStage::Flushed;
                 }
@@ -1818,25 +2023,21 @@ impl TerminalPublication {
                     self.sync_attempts += 1;
                     if let Err(error) = sink.sync_terminal() {
                         self.remember_error("sync", &error);
-                        return Err(anyhow!(self.stable_error().to_owned()));
+                        return Err(self.stable_error());
                     }
                     self.stage = TerminalPublicationStage::Durable;
                 }
-                TerminalPublicationStage::Durable => return Ok(self.durable_response()),
-                TerminalPublicationStage::Failed => {
-                    return Err(anyhow!(self.stable_error().to_owned()));
-                }
+                TerminalPublicationStage::Durable => return Ok(self.durable_outcome()),
+                TerminalPublicationStage::Failed => return Err(self.stable_error()),
             }
         }
     }
 
     fn remember_error(&mut self, operation: &str, error: &anyhow::Error) {
         if self.first_error.is_none() {
-            let response = self.response.as_ref().unwrap();
-            let state = response["state"].as_str().unwrap_or("unknown");
-            let reason = response["captureEnd"]["incompleteReason"]
-                .as_str()
-                .unwrap_or("none");
+            let end = self.capture_end();
+            let state = end.state().as_str_name();
+            let reason = end.incomplete_reason().as_str_name();
             self.first_error = Some(format!(
                 "terminal source {operation} failed after frozen captureEnd \
                  (capture state={state}, incompleteReason={reason}); \
@@ -1845,38 +2046,44 @@ impl TerminalPublication {
         }
     }
 
-    fn stable_error(&self) -> &str {
-        self.first_error
-            .as_deref()
-            .unwrap_or("terminal source publication failed")
+    /// The first failure, repeated unchanged by every retry that cannot make progress.
+    fn stable_error(&self) -> anyhow::Error {
+        fail(
+            ErrorCode::IoError,
+            self.first_error
+                .as_deref()
+                .unwrap_or("terminal source publication failed"),
+        )
     }
 
-    fn durable_response(&self) -> Value {
-        let mut response = self.response.as_ref().unwrap().clone();
-        response["terminalPublication"] = json!({
-            "state": "durable",
-            "automatic": self.automatic,
-            "appendAttempts": self.append_attempts,
-            "flushAttempts": self.flush_attempts,
-            "syncAttempts": self.sync_attempts,
-            "firstError": self.first_error,
+    fn durable_outcome(&self) -> StopOutcome {
+        let mut outcome = self.outcome.clone().unwrap();
+        outcome.stopped.terminal_publication = Some(capture::TerminalPublication {
+            automatic: self.automatic,
+            append_attempts: self.append_attempts,
+            flush_attempts: self.flush_attempts,
+            sync_attempts: self.sync_attempts,
+            first_error: self.first_error.clone().unwrap_or_default(),
         });
-        response
+        outcome
     }
 }
 
 trait TerminalSink {
-    fn append_terminal(&mut self, value: &Value) -> Result<()>;
+    fn append_terminal(&mut self, end: &capture::CaptureEnd) -> Result<()>;
     fn flush_terminal(&mut self) -> Result<()>;
     fn sync_terminal(&mut self) -> Result<()>;
 }
 
 impl TerminalSink for BufWriter<File> {
-    fn append_terminal(&mut self, value: &Value) -> Result<()> {
+    fn append_terminal(&mut self, end: &capture::CaptureEnd) -> Result<()> {
         write_record(
             self,
-            &control_record(value, capture::record::Record::CaptureEnd),
+            &capture::Record {
+                record: Some(capture::record::Record::CaptureEnd(end.clone())),
+            },
         )
+        .context("append captureEnd")
     }
 
     fn flush_terminal(&mut self) -> Result<()> {
@@ -1909,22 +2116,22 @@ struct WallClockCalibration {
 }
 
 impl WallClockCalibration {
-    fn json(&self) -> Value {
-        json!({
-            "schemaVersion": 1,
-            "method": "clock_gettime-bracket-v1",
-            "sampleCount": self.sample_count,
-            "selectedSampleIndex": self.selected_sample_index,
-            "monotonicClock": "CLOCK_MONOTONIC",
-            "wallClock": "CLOCK_REALTIME",
-            "monotonicBeforeNanos": self.monotonic_before_ns.to_string(),
-            "realtimeNanos": self.realtime_ns.to_string(),
-            "monotonicAfterNanos": self.monotonic_after_ns.to_string(),
-            "monotonicMidpointNanos": self.monotonic_midpoint_ns.to_string(),
-            "realtimeMinusMonotonicNanos": self.realtime_minus_monotonic_ns.to_string(),
-            "bracketWidthNanos": self.bracket_width_ns.to_string(),
-            "midpointUncertaintyNanos": self.midpoint_uncertainty_ns.to_string(),
-            "uncertaintySemantics": "maximum absolute midpoint offset error from unknown realtime-read position within selected monotonic bracket; excludes clock adjustments",
+    /// The record's form. The realtime-minus-monotonic difference of two u64 clocks can in principle
+    /// exceed the sint64 field, so it is converted with a check instead of truncated.
+    fn message(&self) -> Result<capture::WallClockCalibration> {
+        Ok(capture::WallClockCalibration {
+            sample_count: u32::try_from(self.sample_count)
+                .context("wall-clock calibration sample count exceeds u32")?,
+            selected_sample_index: u32::try_from(self.selected_sample_index)
+                .context("wall-clock calibration sample index exceeds u32")?,
+            monotonic_before_nanos: self.monotonic_before_ns,
+            realtime_nanos: self.realtime_ns,
+            monotonic_after_nanos: self.monotonic_after_ns,
+            monotonic_midpoint_nanos: self.monotonic_midpoint_ns,
+            realtime_minus_monotonic_nanos: i64::try_from(self.realtime_minus_monotonic_ns)
+                .context("wall-clock realtime minus monotonic offset exceeds sint64")?,
+            bracket_width_nanos: self.bracket_width_ns,
+            midpoint_uncertainty_nanos: self.midpoint_uncertainty_ns,
         })
     }
 }
@@ -1979,35 +2186,31 @@ fn enable_capture(
     prepare: &PrepareConfig,
     identity: &PreparedIdentity,
     reply: &PreparedReply,
-    mut enable: EnableConfig,
+    enable: EnableConfig,
     skel: &mut crate::bpf_sched_exit::JonoffcpuCookieSkel<'_>,
     writer: &mut BufWriter<File>,
     capture: &mut Option<CaptureState>,
-) -> Result<Value> {
+) -> Result<capture::Enabled> {
     if capture.is_some() {
-        bail!("collector is already enabled");
+        return Err(invalid_state("collector is already enabled"));
     }
-    if enable
-        .sampling
-        .as_ref()
-        .is_some_and(|value| *value != prepare.sampling)
-    {
-        bail!("sampling differs from prepared policy");
+    if enable.sampling != prepare.sampling.message {
+        return Err(invalid_config("sampling differs from prepared policy"));
     }
-    enable.sampling = Some(prepare.sampling.clone());
-    if enable
-        .time_split
-        .as_ref()
-        .is_some_and(|value| *value != prepare.time_split)
-    {
-        bail!("timeSplit differs from prepared configuration");
+    if enable.time_split != prepare.time_split.message {
+        return Err(invalid_config(
+            "timeSplit differs from prepared configuration",
+        ));
     }
-    enable.time_split = Some(prepare.time_split.clone());
     reset_stats(&skel.maps.stats)?;
-    let wall_clock_calibration = capture_wall_clock_calibration()?;
+    let wall_clock_calibration = capture_wall_clock_calibration()?.message()?;
     let started_ns = monotonic_ns()?;
-    let signal_environment =
-        signal_environment_snapshot(identity, enable.signal, "beforeEnable", None);
+    let signal_environment = signal_environment_snapshot(
+        identity,
+        enable.signal,
+        capture::SnapshotPhase::BeforeEnable,
+        None,
+    );
     {
         let bss = skel
             .maps
@@ -2028,7 +2231,6 @@ fn enable_capture(
         match prepare.sampling.admission {
             Admission::Uniform {
                 probability_threshold,
-                ..
             } => {
                 bss.admission_policy = 0;
                 bss.sample_threshold = probability_threshold;
@@ -2041,7 +2243,7 @@ fn enable_capture(
             } => {
                 let record_all_above_ns = record_all_above_micros
                     .checked_mul(1_000)
-                    .context("recordAllAboveMicros overflows nanos")?;
+                    .ok_or_else(|| invalid_config("recordAllAboveMicros overflows nanos"))?;
                 let (scaled, shift) = proportional_scale(record_all_above_ns);
                 bss.admission_policy = 1;
                 bss.sample_threshold = 0;
@@ -2052,37 +2254,50 @@ fn enable_capture(
         }
         bss.next_sequence = 1;
     }
-    let start = json!({
-        "schemaVersion": SCHEMA_VERSION,
-        "recordType": "captureStart",
-        "sourceId": SOURCE_ID,
-        "sessionId": enable.session_id,
-        "captureEpoch": enable.capture_epoch,
-        "signal": enable.signal,
-        "signalDelivery": signal_delivery(enable.signal),
-        "hostTgid": identity.host_tgid,
-        "targetPid": identity.target_pid,
-        "registrationToken": format!("{:016x}", identity.registration_token),
-        "processGenerationNs": identity.process_generation_ns.to_string(),
-        "pidNamespaceDevice": identity.pid_namespace_device.to_string(),
-        "pidNamespaceInode": identity.pid_namespace_inode.to_string(),
-        "startedMonotonicNanos": started_ns.to_string(),
-        "sampling": prepare.sampling.json(),
-        "timeSplit": prepare.time_split.json(),
-        "loader": "libbpf-rs/libbpf-cargo 0.27.1 (libbpf 1.7.0)",
-        "hook": "tp_btf/sched_exit_tp",
-        "switchOutHook": "tp_btf/sched_switch",
-        "timeNamespaceInode": identity.time_namespace_inode.to_string(),
-        "wallClockCalibration": wall_clock_calibration.json(),
-        "signalEnvironment": signal_environment.clone(),
-    });
+    let verified_identity = reply.verified_identity();
+    let start = capture::CaptureStart {
+        source_id: SOURCE_ID.to_string(),
+        session_id: enable.session_id.clone(),
+        capture_epoch: enable.capture_epoch,
+        signal: enable.signal,
+        signal_delivery: enable.signal_delivery as i32,
+        host_tgid: identity.host_tgid,
+        target_pid: identity.target_pid,
+        verified_identity: Some(verified_identity),
+        started_monotonic_nanos: started_ns,
+        sampling: Some(prepare.sampling.message.clone()),
+        time_split: Some(prepare.time_split.message),
+        loader: LOADER.to_string(),
+        hook: HOOK.to_string(),
+        switch_out_hook: SWITCH_OUT_HOOK.to_string(),
+        wall_clock_calibration: Some(wall_clock_calibration),
+        signal_environment: Some(signal_environment.clone()),
+    };
     write_record(
         writer,
-        &control_record(&start, capture::record::Record::CaptureStart),
-    )?;
-    writer.flush().context("flush captureStart")?;
+        &capture::Record {
+            record: Some(capture::record::Record::CaptureStart(start)),
+        },
+    )
+    .coded(ErrorCode::IoError, "append captureStart")?;
+    writer
+        .flush()
+        .coded(ErrorCode::IoError, "flush captureStart")?;
+    let enabled = capture::Enabled {
+        session_id: enable.session_id.clone(),
+        capture_epoch: enable.capture_epoch,
+        signal: enable.signal,
+        signal_delivery: enable.signal_delivery as i32,
+        source_path: path_text(&prepare.output_path),
+        target_pid: reply.target_pid,
+        host_tgid: reply.host_tgid,
+        sampling: Some(reply.sampling.message.clone()),
+        time_split: Some(reply.time_split.message),
+        verified_identity: Some(reply.verified_identity()),
+        signal_environment: Some(signal_environment),
+    };
     *capture = Some(CaptureState {
-        config: enable.clone(),
+        config: enable,
         started_ns,
         userspace: UserStats::default(),
         kernel_symbols: KernelSymbols::load(),
@@ -2092,28 +2307,7 @@ fn enable_capture(
         end_wall_clock_calibration: None,
     });
     skel.maps.bss_data.as_deref_mut().unwrap().enabled = 1;
-    Ok(control_success(json!({
-        "state":"enabled",
-        "sessionId": enable.session_id,
-        "captureEpoch": enable.capture_epoch,
-        "signal": enable.signal,
-        "signalDelivery": signal_delivery(enable.signal),
-        "sourcePath": prepare.output_path,
-        "targetPid": reply.target_pid,
-        "hostTgid": reply.host_tgid,
-        "sampling": reply.sampling.json(),
-        "timeSplit": reply.time_split.json(),
-        "signalEnvironment": signal_environment,
-        "verifiedIdentity": {
-            "registrationToken": format!("{:016x}", reply.registration_token),
-            "processGenerationNs": reply.process_generation_ns.to_string(),
-            "pidNamespaceDevice": reply.pid_namespace_device.to_string(),
-            "pidNamespaceInode": reply.pid_namespace_inode.to_string(),
-            "timeNamespaceInode": reply.time_namespace_inode.to_string(),
-            "clockVerified": true,
-            "monotonicOffsetNanos": "0"
-        }
-    })))
+    Ok(enabled)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2131,20 +2325,22 @@ fn stop_capture(
     switch_in: &mut Option<Link>,
     target_exited: bool,
     automatic: bool,
-) -> Result<Value> {
-    // Once terminal publication starts, the captureEnd object is frozen and
+) -> Result<StopOutcome> {
+    // Once terminal publication starts, the captureEnd record is frozen and
     // the capture is no longer active. A retry may advance flush/fsync only;
-    // it must never build or append another terminal row.
+    // it must never build or append another terminal record.
     if terminal_publication.started() {
         return terminal_publication.advance(writer);
     }
-    let state = capture.as_mut().context("collector is not enabled")?;
+    let state = capture
+        .as_mut()
+        .ok_or_else(|| invalid_state("collector is not enabled"))?;
     let deadline = Instant::now() + timeout;
     let wall_clock_calibration = match &state.end_wall_clock_calibration {
-        Some(calibration) => calibration.clone(),
+        Some(calibration) => *calibration,
         None => {
-            let calibration = capture_wall_clock_calibration()?;
-            state.end_wall_clock_calibration = Some(calibration.clone());
+            let calibration = capture_wall_clock_calibration()?.message()?;
+            state.end_wall_clock_calibration = Some(calibration);
             calibration
         }
     };
@@ -2159,7 +2355,7 @@ fn stop_capture(
             signal_environment_snapshot(
                 identity,
                 state.config.signal,
-                "afterDetach",
+                capture::SnapshotPhase::AfterDetach,
                 Some(deadline),
             )
         })
@@ -2170,7 +2366,10 @@ fn stop_capture(
     while quiet < DRAIN_QUIET_POLLS {
         if Instant::now() >= deadline {
             state.userspace.drain_timed_out += 1;
-            bail!("stop_timeout");
+            return Err(fail(
+                ErrorCode::StopTimeout,
+                "stop timed out draining the observation ring",
+            ));
         }
         let consumed = ring.consume_raw_n(MAX_RING_BATCH);
         if consumed < 0 {
@@ -2203,12 +2402,15 @@ fn stop_capture(
         signal_environment,
         wall_clock_calibration,
     );
-    let response = control_success(json!({
-        "state":if complete { "complete" } else { "incomplete" },
-        "sourcePath": output_path,
-        "captureEnd": end,
-    }));
-    terminal_publication.begin(response, automatic)?;
+    let outcome = StopOutcome {
+        complete,
+        stopped: capture::Stopped {
+            source_path: path_text(output_path),
+            capture_end: Some(end),
+            terminal_publication: None,
+        },
+    };
+    terminal_publication.begin(outcome, automatic)?;
     // Retire the active capture before the first append attempt. Even a
     // partial/ambiguous write failure can therefore never re-enter capture
     // finalization or append a second captureEnd.
@@ -2237,43 +2439,44 @@ fn capture_end(
     drain_completed_ns: u64,
     target_exited: bool,
     complete: bool,
-    signal_environment: Value,
-    wall_clock_calibration: WallClockCalibration,
-) -> Value {
+    signal_environment: capture::SignalEnvironment,
+    wall_clock_calibration: capture::WallClockCalibration,
+) -> capture::CaptureEnd {
+    use capture::IncompleteReason;
     let incomplete_reason = if complete {
-        None
+        IncompleteReason::Unspecified
     } else if target_exited {
-        Some("target_exited")
+        IncompleteReason::TargetExited
     } else if capture.userspace.write_failures != 0 {
-        Some("source_write_failure")
+        IncompleteReason::SourceWriteFailure
     } else if kernel.ring_reserve_failures != 0 {
-        Some("kernel_ring_overflow")
+        IncompleteReason::KernelRingOverflow
     } else if kernel.target_namespace_failures != 0 {
-        Some("target_namespace_mapping_failure")
+        IncompleteReason::TargetNamespaceMappingFailure
     } else {
-        Some("ring_poll_failure")
+        IncompleteReason::RingPollFailure
     };
-    json!({
-        "schemaVersion": SCHEMA_VERSION,
-        "recordType": "captureEnd",
-        "sourceId": SOURCE_ID,
-        "sessionId": capture.config.session_id,
-        "captureEpoch": capture.config.capture_epoch,
-        "state": if complete { "complete" } else { "incomplete" },
-        "startedMonotonicNanos": capture.started_ns.to_string(),
-        "stoppedMonotonicNanos": stopped_ns.to_string(),
-        "detachedMonotonicNanos": detached_ns.to_string(),
-        "drainCompletedMonotonicNanos": drain_completed_ns.to_string(),
-        "drainTimedOut": false,
-        "targetExited": target_exited,
-        "incompleteReason": incomplete_reason,
-        "wallClockCalibration": wall_clock_calibration.json(),
-        "signalEnvironment": signal_environment,
-        "counters": {
-            "kernel": kernel.json(),
-            "userspace": capture.userspace.json(),
-        }
-    })
+    let state = if complete {
+        capture::CaptureState::Complete
+    } else {
+        capture::CaptureState::Incomplete
+    };
+    capture::CaptureEnd {
+        session_id: capture.config.session_id.clone(),
+        capture_epoch: capture.config.capture_epoch,
+        state: state as i32,
+        incomplete_reason: incomplete_reason as i32,
+        started_monotonic_nanos: capture.started_ns,
+        stopped_monotonic_nanos: stopped_ns,
+        detached_monotonic_nanos: detached_ns,
+        drain_completed_monotonic_nanos: drain_completed_ns,
+        drain_timed_out: false,
+        target_exited,
+        wall_clock_calibration: Some(wall_clock_calibration),
+        signal_environment: Some(signal_environment),
+        kernel_counters: Some(kernel.message()),
+        userspace_counters: Some(capture.userspace.message()),
+    }
 }
 
 fn drain_events(
@@ -2381,11 +2584,11 @@ fn observation_record(
             host_tid: event.host_tid,
             target_tgid: event.target_tgid,
             target_tid: event.target_tid,
-            process_generation_ns: event.process_generation_ns,
-            thread_generation_ns: event.thread_generation_ns,
+            process_generation_nanos: event.process_generation_ns,
+            thread_generation_nanos: event.thread_generation_ns,
             registration_token: event.registration_token,
-            start_monotonic_ns: event.start_monotonic_ns,
-            end_monotonic_ns: event.end_monotonic_ns,
+            start_monotonic_nanos: event.start_monotonic_ns,
+            end_monotonic_nanos: event.end_monotonic_ns,
             admission_threshold: event.admission_threshold,
             signal_result: event.signal_result,
             comm: String::from_utf8_lossy(&event.comm[..comm_end]).into_owned(),
@@ -2397,8 +2600,8 @@ fn observation_record(
             // and the correlator rejects it against the recomputed classification.
             reason: OffCpuReason::from_kernel(event.reason)
                 .map_or(0, |reason| i32::from(reason.kernel_value())),
-            prev_task_state: Some(event.prev_task_state),
-            preempted: Some(event.preempted != 0),
+            prev_task_state: event.prev_task_state,
+            preempted: event.preempted != 0,
             runqueue_nanos: (event.has_runqueue != 0).then_some(event.runqueue_ns),
         })),
     }
@@ -2541,18 +2744,6 @@ fn write_record(writer: &mut BufWriter<File>, record: &capture::Record) -> Resul
     Ok(())
 }
 
-/// A control record carries the JSON object it has always carried; only three exist per capture.
-fn control_record(
-    value: &Value,
-    slot: fn(capture::ControlJson) -> capture::record::Record,
-) -> capture::Record {
-    capture::Record {
-        record: Some(slot(capture::ControlJson {
-            json: value.to_string(),
-        })),
-    }
-}
-
 /// This thread's ID in the process's own PID namespace, which is also the target's namespace.
 fn current_tid() -> u32 {
     unsafe { libc::syscall(libc::SYS_gettid) as u32 }
@@ -2580,41 +2771,12 @@ fn clock_ns(clock: libc::clockid_t, name: &str) -> Result<u64> {
         .with_context(|| format!("clock_gettime {name} nanoseconds overflow"))
 }
 
-pub(crate) fn control_success(fields: Value) -> Value {
-    let mut base = json!({"ok":true,"schemaVersion":1,"abiVersion":1});
-    if let (Some(base), Some(fields)) = (base.as_object_mut(), fields.as_object()) {
-        base.extend(fields.clone());
-    }
-    base
-}
-
-pub(crate) fn control_error(code: &str, message: impl Into<String>) -> Value {
-    let state = match code {
-        "stop_timeout" => "stopping",
-        "close_timeout" => "closing",
-        _ => "error",
-    };
-    json!({
-        "ok":false,
-        "schemaVersion":1,
-        "abiVersion":1,
-        "state":state,
-        "error":{"code":code,"message":message.into()}
-    })
-}
-
-pub(crate) fn bounded_json(value: &Value) -> Result<String> {
-    let encoded = serde_json::to_string(value)?;
-    if encoded.len() > MAX_CONTROL_JSON {
-        bail!("control response exceeds {MAX_CONTROL_JSON} bytes");
-    }
-    Ok(encoded)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capture::sampling::Admission as AdmissionMessage;
     use libbpf_rs::Program;
+    use serde_json::json;
 
     static PRIVILEGED_SIGNAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -2628,7 +2790,7 @@ mod tests {
 
     #[derive(Default)]
     struct FaultSink {
-        rows: Vec<Value>,
+        rows: Vec<capture::CaptureEnd>,
         append_failures: usize,
         flush_failures: usize,
         sync_failures: usize,
@@ -2639,14 +2801,14 @@ mod tests {
     }
 
     impl TerminalSink for FaultSink {
-        fn append_terminal(&mut self, value: &Value) -> Result<()> {
+        fn append_terminal(&mut self, end: &capture::CaptureEnd) -> Result<()> {
             self.append_calls += 1;
             if self.append_failures != 0 {
                 self.append_failures -= 1;
                 return Err(std::io::Error::from_raw_os_error(libc::EIO))
                     .context("injected append EIO");
             }
-            self.rows.push(value.clone());
+            self.rows.push(end.clone());
             Ok(())
         }
 
@@ -2675,18 +2837,20 @@ mod tests {
         }
     }
 
-    fn incomplete_terminal_response() -> Value {
-        control_success(json!({
-            "state": "incomplete",
-            "sourcePath": "/tmp/source.ndjson",
-            "captureEnd": {
-                "schemaVersion": SCHEMA_VERSION,
-                "recordType": "captureEnd",
-                "state": "incomplete",
-                "targetExited": true,
-                "incompleteReason": "target_exited",
+    fn incomplete_terminal_outcome() -> StopOutcome {
+        StopOutcome {
+            complete: false,
+            stopped: capture::Stopped {
+                source_path: "/tmp/source.pb".to_string(),
+                capture_end: Some(capture::CaptureEnd {
+                    state: capture::CaptureState::Incomplete as i32,
+                    target_exited: true,
+                    incomplete_reason: capture::IncompleteReason::TargetExited as i32,
+                    ..capture::CaptureEnd::default()
+                }),
+                terminal_publication: None,
             },
-        }))
+        }
     }
 
     /// Models the kernel predicate: strict bounds first, then the random draw against the
@@ -2707,7 +2871,6 @@ mod tests {
         let threshold = match *admission {
             Admission::Uniform {
                 probability_threshold,
-                ..
             } => probability_threshold,
             Admission::Proportional {
                 record_all_above_micros,
@@ -2727,7 +2890,6 @@ mod tests {
 
     fn uniform(probability_threshold: u64) -> Admission {
         Admission::Uniform {
-            probability: "test".to_string(),
             probability_threshold,
         }
     }
@@ -2738,48 +2900,99 @@ mod tests {
         }
     }
 
-    fn sampling_json(bounds: Value, admission: Value) -> Value {
-        let mut sampling =
-            json!({"reasons": ["blocked"], "minOffCpuMicros": null, "maxOffCpuMicros": null});
-        sampling
-            .as_object_mut()
-            .unwrap()
-            .extend(bounds.as_object().unwrap().clone());
-        sampling["admission"] = admission;
-        json!({
-            "targetPid":1,
-            "outputPath":"/tmp/source.ndjson",
-            "sampling":sampling,
-            "timeSplit":{"source":"schedInfo"}
+    fn uniform_message(probability: &str, probability_threshold: u64) -> AdmissionMessage {
+        AdmissionMessage::Uniform(capture::UniformAdmission {
+            probability: probability.to_string(),
+            probability_threshold,
         })
     }
 
-    /// The block is required, names one source, and round-trips to the object the agent sent.
+    fn proportional_message(record_all_above_micros: u64) -> AdmissionMessage {
+        AdmissionMessage::Proportional(capture::ProportionalAdmission {
+            record_all_above_micros,
+        })
+    }
+
+    fn reasons(values: &[capture::OffCpuReason]) -> Vec<i32> {
+        values.iter().map(|reason| *reason as i32).collect()
+    }
+
+    fn sampling(
+        min_off_cpu_micros: Option<u64>,
+        max_off_cpu_micros: Option<u64>,
+        admission: AdmissionMessage,
+    ) -> capture::Sampling {
+        capture::Sampling {
+            reasons: reasons(&[capture::OffCpuReason::Blocked]),
+            min_off_cpu_micros,
+            max_off_cpu_micros,
+            admission: Some(admission),
+        }
+    }
+
+    fn sched_info() -> capture::TimeSplit {
+        capture::TimeSplit {
+            source: capture::TimeSplitSource::SchedInfo as i32,
+        }
+    }
+
+    fn prepare_request(sampling: capture::Sampling) -> capture::PrepareRequest {
+        capture::PrepareRequest {
+            target_pid: 1,
+            output_path: "/tmp/source.pb".to_string(),
+            sampling: Some(sampling),
+            time_split: Some(sched_info()),
+            exclude_calling_thread: false,
+        }
+    }
+
+    fn parse(request: &capture::PrepareRequest) -> Result<PrepareConfig> {
+        parse_prepare(&request.encode_to_vec())
+    }
+
+    fn code_of(result: Result<PrepareConfig>) -> ErrorCode {
+        Failure::of(&result.expect_err("request unexpectedly accepted")).code
+    }
+
+    /// The block is required, names one source, and is echoed as the agent sent it.
     #[test]
     fn time_split_is_an_explicit_required_block() {
-        let uniform_one =
-            json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64});
-        let mut value = sampling_json(json!({}), uniform_one);
-        let parsed = parse_prepare(&value.to_string()).unwrap();
+        let mut request = prepare_request(sampling(None, None, uniform_message("1", 1 << 32)));
+        let parsed = parse(&request).unwrap();
         assert_eq!(parsed.time_split.source, TimeSplitSource::SchedInfo);
         assert_eq!(parsed.time_split.kernel_value(), 1);
-        assert_eq!(parsed.time_split.json(), json!({"source":"schedInfo"}));
-        value["timeSplit"] = json!({"source":"off"});
-        let off = parse_prepare(&value.to_string()).unwrap();
-        assert_eq!(off.time_split.kernel_value(), 0);
-        assert_eq!(off.time_split.json(), json!({"source":"off"}));
+        assert_eq!(parsed.time_split.message, sched_info());
+        let off = capture::TimeSplit {
+            source: capture::TimeSplitSource::Off as i32,
+        };
+        request.time_split = Some(off);
+        let parsed = parse(&request).unwrap();
+        assert_eq!(parsed.time_split.kernel_value(), 0);
+        assert_eq!(parsed.time_split.message, off);
         for rejected in [
-            json!({"source":"wakeup"}),
-            json!({"source":"schedinfo"}),
-            json!({}),
-            json!({"source":"off","extra":1}),
-            json!("off"),
+            Some(capture::TimeSplit { source: 0 }),
+            Some(capture::TimeSplit { source: 3 }),
+            None,
         ] {
-            value["timeSplit"] = rejected.clone();
-            assert!(parse_prepare(&value.to_string()).is_err(), "{rejected}");
+            request.time_split = rejected;
+            assert_eq!(code_of(parse(&request)), ErrorCode::InvalidConfig);
         }
-        value.as_object_mut().unwrap().remove("timeSplit");
-        assert!(parse_prepare(&value.to_string()).is_err());
+    }
+
+    /// Undecodable, empty and incomplete requests are configuration errors.
+    #[test]
+    fn malformed_prepare_requests_are_invalid_config() {
+        assert_eq!(code_of(parse_prepare(&[0xff])), ErrorCode::InvalidConfig);
+        assert_eq!(code_of(parse_prepare(&[])), ErrorCode::InvalidConfig);
+        let mut request = prepare_request(sampling(None, None, uniform_message("1", 1 << 32)));
+        request.target_pid = 0;
+        assert_eq!(code_of(parse(&request)), ErrorCode::InvalidConfig);
+        request.target_pid = 1;
+        request.output_path.clear();
+        assert_eq!(code_of(parse(&request)), ErrorCode::InvalidConfig);
+        request.output_path = "/tmp/source.pb".to_string();
+        request.sampling = None;
+        assert_eq!(code_of(parse(&request)), ErrorCode::InvalidConfig);
     }
 
     /// The ring record keeps the C layout, and the run-queue part reaches field 21 only when the
@@ -2804,27 +3017,38 @@ mod tests {
 
     #[test]
     fn delivery_policy_must_match_signal_before_enable() {
-        let mut value = json!({
-            "sessionId":"01234567-89ab-cdef-0123-456789abcdef",
-            "captureEpoch":1,
-            "signal":libc::SIGRTMIN(),
-            "signalDelivery":"queued"
-        });
-        assert!(parse_enable(&value.to_string()).is_ok());
-        value["signalDelivery"] = json!("coalescing");
-        assert!(parse_enable(&value.to_string()).is_err());
-        value["signal"] = json!(libc::SIGPROF);
-        assert!(parse_enable(&value.to_string()).is_ok());
-        value["signalDelivery"] = json!("queued");
-        assert!(parse_enable(&value.to_string()).is_err());
-        value["signalDelivery"] = json!("unknown");
-        assert!(parse_enable(&value.to_string()).is_err());
-        value.as_object_mut().unwrap().remove("signalDelivery");
-        assert!(parse_enable(&value.to_string()).is_ok());
+        let mut request = capture::EnableRequest {
+            session_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            capture_epoch: 1,
+            signal: libc::SIGRTMIN(),
+            signal_delivery: capture::SignalDelivery::Queued as i32,
+            sampling: Some(sampling(None, None, uniform_message("1", 1 << 32))),
+            time_split: Some(sched_info()),
+        };
+        let parse = |request: &capture::EnableRequest| parse_enable(&request.encode_to_vec());
+        assert!(parse(&request).is_ok());
+        request.signal_delivery = capture::SignalDelivery::Coalescing as i32;
+        assert!(parse(&request).is_err());
+        request.signal = libc::SIGPROF;
+        assert!(parse(&request).is_ok());
+        request.signal_delivery = capture::SignalDelivery::Queued as i32;
+        assert!(parse(&request).is_err());
+        // Delivery is never inferred from the signal.
+        request.signal_delivery = capture::SignalDelivery::Unspecified as i32;
+        assert!(parse(&request).is_err());
+        request.signal_delivery = 7;
+        assert!(parse(&request).is_err());
+        request.signal_delivery = capture::SignalDelivery::Coalescing as i32;
         for reserved in 32..libc::SIGRTMIN() {
-            value["signal"] = json!(reserved);
-            assert!(parse_enable(&value.to_string()).is_err());
+            request.signal = reserved;
+            assert!(parse(&request).is_err());
         }
+        request.signal = libc::SIGPROF;
+        request.session_id = "01234567-89AB-cdef-0123-456789abcdef".to_string();
+        assert!(parse(&request).is_err());
+        request.session_id = "01234567-89ab-cdef-0123-456789abcdef".to_string();
+        request.sampling = None;
+        assert!(parse(&request).is_err());
     }
 
     #[test]
@@ -2904,19 +3128,21 @@ mod tests {
     /// its duration and whatever the admission draw.
     #[test]
     fn reason_filter_precedes_bounds_and_admission() {
-        let parse = |reasons: Value| {
-            let mut value = sampling_json(
-                json!({"minOffCpuMicros":10}),
-                json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64}),
-            );
-            value["sampling"]["reasons"] = reasons;
-            parse_prepare(&value.to_string())
+        use capture::OffCpuReason as Reason;
+        let parse_reasons = |values: Vec<i32>| {
+            let mut message = sampling(Some(10), None, uniform_message("1", 1 << 32));
+            message.reasons = values;
+            parse(&prepare_request(message))
         };
-        let blocked = parse(json!(["blocked"])).unwrap().sampling;
-        let everything = parse(json!(["blocked", "runnable", "preempted"]))
-            .unwrap()
-            .sampling;
-        let selected = |sampling: &SamplingConfig, reason: OffCpuReason, duration_ns: u64| {
+        let blocked = parse_reasons(reasons(&[Reason::Blocked])).unwrap().sampling;
+        let everything = parse_reasons(reasons(&[
+            Reason::Blocked,
+            Reason::Runnable,
+            Reason::Preempted,
+        ]))
+        .unwrap()
+        .sampling;
+        let selected = |sampling: &SamplingPolicy, reason: OffCpuReason, duration_ns: u64| {
             sampling.reason_mask() & (1 << reason.kernel_value()) != 0
                 && admitted(
                     duration_ns,
@@ -2933,24 +3159,18 @@ mod tests {
         assert!(selected(&everything, OffCpuReason::Preempted, 20_000));
         assert_eq!(everything.reason_mask(), 0b1110);
         for rejected in [
-            json!([]),
-            json!(["preempted", "blocked"]),
-            json!(["blocked", "blocked"]),
-            json!(["sleeping"]),
-            json!("blocked"),
-            Value::Null,
+            vec![],
+            reasons(&[Reason::Preempted, Reason::Blocked]),
+            reasons(&[Reason::Blocked, Reason::Blocked]),
+            reasons(&[Reason::Unspecified]),
+            vec![4],
         ] {
-            assert!(parse(rejected.clone()).is_err(), "{rejected}");
+            assert_eq!(
+                code_of(parse_reasons(rejected.clone())),
+                ErrorCode::InvalidConfig,
+                "{rejected:?}"
+            );
         }
-        let mut missing = sampling_json(
-            json!({}),
-            json!({"policy":"proportional","recordAllAboveMicros":5}),
-        );
-        missing["sampling"]
-            .as_object_mut()
-            .unwrap()
-            .remove("reasons");
-        assert!(parse_prepare(&missing.to_string()).is_err());
     }
 
     #[test]
@@ -3008,83 +3228,87 @@ mod tests {
 
     #[test]
     fn prepare_policy_accepts_each_shape_and_rejects_bad_values() {
-        let uniform_one =
-            json!({"policy":"uniform","probability":"1","probabilityThreshold":4294967296_u64});
-        for bounds in [
-            json!({}),
-            json!({"minOffCpuMicros":"10"}),
-            json!({"maxOffCpuMicros":"20"}),
-            json!({"minOffCpuMicros":"10","maxOffCpuMicros":"20"}),
+        for (min, max) in [
+            (None, None),
+            (Some(10), None),
+            (None, Some(20)),
+            (Some(10), Some(20)),
         ] {
-            parse_prepare(&sampling_json(bounds.clone(), uniform_one.clone()).to_string()).unwrap();
-            parse_prepare(
-                &sampling_json(
-                    bounds,
-                    json!({"policy":"proportional","recordAllAboveMicros":5}),
-                )
-                .to_string(),
-            )
+            parse(&prepare_request(sampling(
+                min,
+                max,
+                uniform_message("1", 1 << 32),
+            )))
+            .unwrap();
+            parse(&prepare_request(sampling(
+                min,
+                max,
+                proportional_message(5),
+            )))
             .unwrap();
         }
-        let config = parse_prepare(
-            &sampling_json(
-                json!({"minOffCpuMicros":10}),
-                json!({"policy":"proportional","recordAllAboveMicros":5}),
-            )
-            .to_string(),
-        )
-        .unwrap();
+        let message = sampling(Some(10), None, proportional_message(5));
+        let config = parse(&prepare_request(message.clone())).unwrap();
         assert_eq!(config.sampling.min_off_cpu_micros, Some(10));
         assert_eq!(config.sampling.admission, proportional(5));
-        // The echoed object round-trips unchanged.
-        assert_eq!(
-            config.sampling.json(),
-            json!({"reasons":["blocked"],"minOffCpuMicros":10,"maxOffCpuMicros":null,
-                   "admission":{"policy":"proportional","recordAllAboveMicros":5}})
-        );
+        // The echoed message is the one received.
+        assert_eq!(config.sampling.message, message);
         assert_eq!(config.sampling.reason_mask(), 0b0010);
         for rejected in [
-            sampling_json(
-                json!({"minOffCpuMicros":"10","maxOffCpuMicros":"10"}),
-                uniform_one.clone(),
+            sampling(Some(10), Some(10), uniform_message("1", 1 << 32)),
+            sampling(None, Some(u64::MAX), uniform_message("1", 1 << 32)),
+            sampling(None, None, uniform_message("0", 0)),
+            sampling(None, None, uniform_message("2", (1 << 32) + 1)),
+            sampling(None, None, proportional_message(0)),
+            sampling(None, None, proportional_message(u64::MAX)),
+            sampling(
+                None,
+                None,
+                AdmissionMessage::None(capture::NoAdmission::default()),
             ),
-            sampling_json(
-                json!({"maxOffCpuMicros":u64::MAX.to_string()}),
-                uniform_one.clone(),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"uniform","probability":"0","probabilityThreshold":0}),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"uniform","probability":"2","probabilityThreshold":4294967297_u64}),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"uniform","probabilityThreshold":1}),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"proportional","recordAllAboveMicros":0}),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"proportional","recordAllAboveMicros":u64::MAX}),
-            ),
-            sampling_json(
-                json!({}),
-                json!({"policy":"proportional","recordAllAboveMicros":5,"probability":"1"}),
-            ),
-            sampling_json(json!({}), json!({"policy":"none"})),
-            sampling_json(json!({"sampleThreshold":1}), uniform_one.clone()),
-            json!({"targetPid":1,"outputPath":"/tmp/source.ndjson"}),
+            capture::Sampling {
+                admission: None,
+                ..sampling(None, None, proportional_message(5))
+            },
         ] {
-            assert!(
-                parse_prepare(&rejected.to_string()).is_err(),
-                "accepted {rejected}"
+            assert_eq!(
+                code_of(parse(&prepare_request(rejected.clone()))),
+                ErrorCode::InvalidConfig,
+                "accepted {rejected:?}"
             );
         }
+    }
+
+    /// The outermost coded context decides the reply's code; an uncoded error is internal.
+    #[test]
+    fn failures_carry_their_code_through_context() {
+        let io: Result<()> = Err(std::io::Error::from_raw_os_error(libc::ENOENT).into());
+        let coded = io.coded(ErrorCode::IoError, "create source artifact /x");
+        let failure = Failure::of(&coded.context("prepare").unwrap_err());
+        assert_eq!(failure.code, ErrorCode::IoError);
+        assert!(
+            failure
+                .message
+                .starts_with("prepare: create source artifact /x: ")
+        );
+        let failure = Failure::of(&anyhow!("unexpected"));
+        assert_eq!(failure.code, ErrorCode::InternalError);
+        // A failure sent across the worker channel keeps its code.
+        let resent = Failure::of(&Failure::of(&fail(ErrorCode::TargetExited, "gone")).into_error());
+        assert_eq!(resent.code, ErrorCode::TargetExited);
+        assert_eq!(resent.message, "gone");
+        assert_eq!(
+            error_reply(ErrorCode::StopTimeout, String::new()).state(),
+            CollectorState::Stopping
+        );
+        assert_eq!(
+            error_reply(ErrorCode::CloseTimeout, String::new()).state(),
+            CollectorState::Closing
+        );
+        assert_eq!(
+            error_reply(ErrorCode::InvalidHandle, String::new()).state(),
+            CollectorState::Error
+        );
     }
 
     #[test]
@@ -3118,32 +3342,39 @@ mod tests {
     }
 
     #[test]
-    fn wall_clock_calibration_serializes_exact_decimal_nanos() {
+    fn wall_clock_calibration_message_is_exact_and_rejects_an_unrepresentable_offset() {
         let calibration = select_wall_clock_calibration(&[ClockBracket {
+            monotonic_before_ns: 1_000,
+            realtime_ns: 7,
+            monotonic_after_ns: 1_005,
+        }])
+        .unwrap();
+        assert_eq!(
+            calibration.message().unwrap(),
+            capture::WallClockCalibration {
+                sample_count: 1,
+                selected_sample_index: 0,
+                monotonic_before_nanos: 1_000,
+                realtime_nanos: 7,
+                monotonic_after_nanos: 1_005,
+                monotonic_midpoint_nanos: 1_002,
+                realtime_minus_monotonic_nanos: 7 - 1_002,
+                bracket_width_nanos: 5,
+                midpoint_uncertainty_nanos: 3,
+            }
+        );
+        // The proto3 JSON mapping prints the 64-bit values as exact decimal strings.
+        assert_eq!(
+            serde_json::to_value(calibration.message().unwrap()).unwrap()["realtimeMinusMonotonicNanos"],
+            json!("-995")
+        );
+        let beyond = select_wall_clock_calibration(&[ClockBracket {
             monotonic_before_ns: u64::MAX - 5,
             realtime_ns: 7,
             monotonic_after_ns: u64::MAX,
         }])
         .unwrap();
-        assert_eq!(
-            calibration.json(),
-            json!({
-                "schemaVersion": 1,
-                "method": "clock_gettime-bracket-v1",
-                "sampleCount": 1,
-                "selectedSampleIndex": 0,
-                "monotonicClock": "CLOCK_MONOTONIC",
-                "wallClock": "CLOCK_REALTIME",
-                "monotonicBeforeNanos": (u64::MAX - 5).to_string(),
-                "realtimeNanos": "7",
-                "monotonicAfterNanos": u64::MAX.to_string(),
-                "monotonicMidpointNanos": (u64::MAX - 3).to_string(),
-                "realtimeMinusMonotonicNanos": (i128::from(7_u64) - i128::from(u64::MAX - 3)).to_string(),
-                "bracketWidthNanos": "5",
-                "midpointUncertaintyNanos": "3",
-                "uncertaintySemantics": "maximum absolute midpoint offset error from unknown realtime-read position within selected monotonic bracket; excludes clock adjustments",
-            })
-        );
+        assert!(beyond.message().is_err());
     }
 
     #[test]
@@ -3176,18 +3407,20 @@ mod tests {
 
     #[test]
     fn terminal_publication_retries_only_fsync_after_transient_eio() {
-        let response = incomplete_terminal_response();
-        let expected_end = response["captureEnd"].clone();
+        let outcome = incomplete_terminal_outcome();
+        let expected_end = outcome.stopped.capture_end.clone().unwrap();
         let mut publication = TerminalPublication::default();
-        publication.begin(response, true).unwrap();
+        publication.begin(outcome, true).unwrap();
         let mut sink = FaultSink {
             sync_failures: 1,
             ..FaultSink::default()
         };
 
-        let first_error = publication.advance(&mut sink).unwrap_err().to_string();
-        assert!(first_error.contains("capture state=incomplete"));
-        assert!(first_error.contains("incompleteReason=target_exited"));
+        let first_error = publication.advance(&mut sink).unwrap_err();
+        assert_eq!(Failure::of(&first_error).code, ErrorCode::IoError);
+        let first_error = first_error.to_string();
+        assert!(first_error.contains("capture state=CAPTURE_STATE_INCOMPLETE"));
+        assert!(first_error.contains("incompleteReason=INCOMPLETE_REASON_TARGET_EXITED"));
         assert_eq!(publication.stage, TerminalPublicationStage::Flushed);
         assert_eq!(sink.rows, vec![expected_end]);
         assert_eq!(
@@ -3196,14 +3429,18 @@ mod tests {
         );
 
         let result = publication.advance(&mut sink).unwrap();
-        assert_eq!(result["state"], "incomplete");
-        assert_eq!(result["captureEnd"], sink.rows[0]);
-        assert_eq!(result["terminalPublication"]["state"], "durable");
-        assert_eq!(result["terminalPublication"]["automatic"], true);
-        assert_eq!(result["terminalPublication"]["appendAttempts"], 1);
-        assert_eq!(result["terminalPublication"]["flushAttempts"], 1);
-        assert_eq!(result["terminalPublication"]["syncAttempts"], 2);
-        assert_eq!(result["terminalPublication"]["firstError"], first_error);
+        assert_eq!(result.state(), CollectorState::Incomplete);
+        assert_eq!(result.stopped.capture_end.as_ref(), Some(&sink.rows[0]));
+        assert_eq!(
+            result.stopped.terminal_publication,
+            Some(capture::TerminalPublication {
+                automatic: true,
+                append_attempts: 1,
+                flush_attempts: 1,
+                sync_attempts: 2,
+                first_error: first_error.clone(),
+            })
+        );
         assert_eq!(
             (sink.append_calls, sink.flush_calls, sink.sync_calls),
             (1, 1, 2)
@@ -3221,7 +3458,7 @@ mod tests {
     fn terminal_publication_never_retries_an_ambiguous_append_failure() {
         let mut publication = TerminalPublication::default();
         publication
-            .begin(incomplete_terminal_response(), true)
+            .begin(incomplete_terminal_outcome(), true)
             .unwrap();
         let mut sink = FaultSink {
             append_failures: 1,
@@ -3243,7 +3480,7 @@ mod tests {
     fn terminal_publication_retries_flush_without_appending_again() {
         let mut publication = TerminalPublication::default();
         publication
-            .begin(incomplete_terminal_response(), true)
+            .begin(incomplete_terminal_outcome(), true)
             .unwrap();
         let mut sink = FaultSink {
             flush_failures: 1,
@@ -3253,7 +3490,14 @@ mod tests {
         publication.advance(&mut sink).unwrap_err();
         assert_eq!(publication.stage, TerminalPublicationStage::RowWritten);
         let result = publication.advance(&mut sink).unwrap();
-        assert_eq!(result["terminalPublication"]["flushAttempts"], 2);
+        assert_eq!(
+            result
+                .stopped
+                .terminal_publication
+                .as_ref()
+                .map(|publication| publication.flush_attempts),
+            Some(2)
+        );
         assert_eq!(
             (sink.append_calls, sink.flush_calls, sink.sync_calls),
             (1, 2, 1)
@@ -3265,7 +3509,7 @@ mod tests {
     fn terminal_publication_persistent_fsync_failure_is_bounded_per_retry() {
         let mut publication = TerminalPublication::default();
         publication
-            .begin(incomplete_terminal_response(), true)
+            .begin(incomplete_terminal_outcome(), true)
             .unwrap();
         let mut sink = FaultSink {
             persistent_sync_failure: true,
@@ -3340,18 +3584,11 @@ mod tests {
             dead_pid
         );
         let dead_path = privileged_output("dead-target");
-        let dead_error = prepare(PrepareConfig {
-            target_pid: dead_pid as u32,
-            output_path: dead_path.clone(),
-            sampling: privileged_sampling(),
-            time_split: TimeSplitConfig {
-                source: TimeSplitSource::SchedInfo,
-            },
-            exclude_calling_thread: false,
-            calling_tid: 0,
-        })
-        .err()
-        .expect("dead target prepare unexpectedly succeeded");
+        let mut dead_config = privileged_prepare(dead_path.clone());
+        dead_config.target_pid = dead_pid as u32;
+        let dead_error = prepare(dead_config)
+            .err()
+            .expect("dead target prepare unexpectedly succeeded");
         assert!(dead_error.to_string().contains("not visible"));
         assert!(!dead_path.exists());
 
@@ -3367,8 +3604,12 @@ mod tests {
             let result = run_prepare_fault(fault);
             assert!(result.error.contains(expected), "{}", result.error);
             assert!(result.worker_exited);
-            assert_eq!(fs::metadata(&result.path).unwrap().len(), 0);
-            assert_source_has_no_control_rows(&result.path);
+            // The header is written when the artifact is created, and nothing after it.
+            assert_eq!(
+                fs::metadata(&result.path).unwrap().len(),
+                capture::HEADER_LEN as u64
+            );
+            assert_source_has_no_records(&result.path);
             assert_eq!(PRIVILEGED_SIGNAL_COUNT.load(Ordering::Relaxed), 0);
             for id in &result.program_ids {
                 assert!(Program::fd_from_id(*id).is_err(), "program {id} survived");
@@ -3389,7 +3630,7 @@ mod tests {
                 "error": result.error,
                 "successfulHandle": false,
                 "workerExited": result.worker_exited,
-                "artifactBytes": 0,
+                "artifactBytes": capture::HEADER_LEN,
                 "captureStartRows": 0,
                 "observationRows": 0,
                 "signals": 0,
@@ -3409,9 +3650,15 @@ mod tests {
         }
         stop(normal.handle, Duration::from_secs(5)).unwrap();
         close(normal.handle).unwrap();
-        let source = fs::read_to_string(&normal_path).unwrap();
-        assert!(source.lines().any(|line| line.contains("\"captureStart\"")));
-        assert!(source.lines().any(|line| line.contains("\"captureEnd\"")));
+        let records = source_records(&normal_path);
+        assert!(matches!(
+            records.first(),
+            Some(capture::record::Record::CaptureStart(_))
+        ));
+        assert!(matches!(
+            records.last(),
+            Some(capture::record::Record::CaptureEnd(_))
+        ));
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -3436,19 +3683,22 @@ mod tests {
         enable(first.handle, privileged_enable(0x8000_1401)).unwrap();
         thread::sleep(Duration::from_millis(20));
         stop(first.handle, Duration::from_secs(5)).unwrap();
-        let old_handle_error = enable(first.handle, privileged_enable(0x8000_1401))
-            .unwrap_err()
-            .to_string();
+        let old_handle_error = enable(first.handle, privileged_enable(0x8000_1401)).unwrap_err();
+        assert_eq!(Failure::of(&old_handle_error).code, ErrorCode::InvalidState);
+        let old_handle_error = old_handle_error.to_string();
         assert!(old_handle_error.contains("already stopped"));
         close(first.handle).unwrap();
-        let closed_handle_error = enable(first.handle, privileged_enable(0x8000_1401))
-            .unwrap_err()
-            .to_string();
-        assert!(closed_handle_error.contains("invalid collector handle"));
+        let closed_handle_error = enable(first.handle, privileged_enable(0x8000_1401)).unwrap_err();
+        assert_eq!(
+            Failure::of(&closed_handle_error).code,
+            ErrorCode::InvalidHandle
+        );
+        let closed_handle_error = closed_handle_error.to_string();
         let old_source_error = prepare(privileged_prepare(first_path.clone()))
             .err()
-            .expect("old source path unexpectedly reopened")
-            .to_string();
+            .expect("old source path unexpectedly reopened");
+        assert_eq!(Failure::of(&old_source_error).code, ErrorCode::IoError);
+        let old_source_error = old_source_error.to_string();
         assert!(old_source_error.contains("create source artifact"));
 
         let fresh_path = privileged_output("t14-fresh");
@@ -3457,13 +3707,12 @@ mod tests {
         thread::sleep(Duration::from_millis(20));
         stop(fresh.handle, Duration::from_secs(5)).unwrap();
         close(fresh.handle).unwrap();
-        let first_source = fs::read_to_string(&first_path).unwrap();
-        let fresh_source = fs::read_to_string(&fresh_path).unwrap();
-        assert!(first_source.contains("\"captureEpoch\":2147488769"));
-        assert!(fresh_source.contains("\"captureEpoch\":2147488770"));
-        assert!(
-            fresh_source.contains("\"sequence\":\"1\"") || fresh_source.contains("\"captureEnd\"")
-        );
+        let epoch = |path: &Path| match source_records(path).first() {
+            Some(capture::record::Record::CaptureStart(start)) => start.capture_epoch,
+            other => panic!("source does not start with captureStart: {other:?}"),
+        };
+        assert_eq!(epoch(&first_path), 0x8000_1401);
+        assert_eq!(epoch(&fresh_path), 0x8000_1402);
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
@@ -3571,56 +3820,53 @@ mod tests {
         }
     }
 
-    fn privileged_prepare(path: PathBuf) -> PrepareConfig {
-        PrepareConfig {
-            target_pid: unsafe { libc::getpid() as u32 },
-            output_path: path,
-            sampling: privileged_sampling(),
-            time_split: TimeSplitConfig {
-                source: TimeSplitSource::SchedInfo,
-            },
-            exclude_calling_thread: false,
-            calling_tid: 0,
+    fn privileged_sampling() -> capture::Sampling {
+        use capture::OffCpuReason as Reason;
+        capture::Sampling {
+            reasons: reasons(&[Reason::Blocked, Reason::Runnable, Reason::Preempted]),
+            min_off_cpu_micros: None,
+            max_off_cpu_micros: None,
+            admission: Some(uniform_message("1", 1_u64 << 32)),
         }
     }
 
-    fn privileged_sampling() -> SamplingConfig {
-        SamplingConfig {
-            reasons: vec![
-                OffCpuReason::Blocked,
-                OffCpuReason::Runnable,
-                OffCpuReason::Preempted,
-            ],
-            min_off_cpu_micros: None,
-            max_off_cpu_micros: None,
-            admission: uniform(1_u64 << 32),
-        }
+    fn privileged_prepare(path: PathBuf) -> PrepareConfig {
+        let mut request = prepare_request(privileged_sampling());
+        request.target_pid = unsafe { libc::getpid() as u32 };
+        request.output_path = path.to_string_lossy().into_owned();
+        parse(&request).unwrap()
     }
 
     fn privileged_enable(epoch: u32) -> EnableConfig {
-        EnableConfig {
+        let request = capture::EnableRequest {
             session_id: "12345678-1234-4abc-8def-123456789abc".to_string(),
             capture_epoch: epoch,
             signal: libc::SIGRTMIN() + 5,
-            signal_delivery: Some("queued".to_string()),
-            sampling: None,
-            time_split: None,
-        }
+            signal_delivery: capture::SignalDelivery::Queued as i32,
+            sampling: Some(privileged_sampling()),
+            time_split: Some(sched_info()),
+        };
+        parse_enable(&request.encode_to_vec()).unwrap()
     }
 
     fn privileged_output(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "jonoffcpu-{label}-{}-{}.ndjson",
+            "jonoffcpu-{label}-{}-{}.pb",
             std::process::id(),
             random_nonzero_u64().unwrap()
         ))
     }
 
-    fn assert_source_has_no_control_rows(path: &Path) {
-        let source = fs::read_to_string(path).unwrap();
-        assert!(!source.contains("captureStart"));
-        assert!(!source.contains("captureEnd"));
-        assert!(!source.contains("observation"));
+    fn source_records(path: &Path) -> Vec<capture::record::Record> {
+        capture::decode(&fs::read(path).unwrap())
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| record.record)
+            .collect()
+    }
+
+    fn assert_source_has_no_records(path: &Path) {
+        assert!(source_records(path).is_empty());
     }
 
     fn install_privileged_signal_handler() -> Result<()> {

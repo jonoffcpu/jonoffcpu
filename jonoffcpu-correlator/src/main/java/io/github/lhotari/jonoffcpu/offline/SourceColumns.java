@@ -6,7 +6,7 @@ import java.util.BitSet;
 
 /**
  * One slot per observation, in capture file order, holding only what the join and the aggregates
- * read. Fifty-nine bytes a row replaces a retained Gson object graph.
+ * read. Fifty-nine bytes a row replaces a retained object graph.
  *
  * <p>Timestamps, the cookie and the admission threshold are raw u64 bits; compare them through
  * {@link U64}. The interned kernel and user stack ids are kept for the stack profile, which groups

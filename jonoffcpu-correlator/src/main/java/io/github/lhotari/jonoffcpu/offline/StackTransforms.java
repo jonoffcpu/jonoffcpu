@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -230,28 +228,25 @@ record StackTransforms(
     }
 
     /** The options in effect, with every pattern and its source, for a summary. */
-    JsonObject report() {
-        JsonObject report = new JsonObject();
-        report.addProperty("canonicalNames", canonicalNames);
-        report.add("hide", patterns(hide));
-        report.add("trimRoot", patterns(trimRoot));
-        report.add("rootAt", patterns(rootAt));
-        report.addProperty("rootAtUnmatched", keepUnmatchedRoot ? "keep" : "bucket");
-        report.add("leafAt", patterns(leafAt));
-        report.add("collapseLeaf", patterns(collapseLeaf));
-        report.addProperty("collapseLeafLabel", categoryLabel ? "category" : "frame");
-        report.addProperty("threadFrame", threadFrame.label());
-        return report;
+    AnalysisProto.Transforms.Builder report() {
+        return AnalysisProto.Transforms.newBuilder()
+                .setCanonicalNames(canonicalNames)
+                .addAllHide(patterns(hide))
+                .addAllTrimRoot(patterns(trimRoot))
+                .addAllRootAt(patterns(rootAt))
+                .setRootAtUnmatched(keepUnmatchedRoot ? "keep" : "bucket")
+                .addAllLeafAt(patterns(leafAt))
+                .addAllCollapseLeaf(patterns(collapseLeaf))
+                .setCollapseLeafLabel(categoryLabel ? "category" : "frame")
+                .setThreadFrame(threadFrame.label());
     }
 
-    static JsonArray patterns(List<Sourced> patterns) {
-        JsonArray array = new JsonArray();
-        for (Sourced pattern : patterns) {
-            JsonObject item = new JsonObject();
-            item.addProperty("pattern", pattern.pattern());
-            item.addProperty("source", pattern.source());
-            array.add(item);
-        }
-        return array;
+    static List<AnalysisProto.SourcedPattern> patterns(List<Sourced> patterns) {
+        return patterns.stream()
+                .map(pattern -> AnalysisProto.SourcedPattern.newBuilder()
+                        .setPattern(pattern.pattern())
+                        .setSource(pattern.source())
+                        .build())
+                .toList();
     }
 }

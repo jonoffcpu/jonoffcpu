@@ -1,7 +1,16 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.JsonObject;
+import com.google.protobuf.Timestamp;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ArtifactPaths;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.AsyncProfiler;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Failure;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.FailureCode;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Manifest;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ManifestState;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ThreadPolicy;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.AnalysisInputs;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -16,19 +25,28 @@ import java.time.Instant;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * The capture's audit manifest, the {@link Manifest} message, which the controller fills in step by step. Every
+ * write replaces the file atomically with the message's proto3 JSON, so a reader sees one complete state or the
+ * previous one.
+ */
 final class ManifestStore {
+    static final int MAX_MANIFEST_BYTES = 1024 * 1024;
+
     private final Path captureDirectory;
     private final Path manifestPath;
+    private final Path sourcePath;
     private final Path jfrPath;
     private final Object jfrDevice;
     private final Object jfrInode;
-    private final JsonObject manifest;
+    private final Manifest.Builder manifest;
 
-    private ManifestStore(Path captureDirectory, Path jfrPath, Object jfrDevice, Object jfrInode, JsonObject manifest)
+    private ManifestStore(
+            Path captureDirectory, Path jfrPath, Object jfrDevice, Object jfrInode, Manifest.Builder manifest)
             throws IOException {
         this.captureDirectory = captureDirectory;
-        this.manifestPath = Path.of(
-                manifest.getAsJsonObject("artifactPaths").get("manifest").getAsString());
+        this.manifestPath = Path.of(manifest.getArtifactPaths().getManifest());
+        this.sourcePath = Path.of(manifest.getArtifactPaths().getSource());
         this.jfrPath = jfrPath;
         this.jfrDevice = jfrDevice;
         this.jfrInode = jfrInode;
@@ -37,7 +55,7 @@ final class ManifestStore {
     }
 
     /**
-     * A capture file that sits next to the correlation stream and shares its stem: {@code jonoffcpu-capture.ndjson}
+     * A capture file that sits next to the correlation stream and shares its stem: {@code jonoffcpu-capture.pb}
      * gets {@code jonoffcpu-capture.manifest.json}, so the whole capture is recognisable by one name. Only the
      * final extension of the file name is replaced; a leading dot or a dot in a directory name is not one.
      */
@@ -59,40 +77,32 @@ final class ManifestStore {
         if (Files.exists(correlation) || Files.exists(jfr)) {
             throw new IOException("Capture artifact path already exists");
         }
-        JsonObject root = new JsonObject();
-        root.addProperty("schemaVersion", 1);
-        root.addProperty("sessionId", sessionId);
-        root.addProperty("complete", false);
-        root.addProperty("state", "preparing");
-        root.addProperty("createdAt", Instant.now().toString());
-
-        JsonObject artifacts = new JsonObject();
-        artifacts.addProperty("source", correlation.toString());
-        artifacts.addProperty("jfr", jfr.toString());
-        artifacts.addProperty("manifest", manifestPath.toString());
-        root.add("artifactPaths", artifacts);
-
-        JsonObject target = new JsonObject();
-        target.addProperty("targetPid", config.targetPid());
-        root.add("target", target);
-
-        JsonObject profiler = new JsonObject();
-        profiler.addProperty(
-                "requestedLibraryPath", config.asyncProfilerLibrary().toString());
-        profiler.addProperty("requestedOptions", config.asyncProfilerOptions());
-        profiler.addProperty("protocol", "signal-capture-v1");
-        root.add("asyncProfiler", profiler);
-        root.add("sampling", config.sampling().json());
-        root.add("timeSplit", config.timeSplit().json());
-
-        JsonObject threads = new JsonObject();
-        threads.addProperty("schemaVersion", 1);
-        threads.addProperty("controllerWorker", "jonoffcpu-signal-controller");
-        threads.addProperty("controllerWorkerDaemon", true);
-        threads.addProperty("sourceRuntimeWorkers", 1);
-        threads.addProperty("signalTargets", "source-selected target application threads");
-        root.add("threadPolicy", threads);
-        root.addProperty("jdkVersion", System.getProperty("java.version"));
+        Manifest.Builder root = Manifest.newBuilder()
+                .setSessionId(sessionId)
+                .setComplete(false)
+                .setState(ManifestState.MANIFEST_STATE_PREPARING)
+                .setMode(
+                        config.profilerOnly()
+                                ? ManifestProto.CaptureMode.CAPTURE_MODE_PROFILER_ONLY
+                                : ManifestProto.CaptureMode.CAPTURE_MODE_SIGNAL_CAPTURE)
+                .setCreatedAt(now())
+                .setArtifactPaths(ArtifactPaths.newBuilder()
+                        .setSource(correlation.toString())
+                        .setJfr(jfr.toString())
+                        .setManifest(manifestPath.toString()))
+                .setTargetPid(Math.toIntExact(config.targetPid()))
+                .setAsyncProfiler(AsyncProfiler.newBuilder()
+                        .setRequestedLibraryPath(config.asyncProfilerLibrary().toString())
+                        .setRequestedOptions(config.asyncProfilerOptions())
+                        .setProtocol("signal-capture-v1"))
+                .setSampling(config.sampling())
+                .setTimeSplit(config.timeSplit())
+                .setThreadPolicy(ThreadPolicy.newBuilder()
+                        .setControllerWorker("jonoffcpu-signal-controller")
+                        .setControllerWorkerDaemon(true)
+                        .setSourceRuntimeWorkers(1)
+                        .setSignalTargets("source-selected target application threads"))
+                .setJdkVersion(System.getProperty("java.version"));
         boolean reserved = false;
         try {
             try (FileChannel file = FileChannel.open(jfr, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
@@ -120,14 +130,15 @@ final class ManifestStore {
     }
 
     Path sourcePath() {
-        return Path.of(manifest.getAsJsonObject("artifactPaths").get("source").getAsString());
+        return sourcePath;
     }
 
     Path jfrPath() {
         return jfrPath;
     }
 
-    JsonObject root() {
+    /** The manifest being built; a change is published by the next {@link #checkpoint} or state write. */
+    Manifest.Builder root() {
         return manifest;
     }
 
@@ -141,29 +152,28 @@ final class ManifestStore {
         }
     }
 
-    void state(String state) throws IOException {
-        manifest.addProperty("state", state);
-        manifest.addProperty("complete", false);
+    void state(ManifestState state) throws IOException {
+        manifest.setState(state).setComplete(false);
         write(false);
     }
 
-    void failure(String state, Throwable error) throws IOException {
-        manifest.addProperty("state", state);
-        manifest.addProperty("complete", false);
-        JsonObject failure = new JsonObject();
-        failure.addProperty("code", JsonSupport.errorCode(error));
-        failure.addProperty("message", bounded(error.getMessage() == null ? error.toString() : error.getMessage()));
-        failure.addProperty("recordedAt", Instant.now().toString());
-        manifest.add("failure", failure);
+    void failure(ManifestState state, Throwable error) throws IOException {
+        Failure.Builder failure = Failure.newBuilder()
+                .setCode(failureCode(error))
+                .setException(error.getClass().getName())
+                .setMessage(bounded(error.getMessage() == null ? error.toString() : error.getMessage()))
+                .setRecordedAt(now());
+        if (error instanceof CollectorException collector) failure.setCollectorError(collector.error());
+        manifest.setState(state).setComplete(false).setFailure(failure);
         write(false);
     }
 
-    void complete(JsonObject analysisInputs) throws IOException {
-        manifest.add("analysisInputs", analysisInputs);
-        manifest.remove("failure");
-        manifest.addProperty("state", "complete");
-        manifest.addProperty("complete", true);
-        manifest.addProperty("completedAt", Instant.now().toString());
+    void complete(AnalysisInputs analysisInputs) throws IOException {
+        manifest.setAnalysisInputs(analysisInputs)
+                .clearFailure()
+                .setState(ManifestState.MANIFEST_STATE_COMPLETE)
+                .setComplete(true)
+                .setCompletedAt(now());
         write(false);
     }
 
@@ -171,9 +181,26 @@ final class ManifestStore {
         write(false);
     }
 
+    static Timestamp now() {
+        Instant now = Instant.now();
+        return Timestamp.newBuilder()
+                .setSeconds(now.getEpochSecond())
+                .setNanos(now.getNano())
+                .build();
+    }
+
+    private static FailureCode failureCode(Throwable error) {
+        if (error instanceof CollectorException) return FailureCode.FAILURE_CODE_COLLECTOR_ERROR;
+        if (error instanceof IllegalStateException) return FailureCode.FAILURE_CODE_INVALID_STATE;
+        if (error instanceof IllegalArgumentException) return FailureCode.FAILURE_CODE_INVALID_ARGUMENT;
+        if (error instanceof IOException) return FailureCode.FAILURE_CODE_IO_ERROR;
+        if (error instanceof InterruptedException) return FailureCode.FAILURE_CODE_INTERRUPTED;
+        return FailureCode.FAILURE_CODE_INTERNAL_ERROR;
+    }
+
     private void write(boolean create) throws IOException {
-        byte[] bytes = (JsonSupport.GSON.toJson(manifest) + "\n").getBytes(StandardCharsets.UTF_8);
-        if (bytes.length > 1024 * 1024) {
+        byte[] bytes = (ProtoJson.pretty(manifest.build()) + "\n").getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > MAX_MANIFEST_BYTES) {
             throw new IOException("Manifest exceeds 1 MiB");
         }
         if (create) {

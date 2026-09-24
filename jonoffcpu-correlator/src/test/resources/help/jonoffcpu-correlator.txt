@@ -92,7 +92,8 @@ Commands:
   merge      Sums the counters of several stack profiles into one. Thinned profiles cannot be
                merged.
   export     Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.
-  dump       Prints the capture stream as NDJSON, each observation's interned stacks expanded.
+  dump       Prints the capture stream as JSON Lines, one record per line as the capture schema
+               defines it.
   help       Display help information about the specified command.
 
 Writes into the output directory: jonoffcpu-report.json, jonoffcpu-offcpu-stacks.collapsed,

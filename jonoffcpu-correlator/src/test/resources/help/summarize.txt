@@ -6,8 +6,8 @@ and losses, where the time went, the ranked busy and idle tables, the heaviest t
 and the command that reproduces each table.
 Correlation writes it by default; this command rewrites it with an application pattern.
       --profile=FILE     The stack profile. Required.
-      --report=FILE      The correlation report beside it, for the capture section. Default:
-                           jonoffcpu-report.json next to the profile, when it exists.
+      --report=FILE      A correlation report (jonoffcpu-report.json) for the capture section.
+                           Default: the report the profile carries; a merged profile has none.
       --output-dir=DIR   Where to write the digest; its files must not exist. Default: the current
                            directory.
       --app=REGEX        A frame of your application; the deepest one is a stack's boundary.

@@ -1,12 +1,9 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonNull;
-import com.google.gson.JsonObject;
-import io.github.lhotari.jonoffcpu.offline.StackProfile.Header;
+import com.google.protobuf.Message;
+import io.github.lhotari.jonoffcpu.capture.CaptureFormat;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.math.BigInteger;
@@ -20,6 +17,9 @@ import java.util.TreeMap;
 
 /** Command-line entry point for the two-input Java correlator. */
 public final class OffCpuCorrelator {
+    static final String STACK_SEMANTICS =
+            "signal-delivery stack; not guaranteed to match the eBPF scheduler-exit stack";
+
     record OutputOptions(
             boolean collapsed,
             boolean compatibilityJfr,
@@ -107,49 +107,27 @@ public final class OffCpuCorrelator {
     }
 
     /**
-     * Prints the capture stream as one JSON object per line, with each observation's interned stacks
-     * expanded, so humans and tools can read a binary capture without the correlator's analysis.
+     * Prints the capture stream as JSON Lines, one record per line as {@code jonoffcpu-capture.proto} defines it, so
+     * humans and tools can read a binary capture without the correlator's analysis. A record cut short ends the
+     * output with a {@code truncatedTailBytes} line.
      */
     static void dump(Path source) throws IOException {
-        Gson gson = new GsonBuilder().serializeNulls().create();
-        Map<Long, JsonArray> stacks = new java.util.HashMap<>();
         // Flushed, never closed: an in-process caller keeps its standard output.
         BufferedWriter writer = new BufferedWriter(new java.io.OutputStreamWriter(System.out, StandardCharsets.UTF_8));
-        try (java.io.InputStream input = new java.io.BufferedInputStream(java.nio.file.Files.newInputStream(source))) {
-            CaptureStream.readHeader(input);
-            CaptureStream.Framed framed;
-            while ((framed = CaptureStream.next(
+        try (java.io.InputStream input = new java.io.BufferedInputStream(Files.newInputStream(source))) {
+            CaptureFormat.readHeader(input);
+            CaptureFormat.Framed framed;
+            while ((framed = CaptureFormat.next(
                             input, OfflineCorrelator.Limits.defaults().maxLineBytes()))
                     != null) {
-                if (framed.truncated()) {
-                    writer.write(gson.toJson(java.util.Map.of("truncatedTailBytes", framed.bytes().length)));
-                    writer.newLine();
-                    break;
-                }
-                JsonObject row =
-                        switch (framed.record().getRecordCase()) {
-                            case STACK -> {
-                                JsonObject stack =
-                                        CaptureStream.stackRow(framed.record().getStack());
-                                stacks.put(stack.get("stackId").getAsLong(), stack.getAsJsonArray("frames"));
-                                yield stack;
-                            }
-                            case OBSERVATION -> {
-                                JsonObject observation = CaptureStream.observationRow(
-                                        framed.record().getObservation());
-                                for (String stack : List.of("kernelStack", "userStack")) {
-                                    JsonArray frames = stacks.get(
-                                            observation.get(stack + "Id").getAsLong());
-                                    observation.add(stack + "Frames", frames == null ? new JsonArray() : frames);
-                                }
-                                yield observation;
-                            }
-                            default ->
-                                com.google.gson.JsonParser.parseString(CaptureStream.controlJson(framed.record()))
-                                        .getAsJsonObject();
-                        };
-                writer.write(gson.toJson(row));
+                Message line = framed.truncated()
+                        ? ReportProto.TruncatedTail.newBuilder()
+                                .setTruncatedTailBytes(framed.bytes().length)
+                                .build()
+                        : framed.record();
+                writer.write(ProtoJson.line(line));
                 writer.newLine();
+                if (framed.truncated()) break;
             }
         } finally {
             writer.flush();
@@ -274,7 +252,6 @@ public final class OffCpuCorrelator {
     private static void write(AnalysisOutput output, Path directory, OutputOptions options, Verification verify)
             throws IOException {
         Files.createDirectory(directory);
-        Gson gson = new GsonBuilder().serializeNulls().create();
         String prefix = options.prefix();
         boolean narrowed = options.ladder().narrowed();
         // The combined file keeps every recorded interval. When it mixes switch-out reasons, each line starts with
@@ -335,143 +312,125 @@ public final class OffCpuCorrelator {
                 output.writeMatches(writer);
             }
         }
-        JsonObject report = new JsonObject();
-        report.addProperty("schemaVersion", 1);
-        report.addProperty(
-                "stackSemantics", "signal-delivery stack; not guaranteed to match the eBPF scheduler-exit stack");
-        report.addProperty("audit", options.audit().text());
-        report.addProperty(
-                "weightSemantics",
-                "collapsed stacks use rounded integer microseconds; exact selected duration remains in nanoseconds");
+        ReportProto.Report.Builder report = ReportProto.Report.newBuilder()
+                .setStackSemantics(STACK_SEMANTICS)
+                .setAudit(options.audit().text())
+                .setWeightSemantics("collapsed stacks use rounded integer microseconds; exact selected duration remains"
+                        + " in nanoseconds");
         if (output.thinning().active()) {
-            report.add("sourceThinning", output.thinning().report());
-            report.addProperty("keptSourceRows", Integer.toString(output.sourceRows()));
-            report.addProperty("observedKeptDurationNanos", Long.toString(output.observedKeptDurationNanos()));
-            report.addProperty(
-                    "weightSemantics",
-                    "collapsed stacks are inverse-probability estimates from a thinned subsample;"
+            report.setSourceThinning(output.thinning().report())
+                    .setKeptSourceRows(output.sourceRows())
+                    .setObservedKeptDurationNanos(output.observedKeptDurationNanos())
+                    .setWeightSemantics("collapsed stacks are inverse-probability estimates from a thinned subsample;"
                             + " observed kept nanoseconds are reported separately");
         }
-        report.add("analysisInputs", output.analysisInputs());
-        report.add("sourceCounters", output.sourceCounters());
-        report.addProperty("apStoppedAtNanos", output.apStoppedAtNanos());
-        report.addProperty("sourceRows", output.sourceRows());
-        report.addProperty("jfrSamples", output.jfrSamples());
-        report.addProperty("matched", output.matched());
-        report.addProperty("unmatchedSource", output.unmatchedSource());
-        report.addProperty("sourceRowsWithoutSelectedJfrSample", output.sourceRowsWithoutSelectedJfrSample());
-        report.addProperty("orphanJfr", output.orphanJfr());
-        report.addProperty("invalidSource", output.invalidSource());
-        report.addProperty("invalidJfr", output.invalidJfr());
-        report.addProperty("identityUnverified", output.identityUnverified());
-        report.addProperty("selectedObservedDurationNanos", output.selectedObservedDurationNanos());
-        report.addProperty("submittedButNotParsed", output.submittedButNotParsed());
-        if (output.jfrSelection() != null) {
-            report.add("jfrSelection", output.jfrSelection());
+        if (output.analysisInputs() != null) report.setAnalysisInputs(output.analysisInputs());
+        if (output.sourceCounters() != null) report.setSourceCounters(output.sourceCounters());
+        if (output.apStoppedAtNanos() != null) report.setApStoppedAtNanos(output.apStoppedAtNanos());
+        report.setSourceRows(output.sourceRows())
+                .setJfrSamples(output.jfrSamples())
+                .setMatched(output.matched())
+                .setUnmatchedSource(output.unmatchedSource())
+                .setSourceRowsWithoutSelectedJfrSample(output.sourceRowsWithoutSelectedJfrSample())
+                .setOrphanJfr(output.orphanJfr())
+                .setInvalidSource(output.invalidSource())
+                .setInvalidJfr(output.invalidJfr())
+                .setIdentityUnverified(output.identityUnverified())
+                .setSelectedObservedDurationNanos(output.selectedObservedDurationNanos());
+        if (output.submittedButNotParsed() != null) report.setSubmittedButNotParsed(output.submittedButNotParsed());
+        if (output.jfrSelection() != null) report.setJfrSelection(output.jfrSelection());
+        if (options.populationEstimate() && output.populationEstimate() != null) {
+            report.setPopulationEstimate(output.populationEstimate());
         }
-        if (options.populationEstimate()) {
-            report.add("populationEstimate", gson.toJsonTree(output.populationEstimate()));
-        }
-        JsonObject delays = new JsonObject();
-        long[] sortedDelays = output.sortedHandlerDelays();
-        delays.addProperty("count", sortedDelays.length);
-        delays.addProperty("scope", "source interval end to AP handler timestamp, after clock translation");
-        for (int percentile : new int[] {50, 90, 99, 100}) {
-            String name = percentile == 100 ? "max" : "p" + percentile;
-            if (sortedDelays.length == 0) {
-                delays.add(name, JsonNull.INSTANCE);
-            } else {
-                int rank = (int) ((sortedDelays.length * (long) percentile + 99) / 100);
-                delays.addProperty(name, Long.toString(sortedDelays[rank - 1]));
-            }
-        }
-        report.add("handlerDelayNanos", delays);
+        report.setHandlerDelayNanos(handlerDelays(output.sortedHandlerDelays()));
         if (compatibility != null) {
-            JsonObject view = new JsonObject();
-            view.addProperty("path", compatibility.output().getFileName().toString());
             // quantumNanos is the requested quantum at estimated scale (what one reweighted event
             // represents); observedQuantumNanos is the actual, possibly thinning-shrunk and
             // event-limit-raised, quantum of observed time an event was built from.
-            view.addProperty("quantumNanos", Long.toString(requestedJfrOptions.quantumNanos()));
-            view.addProperty("requestedQuantumNanos", Long.toString(compatibility.requestedQuantumNanos()));
-            view.addProperty("observedQuantumNanos", Long.toString(compatibility.quantumNanos()));
-            view.addProperty("quantumRaisedForEventLimit", compatibility.quantumRaised());
-            view.addProperty("syntheticEvents", Long.toString(compatibility.syntheticEvents()));
-            view.addProperty("representedNanos", compatibility.representedNanos());
-            view.addProperty("quantizationErrorNanos", compatibility.quantizationErrorNanos());
-            view.addProperty("omittedRemainderNanos", compatibility.omittedRemainderNanos());
-            report.add("syntheticJfr", view);
+            report.setSyntheticJfr(ReportProto.SyntheticJfr.newBuilder()
+                    .setPath(compatibility.output().getFileName().toString())
+                    .setQuantumNanos(requestedJfrOptions.quantumNanos())
+                    .setRequestedQuantumNanos(compatibility.requestedQuantumNanos())
+                    .setObservedQuantumNanos(compatibility.quantumNanos())
+                    .setQuantumRaisedForEventLimit(compatibility.quantumRaised())
+                    .setSyntheticEvents(compatibility.syntheticEvents())
+                    .setRepresentedNanos(Long.parseLong(compatibility.representedNanos()))
+                    .setQuantizationErrorNanos(Long.parseLong(compatibility.quantizationErrorNanos()))
+                    .setOmittedRemainderNanos(Long.parseLong(compatibility.omittedRemainderNanos())));
         }
-        JsonObject offCpuReasons = output.offCpuReasons();
-        if (offCpuReasons != null) report.add("offCpuReasons", offCpuReasons);
+        ReportProto.OffCpuReasons offCpuReasons = output.offCpuReasons();
+        if (offCpuReasons != null) report.setOffCpuReasons(offCpuReasons);
         // Always present, with an empty stepsApplied when nothing was needed, so a consumer can see that
         // degradation was considered and declined.
-        report.add("degradation", options.ladder().report(output.peakRetainedBytes()));
-        StackProfile profile = options.stackProfile() ? output.stackProfile("") : null;
+        report.setDegradation(options.ladder().report(output.peakRetainedBytes()));
+        StackProfile profile = options.stackProfile() ? output.stackProfile() : null;
         if (profile != null) {
-            JsonObject view = new JsonObject();
-            view.addProperty("path", OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX));
-            view.addProperty("entries", profile.entries().size());
-            view.add("dimensions", gson.toJsonTree(profile.header().dimensions()));
-            view.add("dimensionsDropped", gson.toJsonTree(profile.header().dimensionsDropped()));
-            view.addProperty("estimateAvailable", profile.header().estimateAvailable());
-            view.addProperty("timeSplitAvailable", profile.header().timeSplitAvailable());
-            report.add("stackProfile", view);
-            if (options.digest()) report.add("digest", digest(directory, prefix, profile, report));
+            report.setStackProfile(ReportProto.StackProfileSummary.newBuilder()
+                    .setPath(OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX))
+                    .setEntries(profile.entries().size())
+                    .addAllDimensions(profile.header().dimensions())
+                    .addAllDimensionsDropped(profile.header().dimensionsDropped())
+                    .setEstimateAvailable(profile.header().estimateAvailable())
+                    .setTimeSplitAvailable(profile.header().timeSplitAvailable()));
+            if (options.digest()) report.setDigest(digest(directory, prefix, profile, report.build()));
         }
-        // Explicit nulls keep the echoed sampling bounds and an unavailable estimate visible as such.
-        String reportJson =
-                new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report);
+        ReportProto.Report built = report.build();
         if (profile != null) {
             // The profile carries the report it was produced with, so it stays interpretable on its own.
-            Header header = profile.header();
-            new StackProfile(
-                            new Header(
-                                    header.sources(),
-                                    header.dimensions(),
-                                    header.estimateAvailable(),
-                                    reportJson,
-                                    header.label(),
-                                    header.dimensionsDropped(),
-                                    header.timeSplitAvailable()),
-                            profile.entries())
+            new StackProfile(profile.header().withReport(built), profile.entries())
                     .write(directory.resolve(OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX)));
         }
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.name(prefix, OutputFiles.REPORT_SUFFIX)))) {
-            writer.write(reportJson);
-            writer.newLine();
-        }
+        writePretty(directory.resolve(OutputFiles.name(prefix, OutputFiles.REPORT_SUFFIX)), built);
         verify.verify();
         if (narrowed) {
             // A narrowed window is not the question that was asked: it never promotes the directory to
             // complete, and the same no-replace hard-link publication writePartial uses keeps a
             // half-written marker from ever being observed.
-            JsonObject marker = new JsonObject();
-            marker.addProperty("schemaVersion", 1);
-            marker.addProperty("state", "narrowed");
-            marker.addProperty("coverageComplete", false);
-            marker.addProperty(
-                    "effectiveToNanos", Long.toString(options.ladder().narrowedToNanos()));
-            Path temporary = Files.createTempFile(directory, ".narrowed-marker-", ".tmp");
-            try {
-                Files.writeString(temporary, gson.toJson(marker) + "\n", StandardCharsets.UTF_8);
-                Files.createLink(directory.resolve(OutputFiles.NARROWED), temporary);
-            } finally {
-                Files.deleteIfExists(temporary);
-            }
+            publishMarker(
+                    directory,
+                    OutputFiles.NARROWED,
+                    ReportProto.Marker.newBuilder()
+                            .setState(ReportProto.MarkerState.MARKER_STATE_NARROWED)
+                            .setCoverageComplete(false)
+                            .setEffectiveToNanos(options.ladder().narrowedToNanos())
+                            .build());
         } else {
             try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.COMPLETE))) {
-                writer.write("{\"schemaVersion\":1,\"state\":\"complete\"}\n");
+                writer.write(ProtoJson.line(ReportProto.Marker.newBuilder()
+                        .setState(ReportProto.MarkerState.MARKER_STATE_COMPLETE)
+                        .setCoverageComplete(true)
+                        .build()));
+                writer.newLine();
             }
         }
+    }
+
+    /** The delivery-delay percentiles by nearest rank; unset when nothing matched. */
+    static ReportProto.HandlerDelays handlerDelays(long[] sortedDelays) {
+        ReportProto.HandlerDelays.Builder delays = ReportProto.HandlerDelays.newBuilder()
+                .setCount(sortedDelays.length)
+                .setScope("source interval end to AP handler timestamp, after clock translation");
+        if (sortedDelays.length > 0) {
+            delays.setP50(percentile(sortedDelays, 50))
+                    .setP90(percentile(sortedDelays, 90))
+                    .setP99(percentile(sortedDelays, 99))
+                    .setMax(percentile(sortedDelays, 100));
+        }
+        return delays.build();
+    }
+
+    private static long percentile(long[] sorted, int percentile) {
+        int rank = (int) ((sorted.length * (long) percentile + 99) / 100);
+        return sorted[rank - 1];
     }
 
     /**
      * Writes the analysis digest beside the report and returns the report's {@code digest} object. The digest is a
      * convenience: a failure to produce it is reported there, its files are removed, and the correlation goes on.
      */
-    private static JsonObject digest(Path directory, String prefix, StackProfile profile, JsonObject report) {
-        JsonObject view = new JsonObject();
+    private static ReportProto.DigestFiles digest(
+            Path directory, String prefix, StackProfile profile, ReportProto.Report report) {
+        ReportProto.DigestFiles.Builder view = ReportProto.DigestFiles.newBuilder();
         Path json = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_JSON_SUFFIX));
         Path markdown = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_MD_SUFFIX));
         try {
@@ -479,9 +438,8 @@ public final class OffCpuCorrelator {
                     Digest.of(profile, OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX), report, Digest.defaults()),
                     json,
                     markdown);
-            view.addProperty("path", markdown.getFileName().toString());
-            view.addProperty("json", json.getFileName().toString());
-            view.addProperty("schemaVersion", Digest.SCHEMA_VERSION);
+            view.setPath(markdown.getFileName().toString());
+            view.setJson(json.getFileName().toString());
         } catch (IOException | RuntimeException failure) {
             try {
                 Files.deleteIfExists(json);
@@ -489,9 +447,9 @@ public final class OffCpuCorrelator {
             } catch (IOException ignored) {
                 // The error below is what the reader needs; a leftover file is named by it too.
             }
-            view.addProperty("error", String.valueOf(failure));
+            view.setError(String.valueOf(failure));
         }
-        return view;
+        return view.build();
     }
 
     /** A digest recheck run after every other artifact is written but before the completion marker. */
@@ -507,7 +465,6 @@ public final class OffCpuCorrelator {
     static void writePartial(OfflineCorrelator.PartialAnalysis result, Path directory, boolean collapsed)
             throws IOException {
         Files.createDirectory(directory);
-        Gson gson = new GsonBuilder().serializeNulls().create();
         if (collapsed) {
             try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_COLLAPSED))) {
                 for (var entry : new TreeMap<>(result.collapsedNanos()).entrySet()) {
@@ -520,75 +477,44 @@ public final class OffCpuCorrelator {
             }
         }
         try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_CLASSIFIED_RECORDS))) {
-            for (var record : result.records()) {
-                JsonObject row = gson.toJsonTree(record).getAsJsonObject();
-                row.addProperty("state", "incomplete");
-                row.addProperty("analysisMode", "partial");
-                gson.toJson(row, writer);
+            for (ReportProto.ClassifiedRecord record : result.records()) {
+                writer.write(ProtoJson.line(record));
                 writer.newLine();
             }
         }
         try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_PAIRS))) {
-            for (var pair : result.pairs()) {
-                JsonObject row = new JsonObject();
-                row.addProperty("state", "incomplete");
-                row.addProperty("pairFinality", "provisional-within-recovered-records");
-                row.addProperty(
-                        "correlationId", pair.observation().get("correlationId").getAsString());
-                row.addProperty("fromNanos", pair.fromNanos().toString());
-                row.addProperty("toNanos", pair.toNanos().toString());
-                row.addProperty("durationNanos", pair.durationNanos().toString());
-                row.addProperty(
-                        "handlerDelayNanos",
-                        pair.handlerDelayNanos() == null
-                                ? null
-                                : pair.handlerDelayNanos().toString());
-                row.addProperty("threadIdentityVerified", pair.threadIdentityVerified());
-                gson.toJson(row, writer);
+            for (OfflineCorrelator.Match pair : result.pairs()) {
+                writer.write(ProtoJson.line(pair.pair()));
                 writer.newLine();
             }
         }
-        JsonObject report = result.diagnostics().deepCopy();
-        report.addProperty("schemaVersion", 1);
-        report.addProperty("analysisMode", "partial");
-        report.addProperty("state", result.state());
-        report.addProperty("coverageComplete", result.coverageComplete());
-        report.addProperty("pairFinality", "provisional-within-recovered-records");
-        report.addProperty(
-                "stackSemantics", "signal-delivery stack; not guaranteed to match the eBPF scheduler-exit stack");
-        report.addProperty(
-                "weightSemantics",
-                "collapsed stacks use rounded integer microseconds; observed prefix only; no loss correction");
-        report.add("observedSourceCapture", result.sourceCapture());
-        report.add("observedSourceEnd", result.sourceEnd());
-        report.addProperty("sourceRows", Integer.toString(result.sourceRows()));
-        report.addProperty("jfrSamples", Integer.toString(result.jfrSamples()));
-        report.addProperty("provisionalPairs", Integer.toString(result.provisionalPairs()));
-        report.addProperty("unmatchedSource", Integer.toString(result.unmatchedSource()));
-        report.addProperty("orphanJfr", Integer.toString(result.orphanJfr()));
-        report.addProperty("invalidSource", Integer.toString(result.invalidSource()));
-        report.addProperty("invalidJfr", Integer.toString(result.invalidJfr()));
-        report.addProperty("identityUnverified", Integer.toString(result.identityUnverified()));
-        report.addProperty("sourceSelectedObservedDurationNanos", result.sourceSelectedObservedDurationNanos());
-        report.addProperty("pairedSelectedObservedDurationNanos", result.pairedSelectedObservedDurationNanos());
-        report.addProperty("submittedButNotParsed", result.submittedButNotParsed());
-        try (BufferedWriter writer = newFile(directory.resolve(OutputFiles.INCOMPLETE_REPORT))) {
-            new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(report, writer);
-            writer.newLine();
-        }
-        JsonObject marker = new JsonObject();
-        marker.addProperty("schemaVersion", 1);
-        marker.addProperty("analysisMode", "partial");
-        marker.addProperty("state", "incomplete");
-        marker.addProperty("coverageComplete", false);
-        marker.add("incompleteReasons", report.get("incompleteReasons"));
-        // A no-replace hard link publishes only the fully written marker, never a partial JSON write.
-        Path temporary = Files.createTempFile(directory, ".partial-marker-", ".tmp");
+        writePretty(directory.resolve(OutputFiles.INCOMPLETE_REPORT), result.report());
+        publishMarker(
+                directory,
+                OutputFiles.PARTIAL,
+                ReportProto.Marker.newBuilder()
+                        .setState(ReportProto.MarkerState.MARKER_STATE_INCOMPLETE)
+                        .setCoverageComplete(false)
+                        .addAllIncompleteReasons(result.report().getIncompleteReasonsList())
+                        .build());
+    }
+
+    /** A no-replace hard link publishes only the fully written marker, never a partial write. */
+    private static void publishMarker(Path directory, String name, ReportProto.Marker marker) throws IOException {
+        Path temporary = Files.createTempFile(directory, "." + name + "-", ".tmp");
         try {
-            Files.writeString(temporary, gson.toJson(marker) + "\n", StandardCharsets.UTF_8);
-            Files.createLink(directory.resolve(OutputFiles.PARTIAL), temporary);
+            Files.writeString(temporary, ProtoJson.line(marker) + "\n", StandardCharsets.UTF_8);
+            Files.createLink(directory.resolve(name), temporary);
         } finally {
             Files.deleteIfExists(temporary);
+        }
+    }
+
+    /** Writes a message as indented JSON into a new file. */
+    static void writePretty(Path file, Message message) throws IOException {
+        try (BufferedWriter writer = newFile(file)) {
+            writer.write(ProtoJson.pretty(message));
+            writer.newLine();
         }
     }
 

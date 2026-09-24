@@ -33,19 +33,26 @@ pub mod bpf_endpoint_boundary {
     include!(concat!(env!("OUT_DIR"), "/endpoint_boundary.skel.rs"));
 }
 
-/// The capture stream schema, generated from
-/// jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto.
+/// The capture stream and collector protocol schemas, generated from
+/// jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto and jonoffcpu-collector.proto,
+/// which share one package. Every message also has the proto3 JSON mapping through serde
+/// (lowerCamelCase names, 64-bit integers as decimal strings, enums by value name), which is how
+/// the proof tools print records and replies.
 #[allow(clippy::all)]
 pub mod capture {
     include!(concat!(
         env!("OUT_DIR"),
         "/io.github.lhotari.jonoffcpu.capture.v1.rs"
     ));
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/io.github.lhotari.jonoffcpu.capture.v1.serde.rs"
+    ));
 
     /// Header written once at the start of a capture file: the magic, a zero byte, and the format
     /// version. A reader that does not find it is looking at something else entirely.
     pub const MAGIC: &[u8; 10] = b"JONOFFCPU\0";
-    pub const FORMAT_VERSION: u16 = 1;
+    pub const FORMAT_VERSION: u16 = 2;
     pub const HEADER_LEN: usize = MAGIC.len() + 2;
 
     pub fn header() -> [u8; HEADER_LEN] {
@@ -75,65 +82,22 @@ pub mod capture {
         }
         Ok(records)
     }
-
-    /// The debug projection of a record: the JSON shape the stream used to have, for proof tools and
-    /// for `jonoffcpu-correlator --dump`.
-    pub fn to_json(record: &Record) -> serde_json::Value {
-        use serde_json::json;
-        match &record.record {
-            Some(record::Record::CaptureStart(control))
-            | Some(record::Record::CaptureEnd(control))
-            | Some(record::Record::CaptureFinalized(control)) => {
-                serde_json::from_str(&control.json).unwrap_or(serde_json::Value::Null)
-            }
-            Some(record::Record::Stack(stack)) => json!({
-                "recordType": "stack",
-                "stackId": stack.id,
-                "frames": stack.frame.iter().map(|frame| json!({
-                    "address": format!("{:016x}", frame.address),
-                    "symbol": frame.symbol,
-                    "module": frame.module,
-                })).collect::<Vec<_>>(),
-            }),
-            Some(record::Record::Observation(observation)) => json!({
-                "recordType": "observation",
-                "correlationId": format!("{:016x}", observation.correlation_id),
-                "hostTgid": observation.host_tgid,
-                "hostTid": observation.host_tid,
-                "targetTgid": observation.target_tgid,
-                "targetTid": observation.target_tid,
-                "processGenerationNs": observation.process_generation_ns.to_string(),
-                "threadGenerationNs": observation.thread_generation_ns.to_string(),
-                "registrationToken": format!("{:016x}", observation.registration_token),
-                "startMonotonicNanos": observation.start_monotonic_ns.to_string(),
-                "endMonotonicNanos": observation.end_monotonic_ns.to_string(),
-                "admissionThreshold": observation.admission_threshold,
-                "signalResult": observation.signal_result,
-                "comm": observation.comm,
-                "kernelStackId": observation.kernel_stack_id,
-                "userStackId": observation.user_stack_id,
-                "kernelStackError": observation.kernel_stack_error,
-                "userStackError": observation.user_stack_error,
-                "reason": match observation.reason() {
-                    OffCpuReason::Unspecified => serde_json::Value::Null,
-                    OffCpuReason::Blocked => "blocked".into(),
-                    OffCpuReason::Runnable => "runnable".into(),
-                    OffCpuReason::Preempted => "preempted".into(),
-                },
-                "prevTaskState": observation.prev_task_state,
-                "preempted": observation.preempted,
-            }),
-            None => serde_json::Value::Null,
-        }
-    }
 }
 
 mod collector;
 
-pub const ABI_VERSION: u32 = 1;
+/// The C ABI version, carried in every `JonoffcpuResult` and every `CollectorReply`. Version 2
+/// exchanges encoded protobuf messages instead of JSON.
+pub const ABI_VERSION: u32 = 2;
 
-use serde_json::Value;
-use std::ffi::CString;
+/// The bound on an encoded request and on an encoded reply.
+pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// The longest error message a reply carries, so an error reply always fits the bound.
+const MAX_ERROR_MESSAGE_BYTES: usize = 8 * 1024;
+
+use capture::{CollectorErrorCode as ErrorCode, CollectorReply};
+use prost::Message;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 use std::slice;
@@ -148,14 +112,16 @@ const STATUS_IO_ERROR: i32 = 5;
 const STATUS_INTERNAL_ERROR: i32 = 6;
 const STATUS_STOP_TIMEOUT: i32 = 7;
 
+/// The result of every C ABI call: the status the call returned and the encoded `CollectorReply`,
+/// owned by the library until `jonoffcpu_result_free`.
 #[repr(C)]
 pub struct JonoffcpuResult {
     pub struct_size: u32,
     pub abi_version: u32,
     pub code: i32,
     pub reserved: u32,
-    pub json: *mut libc::c_char,
-    pub json_len: usize,
+    pub bytes: *mut u8,
+    pub len: usize,
 }
 
 impl Default for JonoffcpuResult {
@@ -165,48 +131,58 @@ impl Default for JonoffcpuResult {
             abi_version: ABI_VERSION,
             code: STATUS_INTERNAL_ERROR,
             reserved: 0,
-            json: ptr::null_mut(),
-            json_len: 0,
+            bytes: ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+impl JonoffcpuResult {
+    /// The reply bytes, or an empty slice before a call filled the result.
+    pub fn reply_bytes(&self) -> &[u8] {
+        if self.bytes.is_null() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.bytes, self.len) }
         }
     }
 }
 
 #[unsafe(no_mangle)]
-/// Prepare a disabled native collector from UTF-8 JSON.
+/// Prepare a disabled native collector from an encoded `PrepareRequest`.
 ///
 /// # Safety
-/// `json` must reference `len` readable bytes and `out` must reference writable
+/// `request` must reference `len` readable bytes and `out` must reference writable
 /// storage for one `JonoffcpuResult`.
 pub unsafe extern "C" fn jonoffcpu_collector_prepare(
-    json: *const libc::c_char,
+    request: *const u8,
     len: usize,
     out: *mut JonoffcpuResult,
 ) -> i32 {
     unsafe {
         ffi_call(out, || {
-            let input = input_json(json, len)?;
+            let input = input_bytes(request, len)?;
             let prepared = collector::prepare(collector::parse_prepare(input)?)?;
-            let _ = prepared.handle;
-            Ok(prepared.response)
+            Ok(prepared.reply)
         })
     }
 }
 
 #[unsafe(no_mangle)]
-/// Configure and enable a prepared collector.
+/// Enable a prepared collector with an encoded `EnableRequest`.
 ///
 /// # Safety
-/// `json` must reference `len` readable bytes and `out` must reference writable
+/// `request` must reference `len` readable bytes and `out` must reference writable
 /// storage for one `JonoffcpuResult`.
 pub unsafe extern "C" fn jonoffcpu_collector_enable(
     handle: u64,
-    json: *const libc::c_char,
+    request: *const u8,
     len: usize,
     out: *mut JonoffcpuResult,
 ) -> i32 {
     unsafe {
         ffi_call(out, || {
-            let input = input_json(json, len)?;
+            let input = input_bytes(request, len)?;
             collector::enable(handle, collector::parse_enable(input)?)
         })
     }
@@ -225,7 +201,10 @@ pub unsafe extern "C" fn jonoffcpu_collector_stop(
     unsafe {
         ffi_call(out, || {
             if timeout_ms == 0 {
-                anyhow::bail!("stop timeout must be nonzero");
+                return Err(collector::fail(
+                    ErrorCode::InvalidConfig,
+                    "stop timeout must be nonzero",
+                ));
             }
             collector::stop(handle, Duration::from_millis(timeout_ms))
         })
@@ -242,7 +221,7 @@ pub unsafe extern "C" fn jonoffcpu_collector_close(handle: u64, out: *mut Jonoff
 }
 
 #[unsafe(no_mangle)]
-/// Free JSON storage returned in a `JonoffcpuResult` and reset the structure.
+/// Free the reply storage returned in a `JonoffcpuResult` and reset the structure.
 ///
 /// # Safety
 /// `result` must be null or point to a result last initialized by this library
@@ -252,84 +231,111 @@ pub unsafe extern "C" fn jonoffcpu_result_free(result: *mut JonoffcpuResult) {
         return;
     }
     let result = unsafe { &mut *result };
-    if !result.json.is_null() {
-        drop(unsafe { CString::from_raw(result.json) });
+    if !result.bytes.is_null() {
+        drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(result.bytes, result.len)) });
     }
     *result = JonoffcpuResult::default();
     result.code = STATUS_OK;
 }
 
-unsafe fn input_json<'a>(json: *const libc::c_char, len: usize) -> anyhow::Result<&'a str> {
-    if json.is_null() || len == 0 || len > 64 * 1024 {
-        anyhow::bail!("JSON input pointer/length is invalid");
+/// The request bytes. An empty request is a message with every field at its default, which the
+/// request's validation then rejects.
+unsafe fn input_bytes<'a>(request: *const u8, len: usize) -> anyhow::Result<&'a [u8]> {
+    if len == 0 {
+        return Ok(&[]);
     }
-    std::str::from_utf8(unsafe { slice::from_raw_parts(json.cast::<u8>(), len) })
-        .map_err(|_| anyhow::anyhow!("JSON input is not UTF-8"))
+    if request.is_null() || len > MAX_MESSAGE_BYTES {
+        return Err(collector::fail(
+            ErrorCode::InvalidConfig,
+            format!("request must be at most {MAX_MESSAGE_BYTES} readable bytes"),
+        ));
+    }
+    Ok(unsafe { slice::from_raw_parts(request, len) })
 }
 
+/// Runs one call and stores its encoded reply. Every outcome, including a panic, is a reply; the
+/// returned status is zero exactly when the reply is not an error.
 unsafe fn ffi_call(
     out: *mut JonoffcpuResult,
-    operation: impl FnOnce() -> anyhow::Result<Value>,
+    operation: impl FnOnce() -> anyhow::Result<CollectorReply>,
 ) -> i32 {
     if out.is_null() {
         return STATUS_INVALID_CONFIG;
     }
     unsafe { ptr::write(out, JonoffcpuResult::default()) };
-    let result = catch_unwind(AssertUnwindSafe(operation));
-    let (status, value) = match result {
-        Ok(Ok(value)) => (STATUS_OK, value),
+    let reply = match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(Ok(reply)) => reply,
         Ok(Err(error)) => {
-            let message = format!("{error:#}");
-            let (status, code) = classify_error(&message);
-            (status, collector::control_error(code, message))
+            let failure = collector::Failure::of(&error);
+            collector::error_reply(failure.code, bounded_message(failure.message))
         }
-        Err(_) => (
-            STATUS_INTERNAL_ERROR,
-            collector::control_error("internal_error", "native collector panicked"),
+        Err(_) => collector::error_reply(
+            ErrorCode::InternalError,
+            "native collector panicked".to_string(),
         ),
     };
-    let encoded = collector::bounded_json(&value).unwrap_or_else(|_| {
-        "{\"ok\":false,\"schemaVersion\":1,\"abiVersion\":1,\"state\":\"error\",\"error\":{\"code\":\"internal_error\",\"message\":\"response encoding failed\"}}".to_string()
-    });
-    let encoded = CString::new(encoded).expect("JSON encoder emitted a NUL byte");
-    let length = encoded.as_bytes().len();
+    let mut encoded = reply.encode_to_vec();
+    let mut status = match &reply.result {
+        Some(capture::collector_reply::Result::Error(error)) => status_of(error.code()),
+        _ => STATUS_OK,
+    };
+    if encoded.len() > MAX_MESSAGE_BYTES {
+        encoded = collector::error_reply(
+            ErrorCode::InternalError,
+            format!("collector reply exceeds {MAX_MESSAGE_BYTES} bytes"),
+        )
+        .encode_to_vec();
+        status = STATUS_INTERNAL_ERROR;
+    }
+    let length = encoded.len();
     let output = unsafe { &mut *out };
     output.code = status;
-    output.json_len = length;
-    output.json = encoded.into_raw();
+    output.len = length;
+    output.bytes = Box::into_raw(encoded.into_boxed_slice()).cast::<u8>();
     status
 }
 
-fn classify_error(message: &str) -> (i32, &'static str) {
-    if message.contains("target_exited") {
-        (STATUS_INVALID_STATE, "target_exited")
-    } else if message.contains("invalid collector handle") {
-        (STATUS_INVALID_HANDLE, "invalid_handle")
-    } else if message.contains("already enabled")
-        || message.contains("already stopped")
-        || message.contains("not enabled")
-    {
-        (STATUS_INVALID_STATE, "invalid_state")
-    } else if message.contains("stop_timeout") || message.contains("stop timed out") {
-        (STATUS_STOP_TIMEOUT, "stop_timeout")
-    } else if message.contains("close_timeout") || message.contains("close timed out") {
-        (STATUS_STOP_TIMEOUT, "close_timeout")
-    } else if message.contains("BPF") || message.contains("bpf") || message.contains("attach") {
-        (STATUS_BPF_UNSUPPORTED, "bpf_unsupported")
-    } else if message.contains("source artifact")
-        || message.contains("fsync")
-        || message.contains("flush")
-        || message.contains("No such file")
-        || message.contains("Permission denied")
-    {
-        (STATUS_IO_ERROR, "io_error")
-    } else if message.contains("JSON")
-        || message.contains("must")
-        || message.contains("differs")
-        || message.contains("time namespace")
-    {
-        (STATUS_INVALID_CONFIG, "invalid_config")
-    } else {
-        (STATUS_INTERNAL_ERROR, "internal_error")
+/// Truncates an error message at a character boundary, so an error reply stays within the bound.
+fn bounded_message(mut message: String) -> String {
+    if message.len() > MAX_ERROR_MESSAGE_BYTES {
+        let mut end = MAX_ERROR_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
     }
+    message
+}
+
+/// The C status of an error reply, kept from ABI version 1 so the codes stay stable.
+fn status_of(code: ErrorCode) -> i32 {
+    match code {
+        ErrorCode::InvalidConfig => STATUS_INVALID_CONFIG,
+        ErrorCode::InvalidHandle => STATUS_INVALID_HANDLE,
+        ErrorCode::InvalidState | ErrorCode::TargetExited => STATUS_INVALID_STATE,
+        ErrorCode::BpfUnsupported => STATUS_BPF_UNSUPPORTED,
+        ErrorCode::IoError => STATUS_IO_ERROR,
+        ErrorCode::StopTimeout | ErrorCode::CloseTimeout => STATUS_STOP_TIMEOUT,
+        ErrorCode::InternalError | ErrorCode::Unspecified => STATUS_INTERNAL_ERROR,
+    }
+}
+
+/// Calls one C ABI entry point in-process and decodes its reply, for the proof tools. The status
+/// must agree with the reply: zero exactly when the reply is not an error.
+pub fn call_collector(
+    operation: impl FnOnce(*mut JonoffcpuResult) -> i32,
+) -> anyhow::Result<(i32, CollectorReply)> {
+    let mut result = JonoffcpuResult::default();
+    let status = operation(&mut result);
+    let decoded = CollectorReply::decode(result.reply_bytes());
+    unsafe { jonoffcpu_result_free(&mut result) };
+    let reply = decoded.map_err(|error| anyhow::anyhow!("undecodable collector reply: {error}"))?;
+    let is_error = matches!(
+        reply.result,
+        Some(capture::collector_reply::Result::Error(_))
+    );
+    if reply.abi_version != ABI_VERSION || (status == STATUS_OK) == is_error {
+        anyhow::bail!("collector status {status} disagrees with its reply: {reply:?}");
+    }
+    Ok((status, reply))
 }
