@@ -42,11 +42,11 @@ pub mod bpf_endpoint_boundary {
 pub mod capture {
     include!(concat!(
         env!("OUT_DIR"),
-        "/io.github.lhotari.jonoffcpu.capture.v1.rs"
+        "/io.github.jonoffcpu.jonoffcpu.capture.v1.rs"
     ));
     include!(concat!(
         env!("OUT_DIR"),
-        "/io.github.lhotari.jonoffcpu.capture.v1.serde.rs"
+        "/io.github.jonoffcpu.jonoffcpu.capture.v1.serde.rs"
     ));
 
     /// Header written once at the start of a capture file: the magic, a zero byte, and the format

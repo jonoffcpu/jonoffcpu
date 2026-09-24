@@ -11,13 +11,13 @@
 
 syntax = "proto3";
 
-package io.github.lhotari.jonoffcpu.analysis.v1;
+package io.github.jonoffcpu.jonoffcpu.analysis.v1;
 
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-profile.proto";
 import "jonoffcpu-report.proto";
 
-option java_package = "io.github.lhotari.jonoffcpu.offline";
+option java_package = "io.github.jonoffcpu.jonoffcpu.offline";
 option java_outer_classname = "AnalysisProto";
 
 // A pattern with where it came from: "inline", a file, or "preset:NAME".
@@ -59,7 +59,7 @@ message NoApplicationFrame {
 
 message SliceSummary {
   // The selected reasons; every reason when --reason is all.
-  repeated io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reasons = 1;
+  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reasons = 1;
   string stack = 2;
   string weights = 3;
   string time = 4;
@@ -134,7 +134,7 @@ message TopSelection {
   optional string run = 2;
   optional string collapsed_input = 3;
   // The selected reasons; empty for every reason.
-  repeated io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reasons = 4;
+  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reasons = 4;
   string weights = 5;
   repeated SourcedPattern app = 6;
   repeated SourcedPattern idle = 7;
@@ -190,7 +190,7 @@ message TopRow {
   optional string sleeping = 8;
   optional string runqueue = 9;
   // The reason with the most weight; unset for a collapsed input.
-  optional io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reason = 10;
+  optional io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reason = 10;
   // --by boundary: the heaviest root-most application frame.
   optional string caller = 11;
 }
@@ -235,7 +235,7 @@ message Digest {
 
 message DigestCapture {
   string session_id = 1;
-  io.github.lhotari.jonoffcpu.capture.v1.Sampling sampling = 2;
+  io.github.jonoffcpu.jonoffcpu.capture.v1.Sampling sampling = 2;
   uint64 source_rows = 3;
   uint64 matched = 4;
   uint64 source_rows_without_selected_jfr_sample = 5;
@@ -245,11 +245,11 @@ message DigestCapture {
   uint64 identity_unverified = 9;
   uint64 selected_observed_duration_nanos = 10;
   CollectorLoss loss = 11;
-  io.github.lhotari.jonoffcpu.report.v1.HandlerDelays handler_delay_nanos = 12;
-  repeated io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reasons = 13;
-  io.github.lhotari.jonoffcpu.report.v1.KernelSwitchOuts kernel_switch_outs = 14;
-  io.github.lhotari.jonoffcpu.report.v1.PopulationEstimate population_estimate = 15;
-  repeated io.github.lhotari.jonoffcpu.report.v1.DegradationStep degradation_steps = 16;
+  io.github.jonoffcpu.jonoffcpu.report.v1.HandlerDelays handler_delay_nanos = 12;
+  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reasons = 13;
+  io.github.jonoffcpu.jonoffcpu.report.v1.KernelSwitchOuts kernel_switch_outs = 14;
+  io.github.jonoffcpu.jonoffcpu.report.v1.PopulationEstimate population_estimate = 15;
+  repeated io.github.jonoffcpu.jonoffcpu.report.v1.DegradationStep degradation_steps = 16;
 }
 
 // The collector's selection and loss counters.
@@ -287,7 +287,7 @@ message HeavyStack {
 // `export --format jsonl`: one row per profile entry.
 
 message ExportRow {
-  io.github.lhotari.jonoffcpu.capture.v1.OffCpuReason reason = 1;
+  io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reason = 1;
   uint32 task_state = 2;
   // Unset when the profile is not grouped by thread, or the thread is unknown.
   optional string thread = 3;
@@ -321,7 +321,7 @@ message ExportRow {
 message RunMetadata {
   string run = 1;
   string label = 2;
-  repeated io.github.lhotari.jonoffcpu.profile.v1.Provenance sources = 3;
+  repeated io.github.jonoffcpu.jonoffcpu.profile.v1.Provenance sources = 3;
   repeated string dimensions = 4;
   bool estimate_available = 5;
   bool time_split_available = 6;

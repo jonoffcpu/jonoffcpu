@@ -12,7 +12,7 @@ plugins {
 val jonoffcpu = extensions.create<JonoffcpuJavaExtension>("jonoffcpu")
 jonoffcpu.javaRelease.convention(21)
 
-group = "io.github.lhotari"
+group = "io.github.jonoffcpu"
 
 java {
     toolchain {

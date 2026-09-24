@@ -15,12 +15,12 @@
 
 syntax = "proto3";
 
-package io.github.lhotari.jonoffcpu.profile.v1;
+package io.github.jonoffcpu.jonoffcpu.profile.v1;
 
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-report.proto";
 
-option java_package = "io.github.lhotari.jonoffcpu.profile";
+option java_package = "io.github.jonoffcpu.jonoffcpu.profile";
 option java_outer_classname = "ProfileProto";
 
 message Record {
@@ -62,7 +62,7 @@ message ProfileStart {
   // done to produce the numbers (a thinned subsample, a narrowed window). Empty when nothing was.
   string label = 10;
   // The producing run's report, as jonoffcpu-report.json holds it; unset for a merged profile.
-  io.github.lhotari.jonoffcpu.report.v1.Report report = 11;
+  io.github.jonoffcpu.jonoffcpu.report.v1.Report report = 11;
 }
 
 message Provenance {
@@ -79,8 +79,8 @@ message Provenance {
   uint64 window_from_nanos = 8;
   uint64 window_to_nanos = 9;
   // The capture's resolved sampling and time split, as its capture_start recorded them.
-  io.github.lhotari.jonoffcpu.capture.v1.Sampling sampling = 11;
-  io.github.lhotari.jonoffcpu.capture.v1.TimeSplit time_split = 12;
+  io.github.jonoffcpu.jonoffcpu.capture.v1.Sampling sampling = 11;
+  io.github.jonoffcpu.jonoffcpu.capture.v1.TimeSplit time_split = 12;
 }
 
 message StringRecord {

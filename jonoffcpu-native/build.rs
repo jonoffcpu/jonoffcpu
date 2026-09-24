@@ -109,7 +109,7 @@ fn generate_capture_codec(out: &std::path::Path) -> Result<()> {
         .context("register schema descriptors for pbjson")?
         .out_dir(out)
         .extern_path(".google.protobuf.Timestamp", "::pbjson_types::Timestamp")
-        .build(&[".io.github.lhotari.jonoffcpu.capture.v1"])
+        .build(&[".io.github.jonoffcpu.jonoffcpu.capture.v1"])
         .context("generate proto3 JSON mapping")?;
     for schema in SCHEMAS {
         println!("cargo:rerun-if-changed={PROTO_DIR}/{schema}");

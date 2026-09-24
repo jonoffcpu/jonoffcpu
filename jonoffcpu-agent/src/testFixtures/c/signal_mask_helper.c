@@ -7,7 +7,7 @@
 #include <unistd.h>
 
 JNIEXPORT jint JNICALL
-Java_io_github_lhotari_jonoffcpu_agent_SignalMaskHelper_setBlocked(JNIEnv *env, jclass type, jint signal_number,
+Java_io_github_jonoffcpu_jonoffcpu_agent_SignalMaskHelper_setBlocked(JNIEnv *env, jclass type, jint signal_number,
                                                jboolean blocked) {
     (void)env;
     (void)type;
@@ -19,7 +19,7 @@ Java_io_github_lhotari_jonoffcpu_agent_SignalMaskHelper_setBlocked(JNIEnv *env, 
 }
 
 JNIEXPORT jlong JNICALL
-Java_io_github_lhotari_jonoffcpu_agent_SignalMaskHelper_currentTid(JNIEnv *env, jclass type) {
+Java_io_github_jonoffcpu_jonoffcpu_agent_SignalMaskHelper_currentTid(JNIEnv *env, jclass type) {
     (void)env;
     (void)type;
     return (jlong)syscall(SYS_gettid);

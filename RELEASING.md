@@ -8,7 +8,7 @@ Maven-style version beginning with three numeric components.
 
 ## Prerequisites
 
-Create a Sonatype Central Portal account, register the `io.github.lhotari`
+Create a Sonatype Central Portal account, register the `io.github.jonoffcpu`
 namespace, generate a Central Portal user token, and distribute the public half
 of the GPG signing key. The
 [Vanniktech Central Portal guide](https://vanniktech.github.io/gradle-maven-publish-plugin/central/)
