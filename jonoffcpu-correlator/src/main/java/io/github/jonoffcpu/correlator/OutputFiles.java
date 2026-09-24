@@ -12,7 +12,6 @@ final class OutputFiles {
 
     static final String REPORT_SUFFIX = "report.json";
     static final String COLLAPSED_SUFFIX = "offcpu-stacks.collapsed";
-    static final String SYNTHETIC_SUFFIX = "offcpu-synthetic.jfr";
     static final String CLASSIFIED_RECORDS_SUFFIX = "classified-records.jsonl";
     static final String MATCHES_SUFFIX = "matches.jsonl";
     static final String PROFILE_SUFFIX = "offcpu-profile.pb";
@@ -21,7 +20,6 @@ final class OutputFiles {
 
     static final String REPORT = PREFIX + REPORT_SUFFIX;
     static final String COLLAPSED = PREFIX + COLLAPSED_SUFFIX;
-    static final String SYNTHETIC_JFR = PREFIX + SYNTHETIC_SUFFIX;
     static final String CLASSIFIED_RECORDS = PREFIX + CLASSIFIED_RECORDS_SUFFIX;
     static final String MATCHES = PREFIX + MATCHES_SUFFIX;
     static final String PROFILE = PREFIX + PROFILE_SUFFIX;
@@ -34,7 +32,6 @@ final class OutputFiles {
 
     static final String INCOMPLETE_REPORT = INCOMPLETE_PREFIX + REPORT_SUFFIX;
     static final String INCOMPLETE_COLLAPSED = INCOMPLETE_PREFIX + COLLAPSED_SUFFIX;
-    static final String INCOMPLETE_SYNTHETIC_JFR = INCOMPLETE_PREFIX + SYNTHETIC_SUFFIX;
     static final String INCOMPLETE_CLASSIFIED_RECORDS = INCOMPLETE_PREFIX + CLASSIFIED_RECORDS_SUFFIX;
     static final String INCOMPLETE_MATCHES = INCOMPLETE_PREFIX + MATCHES_SUFFIX;
     static final String INCOMPLETE_PAIRS = INCOMPLETE_PREFIX + "pairs.jsonl";

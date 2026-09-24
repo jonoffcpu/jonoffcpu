@@ -16,6 +16,8 @@ import org.gradle.api.tasks.TaskAction
 import org.gradle.work.DisableCachingByDefault
 import java.io.File
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.HexFormat
 import java.util.zip.ZipFile
 
 /** One embedded native bundle: a Linux architecture linked against one C library. */
@@ -265,4 +267,19 @@ abstract class VerifyAgentJar : VerifyJarContents() {
         val expected = selected.flatMap { platform -> NativePlatform.FILE_NAMES.map { "$platform/$it" } }.toSet()
         if (recorded.keys != expected) throw GradleException("Native checksum manifest has missing or unexpected entries")
     }
+}
+
+fun sha256(bytes: ByteArray): String = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))
+
+fun sha256(file: File): String {
+    val digest = MessageDigest.getInstance("SHA-256")
+    file.inputStream().buffered().use { stream ->
+        val buffer = ByteArray(64 * 1024)
+        while (true) {
+            val read = stream.read(buffer)
+            if (read < 0) break
+            digest.update(buffer, 0, read)
+        }
+    }
+    return HexFormat.of().formatHex(digest.digest())
 }

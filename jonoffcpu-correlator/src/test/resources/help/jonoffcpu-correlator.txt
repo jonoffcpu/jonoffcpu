@@ -3,10 +3,9 @@ Usage: java -jar jonoffcpu-correlator.jar [-hV] [--audit=LEVEL] [--collapsed-rea
                                           [--from=TIME] [--from-ns=N] [--jfr=FILE]
                                           [--max-accounted-loss=F] [--max-handler-delay-ns=N]
                                           [--max-profile-entries=N] [--max-retained-bytes=N]
-                                          [--max-rows=N] [--max-synthetic-events=N]
-                                          [--on-limit=POLICY] [--output=DIR] [--partial=true|false]
-                                          [--partial-jfr=true|false] [--profile-group-by=LIST]
-                                          [--profile-output=true|false] [--quantum-ns=N]
+                                          [--max-rows=N] [--on-limit=POLICY] [--output=DIR]
+                                          [--partial=true|false] [--partial-jfr=true|false]
+                                          [--profile-group-by=LIST] [--profile-output=true|false]
                                           [--source=FILE] [--summary-output=true|false]
                                           [--thinning=Q] [--thinning-seed=N] [--to=TIME]
                                           [--to-ns=N] [COMMAND]
@@ -31,13 +30,9 @@ produces. Without a subcommand it correlates, with the options below.
       --max-rows=N           Most source rows admitted. Default: 100000000.
       --max-retained-bytes=N Retained-bytes budget. Default: sixty percent of the heap, never below
                                256 MiB.
-      --format=FORMAT        Which derived outputs to write: both, collapsed or jfr; with --partial
-                               true, diagnostics or collapsed. Default: both, or diagnostics with
-                               --partial true.
-      --quantum-ns=N         Off-CPU time one synthetic JFR event represents. Default: 1000000.
-      --max-synthetic-events=N
-                             Most synthetic JFR events; the quantum is raised to fit. Default:
-                               10000000.
+      --format=FORMAT        Which derived outputs to write: collapsed, the only choice for a
+                               complete analysis; with --partial true, diagnostics or collapsed.
+                               Default: collapsed, or diagnostics with --partial true.
       --estimate-population=true|false
                              Report the inverse-probability population estimate. Requires the
                                complete, unselected JFR and an unthinned source. Default: false.
@@ -97,9 +92,9 @@ Commands:
   help       Display help information about the specified command.
 
 Writes into the output directory: jonoffcpu-report.json, jonoffcpu-offcpu-stacks.collapsed,
-jonoffcpu-offcpu-profile.pb, the digest jonoffcpu-summary.md and jonoffcpu-summary.json,
-jonoffcpu-offcpu-synthetic.jfr and, last, jonoffcpu-complete.json; jonoffcpu-classified-records.
-jsonl is written only for --audit full and jonoffcpu-matches.jsonl for --audit full or matches;
---partial true writes INCOMPLETE-jonoffcpu-* files and jonoffcpu-partial.json instead.
+jonoffcpu-offcpu-profile.pb, the digest jonoffcpu-summary.md and jonoffcpu-summary.json and, last,
+jonoffcpu-complete.json; jonoffcpu-classified-records.jsonl is written only for --audit full and
+jonoffcpu-matches.jsonl for --audit full or matches; --partial true writes INCOMPLETE-jonoffcpu-*
+files and jonoffcpu-partial.json instead.
 
 Exit status: 0 complete, 2 narrowed or partial output, 64 invalid command line.

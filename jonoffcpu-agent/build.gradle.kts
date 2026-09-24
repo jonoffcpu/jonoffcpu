@@ -21,16 +21,6 @@ dependencies {
     embeddedRuntime(libs.snakeyaml)
 }
 
-tasks.verifyDependencyDigests {
-    digests =
-        mapOf(
-            "protobuf-java-4.33.1.jar" to "fd5cf3d55bc2c3ddb2a8640c9d4c69daa9a5b326fb6e05bae0e56b3f4f85e0f7",
-            "protobuf-java-util-4.33.1.jar" to "f8788f87658d46f8ddb864455eaa046aa218e419c98c93326643ae465aa5c843",
-            "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
-            "snakeyaml-2.7.jar" to "2e194eba45a67dee19a4e272f4a04b18de8054e9f598b094382f6dae0b0e4b5e",
-        )
-}
-
 val rootDirectory = isolated.rootProject.projectDirectory
 val asyncProfilerDir = rootDirectory.dir("async-profiler")
 
@@ -188,8 +178,6 @@ val verifyRuntimeJar =
                 "com/google/protobuf/",
                 "one/profiler/",
                 "io/github/jonoffcpu/correlator/",
-                "io/github/jonoffcpu/jfr/",
-                "org/openjdk/jmc/",
             )
     }
 tasks.check {

@@ -1,10 +1,10 @@
 Usage: java -jar jonoffcpu-correlator.jar correlate [-hV] [--audit=LEVEL]
        [--collapsed-reason-frame=MODE] [--estimate-population=true|false] [--format=FORMAT]
        [--from=TIME] [--from-ns=N] [--jfr=FILE] [--max-accounted-loss=F] [--max-handler-delay-ns=N]
-       [--max-profile-entries=N] [--max-retained-bytes=N] [--max-rows=N] [--max-synthetic-events=N]
-       [--on-limit=POLICY] [--output=DIR] [--partial=true|false] [--partial-jfr=true|false]
-       [--profile-group-by=LIST] [--profile-output=true|false] [--quantum-ns=N] [--source=FILE]
-       [--summary-output=true|false] [--thinning=Q] [--thinning-seed=N] [--to=TIME] [--to-ns=N]
+       [--max-profile-entries=N] [--max-retained-bytes=N] [--max-rows=N] [--on-limit=POLICY]
+       [--output=DIR] [--partial=true|false] [--partial-jfr=true|false] [--profile-group-by=LIST]
+       [--profile-output=true|false] [--source=FILE] [--summary-output=true|false] [--thinning=Q]
+       [--thinning-seed=N] [--to=TIME] [--to-ns=N]
 Correlates a capture with its JFR into a new output directory (the default command).
       --source=FILE          The finalized capture stream the agent wrote (jonoffcpu-capture.pb).
                                Required.
@@ -25,13 +25,9 @@ Correlates a capture with its JFR into a new output directory (the default comma
       --max-rows=N           Most source rows admitted. Default: 100000000.
       --max-retained-bytes=N Retained-bytes budget. Default: sixty percent of the heap, never below
                                256 MiB.
-      --format=FORMAT        Which derived outputs to write: both, collapsed or jfr; with --partial
-                               true, diagnostics or collapsed. Default: both, or diagnostics with
-                               --partial true.
-      --quantum-ns=N         Off-CPU time one synthetic JFR event represents. Default: 1000000.
-      --max-synthetic-events=N
-                             Most synthetic JFR events; the quantum is raised to fit. Default:
-                               10000000.
+      --format=FORMAT        Which derived outputs to write: collapsed, the only choice for a
+                               complete analysis; with --partial true, diagnostics or collapsed.
+                               Default: collapsed, or diagnostics with --partial true.
       --estimate-population=true|false
                              Report the inverse-probability population estimate. Requires the
                                complete, unselected JFR and an unthinned source. Default: false.

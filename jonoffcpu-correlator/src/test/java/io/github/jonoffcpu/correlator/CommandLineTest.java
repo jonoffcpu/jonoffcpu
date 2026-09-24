@@ -180,8 +180,6 @@ class CommandLineTest {
                 source.toString(),
                 "--jfr",
                 jfr.toString(),
-                "--quantum-ns",
-                "10000000",
                 "--audit",
                 "none",
                 "--from",

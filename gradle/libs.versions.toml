@@ -1,13 +1,10 @@
-# Every library and plugin version of the build, declared once. The embedded libraries' SHA-256 digests are pinned
-# next to their use in the module build scripts, which verify them before shading.
+# Every library and plugin version of the build, declared once.
 [versions]
 protobuf = "4.36.1"
-jmc-writer = "9.1.2"
 junit = "6.1.3"
 
 [libraries]
 gson = "com.google.code.gson:gson:2.14.0"
-jmc-flightrecorder-writer = { module = "org.openjdk.jmc:flightrecorder.writer", version.ref = "jmc-writer" }
 picocli = "info.picocli:picocli:4.7.7"
 protobuf-java = { module = "com.google.protobuf:protobuf-java", version.ref = "protobuf" }
 protobuf-java-util = { module = "com.google.protobuf:protobuf-java-util", version.ref = "protobuf" }

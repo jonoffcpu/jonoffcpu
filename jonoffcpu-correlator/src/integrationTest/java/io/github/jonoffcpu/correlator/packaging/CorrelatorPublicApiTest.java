@@ -40,7 +40,7 @@ class CorrelatorPublicApiTest {
     void implementationClassesStayPackagePrivate() throws Exception {
         for (String name : List.of(
                 "io.github.jonoffcpu.correlator.OfflineCorrelator",
-                "io.github.jonoffcpu.correlator.CompatibilityJfrWriter")) {
+                "io.github.jonoffcpu.correlator.CorrelationEngine")) {
             assertThat(Modifier.isPublic(Class.forName(name).getModifiers()))
                     .as("%s must remain an implementation detail", name)
                     .isFalse();

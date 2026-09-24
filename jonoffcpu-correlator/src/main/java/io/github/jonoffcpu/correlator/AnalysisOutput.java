@@ -71,8 +71,6 @@ interface AnalysisOutput {
 
     void writeMatches(BufferedWriter writer) throws IOException;
 
-    SyntheticJfrSource synthetic() throws IOException;
-
     /**
      * The switch-out reasons with a positive selected duration, in canonical order. Empty for the retained view,
      * which predates the classification.
@@ -224,11 +222,6 @@ interface AnalysisOutput {
             @Override
             public void writeMatches(BufferedWriter writer) throws IOException {
                 for (var match : analysis.matches()) line(writer, match.pair());
-            }
-
-            @Override
-            public SyntheticJfrSource synthetic() throws IOException {
-                return SyntheticJfrSource.of(analysis);
             }
         };
     }
@@ -408,11 +401,6 @@ interface AnalysisOutput {
                     if (delay != null) row.setHandlerDelayNanos(delay);
                     line(writer, row.build());
                 }
-            }
-
-            @Override
-            public SyntheticJfrSource synthetic() {
-                return SyntheticJfrSource.of(result);
             }
 
             @Override

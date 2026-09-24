@@ -222,7 +222,7 @@ class PrimitiveStructuresTest {
                 .isGreaterThanOrEqualTo(1000L * 38);
 
         SampleColumns samples = new SampleColumns(2);
-        for (int slot = 0; slot < 1000; slot++) samples.add(0x8000000100000000L | slot, 5000 + slot, 7L, 456, 1, 2);
+        for (int slot = 0; slot < 1000; slot++) samples.add(0x8000000100000000L | slot, 5000 + slot, 456, 1, 2);
         assertThat(samples.size()).as("Sample columns lost rows").isEqualTo(1000);
         assertThat(samples.monotonicNanos(999)).as("Sample columns lost rows").isEqualTo(5999);
         assertThat(samples.stackId(999)).as("Sample dictionary ids lost").isEqualTo(1);
@@ -271,37 +271,6 @@ class PrimitiveStructuresTest {
     }
 
     @Test
-    void quantum() throws IOException {
-        long[] weights = {10_000, 3_000, 1};
-        var exact = QuantumPlanner.plan(weights, 1000, 1_000_000);
-        assertThat(exact.quantumNanos()).as("A fitting quantum must not change").isEqualTo(1000);
-        assertThat(exact.raised()).as("A fitting quantum must not be raised").isFalse();
-        assertThat(exact.syntheticEvents())
-                .as("Event count is not the sum of per-stack floors")
-                .isEqualTo(13);
-        var raised = QuantumPlanner.plan(weights, 1000, 6);
-        assertThat(raised.raised()).as("The request must be reported as raised").isTrue();
-        assertThat(raised.requestedQuantumNanos())
-                .as("The request must be reported as raised")
-                .isEqualTo(1000);
-        assertThat(raised.syntheticEvents())
-                .as("Raising the quantum did not bring the event count under the cap")
-                .isLessThanOrEqualTo(6);
-        assertThat(raised.quantumNanos()).as("The quantum was not raised").isGreaterThan(1000);
-        // A coarser quantum is a rendering choice: the totals it represents never grow.
-        assertThat(raised.syntheticEvents() * raised.quantumNanos())
-                .as("A coarser quantum represented more time than was measured")
-                .isLessThanOrEqualTo(13_001);
-        var empty = QuantumPlanner.plan(new long[0], 1000, 10);
-        assertThat(empty.syntheticEvents())
-                .as("An empty correlation needs no events")
-                .isZero();
-        assertThat(empty.raised())
-                .as("An empty correlation needs no coarsening")
-                .isFalse();
-    }
-
-    @Test
     void thinning() {
         assertThat(Thinning.NONE.active()).as("q = 1 must not be active").isFalse();
         assertThat(Thinning.NONE.keeps(1234L))
@@ -339,9 +308,6 @@ class PrimitiveStructuresTest {
         assertThat(tenth.scale(1000))
                 .as("q = 0.1 must scale a thousand observed nanoseconds to about ten thousand")
                 .isStrictlyBetween(BigInteger.valueOf(9990), BigInteger.valueOf(10010));
-        assertThat(tenth.scaleQuantum(1_000_000))
-                .as("A thinned run must spend fewer observed nanos per event")
-                .isLessThan(1_000_000);
     }
 
     @Test

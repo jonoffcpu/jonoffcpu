@@ -71,10 +71,6 @@ classpath="$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
   --source /out/jonoffcpu-capture.pb \
   --jfr /out/jonoffcpu-capture.jfr \
   --output /out/analysis > /out/analysis.log 2>&1
-"$JAVA_HOME/bin/jfr" summary /out/analysis/jonoffcpu-offcpu-synthetic.jfr \
-  > /out/synthetic-jfr-summary.log 2>&1
-"$ap/build/bin/jfrconv" --cpu /out/analysis/jonoffcpu-offcpu-synthetic.jfr \
-  /out/analysis/compatibility-view.collapsed > /out/converter.log 2>&1
 
 python3 - <<'PY'
 import json
@@ -83,10 +79,7 @@ from pathlib import Path
 out = Path('/out')
 report = json.loads((out / 'analysis/jonoffcpu-report.json').read_text())
 events = json.loads((out / 'event-counts.json').read_text())
-collapsed = (out / 'analysis/compatibility-view.collapsed').read_text().splitlines()
-converted = sum(int(line.rsplit(' ', 1)[1]) for line in collapsed)
-# Counters are uint64 in the report, printed as decimal strings by the proto3 JSON mapping.
-expected = int(report['syntheticJfr']['syntheticEvents'])
+collapsed = (out / 'analysis/jonoffcpu-offcpu-stacks.collapsed').read_text().splitlines()
 required = ('jdk.ExecutionSample', 'profiler.SignalSample', 'profiler.WallClockSample',
             'jdk.JavaMonitorEnter', 'jdk.JVMInformation', 'jdk.GCHeapSummary', 'jonoffcpu.IntegrationMarker')
 missing = [event for event in required if int(events.get(event, 0)) <= 0]
@@ -94,6 +87,7 @@ allocations = int(events.get('jdk.ObjectAllocationInNewTLAB', 0)) \
     + int(events.get('jdk.ObjectAllocationOutsideTLAB', 0))
 if allocations <= 0:
     missing.append('allocation samples')
+# Counters are uint64 in the report, printed as decimal strings by the proto3 JSON mapping.
 failures = {
     'unmatchedSource': int(report['unmatchedSource']),
     'orphanJfr': int(report['orphanJfr']),
@@ -106,8 +100,6 @@ if matched <= 0 or any(failures.values()):
     raise SystemExit(f'invalid correlation result: matched={matched}, failures={failures}')
 if missing:
     raise SystemExit(f'missing mixed event categories: {missing}')
-if converted != expected:
-    raise SystemExit(f'converter count {converted} != synthetic events {expected}')
 summary = {
     'schemaVersion': 1,
     'state': 'complete',
@@ -116,8 +108,6 @@ summary = {
     'delivery': __import__('os').environ['JONOFFCPU_DELIVERY'],
     'matched': matched,
     **failures,
-    'syntheticEvents': expected,
-    'convertedEvents': converted,
     'collapsedStacks': len(collapsed),
     'eventCounts': {**{event: events[event] for event in required}, 'allocations': allocations},
 }

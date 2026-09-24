@@ -340,13 +340,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                 raw.getFramesList(), raw.hasStackTruncated() && raw.getStackTruncated(), limits.maxFrames());
         int threadId =
                 dictionaries.internThread(osThreadId, javaThreadId, raw.hasThreadName() ? raw.getThreadName() : null);
-        samples.add(
-                cookie,
-                monotonic,
-                epochNanos(raw.getStartTime()),
-                osThreadId == null ? 0 : (int) (long) osThreadId,
-                stackId,
-                threadId);
+        samples.add(cookie, monotonic, osThreadId == null ? 0 : (int) (long) osThreadId, stackId, threadId);
         // The exporter already rejects a cookie outside the capture epoch, so this can only fire on zero.
         if ((cookie >>> 32) != captureEpoch || (cookie & 0xffffffffL) == 0) {
             samples.reason(samples.size() - 1, Reason.INVALID_COOKIE);
@@ -372,14 +366,6 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     private static long tid(long tid) throws IOException {
         require(tid > 0 && tid <= 0xffffffffL, "Invalid TID");
         return tid;
-    }
-
-    private static long epochNanos(com.google.protobuf.Timestamp startTime) throws IOException {
-        try {
-            return Math.addExact(Math.multiplyExact(startTime.getSeconds(), 1_000_000_000L), startTime.getNanos());
-        } catch (ArithmeticException error) {
-            throw new IOException("Invalid sample start time", error);
-        }
     }
 
     // ---- join ------------------------------------------------------------------------------

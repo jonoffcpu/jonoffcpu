@@ -16,9 +16,8 @@ import java.util.Set;
  *
  * <p>The capture stream already interns its native stacks. The JFR does not, so the correlator
  * interns the delivery stacks itself: a sample keeps only an id, and the frames, the collapsed key
- * and the thread identity are stored once. Two stacks share an id exactly when {@code
- * CompatibilityJfrWriter.canonicalStack} would give them the same key — the truncation flag and
- * every frame's type, class, method, descriptor, line and bytecode index.
+ * and the thread identity are stored once. Two stacks share an id exactly when they agree on the
+ * truncation flag and every frame's type, class, method, descriptor, line and bytecode index.
  *
  * <p>A frame's type, class, method and descriptor are each either set or absent in {@code SignalProto.JfrFrame},
  * and this interner keeps an absent field (null) apart from an empty one. The sole producer of these frames, {@code
