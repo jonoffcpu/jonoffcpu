@@ -234,7 +234,7 @@ tools/run-collector-smoke-musl.sh
 
 For the full OpenJDK 17 native-agent integration, including an isolated musl
 async-profiler build, mixed CPU/allocation/wall/lock/JVM recording, private PID
-namespace correlation, synthetic JFR generation and `jfrconv`, run:
+namespace correlation and the offline correlator's collapsed stacks, run:
 
 ```sh
 tools/run-agent-smoke-musl.py \

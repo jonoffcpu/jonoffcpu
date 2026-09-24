@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
-// What a correlation writes into its output directory, other than the collapsed stacks, the stack
-// profile and the synthetic JFR: the report, the per-row audit files, the partial-mode diagnostics and
-// the markers. This schema is their single definition. Every file is this schema's proto3 JSON mapping,
+// What a correlation writes into its output directory, other than the collapsed stacks and the stack
+// profile: the report, the per-row audit files, the partial-mode diagnostics and the markers. This
+// schema is their single definition. Every file is this schema's proto3 JSON mapping,
 // printed by protobuf's JsonFormat (`ProtoJson`): lowerCamelCase names, 64-bit integers as decimal
 // strings, exact decimals (probabilities, fractions) as decimal strings, enums by their value names,
 // every field without presence printed even at its default, and a field with presence (a message, an
@@ -59,8 +59,8 @@ message Report {
   // Set with --estimate-population true.
   PopulationEstimate population_estimate = 22;
   HandlerDelays handler_delay_nanos = 23;
-  // Set when the synthetic JFR was written.
-  SyntheticJfr synthetic_jfr = 24;
+  reserved 24;
+  reserved "synthetic_jfr";
   OffCpuReasons off_cpu_reasons = 25;
   // Always set, with no steps when nothing needed to degrade.
   DegradationReport degradation = 26;
@@ -143,21 +143,6 @@ message HandlerDelays {
   optional int64 max = 6;
 }
 
-message SyntheticJfr {
-  string path = 1;
-  // The requested quantum at estimated scale: what one reweighted event represents.
-  uint64 quantum_nanos = 2;
-  uint64 requested_quantum_nanos = 3;
-  // The quantum of observed time an event was actually built from.
-  uint64 observed_quantum_nanos = 4;
-  bool quantum_raised_for_event_limit = 5;
-  uint64 synthetic_events = 6;
-  uint64 represented_nanos = 7;
-  // Represented minus exact; never positive.
-  int64 quantization_error_nanos = 8;
-  uint64 omitted_remainder_nanos = 9;
-}
-
 message OffCpuReasons {
   string semantics = 1;
   // The reasons the kernel kept, from the capture's sampling.
@@ -221,9 +206,9 @@ message DegradationStep {
     ThinSource thin_source = 2;
     DropAuditOutputs drop_audit_outputs = 3;
     NarrowWindow narrow_window = 4;
-    CoarsenSyntheticQuantum coarsen_synthetic_quantum = 5;
-    OmitSyntheticJfr omit_synthetic_jfr = 6;
   }
+  reserved 5, 6;
+  reserved "coarsen_synthetic_quantum", "omit_synthetic_jfr";
 }
 
 message ThinSource {
@@ -243,13 +228,6 @@ message NarrowWindow {
   uint64 effective_to_nanos = 1;
   string clock = 2;
 }
-
-message CoarsenSyntheticQuantum {
-  uint64 from_nanos = 1;
-  uint64 to_nanos = 2;
-}
-
-message OmitSyntheticJfr {}
 
 message StackProfileSummary {
   string path = 1;

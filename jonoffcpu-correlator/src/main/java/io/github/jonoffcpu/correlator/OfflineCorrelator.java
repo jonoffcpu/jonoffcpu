@@ -23,7 +23,7 @@ import java.util.TreeMap;
  *
  * <p>Stack weights are selected observed off-CPU nanoseconds, never inverse-probability estimates.
  * An optional source-duration population estimate is kept as a separate exact rational aggregate;
- * it never changes collapsed stacks or synthetic JFR events. The JFR stack is the signal-delivery
+ * it never changes collapsed stacks. The JFR stack is the signal-delivery
  * stack, which may differ from the native stack captured by eBPF at scheduler exit. Neither the
  * cookie nor a small measured delay proves simultaneity. Optional windows clip durations only after
  * joining the full capture, so a delayed signal outside a measurement window can still identify an
@@ -143,8 +143,7 @@ final class OfflineCorrelator {
     }
 
     /**
-     * A matched pair with both of its rows and the clipped source-clock interval; useful to build explicit synthetic
-     * compatibility output. {@code handlerDelayNanos} is null when no verified clock offset relates the clocks.
+     * A matched pair with both of its rows and the clipped source-clock interval. {@code handlerDelayNanos} is null when no verified clock offset relates the clocks.
      */
     public record Match(
             CaptureProto.Observation observation,

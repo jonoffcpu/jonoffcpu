@@ -9,7 +9,7 @@ import java.math.BigInteger;
  * report prints. Nothing here is a per-row message; the audit outputs re-read the two files.
  *
  * <p>The per-match values — the clipped interval, the delivery delay — are derived rather than
- * stored, so the audit writer, the synthetic JFR and the report cannot drift apart on the clipping
+ * stored, so the audit writer, the collapsed stacks and the report cannot drift apart on the clipping
  * rule.
  */
 record CorrelationResult(

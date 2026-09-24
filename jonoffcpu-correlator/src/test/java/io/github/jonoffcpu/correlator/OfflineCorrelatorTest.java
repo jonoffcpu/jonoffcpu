@@ -113,9 +113,6 @@ class OfflineCorrelatorTest {
         assertThat(report.hasPopulationEstimate())
                 .as("Population estimate must be opt-in")
                 .isFalse();
-        assertThat(output.resolve(OutputFiles.SYNTHETIC_JFR))
-                .as("Missing default JFR output")
-                .isRegularFile();
         try (var listing = Files.list(output)) {
             Set<String> names =
                     listing.map(path -> path.getFileName().toString()).collect(Collectors.toSet());
@@ -124,7 +121,6 @@ class OfflineCorrelatorTest {
                     .containsExactlyInAnyOrder(
                             OutputFiles.REPORT,
                             OutputFiles.COLLAPSED,
-                            OutputFiles.SYNTHETIC_JFR,
                             OutputFiles.CLASSIFIED_RECORDS,
                             OutputFiles.MATCHES,
                             OutputFiles.COMPLETE);
@@ -148,9 +144,6 @@ class OfflineCorrelatorTest {
                 .as("The classified source row must re-expand its interned kernel stack")
                 .extracting(CaptureProto.Frame::getSymbol)
                 .containsExactly("kernel_wait");
-        assertThat(report.hasSyntheticJfr())
-                .as("Missing JFR quantization metadata")
-                .isTrue();
         // Existing output must be preserved, even if its directory is empty.
         assertThatExceptionOfType(FileAlreadyExistsException.class)
                 .as("Existing analysis overwritten")
@@ -573,11 +566,10 @@ class OfflineCorrelatorTest {
                 .contains("saturated-counter-eligibleIntervals");
     }
 
-    @ParameterizedTest(name = "--format {0}")
-    @ValueSource(strings = {"collapsed", "jfr"})
-    void outputFormatSelection(String format, @TempDir Path dir) throws Exception {
+    @Test
+    void collapsedFormat(@TempDir Path dir) throws Exception {
         Fixture fixture = fixture(dir);
-        Path selected = dir.resolve("analysis-" + format);
+        Path selected = dir.resolve("analysis-collapsed");
         assertThat(OffCpuCorrelator.run(new String[] {
                     "--source",
                     fixture.source().toString(),
@@ -586,26 +578,38 @@ class OfflineCorrelatorTest {
                     "--output",
                     selected.toString(),
                     "--format",
-                    format,
-                    "--quantum-ns",
-                    "1000"
+                    "collapsed"
                 }))
                 .isZero();
-        assertThat(Files.exists(selected.resolve(OutputFiles.SYNTHETIC_JFR)))
-                .as("JFR output format selection ignored")
-                .isEqualTo(format.equals("jfr"));
-        assertThat(Files.exists(selected.resolve(OutputFiles.COLLAPSED)))
-                .as("Collapsed output format selection ignored")
-                .isEqualTo(format.equals("collapsed"));
-        ReportProto.Report selectedReport = report(selected.resolve(OutputFiles.REPORT));
-        assertThat(selectedReport.hasSyntheticJfr())
-                .as("Incorrect JFR metadata selection")
-                .isEqualTo(format.equals("jfr"));
-        if (format.equals("jfr")) {
-            assertThat(selectedReport.getSyntheticJfr().getSyntheticEvents())
-                    .as("CLI quantum was not applied")
-                    .isEqualTo(3);
-        }
+        assertThat(selected.resolve(OutputFiles.COLLAPSED))
+                .as("--format collapsed must write the collapsed stacks")
+                .isRegularFile();
+        assertThat(selected.resolve(OutputFiles.COMPLETE))
+                .as("--format collapsed must publish a complete analysis")
+                .isRegularFile();
+    }
+
+    /** Complete analysis writes only the collapsed stacks; the partial mode's diagnostics are not a choice here. */
+    @ParameterizedTest(name = "--format {0}")
+    @CsvSource({
+        "both, 'expected one of collapsed, diagnostics'",
+        "jfr, 'expected one of collapsed, diagnostics'",
+        "diagnostics, only with --partial true"
+    })
+    void unsupportedFormat(String format, String message, @TempDir Path dir) throws Exception {
+        Fixture fixture = fixture(dir);
+        Path rejected = dir.resolve("analysis-" + format);
+        CommandLineFixture.usageError(
+                message,
+                "--source",
+                fixture.source().toString(),
+                "--jfr",
+                fixture.jfr().toString(),
+                "--output",
+                rejected.toString(),
+                "--format",
+                format);
+        assertThat(rejected).as("A rejected format created files").doesNotExist();
     }
 
     @Test

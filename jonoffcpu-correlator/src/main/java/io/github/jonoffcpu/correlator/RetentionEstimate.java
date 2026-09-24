@@ -18,16 +18,17 @@ import java.nio.file.Path;
  * <p>The per-record constants are measured on a three-minute Apache Pulsar broker capture:
  * 110.9 MB of capture stream for 1,121,421 observations (99 bytes each) and 38.2 MB of JFR for
  * 1,121,418 {@code profiler.SignalSample} events (35 bytes each). A source column slot is 59 bytes
- * (38 before the stack profile kept each row's reason, task state and native stack ids, 51 before the run-queue
- * reading), a sample slot 38, and a cookie index entry 24 at the index's half load factor. Interned stacks
- * are bounded by the number of distinct stacks rather than by input size — that capture had 10,631
- * — so they enter as a flat allowance.
+ * (38 before the stack profile kept each row's reason, task state and native stack ids, 51 before
+ * the run-queue reading), a sample slot 30 (38 while it kept each sample's event time), and a
+ * cookie index entry 24 at the index's half load factor. Interned stacks are bounded by the number
+ * of distinct stacks rather than by input size — that capture had 10,631 — so they enter as a flat
+ * allowance.
  */
 record RetentionEstimate(long sourceBytes, long jfrBytes, long observations, long samples, long retainedBytes) {
     private static final long CAPTURE_BYTES_PER_OBSERVATION = 99;
     private static final long JFR_BYTES_PER_SAMPLE = 35;
     private static final long SOURCE_SLOT_BYTES = 59;
-    private static final long SAMPLE_SLOT_BYTES = 38;
+    private static final long SAMPLE_SLOT_BYTES = 30;
     private static final long INDEX_ENTRY_BYTES = 24;
     private static final long INTERNED_STACK_ALLOWANCE_BYTES = 64L << 20;
     private static final long BUDGET_FLOOR_BYTES = 256L << 20;

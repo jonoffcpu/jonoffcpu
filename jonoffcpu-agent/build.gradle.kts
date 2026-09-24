@@ -178,8 +178,6 @@ val verifyRuntimeJar =
                 "com/google/protobuf/",
                 "one/profiler/",
                 "io/github/jonoffcpu/correlator/",
-                "io/github/jonoffcpu/jfr/",
-                "org/openjdk/jmc/",
             )
     }
 tasks.check {

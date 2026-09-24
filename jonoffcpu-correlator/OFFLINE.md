@@ -98,7 +98,7 @@ Each `offCpuReasons.matched` entry gives `sleepingNanos`, `runqueueNanos` and
 `unsplitNanos` for its reason, and `offCpuReasons.timeSplit` names the `source`, whether the split is
 `available`, the rule, the unsplit intervals by cause (`withoutReading`,
 `readingExceedsInterval`) and the kernel's `runqueueInversions`. The default
-collapsed files, the audit files and the synthetic JFR carry the whole interval
+collapsed files and the audit files carry the whole interval
 as before; the split reaches the stack profile and the `stacks --time` slices.
 
 A record's length prefix is checked against the record limit before any bytes
@@ -138,10 +138,9 @@ recognisable wherever the directory ends up. A successful run writes:
 | `jonoffcpu-report.json` | Capture counters, classifications, handler-delay percentiles, interpretation notes, the degradation ladder and the opt-in population estimate | always |
 | `jonoffcpu-classified-records.jsonl` | Source and resolved JFR rows, including rejected and unmatched observations, with their classification | `--audit full` |
 | `jonoffcpu-matches.jsonl` | Cookies, clipped intervals, delivery delays and whether the target-to-JFR thread mapping could be verified | `--audit matches` (default) or `full` |
-| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling unless thinning applied (see **Degradation**). Every recorded interval, whatever its reason; when more than one reason contributes, each line starts with `[offcpu: <reason>]` (`--collapsed-reason-frame auto\|always\|never`) | `--format both` (default) or `collapsed` |
+| `jonoffcpu-offcpu-stacks.collapsed` | Root-first signal-delivery stacks weighted in integer microseconds instead of sample counts; exact nanosecond durations remain in the report; no inverse-probability scaling unless thinning applied (see **Degradation**). Every recorded interval, whatever its reason; when more than one reason contributes, each line starts with `[offcpu: <reason>]` (`--collapsed-reason-frame auto\|always\|never`) | always |
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, restricted to one switch-out reason, without the reason frame | as above, and only when more than one reason contributes |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile; see **Stack profile** | `--profile-output true` (default) |
-| `jonoffcpu-offcpu-synthetic.jfr` | An explicitly synthetic CPU-compatible view, using duration-quantized `jdk.ExecutionSample` events | `--format both` (default) or `jfr` |
 | `jonoffcpu-complete.json` | Completion marker, `{"state":"MARKER_STATE_COMPLETE","coverageComplete":true,...}` | last; a directory without it is not a complete analysis, and it is never written for a narrowed run (see **Degradation**) |
 
 Every JSON output is a protobuf message printed in the proto3 JSON mapping by
@@ -170,8 +169,7 @@ out for a match and for a plain unmatched or orphan row. A match row
 `threadIdentityVerified`.
 
 The original combined JFR is never rewritten. CPU, allocation, lock, wall and JVM
-events in it remain available to other tools. Both derived formats are produced by default. Use `--format collapsed` or
-`--format jfr` to select one.
+events in it remain available to other tools.
 
 `--audit full|matches|none` controls how much per-row audit output is written.
 The CLI defaults to `matches`: `jonoffcpu-matches.jsonl` is written but
@@ -193,20 +191,8 @@ streaming pass did: `--audit full` then documents the kept subsample, row for ro
 against the counters in the report, which is what an audit of a degraded run means.
 
 Reading, selecting, and cutting existing events uses the public JDK
-`RecordingFile` API. The synthetic compatibility view has a different requirement:
-it creates new historical `jdk.ExecutionSample` events with explicit thread and
-stack constant-pool values. `RecordingFile.write` can only retain events from an
-existing recording, and the public `EventFactory` API emits custom events from the
-current JVM. The synthetic writer therefore remains a separate, patched and pinned
-JMC writer implementation.
+`RecordingFile` API.
 
-The synthetic JFR defaults to a 1 ms quantum (`--quantum-ns 1000000`) and caps
-expansion at ten million events (`--max-synthetic-events`). Each event represents
-one quantum of selected observed off-CPU time. Integer remainder carries forward
-per resolved stack, so rendering timestamps are approximate and the final omitted
-remainder is less than one quantum per stack. The report and a metadata event
-record exact duration, represented duration and quantization error. This is a
-compatibility view for CPU flamegraph tooling, not a recording of CPU execution.
 The collapsed output uses rounded integer microsecond weights; the report retains exact nanosecond totals.
 Render it with the `jfr-converter.jar` from the same release, whose `--units`
 option labels the flame graph in those microseconds:
@@ -229,7 +215,7 @@ below it). The correlator recomputes that threshold from the `captureStart`
 producer's word alone. The sum is accumulated in exact fixed-point arithmetic and
 reported as `estimatedDurationNanos`, truncated to whole nanoseconds (at most one
 nanosecond low); nothing passes through floating point, and the estimate never
-scales the collapsed stacks or synthetic JFR. `status` is
+scales the collapsed stacks. `status` is
 `ESTIMATE_STATUS_AVAILABLE` or `ESTIMATE_STATUS_UNAVAILABLE`, and `admissionPolicy` names the policy
 in effect. The report also keeps the durable source duration and the smaller
 stack-matched duration separate, because missing or delayed Java stack delivery
@@ -579,24 +565,19 @@ A profile is not an audit log. When a capture does not fit the retained-bytes bu
 `--on-limit degrade` (the default) walks a ladder rather than refusing, and records
 every step in the report's `degradation` object (a `DegradationReport`):
 
-1. **Coarsen the synthetic quantum.** The event count for a quantum is the sum of
-   per-stack floors and is known before the first event is written, so the quantum is
-   raised until it fits. A synthetic JFR renders totals the report states exactly, so
-   this costs granularity, not time. `requestedQuantumNanos` and
-   `quantumRaisedForEventLimit` appear in the report's `syntheticJfr` block.
-2. **Drop the audit outputs.** `--audit matches`, then `--audit none`. They cost the
+1. **Drop the audit outputs.** `--audit matches`, then `--audit none`. They cost the
    most and contribute nothing to the flame graph.
-3. **Thin the source and reweight.** Each recorded interval is kept with probability
+2. **Thin the source and reweight.** Each recorded interval is kept with probability
    `q`, decided by hashing its cookie, and the duration it contributes is scaled by the
    exact reciprocal of the realised probability. The result is an unbiased estimate of
    the same per-stack totals over the whole requested window. Because the cookie is the
    join key, an observation and its JFR sample are dropped together, so every count in
    the report describes one coherent subsample. `--thinning <q>` pins it and
    `--thinning-seed` changes the draw; `q = 1` is the default whenever the input fits.
-4. **Narrow the window.** Analyse `[from, effectiveTo)` completely rather than the whole
+3. **Narrow the window.** Analyse `[from, effectiveTo)` completely rather than the whole
    window approximately. Because both inputs are ordered on the delivery clock, a prefix
    is a complete analysis of a shorter window.
-5. **Fail**, naming the limit, the steps already tried and the flag that would allow the
+4. **Fail**, naming the limit, the steps already tried and the flag that would allow the
    next one.
 
 `--on-limit fail` restores the old behaviour. `--on-limit truncate` skips thinning and
@@ -638,8 +619,8 @@ mark), `attempts`, the top-level `narrowedToNanos` (left out unless the window w
 narrowed, mirroring `peakRetainedBytes` so a consumer that reads only the top-level
 object need not scan `stepsApplied` for the `narrowWindow` entries), and `stepsApplied`:
 one entry per ladder step actually taken, with its `reason` and the step as the
-one key that names it — `thinSource`, `dropAuditOutputs`, `narrowWindow`,
-`coarsenSyntheticQuantum` or `omitSyntheticJfr` — holding the step's details.
+one key that names it — `thinSource`, `dropAuditOutputs` or `narrowWindow` — holding
+the step's details.
 
 ## Interpretation
 
@@ -727,7 +708,7 @@ Advanced selection and recovery options are available through
 `OffCpuCorrelator.run(args)`, which returns the CLI status without terminating
 the calling JVM. `SignalJfrExporter.export(Path, Writer)` prints a JFR's signal
 events as JSON Lines, one `SignalRecord` per line. Protobuf (with the Gson
-parser its `JsonFormat` uses), picocli and the JMC writer are relocated
+parser its `JsonFormat` uses) and picocli are relocated
 implementation details and do not appear in public method signatures.
 
 ## Explicit incomplete diagnostics
@@ -756,7 +737,7 @@ Its new output directory holds a visibly different file set:
 | `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed` | Prefix stacks, each under an explicit incomplete root label that survives ordinary flame graph rendering | `--format collapsed` |
 | `jonoffcpu-partial.json` | Marker with `state: MARKER_STATE_INCOMPLETE`, `coverageComplete: false` and the `incompleteReasons` | last |
 
-There is never a `jonoffcpu-complete.json` or a synthetic JFR in partial mode.
+There is never a `jonoffcpu-complete.json` in partial mode.
 
 Only fully decoded records are retained. A final record cut short is discarded
 and its byte count reported; a malformed complete record remains an error. Missing source end/footer or AP terminal stats, and a JFR decoding failure
@@ -775,8 +756,8 @@ A missing footer does not establish a shared clock or a zero offset. Such result
 leave out handler delays and reject `--max-handler-delay-ns`; a missing AP final
 submitted count is left out, not zero. Explicit `--from-ns`/`--to-ns` can still clip
 observed source intervals in their own monotonic clock. No wall-time mapping is
-inferred. Population estimates and synthetic JFR output require the complete path
-and are rejected in partial mode.
+inferred. Population estimates require the complete path and are rejected in partial
+mode.
 
 The JFR prefix reader behind partial mode reports its parser evidence in the
 report's `jfrParse` object and never emits a successful end row.
