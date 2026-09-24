@@ -21,7 +21,7 @@ docker run --rm --privileged \
   -e JONOFFCPU_LATENCY_BLOCKED_SLEEPS="${JONOFFCPU_LATENCY_BLOCKED_SLEEPS:-0}" \
   -e JONOFFCPU_LATENCY_MAX_SECONDS="${JONOFFCPU_LATENCY_MAX_SECONDS:-30}" \
   -e JONOFFCPU_LATENCY_PENDING_LIMIT="${JONOFFCPU_LATENCY_PENDING_LIMIT:-}" \
-  -e JONOFFCPU_LATENCY_SOURCE="${JONOFFCPU_LATENCY_SOURCE:-/evidence/jonoffcpu-native-signal-latency-source.ndjson}" \
+  -e JONOFFCPU_LATENCY_SOURCE="${JONOFFCPU_LATENCY_SOURCE:-/evidence/jonoffcpu-native-signal-latency-source.pb}" \
   -w /work/jonoffcpu-native \
   "$image" \
   cargo run --release --locked --bin jonoffcpu-native-signal-latency

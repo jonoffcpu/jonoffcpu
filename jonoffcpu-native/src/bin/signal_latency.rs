@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 use anyhow::{Context, Result, bail};
+use jonoffcpu_native::capture::collector_reply::Result as Reply;
+use jonoffcpu_native::capture::record::Record;
+use jonoffcpu_native::capture::{self, CollectorReply};
 use jonoffcpu_native::{
-    JonoffcpuResult, jonoffcpu_collector_close, jonoffcpu_collector_enable,
-    jonoffcpu_collector_prepare, jonoffcpu_collector_stop, jonoffcpu_result_free,
+    JonoffcpuResult, call_collector, jonoffcpu_collector_close, jonoffcpu_collector_enable,
+    jonoffcpu_collector_prepare, jonoffcpu_collector_stop,
 };
+use prost::Message;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -88,7 +92,7 @@ fn main() -> Result<()> {
     let pending_limit = env_u64("JONOFFCPU_LATENCY_PENDING_LIMIT")?;
     let max_runtime = Duration::from_secs(env_u64("JONOFFCPU_LATENCY_MAX_SECONDS")?.unwrap_or(30));
     let output = std::env::var("JONOFFCPU_LATENCY_SOURCE")
-        .unwrap_or_else(|_| "/tmp/jonoffcpu-native-latency-source.ndjson".to_string());
+        .unwrap_or_else(|_| "/tmp/jonoffcpu-native-latency-source.pb".to_string());
     let _ = fs::remove_file(&output);
     let load_before = read_trimmed("/proc/loadavg");
     let shared = allocate_shared()?;
@@ -103,39 +107,56 @@ fn main() -> Result<()> {
     let mut child = ChildGuard { pid: child, shared };
     wait_ready(shared)?;
 
-    let prepare = call(|out| unsafe {
-        let request = json!({
-            "targetPid":child.pid,
-            "outputPath":output,
-            "sampling": {
-                "reasons": ["blocked", "runnable", "preempted"],
-                "minOffCpuMicros": null,
-                "maxOffCpuMicros": null,
-                "admission": {
-                    "policy": "uniform",
-                    "probability": "1",
-                    "probabilityThreshold": 4_294_967_296_u64,
-                },
+    let sampling = capture::Sampling {
+        reasons: vec![
+            capture::OffCpuReason::Blocked as i32,
+            capture::OffCpuReason::Runnable as i32,
+            capture::OffCpuReason::Preempted as i32,
+        ],
+        min_off_cpu_micros: None,
+        max_off_cpu_micros: None,
+        admission: Some(capture::sampling::Admission::Uniform(
+            capture::UniformAdmission {
+                probability: "1".to_string(),
+                probability_threshold: 1 << 32,
             },
-            "timeSplit": {"source": "schedInfo"},
-        })
-        .to_string();
-        jonoffcpu_collector_prepare(request.as_ptr().cast(), request.len(), out)
-    })?;
-    let handle = u64::from_str_radix(
-        prepare["handle"]
-            .as_str()
-            .context("prepare response missing handle")?,
-        16,
-    )?;
+        )),
+    };
+    let time_split = capture::TimeSplit {
+        source: capture::TimeSplitSource::SchedInfo as i32,
+    };
+    let prepare_request = capture::PrepareRequest {
+        target_pid: u32::try_from(child.pid).context("child PID is negative")?,
+        output_path: output.clone(),
+        sampling: Some(sampling.clone()),
+        time_split: Some(time_split),
+        exclude_calling_thread: false,
+    }
+    .encode_to_vec();
+    let Some(Reply::Prepared(prepared)) = call(|out| unsafe {
+        jonoffcpu_collector_prepare(prepare_request.as_ptr(), prepare_request.len(), out)
+    })?
+    .result
+    else {
+        bail!("prepare did not return Prepared");
+    };
+    let handle = prepared.handle;
+    let delivery = if signal >= libc::SIGRTMIN() && signal <= libc::SIGRTMAX() {
+        capture::SignalDelivery::Queued
+    } else {
+        capture::SignalDelivery::Coalescing
+    };
+    let enable_request = capture::EnableRequest {
+        session_id: "6c6a9170-0d39-4d89-8a5a-196a3d849ce1".to_string(),
+        capture_epoch: 2_147_483_649,
+        signal,
+        signal_delivery: delivery as i32,
+        sampling: Some(sampling),
+        time_split: Some(time_split),
+    }
+    .encode_to_vec();
     call(|out| unsafe {
-        let request = json!({
-            "sessionId":"6c6a9170-0d39-4d89-8a5a-196a3d849ce1",
-            "captureEpoch":2_147_483_649_u32,
-            "signal":signal,
-        })
-        .to_string();
-        jonoffcpu_collector_enable(handle, request.as_ptr().cast(), request.len(), out)
+        jonoffcpu_collector_enable(handle, enable_request.as_ptr(), enable_request.len(), out)
     })?;
 
     let started = Instant::now();
@@ -149,29 +170,31 @@ fn main() -> Result<()> {
     // Allow signal work already accepted before detach to reach the handler.
     thread::sleep(Duration::from_millis(100));
     child.stop_and_wait()?;
+    let capture_state = stop.state().as_str_name();
+    let Some(Reply::Stopped(stopped)) = stop.result else {
+        bail!("stop did not return Stopped");
+    };
+    let end = stopped
+        .capture_end
+        .context("stop reply has no captureEnd")?;
+    let kernel = end.kernel_counters.unwrap_or_default();
+    let userspace = end.userspace_counters.unwrap_or_default();
 
-    let rows = jonoffcpu_native::capture::decode(&fs::read(&output)?)?
-        .iter()
-        .map(jonoffcpu_native::capture::to_json)
-        .collect::<Vec<_>>();
+    let records = capture::decode(&fs::read(&output)?)?;
     let mut source = HashMap::new();
     let mut duplicate_source = 0u64;
     let mut signal_request_failures = 0u64;
-    for row in rows.iter().filter(|row| row["recordType"] == "observation") {
-        let cookie = u64::from_str_radix(
-            row["correlationId"]
-                .as_str()
-                .context("observation missing correlationId")?,
-            16,
-        )?;
-        let end = row["endMonotonicNanos"]
-            .as_str()
-            .context("observation missing endMonotonicNanos")?
-            .parse::<u64>()?;
-        if source.insert(cookie, end).is_some() {
+    for record in &records {
+        let Some(Record::Observation(row)) = &record.record else {
+            continue;
+        };
+        if source
+            .insert(row.correlation_id, row.end_monotonic_nanos)
+            .is_some()
+        {
             duplicate_source += 1;
         }
-        if row["signalResult"].as_i64() != Some(0) {
+        if row.signal_result != 0 {
             signal_request_failures += 1;
         }
     }
@@ -210,8 +233,6 @@ fn main() -> Result<()> {
         }
     }
     latencies.sort_unstable();
-    let kernel = &stop["captureEnd"]["counters"]["kernel"];
-    let userspace = &stop["captureEnd"]["counters"]["userspace"];
     let elapsed_ms = started.elapsed().as_millis();
     let result = json!({
         "benchmark":"native-signal-handler-entry-v1",
@@ -229,10 +250,10 @@ fn main() -> Result<()> {
         "requestedHandlerSamples":target_samples,
         "measurementElapsedMillis":elapsed_ms,
         "counts":{
-            "selectedIntervals":decimal_counter(kernel, "selectedIntervals")?,
-            "ringReserveFailures":decimal_counter(kernel, "ringReserveFailures")?,
-            "signalFailures":decimal_counter(kernel, "signalFailures")?,
-            "writtenObservations":decimal_counter(userspace, "writtenObservations")?,
+            "selectedIntervals":kernel.selected_intervals,
+            "ringReserveFailures":kernel.ring_reserve_failures,
+            "signalFailures":kernel.signal_failures,
+            "writtenObservations":userspace.written_observations,
             "sourceUnique":source.len(),
             "sourceDuplicate":duplicate_source,
             "signalRequestFailuresInRows":signal_request_failures,
@@ -257,11 +278,11 @@ fn main() -> Result<()> {
             "loadavgBefore":load_before,
             "loadavgAfter":read_trimmed("/proc/loadavg"),
             "pidNamespace":"private Docker PID namespace; targetPid differs from BPF hostTgid",
-            "targetPid":prepare["targetPid"],
-            "hostTgid":prepare["hostTgid"],
+            "targetPid":prepared.target_pid,
+            "hostTgid":prepared.host_tgid,
         },
         "sourcePath":output,
-        "captureState":stop["state"],
+        "captureState":capture_state,
     });
     println!("{}", serde_json::to_string_pretty(&result)?);
     unsafe { libc::munmap(shared.cast(), size_of::<SharedCapture>()) };
@@ -401,27 +422,15 @@ fn wait_ready(shared: *mut SharedCapture) -> Result<()> {
     bail!("latency target did not install its handler")
 }
 
-fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<Value> {
-    let mut result = JonoffcpuResult::default();
-    let status = operation(&mut result);
-    if result.json.is_null() {
-        bail!("native call returned no JSON ({status})");
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(result.json.cast::<u8>(), result.json_len) };
-    let value: Value = serde_json::from_slice(bytes)?;
-    unsafe { jonoffcpu_result_free(&mut result) };
+fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<CollectorReply> {
+    let (status, reply) = call_collector(operation)?;
     if status != 0 {
-        bail!("native call failed ({status}): {value}");
+        bail!(
+            "native call failed ({status}): {}",
+            serde_json::to_string(&reply)?
+        );
     }
-    Ok(value)
-}
-
-fn decimal_counter(object: &Value, name: &str) -> Result<u64> {
-    object[name]
-        .as_str()
-        .with_context(|| format!("missing counter {name}"))?
-        .parse()
-        .with_context(|| format!("invalid counter {name}"))
+    Ok(reply)
 }
 
 fn percentile(sorted: &[u64], percent: usize) -> u64 {

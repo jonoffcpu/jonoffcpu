@@ -36,21 +36,18 @@ struct profiler_output {
 
 static struct profiler_output current_profiler_output;
 
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
-        JNIEnv* env, jclass ignored, jstring config);
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
-        JNIEnv* env, jclass ignored, jlong handle, jstring capture);
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
+        JNIEnv* env, jclass ignored, jbyteArray request);
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
+        JNIEnv* env, jclass ignored, jlong handle, jbyteArray request);
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
         JNIEnv* env, jclass ignored, jlong handle, jlong timeout_millis);
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
         JNIEnv* env, jclass ignored, jlong handle);
 JNIEXPORT void JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_initialize0(
         JNIEnv* env, jclass ignored, jstring library);
 JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeProfiler_execute0(
         JNIEnv* env, jclass ignored, jbyteArray command);
-
-typedef int32_t (*json_call)(const char*, size_t, struct jonoffcpu_result*);
-typedef int32_t (*handle_json_call)(uint64_t, const char*, size_t, struct jonoffcpu_result*);
 
 static void throw_by_name(JNIEnv* env, const char* class_name, const char* message) {
     jclass type = (*env)->FindClass(env, class_name);
@@ -97,20 +94,6 @@ static jbyteArray new_byte_array(JNIEnv* env, const char* data, size_t length) {
     return result;
 }
 
-static jbyteArray utf8_bytes(JNIEnv* env, jstring value) {
-    if (value == NULL) {
-        throw_by_name(env, "java/lang/IllegalArgumentException", "JSON input must not be null");
-        return NULL;
-    }
-    jclass string_class = (*env)->FindClass(env, "java/lang/String");
-    if (string_class == NULL) return NULL;
-    jmethodID get_bytes = (*env)->GetMethodID(env, string_class, "getBytes", "(Ljava/lang/String;)[B");
-    if (get_bytes == NULL) return NULL;
-    jstring charset = (*env)->NewStringUTF(env, "UTF-8");
-    if (charset == NULL) return NULL;
-    return (jbyteArray)(*env)->CallObjectMethod(env, value, get_bytes, charset);
-}
-
 static jstring new_utf8_string(JNIEnv* env, const char* data, size_t length) {
     if (length > (size_t)INT32_MAX) {
         throw_by_name(env, "java/lang/IllegalStateException", "Native result is too large");
@@ -131,31 +114,58 @@ static jstring new_utf8_string(JNIEnv* env, const char* data, size_t length) {
     return (jstring)(*env)->NewObject(env, string_class, constructor, bytes, charset);
 }
 
-static int contains(const char* data, size_t length, const char* needle) {
-    size_t needle_length = strlen(needle);
-    if (needle_length > length) return 0;
-    for (size_t i = 0; i <= length - needle_length; i++) {
-        if (memcmp(data + i, needle, needle_length) == 0) return 1;
-    }
-    return 0;
-}
-
-static jstring finish_result(JNIEnv* env, int32_t return_code, struct jonoffcpu_result* result) {
-    jstring response = NULL;
+// Returns the encoded CollectorReply, error replies included; the Java side decodes it. The bridge
+// only checks the ABI envelope and the length bound, and interprets none of the bytes.
+static jbyteArray finish_result(JNIEnv* env, int32_t return_code, struct jonoffcpu_result* result) {
+    jbyteArray response = NULL;
     if (result->struct_size != sizeof(*result) || result->abi_version != JONOFFCPU_COLLECTOR_ABI_VERSION) {
         throw_by_name(env, "java/lang/IllegalStateException", "Native collector ABI result mismatch");
     } else if (result->code != return_code) {
         throw_by_name(env, "java/lang/IllegalStateException", "Native collector return code mismatch");
-    } else if (result->json == NULL || result->json_len == 0 || result->json_len > JONOFFCPU_MAX_RESULT_BYTES) {
-        throw_by_name(env, "java/lang/IllegalStateException", "Native collector returned invalid JSON length");
-    } else if ((return_code == 0 && !contains(result->json, result->json_len, "\"ok\":true"))
-            || (return_code != 0 && !contains(result->json, result->json_len, "\"ok\":false"))) {
-        throw_by_name(env, "java/lang/IllegalStateException", "Native collector code/JSON status mismatch");
+    } else if (result->bytes == NULL || result->len == 0
+            || result->len > JONOFFCPU_COLLECTOR_MAX_MESSAGE_BYTES) {
+        throw_by_name(env, "java/lang/IllegalStateException", "Native collector returned an invalid reply length");
     } else {
-        response = new_utf8_string(env, result->json, result->json_len);
+        response = (*env)->NewByteArray(env, (jsize)result->len);
+        if (response != NULL) {
+            (*env)->SetByteArrayRegion(env, response, 0, (jsize)result->len, (const jbyte*)result->bytes);
+            if ((*env)->ExceptionCheck(env)) response = NULL;
+        }
     }
     jonoffcpu_result_free(result);
     return response;
+}
+
+// Copies a request array into native memory the collector can read without holding a JNI
+// critical region. Returns NULL with a pending exception on failure.
+static uint8_t* copy_request(JNIEnv* env, jbyteArray request, jsize* length, const char* name) {
+    if (request == NULL) {
+        char message[128];
+        snprintf(message, sizeof(message), "%s must not be null", name);
+        throw_by_name(env, "java/lang/IllegalArgumentException", message);
+        return NULL;
+    }
+    // An encoded message with every field at its default is legitimately empty; the collector
+    // rejects it with an INVALID_CONFIG reply.
+    *length = (*env)->GetArrayLength(env, request);
+    if (*length < 0 || (size_t)*length > JONOFFCPU_COLLECTOR_MAX_MESSAGE_BYTES) {
+        char message[128];
+        snprintf(message, sizeof(message), "%s exceeds %u bytes", name,
+                JONOFFCPU_COLLECTOR_MAX_MESSAGE_BYTES);
+        throw_by_name(env, "java/lang/IllegalArgumentException", message);
+        return NULL;
+    }
+    uint8_t* bytes = malloc(*length == 0 ? 1 : (size_t)*length);
+    if (bytes == NULL) {
+        throw_by_name(env, "java/lang/OutOfMemoryError", "Cannot copy native collector request");
+        return NULL;
+    }
+    if (*length != 0) (*env)->GetByteArrayRegion(env, request, 0, *length, (jbyte*)bytes);
+    if ((*env)->ExceptionCheck(env)) {
+        free(bytes);
+        return NULL;
+    }
+    return bytes;
 }
 
 static void initialize_result(struct jonoffcpu_result* result) {
@@ -181,13 +191,13 @@ static void JNICALL on_vm_init(jvmtiEnv* jvmti, JNIEnv* env, jthread thread) {
         return;
     }
     JNINativeMethod methods[] = {
-        {(char*)"prepare", (char*)"(Ljava/lang/String;)Ljava/lang/String;",
+        {(char*)"prepare", (char*)"([B)[B",
          (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare},
-        {(char*)"enable", (char*)"(JLjava/lang/String;)Ljava/lang/String;",
+        {(char*)"enable", (char*)"(J[B)[B",
          (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable},
-        {(char*)"stop", (char*)"(JJ)Ljava/lang/String;",
+        {(char*)"stop", (char*)"(JJ)[B",
          (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop},
-        {(char*)"close", (char*)"(J)Ljava/lang/String;",
+        {(char*)"close", (char*)"(J)[B",
          (void*)Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close},
     };
     if ((*env)->RegisterNatives(env, native_collector, methods,
@@ -272,45 +282,33 @@ JNIEXPORT void JNICALL Agent_OnUnload(JavaVM* vm) {
     agent_library_path = NULL;
 }
 
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
-        JNIEnv* env, jclass ignored, jstring config) {
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_prepare(
+        JNIEnv* env, jclass ignored, jbyteArray request) {
     (void)ignored;
-    jbyteArray bytes = utf8_bytes(env, config);
-    if (bytes == NULL) return NULL;
-    jsize length = (*env)->GetArrayLength(env, bytes);
-    if (length > (jsize)JONOFFCPU_MAX_RESULT_BYTES) {
-        throw_by_name(env, "java/lang/IllegalArgumentException", "Native config exceeds 64 KiB");
-        return NULL;
-    }
-    jbyte* data = (*env)->GetByteArrayElements(env, bytes, NULL);
+    jsize length = 0;
+    uint8_t* data = copy_request(env, request, &length, "PrepareRequest");
     if (data == NULL) return NULL;
     struct jonoffcpu_result result;
     initialize_result(&result);
-    int32_t code = jonoffcpu_collector_prepare((const char*)data, (size_t)length, &result);
-    (*env)->ReleaseByteArrayElements(env, bytes, data, JNI_ABORT);
+    int32_t code = jonoffcpu_collector_prepare(data, (size_t)length, &result);
+    free(data);
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
-        JNIEnv* env, jclass ignored, jlong handle, jstring capture) {
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_enable(
+        JNIEnv* env, jclass ignored, jlong handle, jbyteArray request) {
     (void)ignored;
-    jbyteArray bytes = utf8_bytes(env, capture);
-    if (bytes == NULL) return NULL;
-    jsize length = (*env)->GetArrayLength(env, bytes);
-    if (length > (jsize)JONOFFCPU_MAX_RESULT_BYTES) {
-        throw_by_name(env, "java/lang/IllegalArgumentException", "Native capture config exceeds 64 KiB");
-        return NULL;
-    }
-    jbyte* data = (*env)->GetByteArrayElements(env, bytes, NULL);
+    jsize length = 0;
+    uint8_t* data = copy_request(env, request, &length, "EnableRequest");
     if (data == NULL) return NULL;
     struct jonoffcpu_result result;
     initialize_result(&result);
-    int32_t code = jonoffcpu_collector_enable((uint64_t)handle, (const char*)data, (size_t)length, &result);
-    (*env)->ReleaseByteArrayElements(env, bytes, data, JNI_ABORT);
+    int32_t code = jonoffcpu_collector_enable((uint64_t)handle, data, (size_t)length, &result);
+    free(data);
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_stop(
         JNIEnv* env, jclass ignored, jlong handle, jlong timeout_millis) {
     (void)ignored;
     if (timeout_millis < 0) {
@@ -323,7 +321,7 @@ JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector
     return finish_result(env, code, &result);
 }
 
-JNIEXPORT jstring JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
+JNIEXPORT jbyteArray JNICALL Java_io_github_lhotari_jonoffcpu_agent_NativeCollector_close(
         JNIEnv* env, jclass ignored, jlong handle) {
     (void)ignored;
     struct jonoffcpu_result result;
