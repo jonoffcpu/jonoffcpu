@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: MIT
+//
+// The control protocol between the agent and the native off-CPU collector. The agent calls the
+// collector's C ABI through its JNI bridge: `prepare` and `enable` take an encoded request message,
+// `stop` and `close` take the handle (and the stop timeout) as plain arguments, and every call returns
+// an encoded `CollectorReply`. The bridge copies bytes and interprets none of them.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.capture.v1;
+
+import "jonoffcpu-capture.proto";
+
+option java_package = "io.github.lhotari.jonoffcpu.capture";
+option java_outer_classname = "CollectorProto";
+
+// Attach the collector to the target, disabled, and create the source stream.
+message PrepareRequest {
+  // The target's PID in its own PID namespace, which is also the agent's.
+  uint32 target_pid = 1;
+  string output_path = 2;
+  Sampling sampling = 3;
+  TimeSplit time_split = 4;
+  // Leave the calling thread's own waits out of the capture, as the collector's drain thread's are:
+  // the agent's controller thread calls prepare and later only polls the profiler.
+  bool exclude_calling_thread = 5;
+}
+
+// Start recording under the capture identity async-profiler negotiated.
+message EnableRequest {
+  // A canonical lowercase UUID.
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  int32 signal = 3;
+  // Must match the selected signal's category; never a fallback.
+  SignalDelivery signal_delivery = 4;
+  // Must equal the prepared copies.
+  Sampling sampling = 5;
+  TimeSplit time_split = 6;
+}
+
+message CollectorReply {
+  // The collector's C ABI version.
+  uint32 abi_version = 1;
+  CollectorState state = 2;
+  oneof result {
+    Prepared prepared = 3;
+    Enabled enabled = 4;
+    Stopped stopped = 5;
+    Closed closed = 6;
+    CollectorError error = 7;
+  }
+}
+
+// The collector's state after the call. After an error it is `STOPPING` or `CLOSING` when the call
+// timed out and may be retried, and `ERROR` otherwise.
+enum CollectorState {
+  COLLECTOR_STATE_UNSPECIFIED = 0;
+  COLLECTOR_STATE_PREPARED = 1;
+  COLLECTOR_STATE_ENABLED = 2;
+  COLLECTOR_STATE_COMPLETE = 3;
+  COLLECTOR_STATE_INCOMPLETE = 4;
+  COLLECTOR_STATE_CLOSED = 5;
+  COLLECTOR_STATE_STOPPING = 6;
+  COLLECTOR_STATE_CLOSING = 7;
+  COLLECTOR_STATE_ERROR = 8;
+}
+
+message Prepared {
+  uint64 handle = 1;
+  string source_path = 2;
+  uint32 target_pid = 3;
+  uint32 host_tgid = 4;
+  Sampling sampling = 5;
+  TimeSplit time_split = 6;
+  VerifiedIdentity verified_identity = 7;
+}
+
+message Enabled {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  int32 signal = 3;
+  SignalDelivery signal_delivery = 4;
+  string source_path = 5;
+  uint32 target_pid = 6;
+  uint32 host_tgid = 7;
+  Sampling sampling = 8;
+  TimeSplit time_split = 9;
+  VerifiedIdentity verified_identity = 10;
+  SignalEnvironment signal_environment = 11;
+}
+
+message Stopped {
+  string source_path = 1;
+  // The record the collector appended to the stream, as it appended it.
+  CaptureEnd capture_end = 2;
+  // How the terminal record reached the file.
+  TerminalPublication terminal_publication = 3;
+}
+
+// The terminal `capture_end` is frozen once built; a retried stop only advances its append, flush and
+// fsync, and never appends it twice.
+message TerminalPublication {
+  // True when the collector stopped on its own, because the target exited.
+  bool automatic = 1;
+  uint32 append_attempts = 2;
+  uint32 flush_attempts = 3;
+  uint32 sync_attempts = 4;
+  // The first failed attempt, when a retry succeeded.
+  string first_error = 5;
+}
+
+message Closed {
+  uint64 handle = 1;
+  // The handle was already closed.
+  bool idempotent = 2;
+  // Set when closing an enabled collector stopped it first.
+  Stopped stopped = 3;
+}
+
+message CollectorError {
+  CollectorErrorCode code = 1;
+  string message = 2;
+}
+
+enum CollectorErrorCode {
+  COLLECTOR_ERROR_CODE_UNSPECIFIED = 0;
+  COLLECTOR_ERROR_CODE_INVALID_CONFIG = 1;
+  COLLECTOR_ERROR_CODE_INVALID_HANDLE = 2;
+  COLLECTOR_ERROR_CODE_INVALID_STATE = 3;
+  COLLECTOR_ERROR_CODE_TARGET_EXITED = 4;
+  COLLECTOR_ERROR_CODE_BPF_UNSUPPORTED = 5;
+  COLLECTOR_ERROR_CODE_IO_ERROR = 6;
+  COLLECTOR_ERROR_CODE_STOP_TIMEOUT = 7;
+  COLLECTOR_ERROR_CODE_CLOSE_TIMEOUT = 8;
+  COLLECTOR_ERROR_CODE_INTERNAL_ERROR = 9;
+}

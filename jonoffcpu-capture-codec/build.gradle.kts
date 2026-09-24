@@ -11,6 +11,7 @@ jonoffcpu {
 }
 
 dependencies {
-    api(libs.protobuf.javalite)
+    api(libs.protobuf.java)
+    api(libs.protobuf.java.util)
     testFixturesImplementation(libs.gson)
 }

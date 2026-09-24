@@ -1,13 +1,17 @@
 // SPDX-License-Identifier: MIT
 //
 // The jonoffcpu capture stream: the file the agent writes during a capture and the correlator reads
-// offline. This schema is the format's definition; the Rust collector generates its codec from it, and
-// jonoffcpu-capture-codec the one Java codec the agent and the correlator embed.
+// offline. This schema is the format's single definition; the Rust collector generates its codec from
+// it, and jonoffcpu-capture-codec the one Java codec the agent and the correlator embed. Wherever a
+// record is shown as JSON (the agent's manifest, the correlator's dump and classified records), it is
+// this schema's proto3 JSON mapping, printed by protobuf's JsonFormat: lowerCamelCase field names,
+// 64-bit integers as decimal strings, enums by their value names, and unset fields left out.
 //
-// Layout: a 12-byte header, then length-delimited `Record` messages (a varint byte count followed by
-// the message), appended in order. The agent appends the final `capture_finalized` record after the
-// collector has closed the file, so the bytes before it are a stable prefix that the footer's digest
-// covers.
+// Layout: a 12-byte header (the magic `JONOFFCPU\0` and a little-endian uint16 format version, now 2),
+// then length-delimited `Record` messages (a varint byte count followed by the message), appended in
+// order. The collector writes `capture_start`, the stacks and observations and `capture_end`; the agent
+// appends the final `capture_finalized` record after the collector has closed the file, so the bytes
+// before it are a stable prefix that the footer's digest covers.
 //
 // Stacks are interned: a `stack` record is written the first time its id is seen, always before the
 // first observation that references it.
@@ -16,26 +20,374 @@ syntax = "proto3";
 
 package io.github.lhotari.jonoffcpu.capture.v1;
 
+import "google/protobuf/timestamp.proto";
+
 option java_package = "io.github.lhotari.jonoffcpu.capture";
 option java_outer_classname = "CaptureProto";
-option optimize_for = LITE_RUNTIME;
 
 message Record {
   oneof record {
-    // Control records keep the JSON object they have always carried: there are three per capture, so
-    // their size does not matter, and the agent, the manifest and the correlator compare them
-    // structurally against the same values that travel over the JSON control protocol.
-    ControlJson capture_start = 1;
+    CaptureStart capture_start = 1;
     Stack stack = 2;
     Observation observation = 3;
-    ControlJson capture_end = 4;
-    ControlJson capture_finalized = 5;
+    CaptureEnd capture_end = 4;
+    CaptureFinalized capture_finalized = 5;
   }
 }
 
-message ControlJson {
-  string json = 1;
+// ---------------------------------------------------------------------------------------------------
+// Configuration shared by the agent, the collector and the correlator. The agent resolves it, sends
+// it to the collector, and the collector echoes it; every copy (the replies, `capture_start`, the
+// manifest and `analysis_inputs`) must be equal as a message.
+
+// Which completed off-CPU intervals are recorded: the switch-out reasons to keep, optional strict
+// duration bounds applied in the kernel after the reason filter, and the admission policy applied last.
+message Sampling {
+  // Distinct, in the canonical order of the enum's numbers. Empty only under `none`.
+  repeated OffCpuReason reasons = 1;
+  // Strict bounds on the interval's off-CPU duration; unset means unbounded. `none` rejects both.
+  optional uint64 min_off_cpu_micros = 2;
+  optional uint64 max_off_cpu_micros = 3;
+  oneof admission {
+    // No off-CPU source: the agent runs async-profiler alone.
+    NoAdmission none = 4;
+    UniformAdmission uniform = 5;
+    ProportionalAdmission proportional = 6;
+  }
 }
+
+message NoAdmission {}
+
+// Every eligible interval is admitted with the same probability `probability_threshold / 2^32`.
+message UniformAdmission {
+  // The configured probability as exact decimal text, such as "0.01".
+  string probability = 1;
+  // In 1..=2^32.
+  uint64 probability_threshold = 2;
+}
+
+// An interval of at least `record_all_above_micros` is always admitted; a shorter one with
+// probability `duration / record_all_above_micros`.
+message ProportionalAdmission {
+  uint64 record_all_above_micros = 1;
+}
+
+// Where each interval's run-queue part comes from. It changes what is measured, not which intervals
+// are kept, so it sits beside `Sampling` rather than inside it.
+message TimeSplit {
+  TimeSplitSource source = 1;
+}
+
+enum TimeSplitSource {
+  TIME_SPLIT_SOURCE_UNSPECIFIED = 0;
+  // Nothing is read; observations carry no run-queue part.
+  TIME_SPLIT_SOURCE_OFF = 1;
+  // The growth of the scheduler's `task_struct.sched_info.run_delay` across the interval. Fails closed
+  // on a kernel whose BTF lacks the field.
+  TIME_SPLIT_SOURCE_SCHED_INFO = 2;
+}
+
+// A realtime signal is queued, one per request; a standard signal coalesces while one is pending.
+enum SignalDelivery {
+  SIGNAL_DELIVERY_UNSPECIFIED = 0;
+  SIGNAL_DELIVERY_QUEUED = 1;
+  SIGNAL_DELIVERY_COALESCING = 2;
+}
+
+// The identity the collector verified for the target process when it prepared.
+message VerifiedIdentity {
+  fixed64 registration_token = 1;
+  uint64 process_generation_nanos = 2;
+  uint64 pid_namespace_device = 3;
+  uint64 pid_namespace_inode = 4;
+  uint64 time_namespace_inode = 5;
+  bool clock_verified = 6;
+  // The target's CLOCK_MONOTONIC minus the collector's; zero when both share a time namespace.
+  sint64 monotonic_offset_nanos = 7;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Control records.
+
+// Written by the collector when it is enabled.
+message CaptureStart {
+  // The kind of source that wrote the stream, "jonoffcpu.offcpu.v1".
+  string source_id = 1;
+  string session_id = 2;
+  uint32 capture_epoch = 3;
+  int32 signal = 4;
+  SignalDelivery signal_delivery = 5;
+  uint32 host_tgid = 6;
+  // The target's PID in its own PID namespace.
+  uint32 target_pid = 7;
+  VerifiedIdentity verified_identity = 8;
+  uint64 started_monotonic_nanos = 9;
+  Sampling sampling = 10;
+  TimeSplit time_split = 11;
+  // Informational: the BPF loader and the hooks the collector attached.
+  string loader = 12;
+  string hook = 13;
+  string switch_out_hook = 14;
+  WallClockCalibration wall_clock_calibration = 15;
+  SignalEnvironment signal_environment = 16;
+}
+
+// Written by the collector when it stops.
+message CaptureEnd {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  CaptureState state = 3;
+  // Set exactly when `state` is incomplete.
+  IncompleteReason incomplete_reason = 4;
+  uint64 started_monotonic_nanos = 5;
+  uint64 stopped_monotonic_nanos = 6;
+  uint64 detached_monotonic_nanos = 7;
+  uint64 drain_completed_monotonic_nanos = 8;
+  bool drain_timed_out = 9;
+  bool target_exited = 10;
+  WallClockCalibration wall_clock_calibration = 11;
+  // The environment observed after the source was detached.
+  SignalEnvironment signal_environment = 12;
+  KernelCounters kernel_counters = 13;
+  UserspaceCounters userspace_counters = 14;
+}
+
+enum CaptureState {
+  CAPTURE_STATE_UNSPECIFIED = 0;
+  CAPTURE_STATE_COMPLETE = 1;
+  CAPTURE_STATE_INCOMPLETE = 2;
+}
+
+// Why a capture is incomplete, in the order the collector checks them.
+enum IncompleteReason {
+  INCOMPLETE_REASON_UNSPECIFIED = 0;
+  INCOMPLETE_REASON_TARGET_EXITED = 1;
+  INCOMPLETE_REASON_SOURCE_WRITE_FAILURE = 2;
+  INCOMPLETE_REASON_KERNEL_RING_OVERFLOW = 3;
+  INCOMPLETE_REASON_TARGET_NAMESPACE_MAPPING_FAILURE = 4;
+  INCOMPLETE_REASON_RING_POLL_FAILURE = 5;
+}
+
+// The kernel program's counters, summed over CPUs. Durations are in microseconds.
+message KernelCounters {
+  uint64 switch_outs = 1;
+  uint64 scheduler_exit_switches = 2;
+  uint64 scheduler_exit_no_switches = 3;
+  uint64 lifetime_rejections = 4;
+  uint64 thread_state_failures = 5;
+  uint64 eligible_intervals = 6;
+  uint64 eligible_duration_micros = 7;
+  uint64 admission_rejections = 8;
+  uint64 selected_intervals = 9;
+  uint64 sequence_exhaustions = 10;
+  uint64 sequence_contentions = 11;
+  uint64 kernel_stack_failures = 12;
+  uint64 user_stack_failures = 13;
+  uint64 signal_failures = 14;
+  uint64 ring_reserve_failures = 15;
+  uint64 target_namespace_failures = 16;
+  uint64 switch_outs_blocked = 17;
+  uint64 switch_outs_runnable = 18;
+  uint64 switch_outs_preempted = 19;
+  uint64 reason_rejections = 20;
+  uint64 reason_rejected_duration_micros = 21;
+  uint64 runqueue_inversions = 22;
+}
+
+message UserspaceCounters {
+  uint64 received_observations = 1;
+  uint64 written_observations = 2;
+  uint64 symbolization_failures = 3;
+  uint64 write_failures = 4;
+  uint64 poll_failures = 5;
+  uint64 drain_timed_out = 6;
+}
+
+// Appended by the agent after the collector closed the stream: the capture's final state and the
+// inputs the correlator verifies before it trusts either artifact.
+message CaptureFinalized {
+  string session_id = 1;
+  // Unset for a profiler-only capture, which has no source epoch.
+  uint32 capture_epoch = 2;
+  FinalizedState state = 3;
+  AnalysisInputs analysis_inputs = 4;
+  // async-profiler's stop reply, the `signal-capture-v1 stopped ...` line, verbatim.
+  string ap_stop_response = 5;
+  google.protobuf.Timestamp finalized_at = 6;
+}
+
+enum FinalizedState {
+  FINALIZED_STATE_UNSPECIFIED = 0;
+  // The collector's stream and the JFR are complete and verified.
+  FINALIZED_STATE_COMPLETE = 1;
+  // `sampling.admission` is `none`: no source ran, the stream holds only this record, and the JFR is
+  // the only artifact.
+  FINALIZED_STATE_PROFILER_ONLY = 2;
+}
+
+message AnalysisInputs {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  int32 signal = 3;
+  SignalDelivery signal_delivery = 4;
+  uint32 host_tgid = 5;
+  uint32 target_pid = 6;
+  Sampling sampling = 7;
+  TimeSplit time_split = 8;
+  VerifiedIdentity verified_identity = 9;
+  AsyncProfilerStats ap_stats = 10;
+  // The stream prefix before this record; unset for a profiler-only capture.
+  SourceArtifact source_artifact = 11;
+  FileArtifact jfr_artifact = 12;
+}
+
+// async-profiler's signal-capture counters, as its stop reply and its `profiler.SignalCaptureStats`
+// JFR event report them.
+message AsyncProfilerStats {
+  uint64 admitted_signals = 1;
+  uint64 invalid_signal_code = 2;
+  uint64 zero_cookie = 3;
+  uint64 zero_sequence = 4;
+  uint64 stale_epoch = 5;
+  uint64 accepted_cookies = 6;
+  uint64 capture_failures = 7;
+  uint64 submitted_samples = 8;
+}
+
+// The stream prefix the footer covers: the bytes before the `capture_finalized` record.
+message SourceArtifact {
+  // Where the file was when it was finalized; informational, since the correlator reads it wherever
+  // it is now.
+  string path = 1;
+  uint64 raw_bytes = 2;
+  // Lowercase hex.
+  string raw_sha256 = 3;
+}
+
+message FileArtifact {
+  string path = 1;
+  uint64 bytes = 2;
+  // Lowercase hex.
+  string sha256 = 3;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Diagnostics the collector records at start and end.
+
+// One CLOCK_MONOTONIC/CLOCK_REALTIME bracket, the narrowest of several samples, relating the capture's
+// monotonic timestamps to wall-clock time. `midpoint_uncertainty_nanos` is the maximum absolute error
+// of the midpoint offset from the unknown position of the realtime read within the bracket; it
+// excludes clock adjustments.
+message WallClockCalibration {
+  uint32 sample_count = 1;
+  uint32 selected_sample_index = 2;
+  uint64 monotonic_before_nanos = 3;
+  uint64 realtime_nanos = 4;
+  uint64 monotonic_after_nanos = 5;
+  uint64 monotonic_midpoint_nanos = 6;
+  sint64 realtime_minus_monotonic_nanos = 7;
+  uint64 bracket_width_nanos = 8;
+  uint64 midpoint_uncertainty_nanos = 9;
+}
+
+// The target's signal environment, observed best-effort within a time budget: the queued-signal
+// limit and usage, and which threads block the selected signal. Numbers read from procfs are
+// discarded when the target's pidfd reports that it exited around the snapshot.
+message SignalEnvironment {
+  SnapshotPhase phase = 1;
+  // Unset when the monotonic clock could not be read, with the reason.
+  optional uint64 observed_monotonic_nanos = 2;
+  string clock_unavailable_reason = 3;
+  int32 selected_signal = 4;
+  SignalDelivery signal_delivery = 5;
+  int32 runtime_realtime_min = 6;
+  int32 runtime_realtime_max = 7;
+  uint64 time_budget_millis = 8;
+  uint64 maximum_time_budget_millis = 9;
+  bool time_budget_exceeded = 10;
+  bool target_pidfd_alive_before = 11;
+  bool target_pidfd_alive_after = 12;
+  // The target process's RLIMIT_SIGPENDING. Queued signals are accounted per real user.
+  SigpendingLimit rlimit_sigpending = 13;
+  // The `SigQ` line of the target's status: queued signals of the real user, shared by all its
+  // processes, so it guarantees no capacity.
+  SignalQueue signal_queue = 14;
+  ThreadMaskAudit thread_mask_audit = 15;
+}
+
+enum SnapshotPhase {
+  SNAPSHOT_PHASE_UNSPECIFIED = 0;
+  SNAPSHOT_PHASE_BEFORE_ENABLE = 1;
+  SNAPSHOT_PHASE_AFTER_DETACH = 2;
+}
+
+enum DiagnosticStatus {
+  DIAGNOSTIC_STATUS_UNSPECIFIED = 0;
+  DIAGNOSTIC_STATUS_OK = 1;
+  // Some of the data was read, but not all of it.
+  DIAGNOSTIC_STATUS_PARTIAL = 2;
+  DIAGNOSTIC_STATUS_UNAVAILABLE = 3;
+}
+
+message SigpendingLimit {
+  DiagnosticStatus status = 1;
+  RlimitValue soft = 2;
+  RlimitValue hard = 3;
+  string unavailable_reason = 4;
+}
+
+message RlimitValue {
+  oneof value {
+    uint64 limit = 1;
+    bool unlimited = 2;
+  }
+}
+
+message SignalQueue {
+  DiagnosticStatus status = 1;
+  optional uint64 used = 2;
+  optional uint64 limit = 3;
+  optional uint64 observed_headroom = 4;
+  optional bool over_limit = 5;
+  string unavailable_reason = 6;
+  // Unset when the status file was not read.
+  optional bool status_file_truncated = 7;
+}
+
+// Which of the target's threads block the selected signal in `SigBlk`, read from the collector's
+// procfs view without modifying any mask. Threads are read one at a time, so the audit is not atomic.
+message ThreadMaskAudit {
+  DiagnosticStatus status = 1;
+  int32 selected_signal = 2;
+  // The target PID as the collector's procfs names it, and that PID namespace's inode.
+  uint32 target_pid_argument = 3;
+  uint64 target_pid_namespace_inode = 4;
+  uint32 max_audited_threads = 5;
+  uint64 audited_threads = 6;
+  uint64 blocked_threads = 7;
+  uint64 unblocked_threads = 8;
+  uint64 unknown_threads = 9;
+  uint64 enumeration_failures = 10;
+  bool enumeration_truncated = 11;
+  bool time_budget_exceeded = 12;
+  uint64 status_files_truncated = 13;
+  // Zero when every thread was enumerated; unset when enumeration was truncated or failed.
+  optional uint64 unaudited_threads_known_minimum = 14;
+  repeated uint32 blocked_tid_examples = 15;
+  bool blocked_examples_truncated = 16;
+  repeated UnknownThread unknown_examples = 17;
+  bool unknown_examples_truncated = 18;
+  string unavailable_reason = 19;
+}
+
+message UnknownThread {
+  // Unset when the thread could not even be enumerated.
+  optional uint32 tid = 1;
+  string reason = 2;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Stacks and observations.
 
 message Stack {
   int64 id = 1;
@@ -55,11 +407,11 @@ message Observation {
   uint32 host_tid = 3;
   uint32 target_tgid = 4;
   uint32 target_tid = 5;
-  uint64 process_generation_ns = 6;
-  uint64 thread_generation_ns = 7;
+  uint64 process_generation_nanos = 6;
+  uint64 thread_generation_nanos = 7;
   fixed64 registration_token = 8;
-  uint64 start_monotonic_ns = 9;
-  uint64 end_monotonic_ns = 10;
+  uint64 start_monotonic_nanos = 9;
+  uint64 end_monotonic_nanos = 10;
   uint64 admission_threshold = 11;
   sint64 signal_result = 12;
   string comm = 13;
@@ -69,21 +421,19 @@ message Observation {
   string kernel_stack_error = 16;
   string user_stack_error = 17;
   // Why the scheduler took the thread off the CPU, derived by the kernel from the two fields below.
-  // Unspecified in a schemaVersion 2 capture, which predates the classification.
   OffCpuReason reason = 18;
-  // The raw task state `sched_switch` reported for the outgoing thread; 0 is TASK_RUNNING. Explicit
-  // presence, because 0 is meaningful and absence means the capture is not classified.
-  optional uint32 prev_task_state = 19;
+  // The raw task state `sched_switch` reported for the outgoing thread; 0 is TASK_RUNNING.
+  uint32 prev_task_state = 19;
   // The `preempt` argument of `sched_switch`.
-  optional bool preempted = 20;
+  bool preempted = 20;
   // How long the thread waited on a run queue during the interval: the raw growth of the scheduler's
   // own `sched_info.run_delay` between switch-out and switch-in, in the scheduler's rq_clock
-  // nanoseconds. Present when `timeSplit.source` is `schedInfo`. Absent in a schemaVersion 2 or 3
-  // capture, under `timeSplit.source` `off`, and when the counter went backwards (counted as
-  // `runqueueInversions`); such an interval is unsplit. The consumers apply the split rule: a `blocked`
-  // interval slept for its duration minus this value and then waited this long for a CPU, and is
-  // unsplit when this value exceeds its duration; a `runnable` or `preempted` interval is run-queue
-  // time throughout, and this value may exceed its duration by the few microseconds rq_clock can lag.
+  // nanoseconds. Present when `time_split.source` is `TIME_SPLIT_SOURCE_SCHED_INFO`; absent under
+  // `TIME_SPLIT_SOURCE_OFF` and when the counter went backwards (counted as `runqueue_inversions`);
+  // such an interval is unsplit. The consumers apply the split rule: a `blocked` interval slept for its
+  // duration minus this value and then waited this long for a CPU, and is unsplit when this value
+  // exceeds its duration; a `runnable` or `preempted` interval is run-queue time throughout, and this
+  // value may exceed its duration by the few microseconds rq_clock can lag.
   optional uint64 runqueue_nanos = 21;
 }
 
