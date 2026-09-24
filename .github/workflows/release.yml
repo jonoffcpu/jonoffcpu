@@ -6,7 +6,12 @@ on:
       - 'v*'
 
 # Read-only by default, so the publish job, which holds the Maven Central and signing secrets, cannot
-# write to the repository. Only the jobs that create the release and push the README update may.
+# write to the repository. Only the job that creates the GitHub Release may; the README update is
+# pushed with a token of the release GitHub App, which the main branch ruleset lets bypass it.
+#
+# The Maven Central, signing and release app private-key secrets live in the protected `release`
+# environment, which only admits v* tags and waits for a maintainer's approval, so no other workflow,
+# branch or job can read them.
 permissions:
   contents: read
 
@@ -60,6 +65,7 @@ jobs:
       - build-and-verify
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    environment: release
     steps:
       - uses: actions/checkout@v7
         with:
@@ -155,13 +161,22 @@ jobs:
       - github-release
     runs-on: ubuntu-26.04
     timeout-minutes: 10
-    permissions:
-      contents: write
+    environment: release
     steps:
-      # The job pushes the README update with the persisted credentials and uploads no artifacts.
+      # A short-lived installation token of the release GitHub App, limited to pushing to this
+      # repository. Unlike GITHUB_TOKEN, the app may bypass the main branch ruleset, and its push
+      # triggers CI on the README commit.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          client-id: ${{ secrets.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          permission-contents: write
+      # The job pushes the README update with the persisted app token and uploads no artifacts.
       - uses: actions/checkout@v7 # zizmor: ignore[artipacked]
         with:
           ref: ${{ github.event.repository.default_branch }}
+          token: ${{ steps.app-token.outputs.token }}
       - name: Point the README at the released version
         env:
           RELEASE_VERSION: ${{ needs.version.outputs.version }}
@@ -179,12 +194,16 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           if git diff --quiet -- README.md; then
             echo "README already references ${RELEASE_TAG}"
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Commit as the app's bot user, whose noreply address links the commit to the app.
+          bot_user_id=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
           git commit -m "Update version numbers for latest release ${RELEASE_TAG} in README" -- README.md
           git push origin "HEAD:${DEFAULT_BRANCH}"

@@ -14,19 +14,31 @@ of the GPG signing key. The
 [Vanniktech Central Portal guide](https://vanniktech.github.io/gradle-maven-publish-plugin/central/)
 describes those one-time steps.
 
-Configure these GitHub Actions repository secrets:
+Create a GitHub Actions environment named `release` that admits only `v*` tags
+as deployment refs and requires a maintainer's approval, and store these
+secrets in it rather than as repository or organization secrets, so only the
+release jobs that use the environment can read them:
 
 | Secret | Purpose |
 | --- | --- |
 | `MAVEN_CENTRAL_USERNAME` | Central Portal user-token username |
 | `MAVEN_CENTRAL_PASSWORD` | Central Portal user-token password |
 | `SIGNING_IN_MEMORY_KEY` | Complete ASCII-armored private signing key |
-| `SIGNING_IN_MEMORY_KEY_ID` | Optional signing-key ID |
-| `SIGNING_IN_MEMORY_KEY_PASSWORD` | Optional signing-key password |
+| `SIGNING_IN_MEMORY_KEY_ID` | Short (8 hex digit) ID of the signing key |
+| `SIGNING_IN_MEMORY_KEY_PASSWORD` | Signing-key passphrase |
+| `RELEASE_APP_PRIVATE_KEY` | Private key of the release GitHub App |
 
-The release workflow exposes the secrets only to the publication step, adding
-the `ORG_GRADLE_PROJECT_` prefix required to pass them to Gradle as project
-properties. No publishing or signing credentials are stored in the repository.
+The release GitHub App pushes the README version update to the default branch.
+It needs only the Contents read and write repository permission, is installed
+on this repository alone, and is on the bypass list of the default branch's
+ruleset. Its client ID is the `RELEASE_APP_CLIENT_ID` secret, which may be an
+organization secret because it is not sensitive. The repository secret
+`GRADLE_ENCRYPTION_KEY` encrypts the Gradle configuration cache that CI saves.
+
+The release workflow exposes the Maven Central and signing secrets only to the
+publication step, adding the `ORG_GRADLE_PROJECT_` prefix required to pass them
+to Gradle as project properties. No publishing or signing credentials are
+stored in the repository.
 The validated tag version is passed through the reusable build workflow and the
 publication job as `ORG_GRADLE_PROJECT_version`, so both phases use Gradle's
 standard `version` project property.
