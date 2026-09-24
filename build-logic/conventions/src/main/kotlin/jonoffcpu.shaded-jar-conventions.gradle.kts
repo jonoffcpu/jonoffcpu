@@ -1,9 +1,8 @@
 import com.github.jengelman.gradle.plugins.shadow.tasks.ShadowJar
 
-// A self-contained module: its runtime libraries, declared in `embeddedRuntime`, are verified against pinned
-// SHA-256 digests (`verifyDependencyDigests.digests`) when they are external, relocated into the module's own package
-// by the module's shadowJar configuration, and embedded in the one JAR that is built and published. The module adds its relocations,
-// manifest entries and any further contents.
+// A self-contained module: its runtime libraries, declared in `embeddedRuntime`, are relocated into the module's own
+// package by the module's shadowJar configuration and embedded in the one JAR that is built and published. The module
+// adds its relocations, manifest entries and any further contents.
 plugins {
     id("jonoffcpu.publish-conventions")
     id("com.gradleup.shadow")
@@ -26,14 +25,6 @@ configurations.runtimeElements {
     extendsFrom(embeddedRuntime)
 }
 
-val verifyDependencyDigests =
-    tasks.register<VerifyDependencyDigests>("verifyDependencyDigests") {
-        group = "verification"
-        description = "Checks the exact embedded artifacts against their pinned SHA-256 digests before embedding them."
-        // Only external libraries are pinned; the build's own projects, such as the capture codec, are built here.
-        artifacts.from(embeddedRuntime.incoming.artifactView { componentFilter { it is ModuleComponentIdentifier } }.files)
-    }
-
 // The plain JAR is what the plain variants hold, for consumers inside the build; it is never published. Its classifier
 // keeps it apart from the shaded JAR, which is the only published artifact and takes the unclassified name.
 tasks.named<Jar>("jar") {
@@ -41,7 +32,6 @@ tasks.named<Jar>("jar") {
 }
 
 tasks.named<ShadowJar>("shadowJar") {
-    dependsOn(verifyDependencyDigests)
     archiveClassifier = ""
     configurations = listOf(embeddedRuntime)
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE

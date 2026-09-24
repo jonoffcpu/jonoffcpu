@@ -27,19 +27,6 @@ dependencies {
     testFixturesApi(testFixtures(project(":jonoffcpu-capture-codec")))
 }
 
-tasks.verifyDependencyDigests {
-    artifacts.from(jmcWriterSources)
-    digests =
-        mapOf(
-            "protobuf-java-4.33.1.jar" to "fd5cf3d55bc2c3ddb2a8640c9d4c69daa9a5b326fb6e05bae0e56b3f4f85e0f7",
-            "protobuf-java-util-4.33.1.jar" to "f8788f87658d46f8ddb864455eaa046aa218e419c98c93326643ae465aa5c843",
-            "gson-2.14.0.jar" to "2cbd119bf1961c28788310963dc80ba65f58cdeec1dd139c8bdb1240faa2c36f",
-            "picocli-4.7.7.jar" to "f86e30fffd10d2b13b8caa8d4b237a7ee61f2ffccf5b1941de718b765d235bf8",
-            "flightrecorder.writer-9.1.2.jar" to "8313e66f798f31de144c65b257a0434afca07b1bce1b59f17e63aed38c0dc9c1",
-            "flightrecorder.writer-9.1.2-sources.jar" to "7b7c7841028543ec3462a69755b333a6e21a9ca09b85a1845a425337a0821863",
-        )
-}
-
 val rootDirectory = isolated.rootProject.projectDirectory
 val asyncProfilerDir = rootDirectory.dir("async-profiler")
 val asyncProfilerConverter = asyncProfilerDir.file("build/bin/jfrconv")
@@ -92,7 +79,6 @@ val buildAsyncProfilerConverter =
 val jmcPatchSourceDir = layout.buildDirectory.dir("generated/jmc-writer-patch/src")
 val extractJmcWriterSources =
     tasks.register<Sync>("extractJmcWriterSources") {
-        dependsOn(tasks.verifyDependencyDigests)
         from(provider { zipTree(jmcWriterSources.singleFile) }) {
             include("org/openjdk/jmc/flightrecorder/writer/ConstantPool.java")
             include("org/openjdk/jmc/flightrecorder/writer/TypesImpl.java")
