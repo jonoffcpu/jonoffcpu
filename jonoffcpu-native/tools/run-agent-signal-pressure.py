@@ -20,7 +20,7 @@ def capture_rows(jdk, classpath, source):
     protobuf. 64-bit integers are decimal strings and enums are their value names."""
     dumped = subprocess.run(
         [str(jdk / "bin/java"), "-cp", classpath,
-         "io.github.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
+         "io.github.jonoffcpu.correlator.OffCpuCorrelator", "--dump", "--source", str(source)],
         check=True, capture_output=True, text=True).stdout
     return [json.loads(line) for line in dumped.splitlines()]
 
@@ -171,7 +171,7 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     for name, extra in (("analysis-exact", []),
                         ("analysis-delay-filtered", ["--max-handler-delay-ns", str(DELAY_LIMIT_NS)])):
-        run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.OffCpuCorrelator",
+        run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.correlator.OffCpuCorrelator",
              "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
              "--output", case / name, "--max-retained-bytes", str(1024 * 1024 * 1024),
              "--audit", "full", *extra], case / f"{name}.log")

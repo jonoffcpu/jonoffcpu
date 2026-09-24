@@ -67,7 +67,7 @@ printf '\n' >> /out/java-command.txt
 classpath="$agent_build/jonoffcpu-agent.jar:$agent_build/test-classes"
 "$JAVA_HOME/bin/java" -cp "$classpath" io.github.jonoffcpu.agent.MixedRecordingCheck \
   /out/jonoffcpu-capture.jfr /out/event-counts.json > /out/category-check.log 2>&1
-"$JAVA_HOME/bin/java" -cp "$classpath" io.github.jonoffcpu.offline.OffCpuCorrelator \
+"$JAVA_HOME/bin/java" -cp "$classpath" io.github.jonoffcpu.correlator.OffCpuCorrelator \
   --source /out/jonoffcpu-capture.pb \
   --jfr /out/jonoffcpu-capture.jfr \
   --output /out/analysis > /out/analysis.log 2>&1

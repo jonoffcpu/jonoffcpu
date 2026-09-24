@@ -65,7 +65,7 @@ val generateVersionResource =
             val file =
                 outputDir
                     .get()
-                    .file("io/github/jonoffcpu/offline/version.properties")
+                    .file("io/github/jonoffcpu/correlator/version.properties")
                     .asFile
             file.parentFile.mkdirs()
             file.writeText("version=$version\nasyncProfilerCommit=${commit.get()}\n")
@@ -126,7 +126,7 @@ tasks.shadowJar {
     relocate("org.openjdk.jmc", "io.github.jonoffcpu.correlator.internal.shaded.jmc")
     relocate("picocli", "io.github.jonoffcpu.correlator.internal.shaded.picocli")
     manifest {
-        attributes("Main-Class" to "io.github.jonoffcpu.offline.OffCpuCorrelator")
+        attributes("Main-Class" to "io.github.jonoffcpu.correlator.OffCpuCorrelator")
     }
     from(jmcWriterPatchClasses)
 }
@@ -142,10 +142,10 @@ val verifyRuntimeJar =
                 "META-INF/LICENSE",
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-LICENSE.txt",
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-THIRD_PARTY_LICENSES.txt",
-                "io/github/jonoffcpu/offline/OffCpuCorrelator.class",
-                "io/github/jonoffcpu/offline/SignalJfrExporter.class",
-                "io/github/jonoffcpu/offline/ReportProto.class",
-                "io/github/jonoffcpu/capture/ProtoJson.class",
+                "io/github/jonoffcpu/correlator/OffCpuCorrelator.class",
+                "io/github/jonoffcpu/correlator/SignalJfrExporter.class",
+                "io/github/jonoffcpu/correlator/ReportProto.class",
+                "io/github/jonoffcpu/codec/ProtoJson.class",
                 "io/github/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
                 // Every JSON output is printed by JsonFormat, which parses with the relocated Gson.
                 "io/github/jonoffcpu/correlator/internal/shaded/protobuf/util/JsonFormat.class",
@@ -168,8 +168,8 @@ tasks.check {
 tasks.withType<Test>().configureEach {
     jvmArgs(
         "-XX:CompileCommand=quiet",
-        "-XX:CompileCommand=exclude,io.github.jonoffcpu.offline.ScaleFixture::*",
-        "-XX:CompileCommand=dontinline,io.github.jonoffcpu.offline.ScaleFixture::*",
+        "-XX:CompileCommand=exclude,io.github.jonoffcpu.correlator.ScaleFixture::*",
+        "-XX:CompileCommand=dontinline,io.github.jonoffcpu.correlator.ScaleFixture::*",
     )
 }
 
@@ -216,5 +216,5 @@ tasks.check {
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
 // classpath leaves out on purpose, so the packaged-JAR tests are also named.
 tasks.named<Test>("packagedJarTest") {
-    filter { includeTestsMatching("io.github.jonoffcpu.packaging.*") }
+    filter { includeTestsMatching("io.github.jonoffcpu.correlator.packaging.*") }
 }

@@ -19,7 +19,7 @@ enum NativeLibc {
     MUSL("musl");
 
     /** Explicit override, for hosts where neither the process maps nor the loader path are conclusive. */
-    static final String OVERRIDE_PROPERTY = "io.github.jonoffcpu.nativeLibc";
+    static final String OVERRIDE_PROPERTY = "io.github.jonoffcpu.agent.nativeLibc";
 
     private static final Path PROCESS_MAPS = Path.of("/proc/self/maps");
 

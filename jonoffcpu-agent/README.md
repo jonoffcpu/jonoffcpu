@@ -44,7 +44,7 @@ extracts the matching bundle into an owner-only temporary directory, verifies
 each digest, and loads the colocated libraries. Nothing has to be installed
 outside the JAR. If the JAR has no bundle for the detected platform, startup
 fails with a message listing the embedded bundles rather than trying another
-flavour. `-Dio.github.jonoffcpu.nativeLibc=glibc` or `=musl` overrides
+flavour. `-Dio.github.jonoffcpu.agent.nativeLibc=glibc` or `=musl` overrides
 the detection.
 
 The native Docker stages intentionally use the running kernel's BTF to compile

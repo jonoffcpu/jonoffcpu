@@ -11,13 +11,13 @@
 
 syntax = "proto3";
 
-package io.github.jonoffcpu.analysis.v1;
+package io.github.jonoffcpu.correlator.analysis.v1;
 
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-profile.proto";
 import "jonoffcpu-report.proto";
 
-option java_package = "io.github.jonoffcpu.offline";
+option java_package = "io.github.jonoffcpu.correlator";
 option java_outer_classname = "AnalysisProto";
 
 // A pattern with where it came from: "inline", a file, or "preset:NAME".
@@ -245,11 +245,11 @@ message DigestCapture {
   uint64 identity_unverified = 9;
   uint64 selected_observed_duration_nanos = 10;
   CollectorLoss loss = 11;
-  io.github.jonoffcpu.report.v1.HandlerDelays handler_delay_nanos = 12;
+  io.github.jonoffcpu.correlator.report.v1.HandlerDelays handler_delay_nanos = 12;
   repeated io.github.jonoffcpu.capture.v1.OffCpuReason reasons = 13;
-  io.github.jonoffcpu.report.v1.KernelSwitchOuts kernel_switch_outs = 14;
-  io.github.jonoffcpu.report.v1.PopulationEstimate population_estimate = 15;
-  repeated io.github.jonoffcpu.report.v1.DegradationStep degradation_steps = 16;
+  io.github.jonoffcpu.correlator.report.v1.KernelSwitchOuts kernel_switch_outs = 14;
+  io.github.jonoffcpu.correlator.report.v1.PopulationEstimate population_estimate = 15;
+  repeated io.github.jonoffcpu.correlator.report.v1.DegradationStep degradation_steps = 16;
 }
 
 // The collector's selection and loss counters.
@@ -321,7 +321,7 @@ message ExportRow {
 message RunMetadata {
   string run = 1;
   string label = 2;
-  repeated io.github.jonoffcpu.profile.v1.Provenance sources = 3;
+  repeated io.github.jonoffcpu.correlator.profile.v1.Provenance sources = 3;
   repeated string dimensions = 4;
   bool estimate_available = 5;
   bool time_split_available = 6;

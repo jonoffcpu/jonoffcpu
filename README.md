@@ -168,7 +168,7 @@ captures the Java stack, and a 64-bit key ties each measurement to its stack.
    native stacks, and appends each observation to the correlation stream.
    The Java agent finalizes that stream with a footer that binds the JFR's size
    and SHA-256.
-5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/offline/OffCpuCorrelator.java)
+5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/correlator/OffCpuCorrelator.java)
    runs offline. It joins each `SignalSample` to its
    observation by key, weights the Java stack by the kernel-measured duration,
    and writes a report, a collapsed-stack file, a stack profile from which
@@ -353,9 +353,9 @@ linked against both glibc and musl (Alpine), verifies them against a SHA-256
 manifest, and extracts them to a private temporary directory at startup.
 Nothing needs to be installed on the host. The agent picks the glibc or musl
 bundle from the C library mapped into the running JVM; on an unusual host,
-`-Dio.github.jonoffcpu.nativeLibc=glibc` or `=musl` selects it
+`-Dio.github.jonoffcpu.agent.nativeLibc=glibc` or `=musl` selects it
 explicitly. If the temporary directory is mounted `noexec`, point
-`-Dio.github.jonoffcpu.nativeWorkDir` at an executable location.
+`-Dio.github.jonoffcpu.agent.nativeWorkDir` at an executable location.
 
 ### Kernel settings
 
@@ -458,7 +458,7 @@ repository's proof scripts do.
 | BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default seccomp profile permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
 | `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | Earlier releases attached `sched_switch` as a classic tracepoint, for which libbpf reads the numeric id from `events/sched/sched_switch/id`. Both hooks are now BTF raw tracepoints, and on a Linux host the packaged smoke passes without `tracefs` mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
 | Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
-| An executable temporary directory | `-Dio.github.jonoffcpu.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
+| An executable temporary directory | `-Dio.github.jonoffcpu.agent.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
 
 BTF needs nothing: `/sys/kernel/btf/vmlinux` is part of the container's own
 `sysfs` and is readable already.

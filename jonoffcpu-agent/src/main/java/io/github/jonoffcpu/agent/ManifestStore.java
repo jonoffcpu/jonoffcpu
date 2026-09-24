@@ -10,7 +10,7 @@ import io.github.jonoffcpu.agent.ManifestProto.Manifest;
 import io.github.jonoffcpu.agent.ManifestProto.ManifestState;
 import io.github.jonoffcpu.agent.ManifestProto.ThreadPolicy;
 import io.github.jonoffcpu.capture.CaptureProto.AnalysisInputs;
-import io.github.jonoffcpu.capture.ProtoJson;
+import io.github.jonoffcpu.codec.ProtoJson;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;

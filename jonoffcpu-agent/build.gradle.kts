@@ -142,9 +142,9 @@ val generateNativeChecksums =
 
 tasks.shadowJar {
     dependsOn(generateNativeChecksums)
-    relocate("com.google.protobuf", "io.github.jonoffcpu.internal.shaded.protobuf")
-    relocate("com.google.gson", "io.github.jonoffcpu.internal.shaded.gson")
-    relocate("org.yaml.snakeyaml", "io.github.jonoffcpu.internal.shaded.snakeyaml")
+    relocate("com.google.protobuf", "io.github.jonoffcpu.agent.internal.shaded.protobuf")
+    relocate("com.google.gson", "io.github.jonoffcpu.agent.internal.shaded.gson")
+    relocate("org.yaml.snakeyaml", "io.github.jonoffcpu.agent.internal.shaded.snakeyaml")
     manifest {
         attributes(
             "Premain-Class" to "io.github.jonoffcpu.agent.SignalCaptureAgent",
@@ -175,10 +175,10 @@ val verifyRuntimeJar =
             listOf(
                 "META-INF/LICENSE",
                 "META-INF/licenses/async-profiler-LICENSE",
-                "io/github/jonoffcpu/internal/shaded/gson/Gson.class",
-                "io/github/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
-                "io/github/jonoffcpu/internal/shaded/protobuf/util/JsonFormat.class",
-                "io/github/jonoffcpu/internal/shaded/snakeyaml/Yaml.class",
+                "io/github/jonoffcpu/agent/internal/shaded/gson/Gson.class",
+                "io/github/jonoffcpu/agent/internal/shaded/protobuf/CodedInputStream.class",
+                "io/github/jonoffcpu/agent/internal/shaded/protobuf/util/JsonFormat.class",
+                "io/github/jonoffcpu/agent/internal/shaded/snakeyaml/Yaml.class",
             )
         forbiddenPrefixes =
             listOf(
@@ -187,7 +187,7 @@ val verifyRuntimeJar =
                 "org/yaml/snakeyaml/",
                 "com/google/protobuf/",
                 "one/profiler/",
-                "io/github/jonoffcpu/offline/",
+                "io/github/jonoffcpu/correlator/",
                 "io/github/jonoffcpu/jfr/",
                 "org/openjdk/jmc/",
             )

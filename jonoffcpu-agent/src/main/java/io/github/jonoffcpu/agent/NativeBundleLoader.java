@@ -15,7 +15,7 @@ import java.util.Map;
 
 /** Extracts and verifies the native bundle embedded in the agent JAR. */
 final class NativeBundleLoader {
-    private static final String WORK_DIRECTORY_PROPERTY = "io.github.jonoffcpu.nativeWorkDir";
+    private static final String WORK_DIRECTORY_PROPERTY = "io.github.jonoffcpu.agent.nativeWorkDir";
     private static Bundle loaded;
 
     private NativeBundleLoader() {}

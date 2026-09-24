@@ -14,12 +14,12 @@
 
 syntax = "proto3";
 
-package io.github.jonoffcpu.report.v1;
+package io.github.jonoffcpu.correlator.report.v1;
 
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-signals.proto";
 
-option java_package = "io.github.jonoffcpu.offline";
+option java_package = "io.github.jonoffcpu.correlator";
 option java_outer_classname = "ReportProto";
 
 // ---------------------------------------------------------------------------------------------------
@@ -280,7 +280,7 @@ message ClassifiedRecord {
   optional RowReason reason = 3;
   oneof record {
     ClassifiedObservation source = 4;
-    io.github.jonoffcpu.signals.v1.SignalSample jfr = 5;
+    io.github.jonoffcpu.correlator.signals.v1.SignalSample jfr = 5;
   }
 }
 
@@ -359,8 +359,8 @@ message PartialReport {
   // Each set when the prefix holds it.
   io.github.jonoffcpu.capture.v1.CaptureEnd observed_source_end = 12;
   io.github.jonoffcpu.capture.v1.CaptureFinalized observed_finalization = 13;
-  io.github.jonoffcpu.signals.v1.SignalCapture observed_jfr_capture = 14;
-  io.github.jonoffcpu.signals.v1.SignalCaptureStats observed_ap_stats = 15;
+  io.github.jonoffcpu.correlator.signals.v1.SignalCapture observed_jfr_capture = 14;
+  io.github.jonoffcpu.correlator.signals.v1.SignalCaptureStats observed_ap_stats = 15;
   JfrParse jfr_parse = 16;
   Window window = 17;
   uint64 source_rows = 18;

@@ -46,7 +46,7 @@ import io.github.jonoffcpu.capture.CollectorProto.Enabled;
 import io.github.jonoffcpu.capture.CollectorProto.PrepareRequest;
 import io.github.jonoffcpu.capture.CollectorProto.Prepared;
 import io.github.jonoffcpu.capture.CollectorProto.Stopped;
-import io.github.jonoffcpu.capture.ProtoJson;
+import io.github.jonoffcpu.codec.ProtoJson;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.file.Files;

@@ -69,7 +69,7 @@ def main():
     compile_helper(module, jdk, output / "helper-build.log")
     required = (module / "build/lib/libjonoffcpu.so", module / "build/jonoffcpu-agent.jar",
                 module / "build/test-classes/io/github/jonoffcpu/agent/KnownWaitAttributionWorkload.class",
-                module / "build/test-classes/io/github/jonoffcpu/offline/KnownWaitAttributionCheck.class")
+                module / "build/test-classes/io/github/jonoffcpu/correlator/KnownWaitAttributionCheck.class")
     for file in required:
         if not file.is_file():
             raise RuntimeError(f"Missing built fixture artifact: {file}")
@@ -107,10 +107,10 @@ def main():
         make_readable(output)
 
     classpath = f"{build / 'jonoffcpu-agent.jar'}:{build / 'test-classes'}"
-    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.OffCpuCorrelator",
+    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.correlator.OffCpuCorrelator",
          "--source", output / "jonoffcpu-capture.pb", "--jfr", output / "jonoffcpu-capture.jfr",
          "--output", output / "analysis"], output / "analysis.log")
-    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.KnownWaitAttributionCheck",
+    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.correlator.KnownWaitAttributionCheck",
          output / "jonoffcpu-capture.pb", output / "jonoffcpu-capture.jfr", output / "workload.json",
          output / "known-wait-report.json"], output / "known-wait-check.log")
     report = json.loads((output / "known-wait-report.json").read_text())

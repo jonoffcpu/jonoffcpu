@@ -11,7 +11,7 @@ import io.github.jonoffcpu.capture.CaptureFormat;
 import io.github.jonoffcpu.capture.CaptureProto.CaptureFinalized;
 import io.github.jonoffcpu.capture.CaptureProto.FinalizedState;
 import io.github.jonoffcpu.capture.CaptureProto.Record;
-import io.github.jonoffcpu.capture.ProtoJson;
+import io.github.jonoffcpu.codec.ProtoJson;
 import java.io.BufferedInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -62,7 +62,7 @@ final class CaptureChecks {
         if (correlatorRun == null) {
             ClassLoader loader = new URLClassLoader(
                     new URL[] {AgentRuntime.correlatorJar().toUri().toURL()}, ClassLoader.getPlatformClassLoader());
-            correlatorRun = Class.forName("io.github.jonoffcpu.offline.OffCpuCorrelator", true, loader)
+            correlatorRun = Class.forName("io.github.jonoffcpu.correlator.OffCpuCorrelator", true, loader)
                     .getMethod("run", String[].class);
         }
         PrintStream out = System.out;
