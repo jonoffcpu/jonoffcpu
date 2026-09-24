@@ -34,10 +34,9 @@ record StackProfile(Header header, List<Entry> entries) {
     static final byte[] MAGIC = "JONOFFPRF\0".getBytes(StandardCharsets.US_ASCII);
     static final int FORMAT_VERSION = 1;
     static final int HEADER_BYTES = MAGIC.length + 2;
-    /** Schema 2 added {@link Kind#JFR_NATIVE}; a schema 1 profile tags every frame of its Java stacks JAVA. */
-    static final int SCHEMA_VERSION = 2;
+    /** Schema 3 made the sampling, the time split and the report typed messages; older profiles are refused. */
+    static final int SCHEMA_VERSION = 3;
 
-    static final int OLDEST_SCHEMA_VERSION = 1;
     static final String PRODUCER = "jonoffcpu-correlator";
     static final String WEIGHT_SEMANTICS = "selected-observed-offcpu-nanoseconds";
     /** The reason vocabulary written into every profile; {@code Entry.reason} indexes it. */
@@ -61,23 +60,15 @@ record StackProfile(Header header, List<Entry> entries) {
     /** One frame: a Java frame's collapsed name, or a native frame's symbol and module. */
     record Frame(Kind kind, String name, String module) {}
 
-    record Provenance(
-            String sessionId,
-            long captureEpoch,
-            String sourceSha256,
-            String originalJfrSha256,
-            String samplingJson,
-            String thinningProbability,
-            long thinningSeed,
-            long windowFromNanos,
-            long windowToNanos,
-            String timeSplitJson) {}
-
+    /**
+     * What the entries were built from and how they are keyed. {@code report} is the producing run's report, null
+     * for a merged profile.
+     */
     record Header(
-            List<Provenance> sources,
+            List<ProfileProto.Provenance> sources,
             List<String> dimensions,
             boolean estimateAvailable,
-            String reportJson,
+            ReportProto.Report report,
             String label,
             List<String> dimensionsDropped,
             boolean timeSplitAvailable) {
@@ -89,22 +80,28 @@ record StackProfile(Header header, List<Entry> entries) {
 
         /** A header whose entries carry no sleeping/run-queue split. */
         Header(
-                List<Provenance> sources,
+                List<ProfileProto.Provenance> sources,
                 List<String> dimensions,
                 boolean estimateAvailable,
-                String reportJson,
+                ReportProto.Report report,
                 String label,
                 List<String> dimensionsDropped) {
-            this(sources, dimensions, estimateAvailable, reportJson, label, dimensionsDropped, false);
+            this(sources, dimensions, estimateAvailable, report, label, dimensionsDropped, false);
+        }
+
+        /** The same header carrying the producing run's report. */
+        Header withReport(ReportProto.Report value) {
+            return new Header(
+                    sources, dimensions, estimateAvailable, value, label, dimensionsDropped, timeSplitAvailable);
         }
 
         /** The correlation-time thinning of the (single) source, or {@link Thinning#NONE}. */
         Thinning thinning() {
             if (sources.size() != 1) return Thinning.NONE;
-            Provenance source = sources.get(0);
-            return source.thinningProbability().equals("1")
+            ProfileProto.Provenance source = sources.get(0);
+            return source.getThinningProbability().equals("1")
                     ? Thinning.NONE
-                    : Thinning.of(source.thinningProbability(), source.thinningSeed());
+                    : Thinning.of(source.getThinningProbability(), source.getThinningSeed());
         }
     }
 
@@ -234,7 +231,6 @@ record StackProfile(Header header, List<Entry> entries) {
      */
     static StackProfile of(
             CorrelationResult result,
-            String reportJson,
             String label,
             String sourceSha256,
             String originalJfrSha256,
@@ -273,25 +269,24 @@ record StackProfile(Header header, List<Entry> entries) {
                     counters.split()));
         }
         CaptureInput capture = result.capture();
-        Provenance provenance = new Provenance(
-                CaptureInput.text(capture.inputs, "sessionId"),
-                CaptureInput.number(capture.inputs, "captureEpoch"),
-                sourceSha256,
-                originalJfrSha256,
-                CaptureInput.object(capture.start, "sampling").toString(),
-                result.thinning().probability(),
-                result.thinning().seed(),
-                result.clipFromNanos() == null ? 0 : result.clipFromNanos(),
-                result.clipToNanos() == null ? 0 : result.clipToNanos(),
-                capture.start.has("timeSplit")
-                        ? CaptureInput.object(capture.start, "timeSplit").toString()
-                        : "");
+        ProfileProto.Provenance provenance = ProfileProto.Provenance.newBuilder()
+                .setSessionId(capture.sessionId())
+                .setCaptureEpoch(capture.captureEpoch())
+                .setSourceSha256(sourceSha256)
+                .setOriginalJfrSha256(originalJfrSha256)
+                .setSampling(capture.start.getSampling())
+                .setThinningProbability(result.thinning().probability())
+                .setThinningSeed(result.thinning().seed())
+                .setWindowFromNanos(result.clipFromNanos() == null ? 0 : result.clipFromNanos())
+                .setWindowToNanos(result.clipToNanos() == null ? 0 : result.clipToNanos())
+                .setTimeSplit(capture.start.getTimeSplit())
+                .build();
         return new StackProfile(
                 new Header(
                         List.of(provenance),
                         profile.dimensions(),
                         estimateAvailable,
-                        reportJson,
+                        null,
                         label,
                         profile.dropped(),
                         result.timeSplit().available()),
@@ -319,7 +314,7 @@ record StackProfile(Header header, List<Entry> entries) {
         CaptureInput.require(!profiles.isEmpty(), "Nothing to merge");
         List<String> dimensions = profiles.get(0).header().dimensions();
         String label = profiles.get(0).header().label();
-        List<Provenance> sources = new ArrayList<>();
+        List<ProfileProto.Provenance> sources = new ArrayList<>();
         Set<String> dropped = new LinkedHashSet<>();
         boolean estimateAvailable = true;
         boolean timeSplitAvailable = false;
@@ -330,10 +325,10 @@ record StackProfile(Header header, List<Entry> entries) {
             Header header = profile.header();
             CaptureInput.require(header.dimensions().equals(dimensions), "Profiles with different grouping dimensions");
             CaptureInput.require(header.label().equals(label), "Profiles with different collapsed labels");
-            for (Provenance source : header.sources()) {
+            for (ProfileProto.Provenance source : header.sources()) {
                 // A thinned profile's weights are rescaled by its own probability; a sum of differently rescaled
                 // profiles has no single scale to apply afterwards.
-                CaptureInput.require(source.thinningProbability().equals("1"), "A thinned profile cannot be merged");
+                CaptureInput.require(source.getThinningProbability().equals("1"), "A thinned profile cannot be merged");
                 sources.add(source);
             }
             dropped.addAll(header.dimensionsDropped());
@@ -375,14 +370,15 @@ record StackProfile(Header header, List<Entry> entries) {
                     splits.get(key)));
         }
         return new StackProfile(
-                new Header(sources, dimensions, estimateAvailable, "", label, List.copyOf(dropped), timeSplitAvailable),
+                new Header(
+                        sources, dimensions, estimateAvailable, null, label, List.copyOf(dropped), timeSplitAvailable),
                 entries);
     }
 
     /**
      * One Java stack per distinct list of frame names across the inputs, so a stack merges whatever kinds its inputs
-     * gave it: a frame is JAVA only when every input says so. A schema 1 input calls every frame JAVA, which a newer
-     * input's JFR_NATIVE therefore overrules.
+     * gave it: a frame is JAVA only when every input says so, since async-profiler can record the same frame as Java
+     * code in one capture and as native in another.
      */
     private static Map<List<String>, List<Frame>> javaStacksByName(List<StackProfile> profiles) {
         Map<List<String>, List<Frame>> stacks = new HashMap<>();
@@ -461,21 +457,9 @@ record StackProfile(Header header, List<Entry> entries) {
                 .setWeightSemantics(WEIGHT_SEMANTICS)
                 .setEstimateAvailable(header.estimateAvailable())
                 .setTimeSplitAvailable(header.timeSplitAvailable())
-                .setReportJson(header.reportJson())
-                .setLabel(header.label());
-        for (Provenance source : header.sources()) {
-            start.addSource(ProfileProto.Provenance.newBuilder()
-                    .setSessionId(source.sessionId())
-                    .setCaptureEpoch(source.captureEpoch())
-                    .setSourceSha256(source.sourceSha256())
-                    .setOriginalJfrSha256(source.originalJfrSha256())
-                    .setSamplingJson(source.samplingJson())
-                    .setThinningProbability(source.thinningProbability())
-                    .setThinningSeed(source.thinningSeed())
-                    .setWindowFromNanos(source.windowFromNanos())
-                    .setWindowToNanos(source.windowToNanos())
-                    .setTimeSplitJson(source.timeSplitJson()));
-        }
+                .setLabel(header.label())
+                .addAllSource(header.sources());
+        if (header.report() != null) start.setReport(header.report());
         emit(output, ProfileProto.Record.newBuilder().setProfileStart(start).build());
         Interner interner = new Interner(output);
         for (Entry entry : entries) {
@@ -615,29 +599,13 @@ record StackProfile(Header header, List<Entry> entries) {
                 "Stack profile does not start with profile_start");
         ProfileProto.ProfileStart start = first.getProfileStart();
         int schema = start.getSchemaVersion();
-        CaptureInput.require(
-                schema >= OLDEST_SCHEMA_VERSION && schema <= SCHEMA_VERSION,
-                "Unsupported stack profile schema " + schema);
-        // Kinds a profile's schema does not define are refused rather than guessed.
-        int kinds = schema == 1 ? Kind.KERNEL.ordinal() + 1 : Kind.values().length;
+        CaptureInput.require(schema == SCHEMA_VERSION, "Unsupported stack profile schema " + schema);
+        int kinds = Kind.values().length;
         CaptureInput.require(start.getReasonList().equals(REASONS), "Unsupported stack profile reason vocabulary");
         CaptureInput.require(
                 start.getWeightSemantics().equals(WEIGHT_SEMANTICS), "Unsupported stack profile weight semantics");
         boolean timeSplitAvailable = start.getTimeSplitAvailable();
-        List<Provenance> sources = new ArrayList<>();
-        for (ProfileProto.Provenance source : start.getSourceList()) {
-            sources.add(new Provenance(
-                    source.getSessionId(),
-                    source.getCaptureEpoch(),
-                    source.getSourceSha256(),
-                    source.getOriginalJfrSha256(),
-                    source.getSamplingJson(),
-                    source.getThinningProbability(),
-                    source.getThinningSeed(),
-                    source.getWindowFromNanos(),
-                    source.getWindowToNanos(),
-                    source.getTimeSplitJson()));
-        }
+        List<ProfileProto.Provenance> sources = start.getSourceList();
         List<String> strings = new ArrayList<>();
         strings.add(null);
         List<Frame> frames = new ArrayList<>();
@@ -689,7 +657,7 @@ record StackProfile(Header header, List<Entry> entries) {
                                 split.adds(entry.getObservedNanos(), entry.getEstimatedNanos()),
                                 "Stack profile entry split does not add up to its totals");
                     } else {
-                        // A profile without the split (including one written before it existed) is all unsplit.
+                        // A profile without the split is all unsplit.
                         CaptureInput.require(
                                 split.equals(new Split(0, 0, 0, 0, 0, 0)),
                                 "Stack profile entry carries a split its header does not announce");
@@ -719,7 +687,7 @@ record StackProfile(Header header, List<Entry> entries) {
                         sources,
                         start.getDimensionList(),
                         start.getEstimateAvailable(),
-                        start.getReportJson(),
+                        start.hasReport() ? start.getReport() : null,
                         start.getLabel(),
                         end.getDimensionDroppedList(),
                         timeSplitAvailable),

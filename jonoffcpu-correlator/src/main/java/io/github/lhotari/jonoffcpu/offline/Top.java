@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonNull;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.ComparedRow;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TableSum;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TopResult;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TopRow;
+import io.github.lhotari.jonoffcpu.offline.AnalysisProto.TopTotals;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -32,7 +33,8 @@ import java.util.regex.Pattern;
  * Idle time is listed in its own table, never silently dropped, and every total adds up: busy and idle make the
  * selection, and application rows and the pool table make the busy time.
  *
- * <p>The result is a JSON object; Markdown and CSV are rendered from it, so no format can disagree with another.
+ * <p>The result is a {@link TopResult}, printed as JSON; Markdown and CSV are rendered from it, so no format can
+ * disagree with another.
  */
 final class Top {
     /** What a row is keyed by. */
@@ -88,6 +90,7 @@ final class Top {
     /**
      * The selected items and what the input can say about them: the unit of their weights, whether estimates, the
      * sleeping/run-queue split and thread pools exist, and the sampling that decides whether observed time is biased.
+     * {@code source} names the input in the selection.
      */
     record Input(
             List<Item> items,
@@ -97,7 +100,7 @@ final class Top {
             boolean pools,
             boolean exhaustiveSampling,
             boolean estimateAvailable,
-            JsonObject source) {}
+            AnalysisProto.TopSelection source) {}
 
     private Top() {}
 
@@ -147,9 +150,10 @@ final class Top {
                             : null,
                     !busy.test(entry)));
         }
-        JsonObject source = new JsonObject();
-        source.addProperty("profile", path.toString());
-        source.addProperty("run", StackProfileRenderer.defaultRun(profile));
+        AnalysisProto.TopSelection source = AnalysisProto.TopSelection.newBuilder()
+                .setProfile(path.toString())
+                .setRun(StackProfileRenderer.defaultRun(profile))
+                .build();
         return new Input(
                 items,
                 true,
@@ -172,23 +176,19 @@ final class Top {
             if (!options.filter().keeps(names)) continue;
             items.add(new Item(line.frames(), null, null, 1, line.weight(), null, null, null, !idle.keeps(names)));
         }
-        JsonObject source = new JsonObject();
-        source.addProperty("collapsedInput", path.toString());
+        AnalysisProto.TopSelection source = AnalysisProto.TopSelection.newBuilder()
+                .setCollapsedInput(path.toString())
+                .build();
         return new Input(items, false, false, false, false, true, false, source);
     }
 
     /** Whether every eligible interval was kept, so that observed time is an unbiased weight. */
     static boolean exhaustive(StackProfile.Header header) {
-        for (StackProfile.Provenance source : header.sources()) {
-            if (source.samplingJson() == null || source.samplingJson().isEmpty()) continue;
-            JsonObject admission = JsonParser.parseString(source.samplingJson())
-                    .getAsJsonObject()
-                    .getAsJsonObject("admission");
-            if (admission == null) continue;
-            String policy = admission.get("policy").getAsString();
-            if (policy.equals("proportional")) return false;
-            if (policy.equals("uniform")
-                    && new BigDecimal(admission.get("probability").getAsString()).compareTo(BigDecimal.ONE) < 0) {
+        for (var source : header.sources()) {
+            CaptureProto.Sampling sampling = source.getSampling();
+            if (sampling.hasProportional()) return false;
+            if (sampling.hasUniform()
+                    && new BigDecimal(sampling.getUniform().getProbability()).compareTo(BigDecimal.ONE) < 0) {
                 return false;
             }
         }
@@ -234,10 +234,10 @@ final class Top {
                     .orElse(null);
         }
 
-        String reason() {
+        OffCpuReason reason() {
             return reasons.entrySet().stream()
                     .max(Map.Entry.comparingByValue())
-                    .map(entry -> entry.getKey().label())
+                    .map(Map.Entry::getKey)
                     .orElse(null);
         }
     }
@@ -408,10 +408,10 @@ final class Top {
         return sorted;
     }
 
-    // ---- the result as JSON --------------------------------------------------------------------------------------
+    // ---- the result ---------------------------------------------------------------------------------------------
 
-    /** The ranked tables as one versioned object. */
-    static JsonObject tables(Input input, Options options, String command) {
+    /** The ranked tables. */
+    static TopResult tables(Input input, Options options, String command) {
         Attribution attribution = new Attribution(options);
         List<Item> busy = input.items().stream().filter(item -> !item.idle()).toList();
         List<Item> idle = input.items().stream().filter(Item::idle).toList();
@@ -426,41 +426,37 @@ final class Top {
                     .filter(item -> attribution.boundary(attribution.stack(item)) < 0)
                     .toList();
         }
-        JsonObject result = new JsonObject();
-        result.addProperty("schemaVersion", 1);
-        result.addProperty("command", command);
-        result.addProperty("by", options.by().label());
-        result.addProperty("unit", input.seconds() ? "seconds" : "weight");
-        result.add("selection", selection(input, options));
+        TopResult.Builder result = TopResult.newBuilder()
+                .setCommand(command)
+                .setBy(options.by().label())
+                .setUnit(input.seconds() ? "seconds" : "weight")
+                .setSelection(selection(input, options));
 
         Sum busySum = Sum.of(busy);
-        JsonObject totals = new JsonObject();
-        totals.add("selected", sum(Sum.of(input.items()), input));
-        totals.add("idle", sum(Sum.of(idle), input));
-        totals.add("busy", sum(busySum, input));
+        TopTotals.Builder totals = TopTotals.newBuilder()
+                .setSelected(sum(Sum.of(input.items()), input))
+                .setIdle(sum(Sum.of(idle), input))
+                .setBusy(sum(busySum, input));
         if (boundary) {
-            totals.add("busyApplication", sum(Sum.of(application), input));
-            totals.add("busyNoApplicationFrame", sum(Sum.of(noApplication), input));
+            totals.setBusyApplication(sum(Sum.of(application), input));
+            totals.setBusyNoApplicationFrame(sum(Sum.of(noApplication), input));
         }
-        totals.add(
-                "overExclusion",
-                sum(
-                        Sum.of(idle.stream()
-                                .filter(item -> item.java().stream()
-                                        .anyMatch(frame -> LOCK_ACQUIRE
-                                                .matcher(frame.name())
-                                                .find()))
-                                .toList()),
-                        input));
-        result.add("totals", totals);
+        totals.setOverExclusion(sum(
+                Sum.of(idle.stream()
+                        .filter(item -> item.java().stream()
+                                .anyMatch(frame ->
+                                        LOCK_ACQUIRE.matcher(frame.name()).find()))
+                        .toList()),
+                input));
+        result.setTotals(totals);
 
         List<Row> rows = aggregate(boundary ? application : busy, attribution, options.by(), boundary);
-        result.add("rows", rows(rows, busySum.weight(), input, options, boundary ? "boundary" : "key"));
+        result.addAllRows(rows(rows, busySum.weight(), input, options));
         if (boundary) {
             List<Row> pools = input.pools()
                     ? aggregate(noApplication, attribution, By.POOL, false)
                     : aggregate(noApplication, attribution, By.BOUNDARY, false);
-            result.add("noApplicationFrame", rows(pools, busySum.weight(), input, options, "pool"));
+            result.addAllNoApplicationFrame(rows(pools, busySum.weight(), input, options));
         }
         List<Row> idleRows = boundary
                 ? aggregate(idle, attribution, By.BOUNDARY, false).stream()
@@ -488,48 +484,43 @@ final class Top {
                                 .thenComparing(row -> row.key.get(0)))
                         .toList()
                 : aggregate(idle, attribution, options.by(), false);
-        result.add("idle", rows(idleRows, Sum.of(idle).weight(), input, options, boundary ? "boundary" : "key"));
-        JsonArray warnings = new JsonArray();
+        result.addAllIdle(rows(idleRows, Sum.of(idle).weight(), input, options));
         if (boundary && !noApplication.isEmpty() && input.seconds()) {
-            warnings.add("Busy time without an application frame depends on native symbolization: on a musl image"
-                    + " every native frame is /lib/ld-musl-<arch>.so.1, the HotSpot idle patterns cannot match, and"
-                    + " idle GC and compiler threads count as busy.");
+            result.addWarnings("Busy time without an application frame depends on native symbolization: on a musl"
+                    + " image every native frame is /lib/ld-musl-<arch>.so.1, the HotSpot idle patterns cannot match,"
+                    + " and idle GC and compiler threads count as busy.");
         }
         if (!input.exhaustiveSampling() && options.weights() == StackProfileRenderer.Weights.OBSERVED) {
-            warnings.add("Sampling kept only some intervals (proportional or uniform admission), so observed time"
-                    + " under-weights short waits; use --weights estimated when the estimate is available.");
+            result.addWarnings("Sampling kept only some intervals (proportional or uniform admission), so observed"
+                    + " time under-weights short waits; use --weights estimated when the estimate is available.");
         }
-        result.add("warnings", warnings);
-        return result;
+        return result.build();
     }
 
-    static JsonObject selection(Input input, Options options) {
-        JsonObject selection = input.source().deepCopy();
-        JsonArray reasons = new JsonArray();
-        if (options.reasons() == null) {
-            reasons.add("all");
-        } else {
-            options.reasons().forEach(reason -> reasons.add(reason.label()));
+    static AnalysisProto.TopSelection selection(Input input, Options options) {
+        AnalysisProto.TopSelection.Builder selection = input.source().toBuilder();
+        if (options.reasons() != null) {
+            options.reasons().stream().sorted().forEach(reason -> selection.addReasons(reason.proto()));
         }
-        selection.add("reasons", reasons);
-        selection.addProperty("weights", options.weights().name().toLowerCase(java.util.Locale.ROOT));
-        selection.add("app", StackTransforms.patterns(options.app()));
-        selection.add("idle", StackTransforms.patterns(options.idle()));
-        selection.add("machinery", StackTransforms.patterns(options.machinery()));
-        selection.add("include", StackProfileRenderer.patterns(options.filter().include()));
-        selection.add("exclude", StackProfileRenderer.patterns(options.filter().exclude()));
-        selection.add("transforms", options.transforms().report());
-        selection.addProperty("packageNames", options.packages().label());
-        selection.addProperty("limit", options.limit());
-        return selection;
+        return selection
+                .setWeights(options.weights().name().toLowerCase(java.util.Locale.ROOT))
+                .addAllApp(StackTransforms.patterns(options.app()))
+                .addAllIdle(StackTransforms.patterns(options.idle()))
+                .addAllMachinery(StackTransforms.patterns(options.machinery()))
+                .addAllInclude(StackProfileRenderer.patterns(options.filter().include()))
+                .addAllExclude(StackProfileRenderer.patterns(options.filter().exclude()))
+                .setTransforms(options.transforms().report())
+                .setPackageNames(options.packages().label())
+                .setLimit(options.limit())
+                .build();
     }
 
-    private static JsonObject sum(Sum sum, Input input) {
-        JsonObject object = new JsonObject();
-        object.addProperty("entries", sum.entries());
-        object.addProperty(input.seconds() ? "intervals" : "lines", sum.intervals());
-        object.addProperty("value", value(sum.weight(), input));
-        return object;
+    private static TableSum sum(Sum sum, Input input) {
+        return TableSum.newBuilder()
+                .setEntries(sum.entries())
+                .setIntervals(sum.intervals())
+                .setValue(value(sum.weight(), input).toPlainString())
+                .build();
     }
 
     /** A weight in the table's unit: seconds to three decimals, or the collapsed file's own unit. */
@@ -541,37 +532,36 @@ final class Top {
         return whole.signum() == 0 ? BigDecimal.ZERO : part.divide(whole, 6, RoundingMode.HALF_EVEN);
     }
 
-    private static JsonArray rows(List<Row> rows, BigDecimal whole, Input input, Options options, String keyName) {
-        JsonArray array = new JsonArray();
+    private static List<TopRow> rows(List<Row> rows, BigDecimal whole, Input input, Options options) {
+        List<TopRow> result = new ArrayList<>();
         int rank = 0;
         for (Row row : rows) {
             if (rank == options.limit()) break;
-            JsonObject item = new JsonObject();
-            item.addProperty("rank", ++rank);
-            item.addProperty(keyName, options.packages().apply(row.key.get(0)));
-            if (row.key.size() > 1)
-                item.addProperty("blocker", options.packages().apply(row.key.get(1)));
-            item.addProperty("value", value(row.weight, input));
-            item.addProperty("share", share(row.weight, whole));
-            item.addProperty(input.seconds() ? "intervals" : "lines", row.intervals);
-            if (input.estimateColumn()) item.addProperty("estimated", value(row.estimated, input));
+            TopRow.Builder item = TopRow.newBuilder()
+                    .setRank(++rank)
+                    .setKey(options.packages().apply(row.key.get(0)));
+            if (row.key.size() > 1) item.setBlocker(options.packages().apply(row.key.get(1)));
+            item.setValue(value(row.weight, input).toPlainString())
+                    .setShare(share(row.weight, whole).toPlainString())
+                    .setIntervals(row.intervals);
+            if (input.estimateColumn())
+                item.setEstimated(value(row.estimated, input).toPlainString());
             if (input.splitColumn()) {
-                item.addProperty("sleeping", value(row.sleeping, input));
-                item.addProperty("runqueue", value(row.runqueue, input));
+                item.setSleeping(value(row.sleeping, input).toPlainString());
+                item.setRunqueue(value(row.runqueue, input).toPlainString());
             }
-            if (input.seconds()) item.addProperty("reason", row.reason());
-            if (keyName.equals("boundary") && !row.callers.isEmpty()) {
-                item.addProperty("caller", options.packages().apply(Row.heaviest(row.callers)));
-            }
-            array.add(item);
+            if (input.seconds() && row.reason() != null)
+                item.setReason(row.reason().proto());
+            if (!row.callers.isEmpty()) item.setCaller(options.packages().apply(Row.heaviest(row.callers)));
+            result.add(item.build());
         }
-        return array;
+        return result;
     }
 
     // ---- comparing two runs --------------------------------------------------------------------------------------
 
     /** The application boundary rows of two runs side by side, per unit of work when the units are given. */
-    static JsonObject compare(
+    static TopResult compare(
             Input input, Input baseline, Options options, BigDecimal units, BigDecimal baselineUnits, String command) {
         Attribution attribution = new Attribution(options);
         Map<String, BigDecimal[]> rows = new HashMap<>();
@@ -612,56 +602,55 @@ final class Top {
                 .reversed()
                 .thenComparing(Comparator.comparing(Compared::delta).reversed())
                 .thenComparing(Compared::boundary));
-        JsonObject result = new JsonObject();
-        result.addProperty("schemaVersion", 1);
-        result.addProperty("command", command);
-        result.addProperty("by", "boundary");
-        result.addProperty("unit", perUnit ? "seconds per unit" : "seconds");
-        JsonObject selection = selection(input, options);
-        selection.add("baseline", baseline.source());
+        AnalysisProto.TopSelection.Builder selection = selection(input, options).toBuilder()
+                .setBaseline(AnalysisProto.TopInput.newBuilder()
+                        .setProfile(baseline.source().getProfile())
+                        .setRun(baseline.source().getRun()));
         if (perUnit) {
-            selection.addProperty("units", units);
-            selection.addProperty("baselineUnits", baselineUnits);
+            selection.setUnits(units.toPlainString()).setBaselineUnits(baselineUnits.toPlainString());
         }
-        result.add("selection", selection);
-        JsonObject totals = new JsonObject();
-        totals.addProperty("baselineBusy", value(busy[0], input));
-        totals.addProperty("busy", value(busy[1], input));
-        totals.addProperty("baselineBusyApplication", value(application[0], input));
-        totals.addProperty("busyApplication", value(application[1], input));
-        result.add("totals", totals);
-        JsonArray array = new JsonArray();
+        TopResult.Builder result = TopResult.newBuilder()
+                .setCommand(command)
+                .setBy("boundary")
+                .setUnit(perUnit ? "seconds per unit" : "seconds")
+                .setSelection(selection)
+                .setComparisonTotals(AnalysisProto.ComparisonTotals.newBuilder()
+                        .setBaselineBusy(value(busy[0], input).toPlainString())
+                        .setBusy(value(busy[1], input).toPlainString())
+                        .setBaselineBusyApplication(value(application[0], input).toPlainString())
+                        .setBusyApplication(value(application[1], input).toPlainString()));
         int rank = 0;
         for (Compared row : compared) {
             if (rank == options.limit()) break;
-            JsonObject item = new JsonObject();
-            item.addProperty("rank", ++rank);
-            item.addProperty("boundary", options.packages().apply(row.boundary()));
+            ComparedRow.Builder item = ComparedRow.newBuilder()
+                    .setRank(++rank)
+                    .setBoundary(options.packages().apply(row.boundary()))
+                    .setDelta(row.current().subtract(row.baseline()).toPlainString());
             BigDecimal[] raw = rows.get(row.boundary());
-            item.add("baseline", raw[0].signum() == 0 ? JsonNull.INSTANCE : json(row.baseline()));
-            item.add("value", raw[1].signum() == 0 ? JsonNull.INSTANCE : json(row.current()));
-            item.addProperty("delta", row.current().subtract(row.baseline()));
-            item.add("baselineShare", raw[0].signum() == 0 ? JsonNull.INSTANCE : json(share(raw[0], application[0])));
-            item.add("share", raw[1].signum() == 0 ? JsonNull.INSTANCE : json(share(raw[1], application[1])));
-            array.add(item);
+            if (raw[0].signum() != 0) {
+                item.setBaseline(row.baseline().toPlainString())
+                        .setBaselineShare(share(raw[0], application[0]).toPlainString());
+            }
+            if (raw[1].signum() != 0) {
+                item.setValue(row.current().toPlainString())
+                        .setShare(share(raw[1], application[1]).toPlainString());
+            }
+            result.addComparison(item);
         }
-        result.add("comparison", array);
-        JsonArray warnings = new JsonArray();
         BigDecimal unresolvedBaseline = share(unresolved[0], busy[0]);
         BigDecimal unresolvedCurrent = share(unresolved[1], busy[1]);
         if (unresolvedBaseline.subtract(unresolvedCurrent).abs().compareTo(new BigDecimal("0.10")) > 0) {
-            warnings.add("The runs' unresolved native frames differ by more than 10 points of busy time ("
+            result.addWarnings("The runs' unresolved native frames differ by more than 10 points of busy time ("
                     + percent(unresolvedBaseline) + " vs " + percent(unresolvedCurrent) + "): their busy time without"
                     + " an application frame is not comparable; compare the application rows only.");
         }
         if ((!input.exhaustiveSampling() || !baseline.exhaustiveSampling())
                 && options.weights() == StackProfileRenderer.Weights.OBSERVED) {
-            warnings.add("At least one run kept only some intervals and has no population estimate, so observed"
+            result.addWarnings("At least one run kept only some intervals and has no population estimate, so observed"
                     + " time and its shares are length-biased toward long waits; correlate with"
                     + " --estimate-population true and compare with --weights estimated.");
         }
-        result.add("warnings", warnings);
-        return result;
+        return result.build();
     }
 
     private static BigDecimal normalise(BigDecimal weight, BigDecimal units, Input input) {
@@ -670,19 +659,14 @@ final class Top {
         return value.setScale(3, RoundingMode.HALF_EVEN);
     }
 
-    private static JsonElement json(BigDecimal value) {
-        return new com.google.gson.JsonPrimitive(value);
-    }
-
     // ---- rendering -----------------------------------------------------------------------------------------------
 
     static String percent(BigDecimal share) {
         return share.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_EVEN) + " %";
     }
 
-    static String number(JsonElement value) {
-        if (value == null || value.isJsonNull()) return "";
-        return value.getAsBigDecimal().toPlainString();
+    static String percent(String share) {
+        return share.isEmpty() ? "" : percent(new BigDecimal(share));
     }
 
     /** Markdown code for a cell: frame names carry {@code $}, {@code *} and {@code |}, which must not render. */
@@ -692,124 +676,133 @@ final class Top {
     }
 
     /** Markdown: one table per section, each with a heading and the command that reproduces it. */
-    static String markdown(JsonObject result) {
+    static String markdown(TopResult result) {
         StringBuilder text = new StringBuilder();
-        boolean seconds = result.get("unit").getAsString().startsWith("seconds");
+        boolean seconds = result.getUnit().startsWith("seconds");
         String unit = seconds ? "s" : "weight";
         String count = seconds ? "Intervals" : "Lines";
-        String countKey = seconds ? "intervals" : "lines";
-        text.append("Reproduce: `").append(result.get("command").getAsString()).append("`\n\n");
-        if (result.has("comparison")) {
-            JsonObject totals = result.getAsJsonObject("totals");
-            boolean perUnit = result.get("unit").getAsString().equals("seconds per unit");
+        text.append("Reproduce: `").append(result.getCommand()).append("`\n\n");
+        if (result.hasComparisonTotals()) {
+            AnalysisProto.ComparisonTotals totals = result.getComparisonTotals();
+            boolean perUnit = result.getUnit().equals("seconds per unit");
             String column = perUnit ? "s/unit" : "s";
             text.append("## Busy application time, compared with the baseline\n\n");
             text.append("Busy application time: ")
-                    .append(number(totals.get("baselineBusyApplication")))
+                    .append(totals.getBaselineBusyApplication())
                     .append(" s (baseline) vs ")
-                    .append(number(totals.get("busyApplication")))
+                    .append(totals.getBusyApplication())
                     .append(" s. Busy total including time without an application frame: ")
-                    .append(number(totals.get("baselineBusy")))
+                    .append(totals.getBaselineBusy())
                     .append(" s vs ")
-                    .append(number(totals.get("busy")))
+                    .append(totals.getBusy())
                     .append(" s.\n\n");
             text.append("| # | Boundary | Baseline ")
                     .append(column)
                     .append(" | ")
                     .append(column)
                     .append(" | Delta | Baseline share | Share |\n|---:|---|---:|---:|---:|---:|---:|\n");
-            for (JsonElement element : result.getAsJsonArray("comparison")) {
-                JsonObject row = element.getAsJsonObject();
+            for (ComparedRow row : result.getComparisonList()) {
                 text.append("| ")
-                        .append(row.get("rank").getAsInt())
+                        .append(row.getRank())
                         .append(" | ")
-                        .append(code(row.get("boundary").getAsString()))
+                        .append(code(row.getBoundary()))
                         .append(" | ")
-                        .append(number(row.get("baseline")))
+                        .append(row.getBaseline())
                         .append(" | ")
-                        .append(number(row.get("value")))
+                        .append(row.getValue())
                         .append(" | ")
-                        .append(number(row.get("delta")))
+                        .append(row.getDelta())
                         .append(" | ")
-                        .append(shareCell(row.get("baselineShare")))
+                        .append(percent(row.getBaselineShare()))
                         .append(" | ")
-                        .append(shareCell(row.get("share")))
+                        .append(percent(row.getShare()))
                         .append(" |\n");
             }
-            warnings(result, text);
+            warnings(result.getWarningsList(), text);
             return text.toString();
         }
-        JsonObject totals = result.getAsJsonObject("totals");
+        TopTotals totals = result.getTotals();
         text.append("| Slice | Entries | ")
                 .append(count)
                 .append(" | ")
                 .append(unit)
                 .append(" |\n|---|---:|---:|---:|\n");
-        for (String[] slice : new String[][] {
-            {"selected", "Selected"},
-            {"idle", "Idle"},
-            {"busy", "Busy"},
-            {"busyApplication", "Busy, with an application frame"},
-            {"busyNoApplicationFrame", "Busy, no application frame"},
-            {"overExclusion", "Over-exclusion: idle entries with a lock-acquire frame"}
-        }) {
-            if (!totals.has(slice[0])) continue;
-            JsonObject sum = totals.getAsJsonObject(slice[0]);
-            text.append("| ")
-                    .append(slice[1])
-                    .append(" | ")
-                    .append(sum.get("entries").getAsLong())
-                    .append(" | ")
-                    .append(sum.get(countKey).getAsLong())
-                    .append(" | ")
-                    .append(number(sum.get("value")))
-                    .append(" |\n");
-        }
+        totalsRows(totals, false, text);
         text.append('\n');
-        boolean boundary = result.get("by").getAsString().equals("boundary");
-        text.append(
-                boundary
-                        ? "## Busy, by application boundary\n\n"
-                        : "## Busy, by " + result.get("by").getAsString() + "\n\n");
-        table(result.getAsJsonArray("rows"), boundary ? "boundary" : "key", unit, count, countKey, text);
-        if (result.has("noApplicationFrame")) {
+        boolean boundary = result.getBy().equals("boundary");
+        text.append(boundary ? "## Busy, by application boundary\n\n" : "## Busy, by " + result.getBy() + "\n\n");
+        table(result.getRowsList(), boundary ? "boundary" : "key", unit, count, seconds, text);
+        if (boundary) {
             text.append("\n## Busy without an application frame, by pool\n\n");
-            table(result.getAsJsonArray("noApplicationFrame"), "pool", unit, count, countKey, text);
+            table(result.getNoApplicationFrameList(), "pool", unit, count, seconds, text);
         }
         text.append("\n## Idle, by ")
-                .append(boundary ? "boundary" : result.get("by").getAsString())
+                .append(boundary ? "boundary" : result.getBy())
                 .append("\n\n");
-        table(result.getAsJsonArray("idle"), boundary ? "boundary" : "key", unit, count, countKey, text);
-        warnings(result, text);
+        table(result.getIdleList(), boundary ? "boundary" : "key", unit, count, seconds, text);
+        warnings(result.getWarningsList(), text);
         return text.toString();
     }
 
-    private static String shareCell(JsonElement share) {
-        return share == null || share.isJsonNull() ? "" : percent(share.getAsBigDecimal());
+    /**
+     * The totals as table rows: the selection, idle and busy, and with a boundary the busy time with and without an
+     * application frame, then the over-exclusion check. {@code digest} uses the digest's longer labels.
+     */
+    static void totalsRows(TopTotals totals, boolean digest, StringBuilder text) {
+        totalsRow(totals.getSelected(), digest ? "All selected" : "Selected", text);
+        totalsRow(totals.getIdle(), "Idle", text);
+        totalsRow(totals.getBusy(), "Busy", text);
+        if (totals.hasBusyApplication()) {
+            totalsRow(totals.getBusyApplication(), "Busy, with an application frame", text);
+        }
+        if (totals.hasBusyNoApplicationFrame()) {
+            totalsRow(totals.getBusyNoApplicationFrame(), "Busy, no application frame", text);
+        }
+        totalsRow(
+                totals.getOverExclusion(),
+                digest
+                        ? "Over-exclusion check: idle entries with a lock-acquire frame"
+                        : "Over-exclusion: idle entries with a lock-acquire frame",
+                text);
     }
 
-    private static void warnings(JsonObject result, StringBuilder text) {
-        JsonArray warnings = result.getAsJsonArray("warnings");
+    private static void totalsRow(TableSum sum, String label, StringBuilder text) {
+        text.append("| ")
+                .append(label)
+                .append(" | ")
+                .append(sum.getEntries())
+                .append(" | ")
+                .append(sum.getIntervals())
+                .append(" | ")
+                .append(sum.getValue())
+                .append(" |\n");
+    }
+
+    private static void warnings(List<String> warnings, StringBuilder text) {
         if (warnings.isEmpty()) return;
         text.append('\n');
-        for (JsonElement warning : warnings)
-            text.append("> **Warning:** ").append(warning.getAsString()).append("\n");
+        for (String warning : warnings)
+            text.append("> **Warning:** ").append(warning).append("\n");
     }
 
-    static void table(JsonArray rows, String keyName, String unit, String count, String countKey, StringBuilder text) {
+    /**
+     * One ranked table. {@code keyName} heads the key column; {@code reasons} adds the dominant-reason column, which
+     * only a profile's rows have.
+     */
+    static void table(
+            List<TopRow> rows, String keyName, String unit, String count, boolean reasons, StringBuilder text) {
         if (rows.isEmpty()) {
             text.append("(none)\n");
             return;
         }
-        JsonObject first = rows.get(0).getAsJsonObject();
+        TopRow first = rows.get(0);
         List<String> columns = new ArrayList<>(List.of("#", capital(keyName)));
-        if (first.has("blocker")) columns.add("Blocker");
+        if (first.hasBlocker()) columns.add("Blocker");
         columns.addAll(List.of(unit, "Share", count));
-        if (first.has("estimated")) columns.add("Estimated " + unit);
-        if (first.has("sleeping")) columns.addAll(List.of("Sleeping " + unit, "Run queue " + unit));
-        if (first.has("reason")) columns.add("Reason");
-        boolean callers = false;
-        for (JsonElement row : rows) callers |= row.getAsJsonObject().has("caller");
+        if (first.hasEstimated()) columns.add("Estimated " + unit);
+        if (first.hasSleeping()) columns.addAll(List.of("Sleeping " + unit, "Run queue " + unit));
+        if (reasons) columns.add("Reason");
+        boolean callers = rows.stream().anyMatch(TopRow::hasCaller);
         if (callers) columns.add("Caller");
         text.append("| ").append(String.join(" | ", columns)).append(" |\n|");
         for (String column : columns) {
@@ -825,27 +818,29 @@ final class Top {
                             : "---|");
         }
         text.append('\n');
-        for (JsonElement element : rows) {
-            JsonObject row = element.getAsJsonObject();
+        for (TopRow row : rows) {
             List<String> cells = new ArrayList<>();
-            cells.add(Integer.toString(row.get("rank").getAsInt()));
-            cells.add(code(row.get(keyName).getAsString()));
-            if (first.has("blocker"))
-                cells.add(row.has("blocker") ? code(row.get("blocker").getAsString()) : "");
-            cells.add(number(row.get("value")));
-            cells.add(percent(row.get("share").getAsBigDecimal()));
-            cells.add(Long.toString(row.get(countKey).getAsLong()));
-            if (first.has("estimated")) cells.add(number(row.get("estimated")));
-            if (first.has("sleeping")) {
-                cells.add(number(row.get("sleeping")));
-                cells.add(number(row.get("runqueue")));
+            cells.add(Integer.toString(row.getRank()));
+            cells.add(code(row.getKey()));
+            if (first.hasBlocker()) cells.add(row.hasBlocker() ? code(row.getBlocker()) : "");
+            cells.add(row.getValue());
+            cells.add(percent(row.getShare()));
+            cells.add(Long.toString(row.getIntervals()));
+            if (first.hasEstimated()) cells.add(row.getEstimated());
+            if (first.hasSleeping()) {
+                cells.add(row.getSleeping());
+                cells.add(row.getRunqueue());
             }
-            if (first.has("reason"))
-                cells.add(
-                        row.get("reason").isJsonNull() ? "" : row.get("reason").getAsString());
-            if (callers) cells.add(row.has("caller") ? code(row.get("caller").getAsString()) : "");
+            if (reasons) cells.add(row.hasReason() ? label(row.getReason()) : "");
+            if (callers) cells.add(row.hasCaller() ? code(row.getCaller()) : "");
             text.append("| ").append(String.join(" | ", cells)).append(" |\n");
         }
+    }
+
+    /** A reason as the command line and the collapsed frames spell it. */
+    static String label(CaptureProto.OffCpuReason reason) {
+        OffCpuReason value = OffCpuReason.fromWire(reason.getNumber());
+        return value == null ? "" : value.label();
     }
 
     private static String capital(String text) {
@@ -853,55 +848,50 @@ final class Top {
     }
 
     /** CSV: one row per table row, with a {@code table} column naming its table. */
-    static String csv(JsonObject result) {
+    static String csv(TopResult result) {
         StringBuilder text = new StringBuilder();
-        if (result.has("comparison")) {
+        if (result.hasComparisonTotals()) {
             text.append("table,rank,boundary,baseline,value,delta,baseline_share,share\n");
-            for (JsonElement element : result.getAsJsonArray("comparison")) {
-                JsonObject row = element.getAsJsonObject();
+            for (ComparedRow row : result.getComparisonList()) {
                 text.append(String.join(
                                 ",",
                                 "comparison",
-                                row.get("rank").getAsString(),
-                                csvCell(row.get("boundary").getAsString()),
-                                number(row.get("baseline")),
-                                number(row.get("value")),
-                                number(row.get("delta")),
-                                number(row.get("baselineShare")),
-                                number(row.get("share"))))
+                                Integer.toString(row.getRank()),
+                                csvCell(row.getBoundary()),
+                                row.getBaseline(),
+                                row.getValue(),
+                                row.getDelta(),
+                                row.getBaselineShare(),
+                                row.getShare()))
                         .append('\n');
             }
             return text.toString();
         }
-        String countKey = result.get("unit").getAsString().equals("seconds") ? "intervals" : "lines";
+        boolean seconds = result.getUnit().equals("seconds");
         text.append("table,rank,key,blocker,value,share,")
-                .append(countKey)
+                .append(seconds ? "intervals" : "lines")
                 .append(",estimated,sleeping,runqueue,reason,caller\n");
-        for (String table : List.of("rows", "noApplicationFrame", "idle")) {
-            if (!result.has(table)) continue;
-            for (JsonElement element : result.getAsJsonArray(table)) {
-                JsonObject row = element.getAsJsonObject();
-                String key = row.has("boundary")
-                        ? row.get("boundary").getAsString()
-                        : row.has("pool")
-                                ? row.get("pool").getAsString()
-                                : row.get("key").getAsString();
+        boolean boundary = result.getBy().equals("boundary");
+        List<Map.Entry<String, List<TopRow>>> tables = new ArrayList<>();
+        tables.add(Map.entry("rows", result.getRowsList()));
+        if (boundary) tables.add(Map.entry("noApplicationFrame", result.getNoApplicationFrameList()));
+        tables.add(Map.entry("idle", result.getIdleList()));
+        for (Map.Entry<String, List<TopRow>> table : tables) {
+            for (TopRow row : table.getValue()) {
                 text.append(String.join(
                                 ",",
-                                table,
-                                row.get("rank").getAsString(),
-                                csvCell(key),
-                                csvCell(row.has("blocker") ? row.get("blocker").getAsString() : ""),
-                                number(row.get("value")),
-                                number(row.get("share")),
-                                row.get(countKey).getAsString(),
-                                number(row.get("estimated")),
-                                number(row.get("sleeping")),
-                                number(row.get("runqueue")),
-                                row.has("reason") && !row.get("reason").isJsonNull()
-                                        ? row.get("reason").getAsString()
-                                        : "",
-                                csvCell(row.has("caller") ? row.get("caller").getAsString() : "")))
+                                table.getKey(),
+                                Integer.toString(row.getRank()),
+                                csvCell(row.getKey()),
+                                csvCell(row.getBlocker()),
+                                row.getValue(),
+                                row.getShare(),
+                                Long.toString(row.getIntervals()),
+                                row.getEstimated(),
+                                row.getSleeping(),
+                                row.getRunqueue(),
+                                row.hasReason() ? label(row.getReason()) : "",
+                                csvCell(row.getCaller())))
                         .append('\n');
             }
         }

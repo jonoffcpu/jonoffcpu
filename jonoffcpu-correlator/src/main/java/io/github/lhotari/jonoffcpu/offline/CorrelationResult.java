@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.JsonObject;
 import java.math.BigInteger;
 
 /**
  * What one streaming correlation produced: the columns, the interned JFR dictionaries, the cookie
  * index that resolves a source slot to its sample, the per-stack weights, and the counters the
- * report prints. Nothing here is per-row Gson; the audit outputs re-read the two files.
+ * report prints. Nothing here is a per-row message; the audit outputs re-read the two files.
  *
  * <p>The per-match values — the clipped interval, the delivery delay — are derived rather than
  * stored, so the audit writer, the synthetic JFR and the report cannot drift apart on the clipping
@@ -15,8 +14,8 @@ import java.math.BigInteger;
  */
 record CorrelationResult(
         CaptureInput capture,
-        JsonObject selectionMetadata,
-        String submittedButNotParsed,
+        ReportProto.JfrSelection selectionMetadata,
+        Long submittedButNotParsed,
         SourceColumns sources,
         SampleColumns samples,
         LongIntMap sourceIndex,
@@ -40,7 +39,7 @@ record CorrelationResult(
         int invalidJfr,
         int identityUnverified,
         int sourceRowsWithoutSelectedJfrSample,
-        OfflineCorrelator.PopulationEstimate populationEstimate,
+        ReportProto.PopulationEstimate populationEstimate,
         CorrelationEngine.SourceAggregate sourceAggregate,
         long peakRetainedBytes,
         Thinning thinning,
@@ -119,18 +118,18 @@ record CorrelationResult(
         return samples.monotonicNanos(sample) - sources.end(sourceSlot) - monotonicOffsetNanos;
     }
 
-    String correlationId(int sourceSlot) {
-        return java.util.HexFormat.of().toHexDigits(sources.cookie(sourceSlot));
+    long correlationId(int sourceSlot) {
+        return sources.cookie(sourceSlot);
     }
 
     BigInteger selectedObservedDuration() {
         return BigInteger.valueOf(selectedObservedDurationNanos);
     }
 
-    /** The capture's run-queue source; {@code captureStart} was validated when it was read. */
+    /** The capture's run-queue source; {@code capture_start} was validated when it was read. */
     TimeSplit.Source timeSplit() {
         try {
-            return TimeSplit.source(capture.start);
+            return TimeSplit.source(capture.start.getTimeSplit());
         } catch (java.io.IOException impossible) {
             throw new IllegalStateException(impossible);
         }

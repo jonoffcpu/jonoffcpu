@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
+import com.google.protobuf.Message;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.io.InputStream;
@@ -835,7 +835,7 @@ final class Cli {
             try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
                 StackProfileRenderer.writeCollapsed(rendered, writer);
             }
-            JsonObject json = StackProfileRenderer.summary(
+            AnalysisProto.SliceSummary.Builder json = StackProfileRenderer.summary(
                     rendered,
                     profile,
                     slice.reasons.selected(),
@@ -846,16 +846,14 @@ final class Cli {
                     slice.packageNames);
             if (transforms.active() || transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
                 StackProfileRenderer.Slice before = render(profile, filter, StackTransforms.NONE);
-                json.add(
-                        "transforms",
-                        transformsReport(
-                                transforms,
-                                profile.header().label().length(),
-                                before.nanos(),
-                                rendered.nanos(),
-                                rendered.totalNanos()));
+                json.setTransforms(transformsReport(
+                        transforms,
+                        profile.header().label().length(),
+                        before.nanos(),
+                        rendered.nanos(),
+                        rendered.totalNanos()));
             }
-            writeSummary(json);
+            writeSummary(json.build());
             System.out.println("Wrote " + rendered.nanos().size() + " collapsed stacks to " + output + ": "
                     + rendered.intervals() + " intervals, " + rendered.totalNanos() + " ns"
                     + (slice.time == StackProfileRenderer.Time.TOTAL ? "" : " of " + slice.time.label() + " time")
@@ -888,27 +886,23 @@ final class Cli {
             try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
                 CollapsedStacks.write(rendered, writer);
             }
-            JsonObject json = new JsonObject();
-            json.addProperty("schemaVersion", 1);
-            json.addProperty("input", "collapsed");
-            json.addProperty("packageNames", slice.packageNames.label());
-            json.addProperty("inputLines", lines.size());
-            json.addProperty("lines", rendered.weights().size());
-            json.addProperty("totalWeight", rendered.total().toPlainString());
-            json.add("include", StackProfileRenderer.patterns(filter.include()));
-            json.add("exclude", StackProfileRenderer.patterns(filter.exclude()));
-            JsonObject filtered = new JsonObject();
-            filtered.addProperty("inputLines", rendered.filteredLines());
-            filtered.addProperty("totalWeight", rendered.filteredWeight().toPlainString());
-            json.add("filtered", filtered);
+            AnalysisProto.CollapsedSliceSummary.Builder json = AnalysisProto.CollapsedSliceSummary.newBuilder()
+                    .setPackageNames(slice.packageNames.label())
+                    .setInputLines(lines.size())
+                    .setLines(rendered.weights().size())
+                    .setTotalWeight(rendered.total().toPlainString())
+                    .addAllInclude(StackProfileRenderer.patterns(filter.include()))
+                    .addAllExclude(StackProfileRenderer.patterns(filter.exclude()))
+                    .setFiltered(AnalysisProto.FilteredLines.newBuilder()
+                            .setInputLines(rendered.filteredLines())
+                            .setTotalWeight(rendered.filteredWeight().toPlainString()));
             if (transforms.active()) {
                 CollapsedStacks.Slice before =
                         CollapsedStacks.render(lines, filter, StackTransforms.NONE, slice.packageNames);
-                json.add(
-                        "transforms",
+                json.setTransforms(
                         transformsReport(transforms, 0, before.weights(), rendered.weights(), rendered.total()));
             }
-            writeSummary(json);
+            writeSummary(json.build());
             System.out.println("Wrote " + rendered.weights().size() + " collapsed stacks to " + output + ": weight "
                     + rendered.total().toPlainString()
                     + (filter.active()
@@ -918,12 +912,9 @@ final class Cli {
             return OK;
         }
 
-        private void writeSummary(JsonObject json) throws IOException {
+        private void writeSummary(Message json) throws IOException {
             if (summary == null) return;
-            try (BufferedWriter writer = OffCpuCorrelator.newFile(summary)) {
-                new GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(json, writer);
-                writer.newLine();
-            }
+            OffCpuCorrelator.writePretty(summary, json);
         }
     }
 
@@ -932,17 +923,18 @@ final class Cli {
      * {@code --root-at} the weight and share of {@link StackTransforms#NO_APPLICATION_FRAME}. {@code prefix} is the
      * length of the label every line starts with, which is not a frame.
      */
-    static JsonObject transformsReport(
+    static AnalysisProto.Transforms transformsReport(
             StackTransforms transforms,
             int prefix,
             Map<String, ? extends Number> before,
             Map<String, ? extends Number> after,
             Number total) {
-        JsonObject report = transforms.report();
-        report.addProperty("linesBefore", before.size());
-        report.addProperty("linesAfter", after.size());
-        report.addProperty("framesBefore", meanDepth(before, prefix));
-        report.addProperty("framesAfter", meanDepth(after, prefix));
+        AnalysisProto.Transforms.Builder report = transforms
+                .report()
+                .setLinesBefore(before.size())
+                .setLinesAfter(after.size())
+                .setFramesBefore(meanDepth(before, prefix).toPlainString())
+                .setFramesAfter(meanDepth(after, prefix).toPlainString());
         if (!transforms.rootAt().isEmpty()) {
             java.math.BigDecimal bucket = java.math.BigDecimal.ZERO;
             for (var line : after.entrySet()) {
@@ -953,16 +945,14 @@ final class Cli {
                 }
             }
             java.math.BigDecimal all = new java.math.BigDecimal(total.toString());
-            JsonObject unmatched = new JsonObject();
-            unmatched.addProperty("weight", bucket.toPlainString());
-            unmatched.addProperty(
-                    "share",
-                    all.signum() == 0
-                            ? java.math.BigDecimal.ZERO
-                            : bucket.divide(all, 6, java.math.RoundingMode.HALF_EVEN));
-            report.add("noApplicationFrame", unmatched);
+            report.setNoApplicationFrame(AnalysisProto.NoApplicationFrame.newBuilder()
+                    .setWeight(bucket.toPlainString())
+                    .setShare((all.signum() == 0
+                                    ? java.math.BigDecimal.ZERO
+                                    : bucket.divide(all, 6, java.math.RoundingMode.HALF_EVEN))
+                            .toPlainString()));
         }
-        return report;
+        return report.build();
     }
 
     /** The weight-averaged number of frames per line, to one decimal place. */
@@ -1163,7 +1153,7 @@ final class Cli {
                     slice.reasons.selected(),
                     filters.filter());
             String command = Top.shell(reproduce(parsed));
-            JsonObject result;
+            AnalysisProto.TopResult result;
             if (collapsedInput != null) {
                 result = Top.tables(Top.fromCollapsed(collapsedInput, options), options, command);
             } else {
@@ -1187,13 +1177,7 @@ final class Cli {
             }
             String text =
                     switch (format) {
-                        case "json" ->
-                            new GsonBuilder()
-                                            .serializeNulls()
-                                            .setPrettyPrinting()
-                                            .create()
-                                            .toJson(result)
-                                    + "\n";
+                        case "json" -> ProtoJson.pretty(result) + "\n";
                         case "csv" -> Top.csv(result);
                         default -> Top.markdown(result);
                     };
@@ -1204,8 +1188,8 @@ final class Cli {
                     writer.write(text);
                 }
             }
-            for (var warning : result.getAsJsonArray("warnings")) {
-                spec.commandLine().getErr().println("Warning: " + warning.getAsString());
+            for (String warning : result.getWarningsList()) {
+                spec.commandLine().getErr().println("Warning: " + warning);
             }
             return OK;
         }
@@ -1244,8 +1228,8 @@ final class Cli {
         @Option(
                 names = "--report",
                 paramLabel = "FILE",
-                description = "The correlation report beside it, for the capture section. Default: "
-                        + OutputFiles.REPORT + " next to the profile, when it exists.")
+                description = "A correlation report (" + OutputFiles.REPORT + ") for the capture section. Default:"
+                        + " the report the profile carries; a merged profile has none.")
         Path report;
 
         @Option(
@@ -1260,18 +1244,16 @@ final class Cli {
 
         @Override
         public Integer call() throws Exception {
-            Path reportPath = report;
-            if (reportPath == null) {
-                Path sibling = profile.toAbsolutePath().resolveSibling(OutputFiles.REPORT);
-                if (java.nio.file.Files.isRegularFile(sibling)) reportPath = sibling;
-            }
-            JsonObject reportJson = reportPath == null
-                    ? null
-                    : com.google.gson.JsonParser.parseString(java.nio.file.Files.readString(reportPath))
-                            .getAsJsonObject();
+            StackProfile read = StackProfile.read(profile);
+            // The profile carries the report it was produced with; a report file is parsed strictly, so a file
+            // that is not a report is refused rather than summarised as empty.
+            ReportProto.Report captured = report == null
+                    ? read.header().report()
+                    : ProtoJson.parse(java.nio.file.Files.readString(report), ReportProto.Report.newBuilder())
+                            .build();
             Digest.Options options =
                     new Digest.Options(ranking.app(), ranking.idle(true), ranking.machinery(), ranking.limit);
-            JsonObject digest = Digest.of(StackProfile.read(profile), profile.toString(), reportJson, options);
+            AnalysisProto.Digest digest = Digest.of(read, profile.toString(), captured, options);
             Path directory = outputDirectory == null ? Path.of("") : outputDirectory;
             java.nio.file.Files.createDirectories(directory.toAbsolutePath());
             Path json = directory.resolve(OutputFiles.SUMMARY_JSON);
@@ -1325,8 +1307,8 @@ final class Cli {
             sortOptions = false,
             description = {
                 "Writes one row per stack-profile entry, stacks expanded, for tools such as DuckDB.",
-                "JSON Lines rows carry the stacks as arrays too, counters as numbers, and every row names its run and"
-                        + " whether its estimated columns may be used."
+                "JSON Lines rows carry the stacks as arrays too, 64-bit counters as decimal strings, and every row"
+                        + " names its run and whether its estimated columns may be used."
             })
     static final class Export implements Callable<Integer> {
         @Option(names = "--profile", paramLabel = "FILE", description = "The stack profile to export. Required.")
@@ -1357,32 +1339,15 @@ final class Cli {
                         + " dimensions, estimate validity and totals.")
         Path runMetadata;
 
-        @Option(
-                names = "--numbers",
-                paramLabel = "FORM",
-                defaultValue = "number",
-                converter = NumbersConverter.class,
-                description = "How JSON Lines counters are written: number (a string only past 2^53-1) or string,"
-                        + " as before 0.5.0. Default: ${DEFAULT-VALUE}.")
-        String numbers;
-
         @Override
         public Integer call() throws Exception {
             StackProfile read = StackProfile.read(profile);
             String run = runLabel != null ? runLabel : StackProfileRenderer.defaultRun(read);
             try (BufferedWriter writer = OffCpuCorrelator.newFile(output)) {
-                StackProfileRenderer.export(
-                        read, new StackProfileRenderer.Export(format, run, numbers.equals("string")), writer);
+                StackProfileRenderer.export(read, new StackProfileRenderer.Export(format, run), writer);
             }
             if (runMetadata != null) {
-                try (BufferedWriter writer = OffCpuCorrelator.newFile(runMetadata)) {
-                    new GsonBuilder()
-                            .serializeNulls()
-                            .setPrettyPrinting()
-                            .create()
-                            .toJson(StackProfileRenderer.runMetadata(read, run), writer);
-                    writer.newLine();
-                }
+                OffCpuCorrelator.writePretty(runMetadata, StackProfileRenderer.runMetadata(read, run));
             }
             return OK;
         }
@@ -1393,7 +1358,7 @@ final class Cli {
             mixinStandardHelpOptions = true,
             versionProvider = Version.class,
             description = {
-                "Prints the capture stream as NDJSON, each observation's interned stacks expanded.",
+                "Prints the capture stream as JSON Lines, one record per line as the capture schema defines it.",
                 "`--dump --source FILE` is a deprecated alias."
             })
     static final class Dump implements Callable<Integer> {
@@ -1521,13 +1486,6 @@ final class Cli {
         @Override
         public StackTransforms.ThreadFrame convert(String text) {
             return choice(text, StackTransforms.ThreadFrame.values(), StackTransforms.ThreadFrame::label);
-        }
-    }
-
-    static final class NumbersConverter implements ITypeConverter<String> {
-        @Override
-        public String convert(String text) {
-            return choice(text, new String[] {"number", "string"}, Function.identity());
         }
     }
 

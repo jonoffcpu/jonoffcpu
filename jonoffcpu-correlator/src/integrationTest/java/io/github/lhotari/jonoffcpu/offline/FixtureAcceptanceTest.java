@@ -5,9 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.ProtoJson;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
@@ -129,7 +127,7 @@ class FixtureAcceptanceTest {
     /** The boundary ranking recipe of the README's "Analyzing with SQL", on the 0.5.0 export. */
     static final String BOUNDARY_SQL = """
             CREATE TEMP TABLE entries AS
-            SELECT javaFrames AS frames, observedNanos AS nanos, intervals
+            SELECT javaFrames AS frames, observedNanos::UBIGINT AS nanos, intervals::UBIGINT AS intervals
             FROM read_json('%s', format = 'newline_delimited');
 
             SELECT coalesce(list_filter(frames, lambda f: regexp_matches(f, '^org\\.apache\\.'))[-1],
@@ -168,26 +166,22 @@ class FixtureAcceptanceTest {
         long observed = 0;
         Pattern address = Pattern.compile("(Lambda|LambdaForm\\$D?MH)[./]0x");
         for (String line : rows) {
-            JsonObject row = JsonParser.parseString(line).getAsJsonObject();
-            List<String> frames = new ArrayList<>();
-            row.getAsJsonArray("javaFrames").forEach(frame -> frames.add(frame.getAsString()));
-            assertThat(String.join(";", frames))
+            AnalysisProto.ExportRow row =
+                    ProtoJson.parse(line, AnalysisProto.ExportRow.newBuilder()).build();
+            assertThat(String.join(";", row.getJavaFramesList()))
                     .as("javaFrames must join: %s", line)
-                    .isEqualTo(row.get("javaStack").getAsString());
-            assertThat(row.getAsJsonArray("javaFrameKinds").size())
+                    .isEqualTo(row.getJavaStack());
+            assertThat(row.getJavaFrameKindsCount())
                     .as("One kind per frame: %s", line)
-                    .isEqualTo(frames.size());
-            assertThat(row.get("canonicalJavaStack").getAsString())
-                    .as("Canonical: %s", line)
-                    .doesNotContainPattern(address);
-            observed += row.get("observedNanos").getAsLong();
+                    .isEqualTo(row.getJavaFramesCount());
+            assertThat(row.getCanonicalJavaStack()).as("Canonical: %s", line).doesNotContainPattern(address);
+            observed += row.getObservedNanos();
         }
         assertThat(observed).as("Observed nanoseconds").isEqualTo(8_519_334_220_784L);
-        JsonObject run = JsonParser.parseString(Files.readString(dir.resolve("wolfi-run.json")))
-                .getAsJsonObject();
-        assertThat(run.get("observedNanos").getAsLong())
-                .as("Run metadata total: %s", run)
-                .isEqualTo(observed);
+        AnalysisProto.RunMetadata run = ProtoJson.parse(
+                        Files.readString(dir.resolve("wolfi-run.json")), AnalysisProto.RunMetadata.newBuilder())
+                .build();
+        assertThat(run.getObservedNanos()).as("Run metadata total: %s", run).isEqualTo(Long.toString(observed));
     }
 
     /** The README's SQL recipes on the export reproduce the reference rows; skipped without DuckDB. */
@@ -201,8 +195,8 @@ class FixtureAcceptanceTest {
                 "DESCRIBE SELECT javaFrames, observedNanos FROM read_json('" + jsonl
                         + "', format = 'newline_delimited');");
         assertThat(types)
-                .as("DuckDB must infer the frame arrays and numeric counters")
-                .contains("javaFrames,VARCHAR[]", "observedNanos,BIGINT");
+                .as("DuckDB must infer the frame arrays, and read the 64-bit counters as decimal strings")
+                .contains("javaFrames,VARCHAR[]", "observedNanos,VARCHAR");
         String boundaries = ExportDuckDbTest.duckdb(duckdb, BOUNDARY_SQL.formatted(jsonl));
         assertThat(boundaries)
                 .as("The boundary recipe")
@@ -232,22 +226,17 @@ class FixtureAcceptanceTest {
             "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.isMessageDeleted|0.116|0.124|3.5 %|3.0 %",
             "org.apache.bookkeeper.mledger.impl.ManagedCursorImpl.asyncDelete|0.064|0.101|1.9 %|2.4 %");
 
-    private static JsonObject topJson(List<String> args) throws Exception {
+    private static AnalysisProto.TopResult topJson(List<String> args) throws Exception {
         List<String> command = new ArrayList<>(List.of("top", "--format", "json"));
         command.addAll(args);
         CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code()).as("top failed: %s", invocation).isZero();
-        return JsonParser.parseString(invocation.out()).getAsJsonObject();
+        return ProtoJson.parse(invocation.out(), AnalysisProto.TopResult.newBuilder())
+                .build();
     }
 
-    private static String totals(JsonObject totals, String slice) {
-        var sum = totals.getAsJsonObject(slice);
-        return sum.get("entries").getAsLong() + "/" + sum.get("intervals").getAsLong() + "/"
-                + sum.get("value").getAsBigDecimal().toPlainString();
-    }
-
-    private static String plain(JsonObject object, String field) {
-        return object.get(field).getAsBigDecimal().toPlainString();
+    private static String totals(AnalysisProto.TableSum sum) {
+        return sum.getEntries() + "/" + sum.getIntervals() + "/" + sum.getValue();
     }
 
     /** The top-and-digest worked example, its comparison, the digest bound, and top agreeing with stacks. */
@@ -260,40 +249,33 @@ class FixtureAcceptanceTest {
                 List.of("--app", APP, "--idle-from", "preset:jvm-idle", "--idle", IDLE_BOOKKEEPER, "--limit", "10");
         List<String> args = new ArrayList<>(List.of("--profile", wolfi.toString()));
         args.addAll(options);
-        JsonObject result = topJson(args);
-        JsonObject totals = result.getAsJsonObject("totals");
-        assertThat(totals(totals, "selected")).as("All: %s", totals).isEqualTo("2791/308777/8519.334");
-        assertThat(totals(totals, "idle")).as("Idle: %s", totals).isEqualTo("660/301389/8470.366");
-        assertThat(totals(totals, "busy")).as("Busy: %s", totals).isEqualTo("2131/7388/48.968");
-        assertThat(totals(totals, "busyNoApplicationFrame"))
+        AnalysisProto.TopResult result = topJson(args);
+        AnalysisProto.TopTotals totals = result.getTotals();
+        assertThat(totals(totals.getSelected())).as("All: %s", totals).isEqualTo("2791/308777/8519.334");
+        assertThat(totals(totals.getIdle())).as("Idle: %s", totals).isEqualTo("660/301389/8470.366");
+        assertThat(totals(totals.getBusy())).as("Busy: %s", totals).isEqualTo("2131/7388/48.968");
+        assertThat(totals(totals.getBusyNoApplicationFrame()))
                 .as("No application frame: %s", totals)
                 .isEqualTo("132/237/28.374");
-        assertThat(totals(totals, "overExclusion"))
+        assertThat(totals(totals.getOverExclusion()))
                 .as("Over-exclusion: %s", totals)
                 .isEqualTo("18/18/0.047");
         List<String> rows = new ArrayList<>();
-        for (var element : result.getAsJsonArray("rows")) {
-            JsonObject row = element.getAsJsonObject();
-            rows.add(
-                    row.get("boundary").getAsString() + "|" + row.get("blocker").getAsString() + "|"
-                            + plain(row, "value") + "|" + row.get("intervals").getAsLong());
+        for (AnalysisProto.TopRow row : result.getRowsList()) {
+            rows.add(row.getKey() + "|" + row.getBlocker() + "|" + row.getValue() + "|" + row.getIntervals());
         }
         assertThat(rows).as("Busy by boundary").isEqualTo(BOUNDARY_ROWS);
-        JsonArray pools = result.getAsJsonArray("noApplicationFrame");
+        List<AnalysisProto.TopRow> pools = result.getNoApplicationFrameList();
         List<String> firstPools = new ArrayList<>();
-        for (int index = 0; index < 2; index++) {
-            JsonObject pool = pools.get(index).getAsJsonObject();
-            firstPools.add(pool.get("pool").getAsString() + "|" + plain(pool, "value") + "|"
-                    + pool.get("intervals").getAsLong());
+        for (AnalysisProto.TopRow pool : pools.subList(0, 2)) {
+            firstPools.add(pool.getKey() + "|" + pool.getValue() + "|" + pool.getIntervals());
         }
         assertThat(firstPools)
                 .as("Pools: %s", pools)
                 .containsExactly("ZDriverMinor|22.517|88", "ZDriverMajor|5.527|27");
         List<String> idle = new ArrayList<>();
-        for (var element : result.getAsJsonArray("idle")) {
-            JsonObject row = element.getAsJsonObject();
-            idle.add(row.get("boundary").getAsString() + " "
-                    + row.get("value").getAsBigDecimal().setScale(1, RoundingMode.HALF_EVEN));
+        for (AnalysisProto.TopRow row : result.getIdleList()) {
+            idle.add(row.getKey() + " " + new BigDecimal(row.getValue()).setScale(1, RoundingMode.HALF_EVEN));
         }
         assertThat(idle.subList(0, 5))
                 .as("Idle by boundary: %s", idle)
@@ -315,24 +297,22 @@ class FixtureAcceptanceTest {
                 "5"));
         compare.addAll(options.subList(0, 6));
         compare.addAll(List.of("--limit", "5"));
-        JsonObject comparison = topJson(compare);
+        AnalysisProto.TopResult comparison = topJson(compare);
         List<String> compared = new ArrayList<>();
-        for (var element : comparison.getAsJsonArray("comparison")) {
-            JsonObject row = element.getAsJsonObject();
-            compared.add(row.get("boundary").getAsString() + "|" + plain(row, "baseline") + "|" + plain(row, "value")
-                    + "|" + Top.percent(row.get("baselineShare").getAsBigDecimal()) + "|"
-                    + Top.percent(row.get("share").getAsBigDecimal()));
+        for (AnalysisProto.ComparedRow row : comparison.getComparisonList()) {
+            compared.add(row.getBoundary() + "|" + row.getBaseline() + "|" + row.getValue() + "|"
+                    + Top.percent(row.getBaselineShare()) + "|" + Top.percent(row.getShare()));
         }
         assertThat(compared).as("Comparison").isEqualTo(COMPARISON_ROWS);
-        JsonObject compareTotals = comparison.getAsJsonObject("totals");
+        AnalysisProto.ComparisonTotals compareTotals = comparison.getComparisonTotals();
         assertThat(List.of(
-                        plain(compareTotals, "baselineBusyApplication"),
-                        plain(compareTotals, "busyApplication"),
-                        plain(compareTotals, "baselineBusy"),
-                        plain(compareTotals, "busy")))
+                        compareTotals.getBaselineBusyApplication(),
+                        compareTotals.getBusyApplication(),
+                        compareTotals.getBaselineBusy(),
+                        compareTotals.getBusy()))
                 .as("Comparison totals: %s", compareTotals)
                 .containsExactly("16.574", "20.593", "2019.121", "48.968");
-        assertThat(comparison.getAsJsonArray("warnings")).as("Both warnings").hasSize(2);
+        assertThat(comparison.getWarningsList()).as("Both warnings").hasSize(2);
 
         // top and stacks agree: a boundary's rows add up to the stacks lines that end in it after --leaf-at.
         Path leafAt = run(
@@ -360,9 +340,8 @@ class FixtureAcceptanceTest {
         List<String> all = new ArrayList<>(List.of("--profile", wolfi.toString()));
         all.addAll(options.subList(0, 6));
         all.addAll(List.of("--limit", "100000"));
-        for (var element : topJson(all).getAsJsonArray("rows")) {
-            JsonObject row = element.getAsJsonObject();
-            boundaries.merge(row.get("boundary").getAsString(), row.get("value").getAsBigDecimal(), BigDecimal::add);
+        for (AnalysisProto.TopRow row : topJson(all).getRowsList()) {
+            boundaries.merge(row.getKey(), new BigDecimal(row.getValue()), BigDecimal::add);
         }
         for (var boundary : boundaries.entrySet()) {
             assertThat(boundary.getValue())
@@ -378,8 +357,6 @@ class FixtureAcceptanceTest {
                 "summarize",
                 "--profile",
                 wolfi.toString(),
-                "--report",
-                wolfi.resolveSibling(OutputFiles.REPORT).toString(),
                 "--app",
                 APP,
                 "--idle-from",
@@ -392,13 +369,13 @@ class FixtureAcceptanceTest {
         assertThat(Files.size(digest.resolve(OutputFiles.SUMMARY_MD)))
                 .as("The digest's Markdown must stay under 16 KB")
                 .isLessThan(16 * 1024);
-        JsonObject heaviest = JsonParser.parseString(Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)))
-                .getAsJsonObject()
-                .getAsJsonObject("heaviestStacks");
-        assertThat(heaviest.get("lines").getAsInt())
+        AnalysisProto.HeaviestStacks heaviest = ProtoJson.parse(
+                        Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
+                .getHeaviestStacks();
+        assertThat(heaviest.getLines())
                 .as("Heaviest transformed stacks: %s", heaviest)
                 .isEqualTo(78);
-        assertThat(plain(heaviest, "meanDepth"))
+        assertThat(heaviest.getMeanDepth())
                 .as("Heaviest transformed stacks: %s", heaviest)
                 .isEqualTo("4.1");
     }

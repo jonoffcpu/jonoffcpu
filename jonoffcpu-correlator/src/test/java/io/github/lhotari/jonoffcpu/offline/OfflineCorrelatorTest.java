@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import static io.github.lhotari.jonoffcpu.capture.CaptureFixtures.record;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.KERNEL_STACK_ID;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.concat;
+import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.mutateSource;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.observation;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.partialRecording;
-import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.readRows;
+import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.readRecords;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.recording;
-import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.sampling;
+import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.report;
 import static io.github.lhotari.jonoffcpu.offline.CorrelationFixture.source;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.assertj.core.api.Assertions.assertThatIOException;
 
-import com.google.gson.JsonNull;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import io.github.lhotari.jonoffcpu.capture.CaptureFixtures;
+import io.github.lhotari.jonoffcpu.capture.CaptureFormat;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Record.RecordCase;
 import io.github.lhotari.jonoffcpu.capture.CaptureRecordFixture;
-import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.offline.ReportProto.EstimateStatus;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -37,28 +40,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 /** Real JFR reader plus synthetic source fixtures, including ambiguity, corruption and clipping. */
-public class OfflineCorrelatorTest {
-    /**
-     * Rewrite a source prefix and its digest, so validation cannot pass merely by rejecting a stale
-     * hash.
-     */
-    private static void mutateSource(Path source, String recordType, Consumer<JsonObject> mutation) throws IOException {
-        List<JsonObject> rows = readRows(source);
-        int rowIndex = -1;
-        for (int i = 0; i < rows.size(); i++) {
-            if (rows.get(i).get("recordType").getAsString().equals(recordType)) rowIndex = i;
-        }
-        assertThat(rowIndex).as("No " + recordType + " row to mutate").isNotNegative();
-        mutation.accept(rows.get(rowIndex));
-        int last = rows.size() - 1;
-        byte[] prefix = CaptureStreamFixture.encode(rows.subList(0, last));
-        JsonObject footer = rows.get(last);
-        JsonObject artifact = footer.getAsJsonObject("analysisInputs").getAsJsonObject("sourceArtifact");
-        artifact.addProperty("rawBytes", Integer.toString(prefix.length));
-        artifact.addProperty("rawSha256", CaptureInput.hex(CaptureInput.sha256().digest(prefix)));
-        Files.write(source, CaptureStreamFixture.encode(rows));
-    }
-
+class OfflineCorrelatorTest {
     private static void rejects(Path source, Path jfr, OfflineCorrelator.Limits limits, String reason) {
         assertThatIOException()
                 .as("Expected rejection: " + reason)
@@ -66,23 +48,21 @@ public class OfflineCorrelatorTest {
                 .withMessageContaining(reason);
     }
 
-    private static JsonObject json(Path path) throws IOException {
-        return JsonParser.parseString(Files.readString(path)).getAsJsonObject();
-    }
-
     private static final OfflineCorrelator.Limits DEFAULTS = OfflineCorrelator.Limits.defaults();
 
     /** A one-sample JFR, the observation that matches its sample, and the finalized source holding it. */
-    private record Fixture(Path jfr, long tid, JsonObject observation, Path source) {}
+    private record Fixture(Path jfr, long tid, CaptureProto.Observation observation, Path source) {}
 
     private static Fixture fixture(Path dir) throws IOException {
         Path jfr = recording(dir, 1);
-        long[] tid = new long[1];
-        SignalJfrExporter.visit(jfr, row -> {
-            if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
-        });
-        JsonObject observation = observation(tid[0]);
-        return new Fixture(jfr, tid[0], observation, source(dir, jfr, List.of(observation)));
+        long tid = CorrelationFixture.sampleThread(jfr);
+        CaptureProto.Observation observation = observation(tid).build();
+        return new Fixture(jfr, tid, observation, source(dir, jfr, List.of(observation)));
+    }
+
+    /** Adjusts the {@code capture_end} kernel counters. */
+    private static Consumer<CaptureProto.Record.Builder> kernel(Consumer<CaptureProto.KernelCounters.Builder> change) {
+        return record -> change.accept(record.getCaptureEndBuilder().getKernelCountersBuilder());
     }
 
     @Test
@@ -109,7 +89,7 @@ public class OfflineCorrelatorTest {
                 .isZero();
         assertThat(result.selectedObservedDurationNanos())
                 .as("Duration weight mismatch")
-                .isEqualTo("3000");
+                .isEqualTo(3000);
         assertThat(result.matches().get(0).handlerDelayNanos())
                 .as("Delivery delay mismatch")
                 .isEqualTo(BigInteger.valueOf(1000));
@@ -119,17 +99,18 @@ public class OfflineCorrelatorTest {
         assertThat(output.resolve(OutputFiles.COMPLETE))
                 .as("Missing output completion marker")
                 .isRegularFile();
+        assertThat(CorrelationFixture.marker(output.resolve(OutputFiles.COMPLETE))
+                        .getState())
+                .isEqualTo(ReportProto.MarkerState.MARKER_STATE_COMPLETE);
         assertThat(Files.readString(output.resolve(OutputFiles.COLLAPSED)).strip())
                 .as("Collapsed output is not weighted in integer microseconds")
                 .endsWith(" 3");
-        assertThat(Files.readString(output.resolve(OutputFiles.REPORT)))
-                .as("Missing stack caveat")
-                .contains("signal-delivery stack");
-        JsonObject report = json(output.resolve(OutputFiles.REPORT));
-        assertThat(report.getAsJsonObject("handlerDelayNanos").get("p99").getAsString())
+        ReportProto.Report report = report(output.resolve(OutputFiles.REPORT));
+        assertThat(report.getStackSemantics()).as("Missing stack caveat").contains("signal-delivery stack");
+        assertThat(report.getHandlerDelayNanos().getP99())
                 .as("Delivery delay percentile missing")
-                .isEqualTo("1000");
-        assertThat(report.has("populationEstimate"))
+                .isEqualTo(1000);
+        assertThat(report.hasPopulationEstimate())
                 .as("Population estimate must be opt-in")
                 .isFalse();
         assertThat(output.resolve(OutputFiles.SYNTHETIC_JFR))
@@ -151,10 +132,23 @@ public class OfflineCorrelatorTest {
                     .as("Every output must carry the jonoffcpu- prefix")
                     .allMatch(name -> name.startsWith(OutputFiles.PREFIX));
         }
-        assertThat(output.resolve(OutputFiles.COLLAPSED))
-                .as("Missing default collapsed output")
-                .isRegularFile();
-        assertThat(report.has("syntheticJfr"))
+        List<ReportProto.Pair> pairs = CorrelationFixture.pairs(output.resolve(OutputFiles.MATCHES));
+        assertThat(pairs).as("Match row missing").hasSize(1);
+        assertThat(pairs.get(0).getCorrelationId()).isEqualTo(CorrelationFixture.COOKIE);
+        assertThat(pairs.get(0).getHandlerDelayNanos()).isEqualTo(1000);
+        List<ReportProto.ClassifiedRecord> records =
+                CorrelationFixture.classifiedRecords(output.resolve(OutputFiles.CLASSIFIED_RECORDS));
+        assertThat(records)
+                .as("Classified records must hold the matched source row and sample")
+                .extracting(ReportProto.ClassifiedRecord::getClassification)
+                .containsExactly(
+                        ReportProto.Classification.CLASSIFICATION_MATCHED,
+                        ReportProto.Classification.CLASSIFICATION_MATCHED);
+        assertThat(records.get(0).getSource().getKernelFramesList())
+                .as("The classified source row must re-expand its interned kernel stack")
+                .extracting(CaptureProto.Frame::getSymbol)
+                .containsExactly("kernel_wait");
+        assertThat(report.hasSyntheticJfr())
                 .as("Missing JFR quantization metadata")
                 .isTrue();
         // Existing output must be preserved, even if its directory is empty.
@@ -168,13 +162,8 @@ public class OfflineCorrelatorTest {
         Fixture fixture = fixture(dir);
         Path source = fixture.source();
         Path jfr = fixture.jfr();
-        List<Instant> sampleTimes = new ArrayList<>();
-        SignalJfrExporter.visit(jfr, row -> {
-            if (row.get("recordType").equals("sample")) {
-                sampleTimes.add(Instant.parse((String) row.get("startTime")));
-            }
-        });
-        Instant sampleTime = sampleTimes.get(0);
+        var startTime = CorrelationFixture.samples(jfr).get(0).getStartTime();
+        Instant sampleTime = Instant.ofEpochSecond(startTime.getSeconds(), startTime.getNanos());
         JfrTimeRange.Range beforeSample = JfrTimeRange.resolve(jfr, null, sampleTime.toString());
         var result = OfflineCorrelator.correlate(
                 source,
@@ -189,7 +178,8 @@ public class OfflineCorrelatorTest {
                 .isEqualTo(1);
         assertThat(result.records())
                 .as("Selected-range source omission was not explained")
-                .anyMatch(row -> "sample-not-present-in-selected-jfr".equals(row.reason()));
+                .anyMatch(
+                        row -> row.getReason() == ReportProto.RowReason.ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR);
         Path selectedOutput = dir.resolve("analysis-selected-range");
         assertThat(OffCpuCorrelator.run(new String[] {
                     "--source",
@@ -204,14 +194,11 @@ public class OfflineCorrelatorTest {
                     sampleTime.toString()
                 }))
                 .isZero();
-        JsonObject rangeReport = json(selectedOutput.resolve(OutputFiles.REPORT));
-        assertThat(rangeReport
-                        .getAsJsonObject("jfrSelection")
-                        .get("missingSourceMatchesExpected")
-                        .getAsBoolean())
+        ReportProto.Report rangeReport = report(selectedOutput.resolve(OutputFiles.REPORT));
+        assertThat(rangeReport.getJfrSelection().getMissingSourceMatchesExpected())
                 .as("JFR selection metadata did not explain expected missing matches")
                 .isTrue();
-        assertThat(rangeReport.get("sourceRowsWithoutSelectedJfrSample").getAsLong())
+        assertThat(rangeReport.getSourceRowsWithoutSelectedJfrSample())
                 .as("Expected selected-JFR omission count was not reported")
                 .isEqualTo(1);
     }
@@ -230,10 +217,10 @@ public class OfflineCorrelatorTest {
         assertThat(result.submittedButNotParsed())
                 .as("A valid sample-only partial JFR did not correlate")
                 .isNull();
-        assertThat(result.jfrSelection().get("captureContextPresent").getAsBoolean())
+        assertThat(result.jfrSelection().getCaptureContextPresent())
                 .as("Partial JFR unexpectedly claimed omitted metadata: %s", result.jfrSelection())
                 .isFalse();
-        assertThat(result.jfrSelection().get("terminalStatsPresent").getAsBoolean())
+        assertThat(result.jfrSelection().getTerminalStatsPresent())
                 .as("Partial JFR unexpectedly claimed omitted metadata: %s", result.jfrSelection())
                 .isFalse();
         Path partialOutput = dir.resolve("analysis-partial-jfr");
@@ -272,28 +259,29 @@ public class OfflineCorrelatorTest {
                     "true"
                 }))
                 .isZero();
-        JsonObject estimate = json(estimated.resolve(OutputFiles.REPORT)).getAsJsonObject("populationEstimate");
-        assertThat(estimate.get("method").getAsString())
+        ReportProto.PopulationEstimate estimate =
+                report(estimated.resolve(OutputFiles.REPORT)).getPopulationEstimate();
+        assertThat(estimate.getMethod())
                 .as("Population estimate method missing")
                 .isEqualTo("inverse-probability-source-duration");
-        assertThat(estimate.get("status").getAsString())
+        assertThat(estimate.getStatus())
                 .as("Source estimate unavailable")
-                .isEqualTo("available");
-        assertThat(estimate.get("sourceSelectedObservedDurationNanos").getAsString())
+                .isEqualTo(EstimateStatus.ESTIMATE_STATUS_AVAILABLE);
+        assertThat(estimate.getSourceSelectedObservedDurationNanos())
                 .as("Source duration estimate basis mismatch")
-                .isEqualTo("3000");
-        assertThat(estimate.get("matchedSelectedObservedDurationNanos").getAsString())
+                .isEqualTo(3000);
+        assertThat(estimate.getMatchedSelectedObservedDurationNanos())
                 .as("Matched duration estimate basis mismatch")
-                .isEqualTo("3000");
-        assertThat(estimate.get("admissionPolicy").getAsString())
+                .isEqualTo(3000);
+        assertThat(estimate.getAdmissionPolicy())
                 .as("Population estimate lost policy")
                 .isEqualTo("uniform");
-        assertThat(estimate.get("estimatedDurationNanos").getAsString())
+        assertThat(estimate.getEstimatedDurationNanos())
                 .as("Population estimate is not the truncated exact inverse-probability sum")
                 .isEqualTo(BigInteger.valueOf(3000)
                         .shiftLeft(32)
-                        .divide(BigInteger.valueOf(42949673))
-                        .toString());
+                        .divide(BigInteger.valueOf(CorrelationFixture.THRESHOLD))
+                        .longValueExact());
     }
 
     /**
@@ -304,17 +292,18 @@ public class OfflineCorrelatorTest {
     void proportionalEstimate(@TempDir Path dir) throws Exception {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
-        JsonObject admission = new JsonObject();
-        admission.addProperty("policy", "proportional");
-        admission.addProperty("recordAllAboveMicros", 2);
-        JsonObject certain = fixture.observation().deepCopy();
-        certain.addProperty("admissionThreshold", 1L << 32);
-        JsonObject half = observation(fixture.tid());
-        half.addProperty("correlationId", "8000000100000002");
-        half.addProperty("startMonotonicNanos", "4000");
-        half.addProperty("endMonotonicNanos", "5000");
-        half.addProperty("admissionThreshold", 1L << 31);
-        Path source = source(dir, jfr, List.of(certain, half), sampling(admission));
+        CaptureProto.Sampling proportional =
+                CaptureFixtures.proportionalSampling(2, CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED);
+        CaptureProto.Observation certain = fixture.observation().toBuilder()
+                .setAdmissionThreshold(1L << 32)
+                .build();
+        CaptureProto.Observation half = observation(fixture.tid())
+                .setCorrelationId(CorrelationFixture.COOKIE + 1)
+                .setStartMonotonicNanos(4000)
+                .setEndMonotonicNanos(5000)
+                .setAdmissionThreshold(1L << 31)
+                .build();
+        Path source = source(dir, jfr, List.of(certain, half), proportional);
         var result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource())
                 .as("Proportional rows were not accepted")
@@ -322,38 +311,64 @@ public class OfflineCorrelatorTest {
         assertThat(result.matched()).as("Proportional rows were not accepted").isEqualTo(1);
         var estimate = result.populationEstimate();
         String weighting = "Proportional estimate must weight the half-probability row twice: " + estimate;
-        assertThat(estimate.status()).as(weighting).isEqualTo("available");
-        assertThat(estimate.admissionPolicy()).as(weighting).isEqualTo("proportional");
-        assertThat(estimate.sourceSelectedObservedDurationNanos()).as(weighting).isEqualTo("4000");
-        assertThat(estimate.estimatedDurationNanos()).as(weighting).isEqualTo("5000");
-        JsonObject wrong = half.deepCopy();
-        wrong.addProperty("admissionThreshold", 1L << 32);
-        source = source(dir, jfr, List.of(certain, wrong), sampling(admission));
+        assertThat(estimate.getStatus()).as(weighting).isEqualTo(EstimateStatus.ESTIMATE_STATUS_AVAILABLE);
+        assertThat(estimate.getAdmissionPolicy()).as(weighting).isEqualTo("proportional");
+        assertThat(estimate.getSourceSelectedObservedDurationNanos())
+                .as(weighting)
+                .isEqualTo(4000);
+        assertThat(estimate.getEstimatedDurationNanos()).as(weighting).isEqualTo(5000);
+        CaptureProto.Observation wrong =
+                half.toBuilder().setAdmissionThreshold(1L << 32).build();
+        source = source(dir, jfr, List.of(certain, wrong), proportional);
         result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource())
                 .as("Row threshold that disagrees with the policy was accepted")
                 .isEqualTo(1);
-        assertThat(result.populationEstimate().status())
+        assertThat(result.populationEstimate().getStatus())
                 .as("Invalid row must disable the estimate")
-                .isEqualTo("unavailable");
-        assertThat(result.populationEstimate().unavailableReasons())
+                .isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(result.populationEstimate().getUnavailableReasonsList())
                 .as("Invalid row must disable the estimate")
                 .contains("intrinsically-invalid-or-duplicate-source-rows");
-        source = source(dir, jfr, List.of(certain, half), sampling(admission));
+        source = source(dir, jfr, List.of(certain, half), proportional);
         mutateSource(
                 source,
-                "captureStart",
-                row -> row.getAsJsonObject("sampling")
-                        .getAsJsonObject("admission")
-                        .addProperty("recordAllAboveMicros", 3));
+                RecordCase.CAPTURE_START,
+                record -> record.getCaptureStartBuilder()
+                        .getSamplingBuilder()
+                        .getProportionalBuilder()
+                        .setRecordAllAboveMicros(3));
         rejects(source, jfr, DEFAULTS, "Source/footer mismatch: sampling");
-        JsonObject bounded = sampling(admission);
-        bounded.addProperty("minOffCpuMicros", 1);
+        CaptureProto.Sampling bounded =
+                proportional.toBuilder().setMinOffCpuMicros(1).build();
         source = source(dir, jfr, List.of(certain, half), bounded);
         result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource())
                 .as("Strict lower bound did not reject the 1000 ns row")
                 .isEqualTo(1);
+    }
+
+    /** One row's fixed-point weight: 3000 ns under the uniform threshold, 64 fraction bits below one. */
+    private static final BigInteger ROW_WEIGHT =
+            BigInteger.valueOf(3000).shiftLeft(32 + 64).divide(BigInteger.valueOf(CorrelationFixture.THRESHOLD));
+
+    /** One contended interval: selection counts three intervals, the source holds two rows. */
+    private static final Consumer<CaptureProto.Record.Builder> CONTENDED = kernel(
+            counters -> counters.setSelectedIntervals(3).setEligibleIntervals(3).setSequenceContentions(1));
+
+    /** The matched observation plus one with no JFR sample, both selected. */
+    private static List<CaptureProto.Observation> contentionRows(Fixture fixture) {
+        CaptureProto.Observation unmatched = observation(fixture.tid())
+                .setCorrelationId(CorrelationFixture.COOKIE + 1)
+                .build();
+        return List.of(fixture.observation(), unmatched);
+    }
+
+    /** A two-row source whose kernel counters say one more interval was selected and lost to contention. */
+    private static Path contendedSource(Path dir, Fixture fixture) throws IOException {
+        Path source = source(dir, fixture.jfr(), contentionRows(fixture));
+        mutateSource(source, RecordCase.CAPTURE_END, CONTENDED);
+        return source;
     }
 
     /**
@@ -362,37 +377,11 @@ public class OfflineCorrelatorTest {
      * and reports the loss; any other discrepancy keeps the reasons it always had, and a loss above the limit is
      * refused.
      */
-    /** One row's fixed-point weight: 3000 ns under the uniform threshold, 64 fraction bits below one. */
-    private static final BigInteger ROW_WEIGHT =
-            BigInteger.valueOf(3000).shiftLeft(32 + 64).divide(BigInteger.valueOf(42949673));
-
-    /** One contended interval: selection counts three intervals, the source holds two rows. */
-    private static final Consumer<JsonObject> CONTENDED = row -> {
-        JsonObject kernel = row.getAsJsonObject("counters").getAsJsonObject("kernel");
-        kernel.addProperty("selectedIntervals", "3");
-        kernel.addProperty("eligibleIntervals", "3");
-        kernel.addProperty("sequenceContentions", "1");
-    };
-
-    /** The matched observation plus one with no JFR sample, both selected. */
-    private static List<JsonObject> contentionRows(Fixture fixture) {
-        JsonObject unmatched = observation(fixture.tid());
-        unmatched.addProperty("correlationId", "8000000100000002");
-        return List.of(fixture.observation(), unmatched);
-    }
-
-    /** A two-row source whose kernel counters say one more interval was selected and lost to contention. */
-    private static Path contendedSource(Path dir, Fixture fixture) throws IOException {
-        Path source = source(dir, fixture.jfr(), contentionRows(fixture));
-        mutateSource(source, "captureEnd", CONTENDED);
-        return source;
-    }
-
     @Test
     void sequenceContentionEstimate(@TempDir Path dir) throws Exception {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
-        List<JsonObject> rows = contentionRows(fixture);
+        List<CaptureProto.Observation> rows = contentionRows(fixture);
         var lenient = new OfflineCorrelator.Limits(
                 100_000_000, 1024 * 1024, 256L << 20, 4096, null, null, null, new BigDecimal("0.5"));
         BigInteger rowWeight = ROW_WEIGHT;
@@ -401,58 +390,58 @@ public class OfflineCorrelatorTest {
         Path source = source(dir, jfr, rows);
         var exact = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
         String zero = "Zero contention must keep the exact estimate: " + exact;
-        assertThat(exact.status()).as(zero).isEqualTo("available");
-        assertThat(exact.sourceCoverageComplete()).as(zero).isTrue();
-        assertThat(exact.accountedLoss()).as(zero).isNull();
-        assertThat(exact.assumptions()).as(zero).isEmpty();
-        assertThat(exact.estimatedDurationNanos())
+        assertThat(exact.getStatus()).as(zero).isEqualTo(EstimateStatus.ESTIMATE_STATUS_AVAILABLE);
+        assertThat(exact.getSourceCoverageComplete()).as(zero).isTrue();
+        assertThat(exact.hasAccountedLoss()).as(zero).isFalse();
+        assertThat(exact.getAssumptionsList()).as(zero).isEmpty();
+        assertThat(exact.getEstimatedDurationNanos())
                 .as(zero)
-                .isEqualTo(rowWeight.shiftLeft(1).shiftRight(64).toString());
+                .isEqualTo(rowWeight.shiftLeft(1).shiftRight(64).longValueExact());
 
         // One contended interval explains the gap exactly: available, scaled by 3 / 2, loss reported.
-        Consumer<JsonObject> contended = CONTENDED;
-        mutateSource(source, "captureEnd", contended);
+        mutateSource(source, RecordCase.CAPTURE_END, CONTENDED);
         var accounted = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
         String scaled = "Counted contention must scale the estimate by selected / received: " + accounted;
-        assertThat(accounted.status()).as(scaled).isEqualTo("available");
-        assertThat(accounted.unavailableReasons()).as(scaled).isEmpty();
-        assertThat(accounted.sourceCoverageComplete()).as(scaled).isFalse();
-        assertThat(accounted.sourceRowsUsed()).as(scaled).isEqualTo("2");
-        assertThat(accounted.accountedLoss()).as(scaled).isNotNull();
-        assertThat(accounted.accountedLoss().intervals()).as(scaled).isEqualTo("1");
-        assertThat(accounted.accountedLoss().reason()).as(scaled).isEqualTo("sequence-contention");
-        assertThat(accounted.accountedLoss().fraction()).as(scaled).isEqualTo(new BigDecimal("0.333333"));
-        assertThat(accounted.assumptions()).as(scaled).containsExactly(CorrelationEngine.CONTENTION_INDEPENDENCE);
-        assertThat(accounted.estimatedDurationNanos())
+        assertThat(accounted.getStatus()).as(scaled).isEqualTo(EstimateStatus.ESTIMATE_STATUS_AVAILABLE);
+        assertThat(accounted.getUnavailableReasonsList()).as(scaled).isEmpty();
+        assertThat(accounted.getSourceCoverageComplete()).as(scaled).isFalse();
+        assertThat(accounted.getSourceRowsUsed()).as(scaled).isEqualTo(2);
+        assertThat(accounted.hasAccountedLoss()).as(scaled).isTrue();
+        assertThat(accounted.getAccountedLoss().getIntervals()).as(scaled).isEqualTo(1);
+        assertThat(accounted.getAccountedLoss().getReason()).as(scaled).isEqualTo("sequence-contention");
+        assertThat(accounted.getAccountedLoss().getFraction()).as(scaled).isEqualTo("0.333333");
+        assertThat(accounted.getAssumptionsList())
+                .as(scaled)
+                .containsExactly(CorrelationEngine.CONTENTION_INDEPENDENCE);
+        assertThat(accounted.getEstimatedDurationNanos())
                 .as(scaled)
                 .isEqualTo(rowWeight
                         .shiftLeft(1)
                         .multiply(BigInteger.valueOf(3))
                         .divide(BigInteger.TWO)
                         .shiftRight(64)
-                        .toString());
+                        .longValueExact());
 
         // The same loss above the default 1 % limit is refused, and still reported.
         var refused = OfflineCorrelator.correlate(source, jfr, DEFAULTS).populationEstimate();
         String aboveLimit = "Accounted loss above the limit must be refused: " + refused;
-        assertThat(refused.status()).as(aboveLimit).isEqualTo("unavailable");
-        assertThat(refused.estimatedDurationNanos()).as(aboveLimit).isNull();
-        assertThat(refused.unavailableReasons()).as(aboveLimit).containsExactly("accounted-loss-above-limit");
-        assertThat(refused.accountedLoss()).as(aboveLimit).isNotNull();
-        assertThat(refused.accountedLoss().intervals()).as(aboveLimit).isEqualTo("1");
+        assertThat(refused.getStatus()).as(aboveLimit).isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(refused.hasEstimatedDurationNanos()).as(aboveLimit).isFalse();
+        assertThat(refused.getUnavailableReasonsList()).as(aboveLimit).containsExactly("accounted-loss-above-limit");
+        assertThat(refused.hasAccountedLoss()).as(aboveLimit).isTrue();
+        assertThat(refused.getAccountedLoss().getIntervals()).as(aboveLimit).isEqualTo(1);
 
         // A gap the contention count does not explain keeps both of today's reasons.
-        mutateSource(source, "captureEnd", row -> {
-            JsonObject kernel = row.getAsJsonObject("counters").getAsJsonObject("kernel");
-            kernel.addProperty("selectedIntervals", "4");
-            kernel.addProperty("eligibleIntervals", "4");
-        });
+        mutateSource(
+                source,
+                RecordCase.CAPTURE_END,
+                kernel(counters -> counters.setSelectedIntervals(4).setEligibleIntervals(4)));
         var unexplained = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
         String todays = "Unexplained mismatch must stay unavailable with today's reasons: " + unexplained;
-        assertThat(unexplained.status()).as(todays).isEqualTo("unavailable");
-        assertThat(unexplained.accountedLoss()).as(todays).isNull();
-        assertThat(unexplained.assumptions()).as(todays).isEmpty();
-        assertThat(unexplained.unavailableReasons())
+        assertThat(unexplained.getStatus()).as(todays).isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(unexplained.hasAccountedLoss()).as(todays).isFalse();
+        assertThat(unexplained.getAssumptionsList()).as(todays).isEmpty();
+        assertThat(unexplained.getUnavailableReasonsList())
                 .as(todays)
                 .containsExactly("nonzero-sequenceContentions", "selected-source-row-count-mismatch");
 
@@ -460,15 +449,13 @@ public class OfflineCorrelatorTest {
         source = source(dir, jfr, rows);
         mutateSource(
                 source,
-                "captureEnd",
-                contended.andThen(row -> row.getAsJsonObject("counters")
-                        .getAsJsonObject("kernel")
-                        .addProperty("ringReserveFailures", "1")));
+                RecordCase.CAPTURE_END,
+                CONTENDED.andThen(kernel(counters -> counters.setRingReserveFailures(1))));
         var otherLoss = OfflineCorrelator.correlate(source, jfr, lenient).populationEstimate();
         String otherCounter = "Another nonzero failure counter must keep today's reasons: " + otherLoss;
-        assertThat(otherLoss.status()).as(otherCounter).isEqualTo("unavailable");
-        assertThat(otherLoss.accountedLoss()).as(otherCounter).isNull();
-        assertThat(otherLoss.unavailableReasons())
+        assertThat(otherLoss.getStatus()).as(otherCounter).isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(otherLoss.hasAccountedLoss()).as(otherCounter).isFalse();
+        assertThat(otherLoss.getUnavailableReasonsList())
                 .as(otherCounter)
                 .containsExactly(
                         "nonzero-ringReserveFailures",
@@ -501,22 +488,23 @@ public class OfflineCorrelatorTest {
         assertThat(OffCpuCorrelator.run(args.toArray(String[]::new)))
                 .as("Contended capture did not complete")
                 .isZero();
-        JsonObject report = json(output.resolve(OutputFiles.REPORT));
-        JsonObject estimate = report.getAsJsonObject("populationEstimate");
-        JsonObject loss = estimate.getAsJsonObject("accountedLoss");
+        ReportProto.Report report = report(output.resolve(OutputFiles.REPORT));
+        ReportProto.PopulationEstimate estimate = report.getPopulationEstimate();
+        ReportProto.AccountedLoss loss = estimate.getAccountedLoss();
         String carried = "Report must carry the accounted loss and its assumption: " + estimate;
-        assertThat(loss.get("intervals").getAsString()).as(carried).isEqualTo("1");
-        assertThat(loss.get("fraction").getAsBigDecimal()).as(carried).isEqualTo(new BigDecimal("0.333333"));
-        assertThat(loss.get("reason").getAsString()).as(carried).isEqualTo("sequence-contention");
-        assertThat(estimate.getAsJsonArray("assumptions")).as(carried).hasSize(1);
+        assertThat(loss.getIntervals()).as(carried).isEqualTo(1);
+        assertThat(new BigDecimal(loss.getFraction())).as(carried).isEqualTo(new BigDecimal("0.333333"));
+        assertThat(loss.getReason()).as(carried).isEqualTo("sequence-contention");
+        assertThat(estimate.getAssumptionsList()).as(carried).hasSize(1);
         boolean available = !limit.isEmpty();
         String verdict = "CLI limit " + (available ? limit : "default") + " gave the wrong verdict: " + estimate;
-        assertThat(estimate.get("status").getAsString()).as(verdict).isEqualTo(available ? "available" : "unavailable");
-        assertThat(report.getAsJsonObject("stackProfile")
-                        .get("estimateAvailable")
-                        .getAsBoolean())
+        assertThat(estimate.getStatus())
                 .as(verdict)
-                .isEqualTo(available);
+                .isEqualTo(
+                        available
+                                ? EstimateStatus.ESTIMATE_STATUS_AVAILABLE
+                                : EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(report.getStackProfile().getEstimateAvailable()).as(verdict).isEqualTo(available);
         StackProfile profile = StackProfile.read(output.resolve(OutputFiles.PROFILE));
         BigInteger expected =
                 available ? ROW_WEIGHT.multiply(BigInteger.valueOf(3)).divide(BigInteger.TWO) : ROW_WEIGHT;
@@ -526,6 +514,9 @@ public class OfflineCorrelatorTest {
         assertThat(profile.totalEstimatedNanos())
                 .as("Profile estimates must take the same scale as the total")
                 .isEqualTo(expected.shiftRight(64).longValueExact());
+        assertThat(profile.header().report())
+                .as("The profile must carry the report it was produced with")
+                .isEqualTo(report);
     }
 
     @Test
@@ -548,67 +539,38 @@ public class OfflineCorrelatorTest {
     void unmatchedSourceDurationInEstimate(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
-        JsonObject unmatched = observation(fixture.tid());
-        unmatched.addProperty("correlationId", "8000000100000002");
-        Path twoSource = source(dir, jfr, List.of(fixture.observation(), unmatched));
+        Path twoSource = source(dir, jfr, contentionRows(fixture));
         var two = OfflineCorrelator.correlate(twoSource, jfr, DEFAULTS);
-        assertThat(two.populationEstimate().sourceSelectedObservedDurationNanos())
+        assertThat(two.populationEstimate().getSourceSelectedObservedDurationNanos())
                 .as("Unmatched durable source duration omitted from estimate")
-                .isEqualTo("6000");
-        assertThat(two.populationEstimate().matchedSelectedObservedDurationNanos())
+                .isEqualTo(6000);
+        assertThat(two.populationEstimate().getMatchedSelectedObservedDurationNanos())
                 .as("Stack-matched duration was incorrectly scaled")
-                .isEqualTo("3000");
-        mutateSource(
-                twoSource,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters").getAsJsonObject("kernel").addProperty("selectedIntervals", "3"));
+                .isEqualTo(3000);
+        mutateSource(twoSource, RecordCase.CAPTURE_END, kernel(counters -> counters.setSelectedIntervals(3)));
         two = OfflineCorrelator.correlate(twoSource, jfr, DEFAULTS);
-        assertThat(two.populationEstimate().status())
+        assertThat(two.populationEstimate().getStatus())
                 .as("Missing selected source row did not disable population estimate")
-                .isEqualTo("unavailable");
-        assertThat(two.populationEstimate().unavailableReasons())
+                .isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(two.populationEstimate().getUnavailableReasonsList())
                 .as("Missing selected source row did not disable population estimate")
                 .contains("selected-source-row-count-mismatch");
     }
 
+    /** A counter saturated at the u64 maximum proves nothing, so it cannot vouch for complete coverage. */
     @Test
     void estimatorCounterValidation(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
         Path source = fixture.source();
         Path jfr = fixture.jfr();
-        mutateSource(
-                source,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters")
-                        .getAsJsonObject("kernel")
-                        .addProperty("eligibleIntervals", CaptureInput.U64_MAX.toString()));
+        mutateSource(source, RecordCase.CAPTURE_END, kernel(counters -> counters.setEligibleIntervals(-1L)));
         var result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
-        assertThat(result.populationEstimate().status())
+        assertThat(result.populationEstimate().getStatus())
                 .as("Saturated source counter was treated as exact coverage")
-                .isEqualTo("unavailable");
-        assertThat(result.populationEstimate().unavailableReasons())
+                .isEqualTo(EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE);
+        assertThat(result.populationEstimate().getUnavailableReasonsList())
                 .as("Saturated source counter was treated as exact coverage")
                 .contains("saturated-counter-eligibleIntervals");
-        source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(
-                source,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters").getAsJsonObject("kernel").addProperty("eligibleIntervals", 1));
-        result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
-        assertThat(result.populationEstimate().status())
-                .as("Non-string estimator counter was accepted")
-                .isEqualTo("unavailable");
-        assertThat(result.populationEstimate().unavailableReasons())
-                .as("Non-string estimator counter was accepted")
-                .contains("invalid-counter-eligibleIntervals");
-        source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(
-                source,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters")
-                        .getAsJsonObject("kernel")
-                        .addProperty("targetNamespaceFailures", "+0"));
-        rejects(source, jfr, DEFAULTS, "Invalid unsigned decimal");
     }
 
     @ParameterizedTest(name = "--format {0}")
@@ -635,15 +597,12 @@ public class OfflineCorrelatorTest {
         assertThat(Files.exists(selected.resolve(OutputFiles.COLLAPSED)))
                 .as("Collapsed output format selection ignored")
                 .isEqualTo(format.equals("collapsed"));
-        JsonObject selectedReport = json(selected.resolve(OutputFiles.REPORT));
-        assertThat(selectedReport.has("syntheticJfr"))
+        ReportProto.Report selectedReport = report(selected.resolve(OutputFiles.REPORT));
+        assertThat(selectedReport.hasSyntheticJfr())
                 .as("Incorrect JFR metadata selection")
                 .isEqualTo(format.equals("jfr"));
         if (format.equals("jfr")) {
-            assertThat(selectedReport
-                            .getAsJsonObject("syntheticJfr")
-                            .get("syntheticEvents")
-                            .getAsLong())
+            assertThat(selectedReport.getSyntheticJfr().getSyntheticEvents())
                     .as("CLI quantum was not applied")
                     .isEqualTo(3);
         }
@@ -664,7 +623,7 @@ public class OfflineCorrelatorTest {
         assertThat(result.matched()).as("Clipped before join").isEqualTo(1);
         assertThat(result.selectedObservedDurationNanos())
                 .as("Clipped before join")
-                .isEqualTo("1000");
+                .isEqualTo(1000);
     }
 
     @Test
@@ -681,21 +640,28 @@ public class OfflineCorrelatorTest {
         var result = OfflineCorrelator.correlate(fixture.source(), fixture.jfr(), delayed);
         assertThat(result.invalidSource()).as("Delivery delay not rejected").isEqualTo(1);
         assertThat(result.invalidJfr()).as("Delivery delay not rejected").isEqualTo(1);
+        assertThat(result.records())
+                .as("The delay rejection must be named")
+                .allMatch(row -> row.getReason() == ReportProto.RowReason.ROW_REASON_HANDLER_DELAY_LIMIT_EXCEEDED);
     }
 
     @Test
     void ambiguity(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
-        JsonObject observation = fixture.observation();
-        Path source = source(dir, jfr, List.of(observation, observation.deepCopy()));
+        CaptureProto.Observation observation = fixture.observation();
+        Path source = source(dir, jfr, List.of(observation, observation));
         var result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource()).as("Ambiguity joined").isEqualTo(2);
         assertThat(result.invalidJfr()).as("Ambiguity joined").isEqualTo(1);
         assertThat(result.matched()).as("Ambiguity joined").isZero();
-        JsonObject wrongEpoch = observation.deepCopy();
-        wrongEpoch.addProperty("captureEpoch", 1);
-        source = source(dir, jfr, List.of(observation, wrongEpoch));
+        assertThat(result.records())
+                .as("Every copy of a duplicated cookie must be named")
+                .allMatch(row -> row.getReason() == ReportProto.RowReason.ROW_REASON_DUPLICATE_COOKIE);
+        // A duplicate that is invalid on its own still invalidates the valid copy.
+        CaptureProto.Observation invalidCopy =
+                observation.toBuilder().setRegistrationToken(2).build();
+        source = source(dir, jfr, List.of(observation, invalidCopy));
         result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource())
                 .as("Invalid duplicate escaped ambiguity check")
@@ -708,8 +674,8 @@ public class OfflineCorrelatorTest {
     @Test
     void wrongProcessRegistration(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
-        JsonObject wrongBinding = fixture.observation().deepCopy();
-        wrongBinding.addProperty("registrationToken", "0000000000000002");
+        CaptureProto.Observation wrongBinding =
+                fixture.observation().toBuilder().setRegistrationToken(2).build();
         Path source = source(dir, fixture.jfr(), List.of(wrongBinding));
         var result = OfflineCorrelator.correlate(source, fixture.jfr(), DEFAULTS);
         assertThat(result.invalidSource())
@@ -721,8 +687,8 @@ public class OfflineCorrelatorTest {
     @Test
     void sourceIntervalOutsideCapture(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
-        JsonObject outside = fixture.observation().deepCopy();
-        outside.addProperty("startMonotonicNanos", "1");
+        CaptureProto.Observation outside =
+                fixture.observation().toBuilder().setStartMonotonicNanos(1).build();
         Path source = source(dir, fixture.jfr(), List.of(outside));
         var result = OfflineCorrelator.correlate(source, fixture.jfr(), DEFAULTS);
         assertThat(result.invalidSource())
@@ -742,36 +708,44 @@ public class OfflineCorrelatorTest {
         assertThat(result.invalidSource()).as("Duplicate JFR sample joined").isEqualTo(1);
         assertThat(result.invalidJfr()).as("Duplicate JFR sample joined").isEqualTo(2);
         String erased = "AP-only duplicate erased independently valid source duration";
-        assertThat(result.populationEstimate().status()).as(erased).isEqualTo("available");
-        assertThat(result.populationEstimate().sourceSelectedObservedDurationNanos())
+        assertThat(result.populationEstimate().getStatus())
                 .as(erased)
-                .isEqualTo("3000");
-        assertThat(result.populationEstimate().matchedSelectedObservedDurationNanos())
+                .isEqualTo(EstimateStatus.ESTIMATE_STATUS_AVAILABLE);
+        assertThat(result.populationEstimate().getSourceSelectedObservedDurationNanos())
                 .as(erased)
-                .isEqualTo("0");
+                .isEqualTo(3000);
+        assertThat(result.populationEstimate().getMatchedSelectedObservedDurationNanos())
+                .as(erased)
+                .isZero();
     }
 
     @Test
     void threadAndNamespaceIdentity(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
-        JsonObject observation = fixture.observation().deepCopy();
-        observation.addProperty("targetTid", fixture.tid() + 1);
+        CaptureProto.Observation.Builder observation =
+                fixture.observation().toBuilder().setTargetTid((int) fixture.tid() + 1);
         Path source = source(dir, jfr, List.of(observation));
         var result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource()).as("Thread mismatch joined").isEqualTo(1);
         assertThat(result.invalidJfr()).as("Thread mismatch joined").isEqualTo(1);
-        observation.add("targetTid", JsonNull.INSTANCE);
+        observation.setTargetTid(0);
         source = source(dir, jfr, List.of(observation));
         rejects(source, jfr, DEFAULTS, "Missing target namespace TID");
-        observation.addProperty("targetTid", fixture.tid());
-        observation.addProperty("targetTgid", ProcessHandle.current().pid() + 1);
+        observation
+                .setTargetTid((int) fixture.tid())
+                .setTargetTgid((int) ProcessHandle.current().pid() + 1);
         source = source(dir, jfr, List.of(observation));
         result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.invalidSource()).as("Wrong namespace TGID joined").isEqualTo(1);
         assertThat(result.invalidJfr()).as("Wrong namespace TGID joined").isEqualTo(1);
         source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(source, "captureStart", row -> row.addProperty("pidNamespaceInode", "1"));
+        mutateSource(
+                source,
+                RecordCase.CAPTURE_START,
+                record -> record.getCaptureStartBuilder()
+                        .getVerifiedIdentityBuilder()
+                        .setPidNamespaceInode(1));
         rejects(source, jfr, DEFAULTS, "Verified namespace mismatch");
     }
 
@@ -781,34 +755,29 @@ public class OfflineCorrelatorTest {
         Fixture fixture = fixture(dir);
         Path jfr = fixture.jfr();
         Path source = fixture.source();
-        mutateSource(source, "observation", row -> row.addProperty("kernelStackId", 99));
+        mutateSource(
+                source,
+                RecordCase.OBSERVATION,
+                record -> record.getObservationBuilder().setKernelStackId(99));
         rejects(source, jfr, DEFAULTS, "Observation references an unannounced stack");
         source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(source, "observation", row -> row.addProperty("kernelStackId", -7));
+        mutateSource(
+                source,
+                RecordCase.OBSERVATION,
+                record -> record.getObservationBuilder().setKernelStackId(-7));
         rejects(source, jfr, DEFAULTS, "Unexplained negative stack id");
         source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(source, "stack", row -> row.addProperty("stackId", KERNEL_STACK_ID));
+        mutateSource(
+                source, RecordCase.STACK, record -> record.getStackBuilder().setId(KERNEL_STACK_ID));
         rejects(source, jfr, DEFAULTS, "Duplicate stack record");
     }
 
     @Test
     void targetNamespaceFailures(@TempDir Path dir) throws IOException {
         Fixture fixture = fixture(dir);
-        Path jfr = fixture.jfr();
         Path source = fixture.source();
-        mutateSource(
-                source,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters")
-                        .getAsJsonObject("kernel")
-                        .addProperty("targetNamespaceFailures", "1"));
-        rejects(source, jfr, DEFAULTS, "Source target namespace mapping failed");
-        source = source(dir, jfr, List.of(fixture.observation()));
-        mutateSource(
-                source,
-                "captureEnd",
-                row -> row.getAsJsonObject("counters").getAsJsonObject("kernel").remove("targetNamespaceFailures"));
-        rejects(source, jfr, DEFAULTS, "targetNamespaceFailures");
+        mutateSource(source, RecordCase.CAPTURE_END, kernel(counters -> counters.setTargetNamespaceFailures(1)));
+        rejects(source, fixture.jfr(), DEFAULTS, "Source target namespace mapping failed");
     }
 
     @Test
@@ -817,14 +786,11 @@ public class OfflineCorrelatorTest {
         Path jfr = fixture.jfr();
         Path source = fixture.source();
         byte[] valid = Files.readAllBytes(source);
-        List<JsonObject> rows = readRows(source);
-        assertThat(rows).as("fixture rows missing").isNotEmpty();
-        mutateSource(
-                source,
-                "captureFinalized",
-                row -> row.addProperty(
-                        "apStopResponse",
-                        row.get("apStopResponse").getAsString().replace("stopped-at=9000", "stopped-at=3000")));
+        assertThat(readRecords(source)).as("fixture records missing").isNotEmpty();
+        mutateSource(source, RecordCase.CAPTURE_FINALIZED, record -> {
+            var footer = record.getCaptureFinalizedBuilder();
+            footer.setApStopResponse(footer.getApStopResponse().replace("stopped-at=9000", "stopped-at=3000"));
+        });
         var result = OfflineCorrelator.correlate(source, jfr, DEFAULTS);
         assertThat(result.matched())
                 .as("Source interval after AP stop still joined")
@@ -835,25 +801,31 @@ public class OfflineCorrelatorTest {
         assertThat(result.invalidJfr())
                 .as("Source interval after AP stop still joined")
                 .isEqualTo(1);
-        // A record edited without re-signing the prefix must fail the digest, not the semantics.
-        List<JsonObject> tampered = readRows(source);
-        for (JsonObject row : tampered) {
-            if (row.get("recordType").getAsString().equals("observation")) row.addProperty("hostTid", 457);
+        assertThat(result.records())
+                .as("A pair after the AP stop must be named")
+                .allMatch(row -> row.getReason() == ReportProto.RowReason.ROW_REASON_SAMPLE_FOR_SOURCE_AFTER_AP_STOP);
+        // A record edited without re-sealing the prefix must fail the digest, not the semantics.
+        List<CaptureProto.Record> tampered = new ArrayList<>();
+        for (CaptureProto.Record record : readRecords(source)) {
+            tampered.add(
+                    record.hasObservation()
+                            ? record.toBuilder()
+                                    .setObservation(
+                                            record.getObservation().toBuilder().setHostTid(457))
+                                    .build()
+                            : record);
         }
-        Files.write(source, CaptureStreamFixture.encode(tampered));
+        Files.write(source, CaptureRecordFixture.encode(tampered));
         rejects(source, jfr, DEFAULTS, "Source digest mismatch");
         Files.write(source, java.util.Arrays.copyOf(valid, valid.length - 1));
         rejects(source, jfr, DEFAULTS, "truncated tail");
-        Files.write(source, concat(valid, CaptureRecordFixture.controlRecord("{}")));
+        Files.write(source, concat(valid, CaptureRecordFixture.encode(record(fixture.observation()))));
         rejects(source, jfr, DEFAULTS, "Rows follow");
-        // A control record's JSON is still read with the strict parser.
+        // A record without any of the known kinds is refused, not skipped.
         Files.write(
                 source,
-                concat(
-                        CaptureStreamFixture.header(),
-                        CaptureRecordFixture.controlRecord(
-                                "{\"schemaVersion\":2,\"schemaVersion\":2,\"recordType\":\"captureStart\"}")));
-        rejects(source, jfr, DEFAULTS, "Duplicate JSON field");
+                concat(CaptureFormat.header(), CaptureRecordFixture.encode(CaptureProto.Record.getDefaultInstance())));
+        rejects(source, jfr, DEFAULTS, "Unknown source record");
     }
 
     @ParameterizedTest(name = "{3}")

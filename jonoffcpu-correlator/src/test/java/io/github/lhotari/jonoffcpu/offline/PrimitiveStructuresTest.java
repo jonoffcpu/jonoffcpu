@@ -8,9 +8,7 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -68,25 +66,24 @@ class PrimitiveStructuresTest {
                 .isGreaterThanOrEqualTo(10_000L * 12);
     }
 
-    private static Map<String, Object> frame(String className, String methodName, int line) {
+    private static SignalProto.JfrFrame frame(String className, String methodName, int line) {
         return frame("Interpreted", className, methodName, line);
     }
 
-    private static Map<String, Object> frame(String type, String className, String methodName, int line) {
-        Map<String, Object> frame = new LinkedHashMap<>();
-        frame.put("type", type);
-        frame.put("className", className);
-        frame.put("methodName", methodName);
-        frame.put("descriptor", "()V");
-        frame.put("lineNumber", line);
-        frame.put("bytecodeIndex", 0);
-        return frame;
+    /** A frame as the exporter reads it; a null value is a field the JFR did not report. */
+    private static SignalProto.JfrFrame frame(String type, String className, String methodName, int line) {
+        SignalProto.JfrFrame.Builder frame =
+                SignalProto.JfrFrame.newBuilder().setLineNumber(line).setBytecodeIndex(0);
+        if (type != null) frame.setType(type);
+        if (className != null) frame.setClassName(className);
+        if (methodName != null) frame.setMethodName(methodName);
+        return frame.setMethodDescriptor("()V").build();
     }
 
     @Test
     void dictionaries() throws IOException {
         JfrDictionaries dictionaries = new JfrDictionaries();
-        List<Map<String, Object>> leafFirst = List.of(frame("a.Leaf", "run", 3), frame("a.Root", "main", 1));
+        List<SignalProto.JfrFrame> leafFirst = List.of(frame("a.Leaf", "run", 3), frame("a.Root", "main", 1));
         int first = dictionaries.internStack(leafFirst, false, 4096);
         int again =
                 dictionaries.internStack(List.of(frame("a.Leaf", "run", 3), frame("a.Root", "main", 1)), false, 4096);
@@ -118,12 +115,12 @@ class PrimitiveStructuresTest {
         assertThat(dictionaries.collapsedKey(dictionaries.collapsedOf(empty)))
                 .as("An empty frame list must collapse to the unavailable marker")
                 .isEqualTo("[stack unavailable]");
-        Map<String, Object> unresolved = frame(null, null, -1);
+        SignalProto.JfrFrame unresolved = frame(null, null, -1);
         int missing = dictionaries.internStack(List.of(unresolved), false, 4096);
         assertThat(dictionaries.collapsedKey(dictionaries.collapsedOf(missing)))
                 .as("A frame with no class or method must collapse to [unresolved]")
                 .isEqualTo("[unresolved]");
-        Map<String, Object> awkward = frame("a;b\nc", "run", 1);
+        SignalProto.JfrFrame awkward = frame("a;b\nc", "run", 1);
         int escaped = dictionaries.internStack(List.of(awkward), false, 4096);
         assertThat(dictionaries.collapsedKey(dictionaries.collapsedOf(escaped)))
                 .as("Separator and newline escaping changed")
@@ -231,13 +228,21 @@ class PrimitiveStructuresTest {
         assertThat(samples.stackId(999)).as("Sample dictionary ids lost").isEqualTo(1);
         assertThat(samples.threadId(999)).as("Sample dictionary ids lost").isEqualTo(2);
 
-        assertThat(Reason.DUPLICATE_COOKIE.text()).as("Reason text changed").isEqualTo("duplicate-cookie");
-        assertThat(Reason.NONE.text())
-                .as("A valid row must carry no reason text")
-                .isNull();
-        assertThat(Outcome.NOT_IN_SELECTED_JFR.text())
-                .as("Unmatched reason text changed")
-                .isEqualTo("sample-not-present-in-selected-jfr");
+        assertThat(Reason.DUPLICATE_COOKIE.proto())
+                .as("Reason vocabulary changed")
+                .isEqualTo(ReportProto.RowReason.ROW_REASON_DUPLICATE_COOKIE);
+        assertThat(Reason.NONE.proto()).as("A valid row must carry no reason").isNull();
+        assertThat(Outcome.NOT_IN_SELECTED_JFR.proto())
+                .as("Unmatched reason changed")
+                .isEqualTo(ReportProto.RowReason.ROW_REASON_SAMPLE_NOT_PRESENT_IN_SELECTED_JFR);
+        assertThat(Outcome.MATCHED.proto()).as("A match carries no reason").isNull();
+        for (Reason reason : Reason.values()) {
+            if (reason != Reason.NONE) {
+                assertThat(reason.proto())
+                        .as("Every invalid reason has a wire value: %s", reason)
+                        .isNotNull();
+            }
+        }
         assertThat(Reason.of((byte) Reason.INVALID_PAIR.ordinal()))
                 .as("Reason byte decoding is wrong")
                 .isEqualTo(Reason.INVALID_PAIR);

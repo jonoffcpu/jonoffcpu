@@ -50,7 +50,10 @@ class ExportDuckDbTest {
         }
     }
 
-    /** DuckDB reads the JSON Lines export without a schema: frames as VARCHAR[], counters as BIGINT. */
+    /**
+     * DuckDB reads the JSON Lines export without a schema: frames as VARCHAR[], and the 64-bit counters, which the
+     * proto3 JSON mapping prints as decimal strings, as VARCHAR that one view casts to UBIGINT.
+     */
     @Test
     void readByDuckDb(@TempDir Path dir) throws Exception {
         Path duckdb = duckdb();
@@ -81,27 +84,37 @@ class ExportDuckDbTest {
                         0));
         Path profile = dir.resolve("sql.pb");
         new StackProfile(
-                        new StackProfile.Header(List.of(), List.of("reason", "thread"), false, "{}", "", List.of()),
+                        new StackProfile.Header(List.of(), List.of("reason", "thread"), false, null, "", List.of()),
                         entries)
                 .write(profile);
         Path rows = ExportFixture.export(dir, "sql.jsonl", profile, "--format", "jsonl", "--run-label", "a");
         String types = duckdb(
                 duckdb,
-                "DESCRIBE SELECT javaFrames, javaFrameKinds, observedNanos, run, estimateAvailable FROM read_json('"
-                        + rows + "', format = 'newline_delimited');");
+                "DESCRIBE SELECT javaFrames, javaFrameKinds, observedNanos, taskState, reason, run, estimateAvailable"
+                        + " FROM read_json('" + rows + "', format = 'newline_delimited');");
+        // The proto3 JSON mapping prints 64-bit counters as decimal strings, which DuckDB reads as VARCHAR; 32-bit
+        // values stay numbers.
         assertThat(types)
-                .as("DuckDB must infer the frame arrays, numeric counters and the run columns")
+                .as("DuckDB must infer the frame arrays, the string counters and the run columns")
                 .contains(
                         "javaFrames,VARCHAR[]",
                         "javaFrameKinds,VARCHAR[]",
-                        "observedNanos,BIGINT",
+                        "observedNanos,VARCHAR",
+                        "reason,VARCHAR",
                         "run,VARCHAR",
                         "estimateAvailable,BOOLEAN");
+        // The documented recipe: a view that casts the counters to UBIGINT once, so every query sums exact integers.
+        String view = "CREATE VIEW entries AS SELECT * REPLACE (intervals::UBIGINT AS intervals,"
+                + " observedNanos::UBIGINT AS observedNanos, estimatedNanos::UBIGINT AS estimatedNanos)"
+                + " FROM read_json('" + rows + "', format = 'newline_delimited');";
+        String cast = duckdb(duckdb, view + " SELECT typeof(observedNanos), typeof(intervals) FROM entries LIMIT 1;");
+        assertThat(cast).as("The view must cast the counters").contains("UBIGINT,UBIGINT");
         String boundaries = duckdb(
                 duckdb,
-                "SELECT list_filter(javaFrames, lambda f: regexp_matches(f, '^x\\.'))[1] AS boundary,"
-                        + " sum(observedNanos) / 1e9 AS seconds, sum(intervals) AS intervals FROM read_json('" + rows
-                        + "', format = 'newline_delimited') GROUP BY 1 ORDER BY 1;");
-        assertThat(boundaries).contains("x.App.run,3.0,3", "x.App.wait,1.5,2");
+                view + " SELECT list_filter(javaFrames, lambda f: regexp_matches(f, '^x\\.'))[1] AS boundary,"
+                        + " sum(observedNanos) / 1e9 AS seconds, sum(intervals) AS intervals, any_value(reason)"
+                        + " AS reason FROM entries GROUP BY 1 ORDER BY 1;");
+        assertThat(boundaries)
+                .contains("x.App.run,3.0,3,OFF_CPU_REASON_BLOCKED", "x.App.wait,1.5,2,OFF_CPU_REASON_BLOCKED");
     }
 }

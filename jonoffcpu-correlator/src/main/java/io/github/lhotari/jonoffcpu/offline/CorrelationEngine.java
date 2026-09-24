@@ -1,28 +1,15 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.decimal;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.identity;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.number;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.object;
 import static io.github.lhotari.jonoffcpu.offline.CaptureInput.require;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.signedDecimal;
-import static io.github.lhotari.jonoffcpu.offline.CaptureInput.text;
 
-import com.google.gson.Gson;
-import com.google.gson.GsonBuilder;
-import com.google.gson.JsonObject;
 import io.github.lhotari.jonoffcpu.capture.CaptureProto;
-import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.math.MathContext;
 import java.nio.file.Path;
-import java.time.Instant;
-import java.time.format.DateTimeParseException;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Streams a finalized capture and its combined JFR into primitive columns, joins them on the exact
@@ -31,8 +18,8 @@ import java.util.Map;
  * <p>Nothing per-row survives the pass: an observation becomes 59 bytes of columns, a sample 38
  * plus a dictionary id, and the two audit files are written by re-reading the files afterwards.
  * Validation is unchanged, only relocated: every constant an observation is checked against comes
- * from {@code captureStart}, which the reader delivers before the first observation, and the one
- * test that needs {@code captureEnd} — an interval ending after the source detached — is applied in
+ * from {@code capture_start}, which the reader delivers before the first observation, and the one
+ * test that needs {@code capture_end} — an interval ending after the source detached — is applied in
  * {@link #resolveDeferred(CaptureInput)} with the same precedence the retained chain had.
  */
 final class CorrelationEngine implements CaptureInput.SourceVisitor {
@@ -77,11 +64,11 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     // check counts what was parsed, not what this stage retained.
     private long samplesSeen;
 
-    // Hoisted out of captureStart, so an observation is validated without touching a document.
+    // Hoisted out of capture_start, so an observation is validated without touching a message.
     private long captureEpoch;
-    private long targetPid;
-    private long hostTgid;
-    private BigInteger processGenerationNs;
+    private int targetPid;
+    private int hostTgid;
+    private long processGenerationNanos;
     private long registrationToken;
     private long startedMonotonicNanos;
     private SamplingPolicy sampling;
@@ -174,15 +161,15 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     }
 
     @Override
-    public void start(JsonObject captureStart) throws IOException {
-        captureEpoch = number(captureStart, "captureEpoch");
-        targetPid = number(captureStart, "targetPid");
-        hostTgid = number(captureStart, "hostTgid");
-        processGenerationNs = decimal(captureStart, "processGenerationNs");
-        registrationToken = Long.parseUnsignedLong(text(captureStart, "registrationToken"), 16);
-        startedMonotonicNanos = U64.requireSigned(decimal(captureStart, "startedMonotonicNanos"), "captureStart");
-        sampling = SamplingPolicy.parse(object(captureStart, "sampling"));
-        timeSplit = TimeSplit.source(captureStart);
+    public void start(CaptureProto.CaptureStart captureStart) throws IOException {
+        captureEpoch = Integer.toUnsignedLong(captureStart.getCaptureEpoch());
+        targetPid = captureStart.getTargetPid();
+        hostTgid = captureStart.getHostTgid();
+        processGenerationNanos = captureStart.getVerifiedIdentity().getProcessGenerationNanos();
+        registrationToken = captureStart.getVerifiedIdentity().getRegistrationToken();
+        startedMonotonicNanos = U64.requireSigned(captureStart.getStartedMonotonicNanos(), "captureStart");
+        sampling = SamplingPolicy.parse(captureStart.getSampling());
+        timeSplit = TimeSplit.source(captureStart.getTimeSplit());
     }
 
     @Override
@@ -207,35 +194,26 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         requireStack(observation.getKernelStackId(), observation.getKernelStackError());
         requireStack(observation.getUserStackId(), observation.getUserStackError());
 
-        long start = U64.requireSigned(observation.getStartMonotonicNs(), "startMonotonicNanos");
-        long end = U64.requireSigned(observation.getEndMonotonicNs(), "endMonotonicNanos");
+        long start = U64.requireSigned(observation.getStartMonotonicNanos(), "startMonotonicNanos");
+        long end = U64.requireSigned(observation.getEndMonotonicNanos(), "endMonotonicNanos");
         long cookie = observation.getCorrelationId();
         boolean cookieValid = (cookie >>> 32) == captureEpoch && (cookie & 0xffffffffL) != 0;
         // The kernel derived the reason from the two raw sched_switch arguments it recorded beside it, and its
-        // filter only passes selected reasons: both are recomputed, like the admission threshold. An unclassified
-        // capture carries none of the three fields.
+        // filter only passes selected reasons: both are recomputed, like the admission threshold.
         OffCpuReason switchOut = OffCpuReason.fromWire(observation.getReasonValue());
-        boolean classificationMismatch;
-        if (sampling.classified()) {
-            classificationMismatch = switchOut == null
-                    || !observation.hasPrevTaskState()
-                    || !observation.hasPreempted()
-                    || switchOut != OffCpuReason.classify(observation.getPreempted(), observation.getPrevTaskState())
-                    || !sampling.selects(switchOut);
-        } else {
-            classificationMismatch =
-                    observation.getReasonValue() != 0 || observation.hasPrevTaskState() || observation.hasPreempted();
-        }
+        boolean classificationMismatch = switchOut == null
+                || switchOut != OffCpuReason.classify(observation.getPreempted(), observation.getPrevTaskState())
+                || !sampling.selects(switchOut);
         if (switchOut == null) switchOut = OffCpuReason.UNSPECIFIED;
         boolean policyMismatch = classificationMismatch
                 // Only a capture that reads the scheduler's run delay may carry a run-queue part.
                 || observation.hasRunqueueNanos() && !timeSplit.available()
-                || targetTgid != targetPid
-                || Integer.toUnsignedLong(observation.getHostTgid()) != hostTgid
+                || observation.getTargetTgid() != targetPid
+                || observation.getHostTgid() != hostTgid
                 // The kernel recorded the threshold it drew against; it must be the policy's for this length.
                 || start > end
                 || !BigInteger.valueOf(threshold).equals(sampling.admissionThreshold(BigInteger.valueOf(end - start)))
-                || !unsigned(observation.getProcessGenerationNs()).equals(processGenerationNs)
+                || observation.getProcessGenerationNanos() != processGenerationNanos
                 || observation.getRegistrationToken() != registrationToken;
 
         // The retained chain's precedence, minus the captureEnd half of OUTSIDE_CAPTURE.
@@ -298,67 +276,56 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         return error.isEmpty() ? Math.toIntExact(stackId) : SourceColumns.NO_STACK;
     }
 
-    private static BigInteger unsigned(long bits) {
-        return U64.big(bits);
-    }
-
     // ---- JFR pass --------------------------------------------------------------------------
 
     private CorrelationResult finish(CaptureInput capture, Path jfr, OfflineCorrelator.JfrSelection selection)
             throws IOException {
         resolveDeferred(capture);
-        JsonObject inputs = capture.inputs;
-        Gson gson = new GsonBuilder().serializeNulls().create();
-        JsonObject[] observedStats = new JsonObject[1];
-        SignalJfrExporter.RowConsumer consumer = raw -> {
+        CaptureProto.AsyncProfilerStats[] observedStats = new CaptureProto.AsyncProfilerStats[1];
+        SignalJfrExporter.RowConsumer consumer = row -> {
             capture.budget.countRow();
-            String recordType = (String) raw.get("recordType");
-            require(recordType != null, "Missing string: recordType");
-            switch (recordType) {
-                case "capture" -> {
-                    JsonObject row = gson.toJsonTree(raw).getAsJsonObject();
-                    capture.budget.charge(row);
-                    identity(row, inputs);
+            switch (row.getRecordCase()) {
+                case CAPTURE -> {
+                    SignalProto.SignalCapture context = row.getCapture();
+                    capture.budget.charge(context);
+                    CaptureInput.jfrIdentity(
+                            context.getSessionId(), Integer.toUnsignedLong(context.getCaptureEpoch()), capture);
                     require(
-                            number(row, "signal") == number(inputs, "signal")
-                                    && number(row, "processId") == number(inputs, "targetPid"),
+                            context.getSignal() == capture.start.getSignal()
+                                    && context.getProcessId() == Integer.toUnsignedLong(capture.start.getTargetPid()),
                             "JFR/source target mismatch");
                     require(
-                            text(row, "signalDelivery").equals(text(inputs, "signalDelivery")),
+                            context.getSignalDelivery() == capture.start.getSignalDelivery(),
                             "JFR/source delivery policy mismatch");
-                    if (capture.partial) capture.diagnostics.add("observedJfrCapture", row);
+                    if (capture.partial) capture.diagnostics.setObservedJfrCapture(context);
                 }
-                case "sample" -> sample(raw);
-                case "stats" -> {
-                    JsonObject row = gson.toJsonTree(raw).getAsJsonObject();
-                    capture.budget.charge(row);
-                    OfflineCorrelator.validateStats(row, inputs);
-                    observedStats[0] = row;
-                    if (capture.partial) capture.diagnostics.add("observedApStats", row);
+                case SAMPLE -> sample(row.getSample());
+                case STATS -> {
+                    SignalProto.SignalCaptureStats stats = row.getStats();
+                    capture.budget.charge(stats);
+                    OfflineCorrelator.validateStats(stats, capture);
+                    observedStats[0] = stats.getCounters();
+                    if (capture.partial) capture.diagnostics.setObservedApStats(stats);
                 }
-                case "end" ->
+                case END ->
                     require(
-                            Boolean.TRUE.equals(raw.get("parseComplete"))
-                                    && Long.parseUnsignedLong((String) raw.get("samples")) == samplesSeen,
+                            row.getEnd().getParseComplete() && row.getEnd().getSamples() == samplesSeen,
                             "Incomplete JFR parse");
                 default -> throw new IOException("Unknown JFR row");
             }
         };
-        JsonObject selectionMetadata = OfflineCorrelator.readJfr(capture, jfr, selection, consumer);
+        ReportProto.JfrSelection selectionMetadata = OfflineCorrelator.readJfr(capture, jfr, selection, consumer);
         capture.budget.structures(retainedBytes());
-        JsonObject stats = inputs.has("apStats") ? object(inputs, "apStats") : observedStats[0];
+        CaptureProto.AsyncProfilerStats stats = capture.apStats() != null ? capture.apStats() : observedStats[0];
         BigInteger notParsed = stats == null || selection != null
                 ? null
-                : decimal(stats, "submittedSamples").subtract(BigInteger.valueOf(samplesSeen));
+                : U64.big(stats.getSubmittedSamples()).subtract(BigInteger.valueOf(samplesSeen));
         require(notParsed == null || notParsed.signum() >= 0, "JFR samples exceed submitted samples");
         return join(capture, selectionMetadata, notParsed);
     }
 
-    private void sample(Map<String, Object> raw) throws IOException {
-        Object frames = raw.get("frames");
-        require(frames instanceof List<?>, "Missing stack frames");
-        String cookieText = (String) raw.get("correlationId");
-        long cookie = Long.parseUnsignedLong(cookieText, 16);
+    private void sample(SignalProto.SignalSample raw) throws IOException {
+        long cookie = raw.getCorrelationId();
         samplesSeen++;
         // The source pass (already complete by the time samples stream) marks a cookie DROPPED when its
         // observation was thinned or fell outside a narrowed window; the matching sample follows it down.
@@ -366,16 +333,17 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         // Duplicate detection stays global and exact: a dropped sample still claims its cookie.
         sampleIndex.observe(cookie, kept ? samples.size() : DROPPED);
         if (!kept) return;
-        long monotonic = U64.requireSigned(unsignedDecimal(raw, "monotonicTimeNanos"), "monotonicTimeNanos");
-        Long osThreadId = optionalTid(raw, "osThreadId");
-        Long javaThreadId = (Long) raw.get("javaThreadId");
+        long monotonic = U64.requireSigned(raw.getMonotonicTimeNanos(), "monotonicTimeNanos");
+        Long osThreadId = raw.hasOsThreadId() ? tid(raw.getOsThreadId()) : null;
+        Long javaThreadId = raw.hasJavaThreadId() ? raw.getJavaThreadId() : null;
         int stackId = dictionaries.internStack(
-                (List<?>) frames, Boolean.TRUE.equals(raw.get("stackTruncated")), limits.maxFrames());
-        int threadId = dictionaries.internThread(osThreadId, javaThreadId, (String) raw.get("threadName"));
+                raw.getFramesList(), raw.hasStackTruncated() && raw.getStackTruncated(), limits.maxFrames());
+        int threadId =
+                dictionaries.internThread(osThreadId, javaThreadId, raw.hasThreadName() ? raw.getThreadName() : null);
         samples.add(
                 cookie,
                 monotonic,
-                epochNanos((String) raw.get("startTime")),
+                epochNanos(raw.getStartTime()),
                 osThreadId == null ? 0 : (int) (long) osThreadId,
                 stackId,
                 threadId);
@@ -401,30 +369,15 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
     }
 
-    private static BigInteger unsignedDecimal(Map<String, Object> raw, String key) throws IOException {
-        Object value = raw.get(key);
-        require(value instanceof String, "Missing string: " + key);
-        String text = (String) value;
-        require(text.matches("0|[1-9][0-9]{0,19}"), "Invalid unsigned decimal: " + key);
-        BigInteger parsed = new BigInteger(text);
-        require(parsed.compareTo(CaptureInput.U64_MAX) <= 0, "Unsigned overflow: " + key);
-        return parsed;
-    }
-
-    private static Long optionalTid(Map<String, Object> raw, String key) throws IOException {
-        require(raw.containsKey(key), "Missing thread identity: " + key);
-        Object value = raw.get(key);
-        if (value == null) return null;
-        long tid = ((Number) value).longValue();
+    private static long tid(long tid) throws IOException {
         require(tid > 0 && tid <= 0xffffffffL, "Invalid TID");
         return tid;
     }
 
-    private static long epochNanos(String startTime) throws IOException {
+    private static long epochNanos(com.google.protobuf.Timestamp startTime) throws IOException {
         try {
-            Instant instant = Instant.parse(startTime);
-            return Math.addExact(Math.multiplyExact(instant.getEpochSecond(), 1_000_000_000L), instant.getNano());
-        } catch (DateTimeParseException | ArithmeticException | NullPointerException error) {
+            return Math.addExact(Math.multiplyExact(startTime.getSeconds(), 1_000_000_000L), startTime.getNanos());
+        } catch (ArithmeticException error) {
             throw new IOException("Invalid sample start time", error);
         }
     }
@@ -439,7 +392,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
      */
     private void resolveDeferred(CaptureInput capture) throws IOException {
         if (capture.end == null) return;
-        long detached = U64.requireSigned(decimal(capture.end, "detachedMonotonicNanos"), "detachedMonotonicNanos");
+        long detached = U64.requireSigned(capture.end.getDetachedMonotonicNanos(), "detachedMonotonicNanos");
         for (int slot = 0; slot < sources.size(); slot++) {
             Reason reason = sources.reason(slot);
             if (reason == Reason.NEGATIVE_DURATION || reason == Reason.OUTSIDE_CAPTURE) continue;
@@ -447,8 +400,8 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
     }
 
-    private CorrelationResult join(CaptureInput capture, JsonObject selectionMetadata, BigInteger notParsed)
-            throws IOException {
+    private CorrelationResult join(
+            CaptureInput capture, ReportProto.JfrSelection selectionMetadata, BigInteger notParsed) throws IOException {
         // The cookie indices are populated as each row streams in (see observation/sample), so a
         // dropped row still claims its cookie for duplicate detection without landing in the columns.
         // A duplicated source cookie invalidates every copy and its counterpart.
@@ -457,9 +410,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         // AP-only ambiguity invalidates the stack pair, not an independently valid source duration.
         invalidate(sampleIndex);
 
-        Long offset = capture.inputs.has("monotonicOffsetNanos")
-                ? U64.requireSignedOffset(signedDecimal(capture.inputs, "monotonicOffsetNanos"), "monotonicOffsetNanos")
-                : null;
+        Long offset = capture.monotonicOffsetNanos();
         Long clipFrom = limits.fromNanos() == null ? null : limits.fromNanos().longValueExact();
         Long clipTo = effectiveToNanos();
         Long delayLimit = limits.maxHandlerDelayNanos() == null
@@ -469,7 +420,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         Long apStopBoundary = null;
         boolean apStopAlways = false;
         if (offset != null && capture.apStoppedAtNanos != null) {
-            BigInteger boundary = new BigInteger(capture.apStoppedAtNanos).subtract(BigInteger.valueOf(offset));
+            BigInteger boundary = U64.big(capture.apStoppedAtNanos).subtract(BigInteger.valueOf(offset));
             if (boundary.signum() < 0) apStopAlways = true;
             else if (boundary.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) <= 0) {
                 apStopBoundary = boundary.longValueExact();
@@ -579,7 +530,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         for (int slot = 0; slot < samples.size(); slot++) {
             if (samples.reason(slot) != Reason.NONE) invalidJfr++;
         }
-        OfflineCorrelator.PopulationEstimate estimate =
+        ReportProto.PopulationEstimate estimate =
                 capture.partial ? null : populationEstimate(capture, aggregate, BigInteger.valueOf(total));
         if (accountedScale != null) {
             // The per-entry estimates are the same inverse-probability sum, so they take the same scale.
@@ -588,7 +539,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         return new CorrelationResult(
                 capture,
                 selectionMetadata,
-                notParsed == null ? null : notParsed.toString(),
+                notParsed == null ? null : notParsed.longValueExact(),
                 sources,
                 samples,
                 sourceIndex,
@@ -677,14 +628,13 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
     }
 
     /**
-     * Moved verbatim from the retained chain's aggregate-consistency check, except the row count now
-     * comes from this pass's {@link SourceColumns} rather than a {@code List<Row>}.
+     * The aggregate-consistency check: whether the kernel's and the collector's counters prove that the source rows
+     * are the whole selected population, or a population short by exactly the sequence contentions it counted.
      */
-    private OfflineCorrelator.PopulationEstimate populationEstimate(
+    private ReportProto.PopulationEstimate populationEstimate(
             CaptureInput capture, SourceAggregate aggregate, BigInteger matchedDuration) throws IOException {
-        JsonObject counters = object(capture.end, "counters");
-        JsonObject kernel = object(counters, "kernel");
-        JsonObject userspace = object(counters, "userspace");
+        CaptureProto.KernelCounters kernel = capture.end.getKernelCounters();
+        CaptureProto.UserspaceCounters userspace = capture.end.getUserspaceCounters();
         List<String> reasons = new java.util.ArrayList<>();
         // A second, independent thinning stage composes with this inverse-probability estimate but
         // must not be silently folded into it: report the estimate unavailable instead.
@@ -695,54 +645,41 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
             reasons.add("intrinsically-invalid-or-duplicate-source-rows");
         }
         BigInteger sourceRows = BigInteger.valueOf(sources.size());
-        BigInteger selected = optionalCounter(kernel, "selectedIntervals", reasons);
-        BigInteger eligible = optionalCounter(kernel, "eligibleIntervals", reasons);
-        BigInteger rejected = optionalCounter(kernel, "admissionRejections", reasons);
-        BigInteger received = optionalCounter(userspace, "receivedObservations", reasons);
-        BigInteger written = optionalCounter(userspace, "writtenObservations", reasons);
-        if (eligible != null && rejected != null && selected != null && !eligible.equals(rejected.add(selected))) {
+        BigInteger selected = counter("selectedIntervals", kernel.getSelectedIntervals(), reasons);
+        BigInteger eligible = counter("eligibleIntervals", kernel.getEligibleIntervals(), reasons);
+        BigInteger rejected = counter("admissionRejections", kernel.getAdmissionRejections(), reasons);
+        BigInteger received = counter("receivedObservations", userspace.getReceivedObservations(), reasons);
+        BigInteger written = counter("writtenObservations", userspace.getWrittenObservations(), reasons);
+        if (!eligible.equals(rejected.add(selected))) {
             reasons.add("eligible-selection-counter-mismatch");
         }
-        BigInteger contentions = null;
-        for (String key : List.of(
-                "targetNamespaceFailures",
-                "ringReserveFailures",
-                "sequenceExhaustions",
-                "sequenceContentions",
-                "lifetimeRejections",
-                "threadStateFailures")) {
-            BigInteger value = optionalCounter(kernel, key, reasons);
-            if (key.equals("sequenceContentions")) {
-                contentions = value;
-            } else if (value != null && value.signum() != 0) {
-                reasons.add("nonzero-" + key);
-            }
-        }
-        for (String key : List.of("writeFailures", "pollFailures")) {
-            BigInteger value = optionalCounter(userspace, key, reasons);
-            if (value != null && value.signum() != 0) {
-                reasons.add("nonzero-" + key);
-            }
-        }
+        BigInteger contentions = counter("sequenceContentions", kernel.getSequenceContentions(), reasons);
+        nonzero("targetNamespaceFailures", kernel.getTargetNamespaceFailures(), reasons);
+        nonzero("ringReserveFailures", kernel.getRingReserveFailures(), reasons);
+        nonzero("sequenceExhaustions", kernel.getSequenceExhaustions(), reasons);
+        nonzero("lifetimeRejections", kernel.getLifetimeRejections(), reasons);
+        nonzero("threadStateFailures", kernel.getThreadStateFailures(), reasons);
+        nonzero("writeFailures", userspace.getWriteFailures(), reasons);
+        nonzero("pollFailures", userspace.getPollFailures(), reasons);
         // Sequence contention drops a selected interval after the kernel counted it, and counts the drop. When
         // that count alone closes the gap between selection and every downstream count, and nothing else is
         // wrong, the loss is accounted for; any other discrepancy keeps the reasons it always had.
-        boolean contended = contentions != null && contentions.signum() != 0;
-        boolean rowsMismatch = selected != null
-                && (!selected.equals(sourceRows)
-                        || received != null && !selected.equals(received)
-                        || written != null && !selected.equals(written));
-        OfflineCorrelator.AccountedLoss accountedLoss = null;
+        boolean contended = contentions.signum() != 0;
+        boolean rowsMismatch = !selected.equals(sourceRows) || !selected.equals(received) || !selected.equals(written);
+        ReportProto.AccountedLoss accountedLoss = null;
         List<String> assumptions = List.of();
         if (contended
                 && reasons.isEmpty()
                 && selected.subtract(contentions).equals(sourceRows)
                 && sourceRows.equals(received)
                 && sourceRows.equals(written)) {
-            accountedLoss = new OfflineCorrelator.AccountedLoss(
-                    contentions.toString(),
-                    new BigDecimal(contentions).divide(new BigDecimal(selected), new MathContext(6)),
-                    "sequence-contention");
+            accountedLoss = ReportProto.AccountedLoss.newBuilder()
+                    .setIntervals(contentions.longValue())
+                    .setFraction(new BigDecimal(contentions)
+                            .divide(new BigDecimal(selected), new MathContext(6))
+                            .toPlainString())
+                    .setReason("sequence-contention")
+                    .build();
             assumptions = List.of(CONTENTION_INDEPENDENCE);
             if (new BigDecimal(contentions).compareTo(limits.maxAccountedLoss().multiply(new BigDecimal(selected)))
                     > 0) {
@@ -754,55 +691,40 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
         }
         reasons = reasons.stream().distinct().sorted().toList();
         boolean available = reasons.isEmpty();
-        String estimated = null;
+        ReportProto.PopulationEstimate.Builder estimate = ReportProto.PopulationEstimate.newBuilder()
+                .setMethod("inverse-probability-source-duration")
+                .setStatus(
+                        available
+                                ? ReportProto.EstimateStatus.ESTIMATE_STATUS_AVAILABLE
+                                : ReportProto.EstimateStatus.ESTIMATE_STATUS_UNAVAILABLE)
+                .setScope("completed duration-eligible source intervals")
+                .setAdmissionPolicy(sampling.policy())
+                .setSourceSelectedObservedDurationNanos(aggregate.duration().longValueExact())
+                .setSourceRowsUsed(aggregate.rows())
+                .setMatchedSelectedObservedDurationNanos(matchedDuration.longValueExact())
+                .setSourceCoverageComplete(available && accountedLoss == null)
+                .setStackDeliveryCorrectionApplied(false)
+                .addAllUnavailableReasons(reasons)
+                .addAllAssumptions(assumptions);
+        if (accountedLoss != null) estimate.setAccountedLoss(accountedLoss);
         if (available && accountedLoss != null) {
             accountedScale = new BigInteger[] {selected, sourceRows};
-            estimated = aggregate.estimatedDuration(selected, sourceRows).toString();
+            estimate.setEstimatedDurationNanos(
+                    aggregate.estimatedDuration(selected, sourceRows).longValueExact());
         } else if (available) {
-            estimated = aggregate.estimatedDuration().toString();
+            estimate.setEstimatedDurationNanos(aggregate.estimatedDuration().longValueExact());
         }
-        return new OfflineCorrelator.PopulationEstimate(
-                "inverse-probability-source-duration",
-                available ? "available" : "unavailable",
-                "completed duration-eligible source intervals",
-                sampling.policy(),
-                aggregate.duration().toString(),
-                matchedDuration.toString(),
-                Integer.toString(aggregate.rows()),
-                estimated,
-                available && accountedLoss == null,
-                false,
-                reasons,
-                accountedLoss,
-                assumptions);
+        return estimate.build();
     }
 
-    private static BigInteger optionalCounter(JsonObject counters, String key, List<String> reasons) {
-        com.google.gson.JsonElement value = counters.get(key);
-        if (value == null || value.isJsonNull()) {
-            reasons.add("missing-counter-" + key);
-            return null;
-        }
-        if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isString()) {
-            reasons.add("invalid-counter-" + key);
-            return null;
-        }
-        try {
-            String text = value.getAsString();
-            if (!text.matches("0|[1-9][0-9]{0,19}")) {
-                throw new NumberFormatException();
-            }
-            BigInteger parsed = new BigInteger(text);
-            if (parsed.signum() < 0 || parsed.compareTo(CaptureInput.U64_MAX) > 0) {
-                throw new NumberFormatException();
-            }
-            if (parsed.equals(CaptureInput.U64_MAX)) {
-                reasons.add("saturated-counter-" + key);
-            }
-            return parsed;
-        } catch (RuntimeException error) {
-            reasons.add("invalid-counter-" + key);
-            return null;
-        }
+    /** A counter as an unsigned value; one saturated at the u64 maximum proves nothing. */
+    private static BigInteger counter(String name, long value, List<String> reasons) {
+        if (value == -1L) reasons.add("saturated-counter-" + name);
+        return U64.big(value);
+    }
+
+    private static void nonzero(String name, long value, List<String> reasons) {
+        counter(name, value, reasons);
+        if (value != 0) reasons.add("nonzero-" + name);
     }
 }
