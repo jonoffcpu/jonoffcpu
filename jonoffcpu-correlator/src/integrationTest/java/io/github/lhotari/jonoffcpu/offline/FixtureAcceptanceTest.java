@@ -96,7 +96,7 @@ class FixtureAcceptanceTest {
     static Path run(Path output, List<String> args) throws Exception {
         List<String> command = new ArrayList<>(args);
         command.addAll(List.of("--output", output.toString()));
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code()).as("Failed: %s: %s", args, invocation).isZero();
         return output;
     }
@@ -145,7 +145,7 @@ class FixtureAcceptanceTest {
     private static Path exportWolfi(Path fixtures, Path dir) throws Exception {
         Path profile = fixtures.resolve("pulsar-broker-2026-09-23-wolfi/jonoffcpu-offcpu-profile.pb");
         Path jsonl = dir.resolve("wolfi.jsonl");
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(
                 "export",
                 "--profile",
                 profile.toString(),
@@ -235,7 +235,7 @@ class FixtureAcceptanceTest {
     private static JsonObject topJson(List<String> args) throws Exception {
         List<String> command = new ArrayList<>(List.of("top", "--format", "json"));
         command.addAll(args);
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code()).as("top failed: %s", invocation).isZero();
         return JsonParser.parseString(invocation.out()).getAsJsonObject();
     }
@@ -374,7 +374,7 @@ class FixtureAcceptanceTest {
         }
 
         Path digest = dir.resolve("digest");
-        CommandLineTest.Invocation summarize = CommandLineTest.invoke(
+        CommandLineFixture.Invocation summarize = CommandLineFixture.invoke(
                 "summarize",
                 "--profile",
                 wolfi.toString(),

@@ -30,12 +30,30 @@ How code and tests are written in jonoffcpu. The architecture contracts they ser
 
 ### Layout
 
-Each Java module has two JUnit Jupiter suites, and `check` runs both:
+Each Java module has two JUnit Jupiter suites, and `check` runs both. What they share lives in a third source set,
+the test fixtures of Gradle's [`java-test-fixtures`](https://docs.gradle.org/current/userguide/java_testing.html#sec:java_test_fixtures)
+plugin:
 
 | Source set | Task | Holds |
 |---|---|---|
+| `src/testFixtures` | `compileTestFixturesJava` | Everything a test uses but that is not a test: fixture builders, JFR event types, command-line and export helpers, and the workloads and checks that tests and proof tools launch. Both suites see it. |
 | `src/test` | `test` | Unit tests. Pure Java: no native code, no packaged JAR, no Docker, no external tool, so they run on any platform with a JDK. |
-| `src/integrationTest` | `integrationTest` and the tasks below | Tests that need the native bundle, a packaged JAR, a Linux kernel, Docker or an external tool. It sees the unit tests' output, so fixture builders are shared rather than copied. |
+| `src/integrationTest` | `integrationTest` and the tasks below | Tests that need the native bundle, a packaged JAR, a Linux kernel, Docker or an external tool. |
+
+- **A test class holds tests.** A helper that a second test class needs moves to `src/testFixtures/java`, into a
+  `…Fixture` class in the same package as the code it exercises, so package-private access keeps working. A test
+  never calls into another test class, and a suite never sees another suite's classes. Helpers that only one suite's
+  tests share, such as the integration tests' `AgentRuntime` and `CaptureChecks`, stay in that suite.
+- **Fixtures may use AssertJ**, which `testFixturesImplementation` provides, to check what they build; JUnit,
+  Awaitility and Testcontainers stay with the suites.
+- **Native sources of fixtures** (the C helpers the proof tools compile) live beside them in `src/testFixtures/c`.
+- **Fixtures are never published.** The convention plugin drops the test-fixtures variants from the `java`
+  component, and the shaded modules publish only their shaded JAR.
+- **Fixtures are not copied between modules.** A fixture that several modules need lives in the test fixtures of the
+  module that owns what it builds, and the others depend on it with `testFixtures(project(…))`. The capture stream's
+  `CaptureRecordFixture`, which encodes JSON rows as stream records, is in `jonoffcpu-capture-codec`, beside the
+  codec it uses; the parts that need a module's package-private `CaptureStream`, such as its header and reader, stay
+  in that module's `CaptureStreamFixture`.
 
 Integration tests say what they need with a tag, and the build routes each tag:
 
@@ -51,9 +69,10 @@ container runner copies every JAR flat into one directory named by a classpath w
 class directories ahead of it as Gradle orders them, and mounts the project at its own path, so host paths mean the
 same inside the container.
 
-Main classes that the Python proof tools under `jonoffcpu-native/tools/` launch from `build/classes/java/test`
-(the `*Workload` and `*Check` classes and their helpers) are not tests: they must not depend on JUnit, AssertJ or any
-other test library, because those tools put only the agent JAR and the test classes on the classpath.
+The main classes that the integration tests and the Python proof tools under `jonoffcpu-native/tools/` launch (the
+`*Workload` and `*Check` classes and their helpers) are fixtures in `src/testFixtures`, compiled to
+`build/classes/java/testFixtures`. They must not depend on JUnit, AssertJ or any other test library, because their
+launchers put only the agent JAR and the fixture classes on the classpath.
 
 ### Time budget
 

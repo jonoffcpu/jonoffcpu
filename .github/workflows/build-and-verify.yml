@@ -186,13 +186,13 @@ jobs:
           mkdir workflow-downloads
           mapfile -t agent_jars < <(find jonoffcpu-agent/build/libs -maxdepth 1 -type f \
             -name 'jonoffcpu-agent-*.jar' ! -name '*-plain.jar' \
-            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-test-fixtures.jar')
           mapfile -t correlator_jars < <(find jonoffcpu-correlator/build/libs -maxdepth 1 -type f \
             -name 'jonoffcpu-correlator-*.jar' ! -name '*-plain.jar' \
-            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-test-fixtures.jar')
           mapfile -t converter_jars < <(find jonoffcpu-jfr-converter/build/libs -maxdepth 1 -type f \
             -name 'jonoffcpu-jfr-converter-*.jar' \
-            ! -name '*-sources.jar' ! -name '*-javadoc.jar')
+            ! -name '*-sources.jar' ! -name '*-javadoc.jar' ! -name '*-test-fixtures.jar')
           if [[ ${#agent_jars[@]} -ne 1 || ${#correlator_jars[@]} -ne 1 || ${#converter_jars[@]} -ne 1 ]]; then
             echo "Expected exactly one shaded JAR from each module" >&2
             printf 'Agent JARs: %s\n' "${agent_jars[*]}" >&2

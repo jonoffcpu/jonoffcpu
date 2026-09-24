@@ -10,9 +10,9 @@ import java.io.InputStream;
 import java.util.HexFormat;
 
 /**
- * Framing of the capture stream defined by {@code docs/schema/jonoffcpu-capture.proto}: a fixed header
- * followed by length-delimited protobuf records. The reader never allocates on a claimed length it has
- * not checked, and reports a truncated final record instead of decoding a partial one.
+ * Framing of the capture stream defined by {@code jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto}:
+ * a fixed header followed by length-delimited protobuf records. The reader never allocates on a claimed length it
+ * has not checked, and reports a truncated final record instead of decoding a partial one.
  */
 final class CaptureStream {
     static final byte[] MAGIC = "JONOFFCPU\0".getBytes(java.nio.charset.StandardCharsets.US_ASCII);

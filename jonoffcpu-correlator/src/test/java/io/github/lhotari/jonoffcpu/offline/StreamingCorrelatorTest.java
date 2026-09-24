@@ -33,13 +33,13 @@ class StreamingCorrelatorTest {
     static Path capture(Path dir, Path jfr, long tid, int rows) throws IOException {
         List<JsonObject> observations = new ArrayList<>();
         for (int row = 0; row < rows; row++) {
-            JsonObject observation = OfflineCorrelatorTest.observation(tid);
+            JsonObject observation = CorrelationFixture.observation(tid);
             observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
             observation.addProperty("startMonotonicNanos", Long.toString(1000 + row));
             observation.addProperty("endMonotonicNanos", Long.toString(4000 + row));
             observations.add(observation);
         }
-        return OfflineCorrelatorTest.source(dir, jfr, observations);
+        return CorrelationFixture.source(dir, jfr, observations);
     }
 
     /** The OS thread id of the recording's samples. */
@@ -62,7 +62,7 @@ class StreamingCorrelatorTest {
     /** Spec acceptance 2: the streamed engine and the retained one agree on every output. */
     @Test
     void goldenEquivalence(@TempDir Path dir) throws Exception {
-        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        Path jfr = CorrelationFixture.recording(dir, 1);
         Path source = capture(dir, jfr, sampleThreadId(jfr), 1);
         var limits = OfflineCorrelator.Limits.defaults();
 
@@ -140,7 +140,7 @@ class StreamingCorrelatorTest {
     /** Spec §1: the audit outputs are the only consumers of the per-row documents. */
     @Test
     void auditLevels(@TempDir Path dir) throws Exception {
-        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        Path jfr = CorrelationFixture.recording(dir, 1);
         Path source = capture(dir, jfr, sampleThreadId(jfr), 1);
         for (String level : List.of("full", "matches", "none")) {
             Path output = dir.resolve("audit-" + level);
@@ -169,7 +169,7 @@ class StreamingCorrelatorTest {
     /** The synthetic view is built from interned stacks, not from retained sample documents. */
     @Test
     void syntheticFromColumns(@TempDir Path dir) throws Exception {
-        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        Path jfr = CorrelationFixture.recording(dir, 1);
         Path source = capture(dir, jfr, sampleThreadId(jfr), 3);
         var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
         Path fromAnalysis = dir.resolve("synthetic-analysis.jfr");
@@ -227,17 +227,17 @@ class StreamingCorrelatorTest {
     void syntheticOrderTiesBreakOnCookie(@TempDir Path dir) throws Exception {
         Path jfr = recordingWithSequentialCorrelationIds(dir, 2);
         long tid = sampleThreadId(jfr);
-        JsonObject second = OfflineCorrelatorTest.observation(tid);
+        JsonObject second = CorrelationFixture.observation(tid);
         second.addProperty("correlationId", "8000000100000002");
         second.addProperty("startMonotonicNanos", "1000");
         second.addProperty("endMonotonicNanos", "4000");
-        JsonObject first = OfflineCorrelatorTest.observation(tid);
+        JsonObject first = CorrelationFixture.observation(tid);
         first.addProperty("correlationId", "8000000100000001");
         first.addProperty("startMonotonicNanos", "1000");
         first.addProperty("endMonotonicNanos", "4000");
         // Source-file order deliberately puts the higher cookie first: preserving capture order instead
         // of sorting by cookie would still pass without this check.
-        Path source = OfflineCorrelatorTest.source(dir, jfr, List.of(second, first));
+        Path source = CorrelationFixture.source(dir, jfr, List.of(second, first));
         var analysis = OfflineCorrelator.correlate(source, jfr, OfflineCorrelator.Limits.defaults());
         assertThat(analysis.matched())
                 .as("the tie-break fixture matches both intervals")
@@ -259,17 +259,17 @@ class StreamingCorrelatorTest {
     private static Path recordingWithSequentialCorrelationIds(Path dir, int count) throws IOException {
         Path file = dir.resolve("sequential-" + count + ".jfr");
         try (Recording recording = new Recording()) {
-            recording.enable(OfflineCorrelatorTest.Capture.class);
-            recording.enable(OfflineCorrelatorTest.Sample.class).withStackTrace();
-            recording.enable(OfflineCorrelatorTest.Stats.class);
+            recording.enable(CorrelationFixture.Capture.class);
+            recording.enable(CorrelationFixture.Sample.class).withStackTrace();
+            recording.enable(CorrelationFixture.Stats.class);
             recording.start();
-            new OfflineCorrelatorTest.Capture().commit();
+            new CorrelationFixture.Capture().commit();
             for (int i = 0; i < count; i++) {
-                OfflineCorrelatorTest.Sample sample = new OfflineCorrelatorTest.Sample();
+                CorrelationFixture.Sample sample = new CorrelationFixture.Sample();
                 sample.correlationId = (sample.correlationId & 0xffffffff00000000L) | (i + 1);
                 sample.commit();
             }
-            OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
+            CorrelationFixture.Stats stats = new CorrelationFixture.Stats();
             stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = count;
             stats.commit();
             recording.stop();

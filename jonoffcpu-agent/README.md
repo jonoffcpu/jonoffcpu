@@ -112,7 +112,7 @@ java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture
 Options before `asprofpath` belong to JONOFFCPU:
 
 - `jonoffcpuoutput` (required): exact correlation stream path. The stream is
-  length-delimited protobuf, defined by `docs/schema/jonoffcpu-capture.proto`.
+  length-delimited protobuf, defined by `jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`.
 - `jonoffcpudelivery=queued|coalescing`: signal delivery policy; defaults to `queued`.
 - `sampling-policy=none|uniform|proportional` (required): the admission policy,
   `sampling.admission.policy` in YAML.
@@ -233,7 +233,8 @@ flow, Central Portal setup, and signing configuration.
 ## Tests
 
 `src/test` holds unit tests, which run on any platform with Java and need no native code. `src/integrationTest`
-holds the tests that need the native bundle, the packaged JARs or a Linux kernel. `check` runs both:
+holds the tests that need the native bundle, the packaged JARs or a Linux kernel. `src/testFixtures` holds what both
+share: the capture stream fixture and the workloads the end-to-end tests launch. `check` runs both suites:
 
 ```sh
 ./gradlew :jonoffcpu-agent:check

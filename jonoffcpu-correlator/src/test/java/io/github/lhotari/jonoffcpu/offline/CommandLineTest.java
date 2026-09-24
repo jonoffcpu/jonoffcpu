@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
+import static io.github.lhotari.jonoffcpu.offline.CommandLineFixture.invoke;
+import static io.github.lhotari.jonoffcpu.offline.CommandLineFixture.usageError;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -8,12 +10,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
+import io.github.lhotari.jonoffcpu.offline.CommandLineFixture.Invocation;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
-import java.io.PrintWriter;
-import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
@@ -44,32 +45,6 @@ class CommandLineTest {
     /** Every command with its own help, the top-level one as the empty name. */
     static final List<String> COMMANDS =
             List.of("", "correlate", "stacks", "top", "summarize", "merge", "export", "dump");
-
-    record Invocation(int code, String out, String err) {}
-
-    /** Runs one command line in-process, capturing what picocli prints. */
-    static Invocation invoke(String... args) throws Exception {
-        StringWriter out = new StringWriter();
-        StringWriter err = new StringWriter();
-        int code = Cli.run(args, new PrintWriter(out), new PrintWriter(err));
-        return new Invocation(code, out.toString(), err.toString());
-    }
-
-    /** Checks that a command line is refused as a usage error, with its usage and without a stack trace. */
-    static Invocation usageError(String message, String... args) throws Exception {
-        Invocation invocation = invoke(args);
-        assertThat(invocation.code())
-                .as("A usage error must return 64: %s", invocation)
-                .isEqualTo(Cli.USAGE);
-        assertThat(invocation.err())
-                .as("The usage error must say '%s'", message)
-                .contains(message)
-                .as("A usage error must show the usage")
-                .contains("Usage: ")
-                .as("A usage error must not print a stack trace")
-                .doesNotContain("Exception", "\tat ");
-        return invocation;
-    }
 
     private static String[] words(String command, String... rest) {
         List<String> words = new ArrayList<>();
@@ -191,13 +166,13 @@ class CommandLineTest {
     /** {@code --dump --source} and {@code dump --source} write the same bytes, and neither closes stdout. */
     @Test
     void dumpAlias(@TempDir Path dir) throws Exception {
-        Path jfr = OfflineCorrelatorTest.recording(dir, 1);
+        Path jfr = CorrelationFixture.recording(dir, 1);
         long[] tid = new long[1];
         SignalJfrExporter.visit(jfr, row -> {
             if (row.get("recordType").equals("sample")) tid[0] = (Long) row.get("osThreadId");
         });
-        JsonObject observation = OfflineCorrelatorTest.observation(tid[0]);
-        Path source = OfflineCorrelatorTest.source(dir, jfr, List.of(observation));
+        JsonObject observation = CorrelationFixture.observation(tid[0]);
+        Path source = CorrelationFixture.source(dir, jfr, List.of(observation));
         byte[] alias = stdout("--dump", "--source", source.toString());
         byte[] command = stdout("dump", "--source", source.toString());
         assertThat(alias).as("dump must write something").isNotEmpty();

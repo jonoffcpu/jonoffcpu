@@ -206,7 +206,7 @@ Capture, written by the agent next to `correlationOutput` (the examples assume
 
 | File | Contents | Name comes from |
 | --- | --- | --- |
-| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`docs/schema/jonoffcpu-capture.proto`](docs/schema/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as NDJSON | `correlationOutput` |
+| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as NDJSON | `correlationOutput` |
 | `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
 | `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
 
@@ -217,7 +217,7 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate |
 | `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
-| `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`docs/schema/jonoffcpu-profile.proto`](docs/schema/jonoffcpu-profile.proto) |
+| `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto) |
 | `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: coverage and losses, where the time went, ranked busy and idle tables, the heaviest transformed stacks, and the command that reproduces each table. The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
 | `jonoffcpu-offcpu-synthetic.jfr` | The same data as duration-quantized `jdk.ExecutionSample` events, for JFR viewers |
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
@@ -1220,7 +1220,8 @@ collector change rebuilds only the collector. The tests are JUnit Jupiter
 tests with AssertJ: `src/test` holds unit tests that run on any platform with
 Java, and `src/integrationTest` holds the tests that need the native bundle,
 a packaged JAR, Docker or an external tool, including the agent's end-to-end
-tests against the host kernel in privileged Testcontainers. `check` runs
+tests against the host kernel in privileged Testcontainers. What both
+suites share is in `src/testFixtures`, Gradle's test fixtures. `check` runs
 both; [`CODING.md`](CODING.md) describes the conventions and the time budget
 they keep. CI publishes a
 [Build Scan](https://scans.gradle.com) for every Gradle build, and restores
@@ -1254,6 +1255,7 @@ are in [AGENTS.md](AGENTS.md).
 | --- | --- |
 | [`jonoffcpu-agent/`](jonoffcpu-agent/) | Java agent: capture controller, JNI bridge, and native integration tests ([README](jonoffcpu-agent/README.md)) |
 | [`jonoffcpu-native/`](jonoffcpu-native/) | Rust/[libbpf-rs](https://github.com/libbpf/libbpf-rs) collector, CO-RE eBPF programs, and privileged kernel proof tools ([README](jonoffcpu-native/README.md)) |
+| [`jonoffcpu-capture-codec/`](jonoffcpu-capture-codec/) | The capture stream schema and its Java codec, embedded in the agent and the correlator |
 | [`jonoffcpu-correlator/`](jonoffcpu-correlator/) | Offline correlator: JFR reader and derived-output writers ([OFFLINE.md](jonoffcpu-correlator/OFFLINE.md)) |
 | [`jonoffcpu-jfr-converter/`](jonoffcpu-jfr-converter/) | async-profiler's jfr-converter, built from the submodule's sources |
 | [`build-logic/`](build-logic/) | Gradle convention plugins and task types the modules share |

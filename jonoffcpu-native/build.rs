@@ -88,14 +88,16 @@ fn main() -> Result<()> {
 /// Compiles the capture stream schema with protox, a pure-Rust protobuf compiler, so the pinned
 /// build containers need no protoc.
 fn generate_capture_codec(out: &std::path::Path) -> Result<()> {
-    let schema = PathBuf::from("../docs/schema/jonoffcpu-capture.proto");
-    let descriptors =
-        protox::compile([&schema], ["../docs/schema"]).context("compile capture schema")?;
+    let schema = PathBuf::from("../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto");
+    let descriptors = protox::compile([&schema], ["../jonoffcpu-capture-codec/src/main/proto"])
+        .context("compile capture schema")?;
     prost_build::Config::new()
         .out_dir(out)
         .compile_fds(descriptors)
         .context("generate capture codec")?;
-    println!("cargo:rerun-if-changed=../docs/schema/jonoffcpu-capture.proto");
+    println!(
+        "cargo:rerun-if-changed=../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto"
+    );
     Ok(())
 }
 

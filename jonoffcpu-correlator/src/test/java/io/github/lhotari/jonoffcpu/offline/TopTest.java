@@ -85,7 +85,7 @@ class TopTest {
     private static JsonObject json(String... args) throws Exception {
         List<String> command = new ArrayList<>(List.of("top", "--format", "json"));
         command.addAll(List.of(args));
-        CommandLineTest.Invocation invocation = CommandLineTest.invoke(command.toArray(String[]::new));
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(command.toArray(String[]::new));
         assertThat(invocation.code()).as("top failed: %s", invocation).isZero();
         return JsonParser.parseString(invocation.out()).getAsJsonObject();
     }
@@ -151,7 +151,7 @@ class TopTest {
         assertThat(row(boundary, "rows", 0).has("estimated"))
                 .as("No estimate column without an estimate")
                 .isFalse();
-        CommandLineTest.usageError("--by boundary needs --app", "top", "--profile", profile.toString());
+        CommandLineFixture.usageError("--by boundary needs --app", "top", "--profile", profile.toString());
     }
 
     @Test
@@ -193,13 +193,14 @@ class TopTest {
         JsonObject boundary = json(common.toArray(String[]::new));
         List<String> mdArgs = new ArrayList<>(List.of("top", "--format", "md"));
         mdArgs.addAll(common);
-        String markdown = CommandLineTest.invoke(mdArgs.toArray(String[]::new)).out();
+        String markdown =
+                CommandLineFixture.invoke(mdArgs.toArray(String[]::new)).out();
         assertThat(markdown)
                 .contains("| 1 | `x.B.o` | `java.util.concurrent.locks.ReentrantLock.lock` | 3.000 |")
                 .contains("Reproduce: `java -jar jonoffcpu-correlator.jar top --format md --profile ");
         List<String> csvArgs = new ArrayList<>(List.of("top", "--format", "csv"));
         csvArgs.addAll(common);
-        List<String> csv = CommandLineTest.invoke(csvArgs.toArray(String[]::new))
+        List<String> csv = CommandLineFixture.invoke(csvArgs.toArray(String[]::new))
                 .out()
                 .lines()
                 .toList();
@@ -216,7 +217,7 @@ class TopTest {
     @Test
     void estimatedWeightsAndComparison(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
-        assertThatThrownBy(() -> CommandLineTest.invoke(
+        assertThatThrownBy(() -> CommandLineFixture.invoke(
                         "top", "--profile", profile.toString(), "--app", "^x\\.", "--weights", "estimated"))
                 .as("--weights estimated must be refused without an estimate")
                 .isInstanceOf(IOException.class)
@@ -249,7 +250,7 @@ class TopTest {
                 .contains("length-biased");
         Path estimated = profile(dir, "estimated", PROPORTIONAL, true);
         Path estimatedBaseline = profile(dir, "estimated-baseline", PROPORTIONAL, true);
-        CommandLineTest.usageError(
+        CommandLineFixture.usageError(
                 "compare with --weights estimated",
                 "top",
                 "--profile",
@@ -267,7 +268,7 @@ class TopTest {
         Path firstDigest = dir.resolve("digest-1");
         Path secondDigest = dir.resolve("digest-2");
         for (Path output : List.of(firstDigest, secondDigest)) {
-            CommandLineTest.Invocation invocation = CommandLineTest.invoke(
+            CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(
                     "summarize", "--profile", profile.toString(), "--app", "^x\\.", "--output-dir", output.toString());
             assertThat(invocation.code()).as("summarize failed: %s", invocation).isZero();
         }

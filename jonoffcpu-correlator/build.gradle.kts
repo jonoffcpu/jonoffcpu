@@ -15,11 +15,13 @@ val jmcWriterSources =
     }
 
 dependencies {
+    embeddedRuntime(project(":jonoffcpu-capture-codec"))
     embeddedRuntime(libs.protobuf.javalite)
     embeddedRuntime(libs.gson)
     embeddedRuntime(libs.jmc.flightrecorder.writer)
     embeddedRuntime(libs.picocli)
     jmcWriterSources(variantOf(libs.jmc.flightrecorder.writer) { classifier("sources") })
+    testFixturesApi(testFixtures(project(":jonoffcpu-capture-codec")))
 }
 
 tasks.verifyDependencyDigests {

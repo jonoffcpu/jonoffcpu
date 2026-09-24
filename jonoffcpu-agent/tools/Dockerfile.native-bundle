@@ -86,7 +86,7 @@ FROM collector-dependencies AS collector-build
 ARG TARGETARCH
 COPY jonoffcpu-native jonoffcpu-native
 # The capture stream schema: build.rs compiles it into the collector's codec.
-COPY docs/schema docs/schema
+COPY jonoffcpu-capture-codec/src/main/proto jonoffcpu-capture-codec/src/main/proto
 # Vendored C objects use GCC's outlined AArch64 atomics. Rust's cdylib link
 # does not otherwise retain the static libgcc implementation.
 RUN --mount=type=cache,id=jonoffcpu-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \

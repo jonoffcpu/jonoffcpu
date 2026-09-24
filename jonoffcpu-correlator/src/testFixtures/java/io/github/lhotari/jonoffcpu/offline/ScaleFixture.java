@@ -4,6 +4,7 @@ package io.github.lhotari.jonoffcpu.offline;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureRecordFixture;
 import io.github.lhotari.jonoffcpu.jfr.SignalJfrExporter;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
@@ -94,9 +95,9 @@ final class ScaleFixture {
         String shape = rows + "-" + distinctStacks + (skewed ? "-skewed" : "");
         Path contextFile = dir.resolve("scale-context-" + shape + ".jfr");
         try (Recording context = new Recording()) {
-            context.enable(OfflineCorrelatorTest.Capture.class);
+            context.enable(CorrelationFixture.Capture.class);
             context.start();
-            new OfflineCorrelatorTest.Capture().commit();
+            new CorrelationFixture.Capture().commit();
             context.stop();
             context.dump(contextFile);
         }
@@ -120,13 +121,13 @@ final class ScaleFixture {
         // the test runner's frames below it, which would multiply the cost of recording and reading it.
         try (Recording samples = new Recording();
                 var committer = Executors.newSingleThreadExecutor()) {
-            samples.enable(OfflineCorrelatorTest.Sample.class).withStackTrace();
-            samples.enable(OfflineCorrelatorTest.Stats.class);
+            samples.enable(CorrelationFixture.Sample.class).withStackTrace();
+            samples.enable(CorrelationFixture.Stats.class);
             samples.start();
             committer
                     .submit(() -> {
                         for (int row = 0; row < rows; row++) {
-                            OfflineCorrelatorTest.Sample sample = new OfflineCorrelatorTest.Sample();
+                            CorrelationFixture.Sample sample = new CorrelationFixture.Sample();
                             sample.correlationId = (EPOCH << 32) | (row + 1);
                             // The matching observation's endMonotonicNanos grows with row (see capture()
                             // below); the handler delay is monotonicTimeNanos minus that end, so this must
@@ -142,7 +143,7 @@ final class ScaleFixture {
                         }
                     })
                     .get(2, TimeUnit.MINUTES);
-            OfflineCorrelatorTest.Stats stats = new OfflineCorrelatorTest.Stats();
+            CorrelationFixture.Stats stats = new CorrelationFixture.Stats();
             stats.admittedSignals = stats.acceptedCookies = stats.submittedSamples = rows;
             stats.commit();
             samples.stop();
@@ -153,7 +154,7 @@ final class ScaleFixture {
     }
 
     /** Recurses to the requested depth before committing, so the captured stack trace varies. */
-    private static void commitAtDepth(int depth, OfflineCorrelatorTest.Sample event) {
+    private static void commitAtDepth(int depth, CorrelationFixture.Sample event) {
         if (depth <= 1) {
             event.commit();
         } else {
@@ -182,13 +183,13 @@ final class ScaleFixture {
     }
 
     private static JsonObject captureStart() {
-        JsonObject start = OfflineCorrelatorTest.row("captureStart");
+        JsonObject start = CorrelationFixture.row("captureStart");
         start.addProperty("sourceId", "jonoffcpu.offcpu.v1");
         start.addProperty("signal", 35);
         start.addProperty("signalDelivery", "queued");
         start.addProperty("hostTgid", 123);
         start.addProperty("targetPid", ProcessHandle.current().pid());
-        start.add("sampling", OfflineCorrelatorTest.uniformSampling());
+        start.add("sampling", CorrelationFixture.uniformSampling());
         start.addProperty("processGenerationNs", "100");
         start.addProperty("timeNamespaceInode", "42");
         start.addProperty("pidNamespaceDevice", "4");
@@ -209,7 +210,7 @@ final class ScaleFixture {
 
     private static JsonObject captureEnd(int rows) {
         long stopped = lastObservationEndNanos(rows) + 1000;
-        JsonObject end = OfflineCorrelatorTest.row("captureEnd");
+        JsonObject end = CorrelationFixture.row("captureEnd");
         end.addProperty("state", "complete");
         end.addProperty("drainTimedOut", false);
         end.addProperty("startedMonotonicNanos", "500");
@@ -243,7 +244,7 @@ final class ScaleFixture {
 
     private static JsonObject footer(Path jfr, JfrSummary summary, long rawBytes, String rawSha256, int rows)
             throws IOException {
-        JsonObject footer = OfflineCorrelatorTest.row("captureFinalized");
+        JsonObject footer = CorrelationFixture.row("captureFinalized");
         footer.addProperty("state", "complete");
         JsonObject inputs = captureStart();
         inputs.remove("recordType");
@@ -298,20 +299,19 @@ final class ScaleFixture {
         MessageDigest digest = CaptureInput.sha256();
         try (var out = new BufferedOutputStream(new DigestOutputStream(Files.newOutputStream(body), digest))) {
             out.write(CaptureStreamFixture.header());
-            CaptureStreamFixture.record(captureStart()).writeDelimitedTo(out);
-            CaptureStreamFixture.record(
-                            OfflineCorrelatorTest.stack(OfflineCorrelatorTest.KERNEL_STACK_ID, "kernel_wait"))
+            CaptureRecordFixture.record(captureStart()).writeDelimitedTo(out);
+            CaptureRecordFixture.record(CorrelationFixture.stack(CorrelationFixture.KERNEL_STACK_ID, "kernel_wait"))
                     .writeDelimitedTo(out);
-            CaptureStreamFixture.record(OfflineCorrelatorTest.stack(OfflineCorrelatorTest.USER_STACK_ID, "user_wait"))
+            CaptureRecordFixture.record(CorrelationFixture.stack(CorrelationFixture.USER_STACK_ID, "user_wait"))
                     .writeDelimitedTo(out);
             for (int row = 0; row < rows; row++) {
-                JsonObject observation = OfflineCorrelatorTest.observation(summary.threadId());
+                JsonObject observation = CorrelationFixture.observation(summary.threadId());
                 observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
                 observation.addProperty("startMonotonicNanos", Long.toString(1000L + row));
                 observation.addProperty("endMonotonicNanos", Long.toString(4000L + row));
-                CaptureStreamFixture.record(observation).writeDelimitedTo(out);
+                CaptureRecordFixture.record(observation).writeDelimitedTo(out);
             }
-            CaptureStreamFixture.record(captureEnd(rows)).writeDelimitedTo(out);
+            CaptureRecordFixture.record(captureEnd(rows)).writeDelimitedTo(out);
         }
         long rawBytes = Files.size(body);
         String rawSha256 = CaptureInput.hex(digest.digest());
@@ -320,7 +320,7 @@ final class ScaleFixture {
         try (var out = new BufferedOutputStream(Files.newOutputStream(result));
                 var in = new BufferedInputStream(Files.newInputStream(body))) {
             in.transferTo(out);
-            CaptureStreamFixture.record(footer).writeDelimitedTo(out);
+            CaptureRecordFixture.record(footer).writeDelimitedTo(out);
         }
         Files.delete(body);
         return result;
@@ -346,20 +346,19 @@ final class ScaleFixture {
         MessageDigest digest = CaptureInput.sha256();
         try (var out = new BufferedOutputStream(new DigestOutputStream(Files.newOutputStream(body), digest))) {
             out.write(CaptureStreamFixture.header());
-            CaptureStreamFixture.record(captureStart()).writeDelimitedTo(out);
-            CaptureStreamFixture.record(
-                            OfflineCorrelatorTest.stack(OfflineCorrelatorTest.KERNEL_STACK_ID, "kernel_wait"))
+            CaptureRecordFixture.record(captureStart()).writeDelimitedTo(out);
+            CaptureRecordFixture.record(CorrelationFixture.stack(CorrelationFixture.KERNEL_STACK_ID, "kernel_wait"))
                     .writeDelimitedTo(out);
-            CaptureStreamFixture.record(OfflineCorrelatorTest.stack(OfflineCorrelatorTest.USER_STACK_ID, "user_wait"))
+            CaptureRecordFixture.record(CorrelationFixture.stack(CorrelationFixture.USER_STACK_ID, "user_wait"))
                     .writeDelimitedTo(out);
             for (int row : order) {
-                JsonObject observation = OfflineCorrelatorTest.observation(summary.threadId());
+                JsonObject observation = CorrelationFixture.observation(summary.threadId());
                 observation.addProperty("correlationId", String.format("80000001%08x", row + 1));
                 observation.addProperty("startMonotonicNanos", Long.toString(1000L + row));
                 observation.addProperty("endMonotonicNanos", Long.toString(4000L + row));
-                CaptureStreamFixture.record(observation).writeDelimitedTo(out);
+                CaptureRecordFixture.record(observation).writeDelimitedTo(out);
             }
-            CaptureStreamFixture.record(captureEnd(rows)).writeDelimitedTo(out);
+            CaptureRecordFixture.record(captureEnd(rows)).writeDelimitedTo(out);
         }
         long rawBytes = Files.size(body);
         String rawSha256 = CaptureInput.hex(digest.digest());
@@ -368,7 +367,7 @@ final class ScaleFixture {
         try (var out = new BufferedOutputStream(Files.newOutputStream(result));
                 var in = new BufferedInputStream(Files.newInputStream(body))) {
             in.transferTo(out);
-            CaptureStreamFixture.record(footer).writeDelimitedTo(out);
+            CaptureRecordFixture.record(footer).writeDelimitedTo(out);
         }
         Files.delete(body);
         return result;

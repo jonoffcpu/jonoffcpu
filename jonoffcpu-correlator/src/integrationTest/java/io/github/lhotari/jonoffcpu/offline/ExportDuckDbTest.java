@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.offline;
 
-import static io.github.lhotari.jonoffcpu.offline.ExportTest.frame;
+import static io.github.lhotari.jonoffcpu.offline.ExportFixture.frame;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.fail;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
@@ -84,7 +84,7 @@ class ExportDuckDbTest {
                         new StackProfile.Header(List.of(), List.of("reason", "thread"), false, "{}", "", List.of()),
                         entries)
                 .write(profile);
-        Path rows = ExportTest.export(dir, "sql.jsonl", profile, "--format", "jsonl", "--run-label", "a");
+        Path rows = ExportFixture.export(dir, "sql.jsonl", profile, "--format", "jsonl", "--run-label", "a");
         String types = duckdb(
                 duckdb,
                 "DESCRIBE SELECT javaFrames, javaFrameKinds, observedNanos, run, estimateAvailable FROM read_json('"

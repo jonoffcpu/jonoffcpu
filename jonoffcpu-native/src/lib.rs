@@ -33,7 +33,8 @@ pub mod bpf_endpoint_boundary {
     include!(concat!(env!("OUT_DIR"), "/endpoint_boundary.skel.rs"));
 }
 
-/// The capture stream schema, generated from docs/schema/jonoffcpu-capture.proto.
+/// The capture stream schema, generated from
+/// jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto.
 #[allow(clippy::all)]
 pub mod capture {
     include!(concat!(

@@ -2,9 +2,10 @@
 // default), with sources and javadoc JARs for Maven Central. Tests are JUnit Jupiter with AssertJ and Awaitility, in
 // two suites: `test` holds unit tests that run on any platform with Java, and `integrationTest` holds the tests that
 // need the native bundle, a packaged JAR or an external tool. `check` runs both, with the root project's formatting
-// check.
+// check. What both suites share, fixture builders and the workloads the tests launch, is in `testFixtures`.
 plugins {
     `java-library`
+    `java-test-fixtures`
     `jvm-test-suite`
 }
 
@@ -51,10 +52,12 @@ testing {
         }
         register<JvmTestSuite>("integrationTest") {
             dependencies {
-                // The classes themselves, as the unit tests see them: a shaded module's plain JAR is never built.
+                implementation(project())
+                // The classes also as directories: a container run puts directories ahead of every JAR, so the
+                // module's own classes win over their relocated copies in its shaded JAR.
                 implementation(sourceSets.main.get().output)
-                // The unit tests' fixture builders and JFR event types, shared rather than copied.
-                implementation(sourceSets.test.get().output)
+                // The fixtures the unit tests see, shared rather than copied.
+                implementation(testFixtures(project()))
             }
             targets.configureEach {
                 testTask.configure { shouldRunAfter(tasks.test) }
@@ -63,8 +66,19 @@ testing {
     }
 }
 
-// Integration tests see what the unit tests see: the module's own dependencies, which a shaded module declares
-// compileOnly, and the unit tests' runtime libraries.
+// The fixtures are the tests' own and are never published, whichever component a module publishes.
+val javaComponent = components["java"] as AdhocComponentWithVariants
+configurations
+    .matching { it.name.startsWith("testFixtures") && it.name.endsWith("Elements") }
+    .configureEach { javaComponent.withVariantsFromConfiguration(this) { skip() } }
+
+// Fixtures may check what they build with AssertJ; the rest of the test libraries stay with the suites.
+dependencies {
+    "testFixturesImplementation"(library("assertj-core"))
+}
+
+// Integration tests see what the unit tests see: the libraries a module adds to its unit tests, and their runtime
+// libraries.
 configurations.named("integrationTestImplementation") { extendsFrom(configurations.testImplementation.get()) }
 configurations.named("integrationTestRuntimeOnly") { extendsFrom(configurations.testRuntimeOnly.get()) }
 

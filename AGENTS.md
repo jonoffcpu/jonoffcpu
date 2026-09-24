@@ -28,13 +28,15 @@ smallest relevant layer before running privileged end-to-end tests.
 - Join records by capture identity and the exact 64-bit cookie. Timestamps are
   for clipping and delivery-delay analysis, never a heuristic join key.
 - The capture stream is length-delimited protobuf defined by
-  `docs/schema/jonoffcpu-capture.proto`, which is the format's single
-  definition: the collector generates its codec from it with protox (no protoc
-  in the build containers) and both Java modules with the protobuf Gradle
-  plugin. Control records keep their JSON object, still read with the strict
+  `jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`, which is
+  the format's single definition: the collector generates its codec from it
+  with protox (no protoc in the build containers), and
+  `jonoffcpu-capture-codec` generates the one Java codec with the protobuf
+  Gradle plugin, which the agent and the correlator both embed. Control records keep their JSON object, still read with the strict
   parser. Do not add a second definition of the wire format. The stack
   profile the correlator writes is a separate, derived format with its own
-  single definition in `docs/schema/jonoffcpu-profile.proto`; only the
+  single definition in
+  `jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`; only the
   correlator generates it, and a default rendering of a profile must keep
   reproducing `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 - Native stacks are interned in the stream: one `stack` record per distinct BPF
@@ -95,6 +97,10 @@ smallest relevant layer before running privileged end-to-end tests.
 - `jonoffcpu-agent`: Java 17 bytecode, Java-agent/controller code, JNI bridge,
   packaged native libraries, and native integration fixtures. Keep JFR
   post-processing out of this module.
+- `jonoffcpu-capture-codec`: Java 17 bytecode, the capture stream's generated
+  Java codec and nothing else, plus the test fixtures that encode stream records
+  for both modules' tests. It is not published: the agent and the correlator
+  embed it through `embeddedRuntime` and relocate its protobuf runtime.
 - `jonoffcpu-correlator`: Java 21 bytecode, offline correlation library and CLI,
   including synthetic compatibility JFR output.
 - `jonoffcpu-jfr-converter`: Java 21 build of async-profiler's converter
