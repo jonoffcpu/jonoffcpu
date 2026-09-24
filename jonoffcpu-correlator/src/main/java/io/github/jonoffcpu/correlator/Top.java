@@ -749,8 +749,21 @@ final class Top {
      * application frame, then the over-exclusion check. {@code digest} uses the digest's longer labels.
      */
     static void totalsRows(TopTotals totals, boolean digest, StringBuilder text) {
-        totalsRow(totals.getSelected(), digest ? "All selected" : "Selected", text);
+        if (digest) {
+            // The digest is about busy time, so it leads with it; its tables and stacks leave idle intervals out.
+            busyRows(totals, text);
+            totalsRow(totals.getIdle(), "Idle, left out below", text);
+            totalsRow(totals.getSelected(), "All selected", text);
+            totalsRow(totals.getOverExclusion(), "Over-exclusion check: idle entries with a lock-acquire frame", text);
+            return;
+        }
+        totalsRow(totals.getSelected(), "Selected", text);
         totalsRow(totals.getIdle(), "Idle", text);
+        busyRows(totals, text);
+        totalsRow(totals.getOverExclusion(), "Over-exclusion: idle entries with a lock-acquire frame", text);
+    }
+
+    private static void busyRows(TopTotals totals, StringBuilder text) {
         totalsRow(totals.getBusy(), "Busy", text);
         if (totals.hasBusyApplication()) {
             totalsRow(totals.getBusyApplication(), "Busy, with an application frame", text);
@@ -758,12 +771,6 @@ final class Top {
         if (totals.hasBusyNoApplicationFrame()) {
             totalsRow(totals.getBusyNoApplicationFrame(), "Busy, no application frame", text);
         }
-        totalsRow(
-                totals.getOverExclusion(),
-                digest
-                        ? "Over-exclusion check: idle entries with a lock-acquire frame"
-                        : "Over-exclusion: idle entries with a lock-acquire frame",
-                text);
     }
 
     private static void totalsRow(TableSum sum, String label, StringBuilder text) {

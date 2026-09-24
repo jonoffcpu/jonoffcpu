@@ -287,9 +287,17 @@ class TopTest {
         assertThat(digest.hasCapture())
                 .as("A profile without a report has no capture section")
                 .isFalse();
-        assertThat(digest.getIdle().getRowsList())
+        assertThat(digest.getWhereTheTimeWent().getIdle().getValue())
                 .as("The default idle preset recognises getTask")
-                .hasSize(1);
+                .isEqualTo("7.000");
+        assertThat(digest.getBusy().getRowsList())
+                .as("The busy table leaves the idle interval out")
+                .noneMatch(row ->
+                        row.toString().contains("getTask") || row.toString().contains("x.A.loop"));
+        assertThat(markdown)
+                .as("The digest leads with busy time and has no idle table")
+                .contains("| Busy |", "| Idle, left out below |", "cover busy time only")
+                .doesNotContain("## Idle");
         assertThat(markdown).as("The digest says how to reproduce each table").contains("## How to reproduce");
     }
 

@@ -323,6 +323,21 @@ final class Cli {
         boolean summaryOutput;
 
         @Option(
+                names = "--idle",
+                paramLabel = "REGEX",
+                description = "For the digest: an interval with a frame matching this is idle, a wait for work, and"
+                        + " the digest's tables and stacks leave it out. The other outputs keep every interval."
+                        + " Repeatable.")
+        List<String> idle = new ArrayList<>();
+
+        @Option(
+                names = "--idle-from",
+                paramLabel = "FILE",
+                description = "Read --idle patterns from a file or preset:NAME; repeatable. Default, when no idle"
+                        + " pattern is given: preset:jvm-idle.")
+        List<String> idleFrom = new ArrayList<>();
+
+        @Option(
                 names = "--max-profile-entries",
                 paramLabel = "N",
                 defaultValue = "2000000",
@@ -684,6 +699,8 @@ final class Cli {
                     || options.given("--profile-group-by")
                     || options.given("--max-profile-entries")
                     || options.given("--summary-output")
+                    || options.given("--idle")
+                    || options.given("--idle-from")
                     || options.given("--max-accounted-loss")) {
                 throw options.usage("Partial mode supports diagnostics or labelled collapsed output;"
                         + " the other outputs and population estimates require complete analysis");
@@ -700,12 +717,24 @@ final class Cli {
         if (!format.equals("collapsed")) {
             throw options.usage("Invalid output format: " + format + " (only with --partial true)");
         }
+        boolean idleGiven = !options.idle.isEmpty() || !options.idleFrom.isEmpty();
+        if (idleGiven && !options.summaryOutput) {
+            throw options.usage("--idle and --idle-from shape the digest, which --summary-output false leaves out");
+        }
         ProfileAccumulator.Options profileOptions;
         Thinning thinning;
+        Digest.Options digest = null;
         try {
             profileOptions = ProfileAccumulator.Options.parse(
                     options.profileGroupBy, Integer.toString(options.maxProfileEntries));
             thinning = options.thinning != null ? Thinning.of(options.thinning, options.thinningSeed) : Thinning.NONE;
+            // Resolved before correlating, so that a bad pattern fails at once rather than after the analysis.
+            if (options.summaryOutput) {
+                digest = Digest.defaults(
+                        idleGiven
+                                ? sourced(options.idle, "--idle-from", options.idleFrom)
+                                : sourced(List.of(), "--idle-from", List.of("preset:jvm-idle")));
+            }
         } catch (IllegalArgumentException invalid) {
             throw options.usage(invalid.getMessage());
         }
@@ -724,7 +753,7 @@ final class Cli {
                 options.collapsedReasonFrame,
                 options.profileOutput,
                 profileOptions,
-                options.summaryOutput);
+                digest);
     }
 
     @Command(
@@ -972,8 +1001,8 @@ final class Cli {
         @Option(
                 names = "--idle",
                 paramLabel = "REGEX",
-                description = "An interval with a frame matching this is idle, a wait for work: it is listed in its"
-                        + " own table, not dropped. Repeatable.")
+                description = "An interval with a frame matching this is idle, a wait for work: top lists it in its"
+                        + " own table, and the digest leaves it out of its tables. Repeatable.")
         List<String> idle = new ArrayList<>();
 
         @Option(
@@ -1200,9 +1229,11 @@ final class Cli {
             sortOptions = false,
             description = {
                 "Writes the analysis digest, " + OutputFiles.SUMMARY_MD + " and " + OutputFiles.SUMMARY_JSON
-                        + ": the capture's coverage and losses, where the time went, the ranked busy and idle"
-                        + " tables, the heaviest transformed stacks, and the command that reproduces each table.",
-                "Correlation writes it by default; this command rewrites it with an application pattern."
+                        + ": the capture's coverage and losses, where the time went, the busy time ranked and"
+                        + " its heaviest transformed stacks with the idle waits left out, and the command that"
+                        + " reproduces each table.",
+                "Correlation writes it by default, with its own --idle patterns; this command rewrites it with an"
+                        + " application pattern or other idle patterns."
             })
     static final class Summarize implements Callable<Integer> {
         @Option(names = "--profile", paramLabel = "FILE", description = "The stack profile. Required.")

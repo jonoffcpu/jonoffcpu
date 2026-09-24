@@ -236,6 +236,36 @@ class CommandLineTest {
         assertThat(Files.readString(withoutDigest.resolve(OutputFiles.REPORT)))
                 .as("--summary-output false must write no digest")
                 .doesNotContain("\"digest\"");
+        // --idle-from shapes the digest alone: an idle pattern matching every frame leaves no busy time there, and
+        // every other output is the default one.
+        Path everythingIdle = Files.writeString(dir.resolve("everything-idle.txt"), "# Every frame\n.\n");
+        Path idleDigest = dir.resolve("idle-digest");
+        List<String> withIdle = new ArrayList<>(common);
+        withIdle.addAll(List.of("--output", idleDigest.toString(), "--idle-from", everythingIdle.toString()));
+        assertThat(OffCpuCorrelator.run(withIdle.toArray(String[]::new)))
+                .as("Correlation with idle patterns")
+                .isZero();
+        for (String file : List.of(OutputFiles.COLLAPSED, OutputFiles.PROFILE)) {
+            assertThat(Files.readAllBytes(idleDigest.resolve(file)))
+                    .as("--idle-from must not change %s", file)
+                    .isEqualTo(Files.readAllBytes(first.resolve(file)));
+        }
+        AnalysisProto.Digest idle = CorrelationFixture.parse(
+                        idleDigest.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+                .build();
+        assertThat(idle.getWhereTheTimeWent().getBusy().getIntervals())
+                .as("Every interval matched the idle pattern: %s", idle.getWhereTheTimeWent())
+                .isZero();
+        assertThat(idle.getWhereTheTimeWent().getIdle().getIntervals())
+                .as("Every interval matched the idle pattern: %s", idle.getWhereTheTimeWent())
+                .isEqualTo(idle.getWhereTheTimeWent().getSelected().getIntervals());
+        assertThat(Files.readString(idleDigest.resolve(OutputFiles.SUMMARY_MD)))
+                .as("The digest names the idle patterns it left out")
+                .contains(everythingIdle.toString());
+        List<String> idleWithoutDigest = new ArrayList<>(common);
+        idleWithoutDigest.addAll(List.of(
+                "--output", dir.resolve("idle-without-digest").toString(), "--summary-output", "false", "--idle", "."));
+        CommandLineFixture.usageError("--summary-output false leaves out", idleWithoutDigest.toArray(String[]::new));
         Path slice = dir.resolve("slice.collapsed");
         Path patterns = Files.writeString(dir.resolve("idle.txt"), "epollWait\n");
         assertThat(OffCpuCorrelator.run(new String[] {
