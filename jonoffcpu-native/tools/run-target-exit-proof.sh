@@ -7,7 +7,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 workspace_dir=$(dirname "$repo_dir")
 evidence_dir="$workspace_dir/pulsar-profiling/generic-signal-jfr-implementation/logs"
 image=jonoffcpu-cookie-bpf-toolchain:rust-1.85-libbpf-0.27.1
-source_output=${JONOFFCPU_TARGET_EXIT_OUTPUT:-/evidence/jonoffcpu-target-exit-source.ndjson}
+source_output=${JONOFFCPU_TARGET_EXIT_OUTPUT:-/evidence/jonoffcpu-target-exit-source.pb}
 
 docker build -t "$image" -f "$repo_dir/jonoffcpu-native/tools/Dockerfile.bpf" "$repo_dir/jonoffcpu-native/tools"
 docker run --rm --privileged \

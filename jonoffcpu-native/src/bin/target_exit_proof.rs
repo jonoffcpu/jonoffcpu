@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: MIT
 
 use anyhow::{Context, Result, bail};
+use jonoffcpu_native::capture::collector_reply::Result as Reply;
+use jonoffcpu_native::capture::record::Record;
+use jonoffcpu_native::capture::{self, CollectorReply};
 use jonoffcpu_native::{
-    JonoffcpuResult, jonoffcpu_collector_close, jonoffcpu_collector_enable,
-    jonoffcpu_collector_prepare, jonoffcpu_collector_stop, jonoffcpu_result_free,
+    JonoffcpuResult, call_collector, jonoffcpu_collector_close, jonoffcpu_collector_enable,
+    jonoffcpu_collector_prepare, jonoffcpu_collector_stop,
 };
-use serde_json::{Value, json};
+use prost::Message;
+use serde_json::json;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
@@ -72,45 +76,57 @@ fn parent_proof() -> Result<()> {
     }
 
     let output = std::env::var("JONOFFCPU_TARGET_EXIT_OUTPUT")
-        .unwrap_or_else(|_| format!("/tmp/jonoffcpu-target-exit-{child_pid}.ndjson"));
+        .unwrap_or_else(|_| format!("/tmp/jonoffcpu-target-exit-{child_pid}.pb"));
     let _ = fs::remove_file(&output);
-    let prepare = call(|out| unsafe {
-        let input = json!({
-            "targetPid": child_pid,
-            "outputPath": output,
-            "sampling": {
-                "reasons": ["blocked", "runnable", "preempted"],
-                "minOffCpuMicros": null,
-                "maxOffCpuMicros": null,
-                "admission": {
-                    "policy": "uniform",
-                    "probability": "1",
-                    "probabilityThreshold": 4_294_967_296_u64,
-                },
+    let sampling = capture::Sampling {
+        reasons: vec![
+            capture::OffCpuReason::Blocked as i32,
+            capture::OffCpuReason::Runnable as i32,
+            capture::OffCpuReason::Preempted as i32,
+        ],
+        min_off_cpu_micros: None,
+        max_off_cpu_micros: None,
+        admission: Some(capture::sampling::Admission::Uniform(
+            capture::UniformAdmission {
+                probability: "1".to_string(),
+                probability_threshold: 1 << 32,
             },
-            "timeSplit": {"source": "schedInfo"},
-        })
-        .to_string();
-        jonoffcpu_collector_prepare(input.as_ptr().cast(), input.len(), out)
+        )),
+    };
+    let time_split = capture::TimeSplit {
+        source: capture::TimeSplitSource::SchedInfo as i32,
+    };
+    let prepare_request = capture::PrepareRequest {
+        target_pid: child_pid,
+        output_path: output.clone(),
+        sampling: Some(sampling.clone()),
+        time_split: Some(time_split),
+        exclude_calling_thread: false,
+    }
+    .encode_to_vec();
+    let prepared = call(|out| unsafe {
+        jonoffcpu_collector_prepare(prepare_request.as_ptr(), prepare_request.len(), out)
     })
     .inspect_err(|_| terminate_child(&mut child))?;
-    let handle = u64::from_str_radix(
-        prepare["handle"]
-            .as_str()
-            .context("prepare response missing handle")?,
-        16,
-    )?;
-    call(|out| unsafe {
-        let input = json!({
-            "sessionId":"12345678-1234-4abc-8def-123456789abc",
-            "captureEpoch":17,
-            "signal":TARGET_SIGNAL,
-            "signalDelivery":"coalescing",
-        })
-        .to_string();
-        jonoffcpu_collector_enable(handle, input.as_ptr().cast(), input.len(), out)
-    })
-    .inspect_err(|_| terminate_child(&mut child))?;
+    let Some(Reply::Prepared(prepared)) = prepared.result else {
+        terminate_child(&mut child);
+        bail!("prepare did not return Prepared");
+    };
+    let handle = prepared.handle;
+    let enable_request = |session_id: &str, capture_epoch: u32| {
+        capture::EnableRequest {
+            session_id: session_id.to_string(),
+            capture_epoch,
+            signal: TARGET_SIGNAL,
+            signal_delivery: capture::SignalDelivery::Coalescing as i32,
+            sampling: Some(sampling.clone()),
+            time_split: Some(time_split),
+        }
+        .encode_to_vec()
+    };
+    let input = enable_request("12345678-1234-4abc-8def-123456789abc", 17);
+    call(|out| unsafe { jonoffcpu_collector_enable(handle, input.as_ptr(), input.len(), out) })
+        .inspect_err(|_| terminate_child(&mut child))?;
     thread::sleep(Duration::from_millis(100));
 
     let exit_requested = Instant::now();
@@ -128,9 +144,9 @@ fn parent_proof() -> Result<()> {
     // pidfd, detach, drain and publish captureEnd on its own.
     let end = wait_for_capture_end(&output, Duration::from_secs(10))?;
     let observed_after = exit_requested.elapsed();
-    if end["state"] != "incomplete"
-        || end["targetExited"] != true
-        || end["incompleteReason"] != "target_exited"
+    if end.state() != capture::CaptureState::Incomplete
+        || !end.target_exited
+        || end.incomplete_reason() != capture::IncompleteReason::TargetExited
     {
         bail!("automatic target-exit captureEnd has the wrong terminal state");
     }
@@ -139,7 +155,7 @@ fn parent_proof() -> Result<()> {
         // Leave the worker idle after the automatic fsync failure. It must
         // wait for a command instead of re-entering five-second finalization.
         thread::sleep(Duration::from_millis(100));
-        if capture_end_count(&output)? != 1 {
+        if record_count(&output, is_capture_end)? != 1 {
             bail!("automatic finalization retried captureEnd before Stop");
         }
 
@@ -147,65 +163,65 @@ fn parent_proof() -> Result<()> {
         // is still pending. A rejected Enable must not append another start or
         // otherwise modify the frozen source prefix.
         let source_before_enable = fs::read(&output)?;
+        let input = enable_request("22345678-1234-4abc-8def-123456789abc", 18);
         let rejected_enable = call_error(|out| unsafe {
-            let input = json!({
-                "sessionId":"22345678-1234-4abc-8def-123456789abc",
-                "captureEpoch":18,
-                "signal":TARGET_SIGNAL,
-                "signalDelivery":"coalescing",
-            })
-            .to_string();
-            jonoffcpu_collector_enable(handle, input.as_ptr().cast(), input.len(), out)
+            jonoffcpu_collector_enable(handle, input.as_ptr(), input.len(), out)
         })?;
-        if rejected_enable["error"]["code"] != "invalid_state"
+        if rejected_enable.code() != capture::CollectorErrorCode::InvalidState
             || fs::read(&output)? != source_before_enable
-            || record_type_count(&output, "captureStart")? != 1
-            || record_type_count(&output, "captureEnd")? != 1
+            || record_count(&output, |record| matches!(record, Record::CaptureStart(_)))? != 1
+            || record_count(&output, is_capture_end)? != 1
         {
-            bail!("Enable reopened a terminal-frozen collector: {rejected_enable}");
+            bail!("Enable reopened a terminal-frozen collector: {rejected_enable:?}");
         }
     }
 
     let stop = call(|out| unsafe { jonoffcpu_collector_stop(handle, 5_000, out) })?;
     let stop_retry = call(|out| unsafe { jonoffcpu_collector_stop(handle, 5_000, out) })?;
     let expected_sync_attempts = if expect_terminal_sync_retry { 2 } else { 1 };
-    if stop["state"] != "incomplete"
-        || stop["captureEnd"] != end
+    let Some(Reply::Stopped(stopped)) = stop.result.clone() else {
+        bail!("Stop did not return Stopped");
+    };
+    let publication = stopped.terminal_publication.clone().unwrap_or_default();
+    if stop.state() != capture::CollectorState::Incomplete
+        || stopped.capture_end.as_ref() != Some(&end)
         || stop_retry != stop
-        || stop["terminalPublication"]["state"] != "durable"
-        || stop["terminalPublication"]["automatic"] != true
-        || stop["terminalPublication"]["appendAttempts"] != 1
-        || stop["terminalPublication"]["flushAttempts"] != 1
-        || stop["terminalPublication"]["syncAttempts"] != expected_sync_attempts
+        || !publication.automatic
+        || publication.append_attempts != 1
+        || publication.flush_attempts != 1
+        || publication.sync_attempts != expected_sync_attempts
         || (expect_terminal_sync_retry
-            && !stop["terminalPublication"]["firstError"]
-                .as_str()
-                .is_some_and(|message| message.contains("terminal source sync failed")))
-        || (!expect_terminal_sync_retry && !stop["terminalPublication"]["firstError"].is_null())
+            && !publication
+                .first_error
+                .contains("terminal source sync failed"))
+        || (!expect_terminal_sync_retry && !publication.first_error.is_empty())
     {
-        bail!("Stop did not return the cached automatic terminal witness: {stop}");
+        bail!(
+            "Stop did not return the cached automatic terminal witness: {}",
+            serde_json::to_string(&stop)?
+        );
     }
     call(|out| unsafe { jonoffcpu_collector_close(handle, out) })?;
 
     let source = fs::read(&output).context("read retained partial source")?;
-    let rows = jonoffcpu_native::capture::decode(&source)?
-        .iter()
-        .map(jonoffcpu_native::capture::to_json)
+    let records = capture::decode(&source)?
+        .into_iter()
+        .filter_map(|record| record.record)
         .collect::<Vec<_>>();
-    let capture_end_rows = rows
+    let capture_end_records = records
         .iter()
-        .filter(|row| row["recordType"] == "captureEnd")
+        .filter(|record| is_capture_end(record))
         .count();
-    if rows.first().and_then(|row| row["recordType"].as_str()) != Some("captureStart")
-        || rows.last() != Some(&end)
-        || capture_end_rows != 1
-        || fs::metadata(&output)?.len() == 0
+    let Some(Record::CaptureStart(start)) = records.first() else {
+        bail!("partial target-exit source was not retained");
+    };
+    if records.last() != Some(&Record::CaptureEnd(end.clone()))
+        || capture_end_records != 1
+        || source.is_empty()
     {
         bail!("partial target-exit source was not retained");
     }
-    if rows[0]["targetPid"].as_u64() != Some(u64::from(child_pid))
-        || prepare["targetPid"].as_u64() != Some(u64::from(child_pid))
-    {
+    if start.target_pid != child_pid || prepared.target_pid != child_pid {
         bail!("prepared identity did not retain the exact child target");
     }
 
@@ -216,15 +232,15 @@ fn parent_proof() -> Result<()> {
             "injectedTerminalSyncEio": expect_terminal_sync_retry,
             "enableRejectedAfterTerminalFreeze": expect_terminal_sync_retry,
             "childTargetPid": child_pid,
-            "preparedHostTgid": prepare["hostTgid"],
+            "preparedHostTgid": prepared.host_tgid,
             "targetExitToCaptureEndMillis": observed_after.as_millis(),
             "captureEnd": end,
-            "terminalPublication": stop["terminalPublication"],
-            "captureEndRows": capture_end_rows,
+            "terminalPublication": publication,
+            "captureEndRecords": capture_end_records,
             "idempotentStop": true,
             "sourcePath": output,
             "sourceBytes": source.len(),
-            "sourceRows": rows.len(),
+            "sourceRecords": records.len(),
         }))?
     );
     Ok(())
@@ -245,16 +261,19 @@ fn terminate_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn wait_for_capture_end(path: &str, timeout: Duration) -> Result<Value> {
+fn is_capture_end(record: &Record) -> bool {
+    matches!(record, Record::CaptureEnd(_))
+}
+
+fn wait_for_capture_end(path: &str, timeout: Duration) -> Result<capture::CaptureEnd> {
     let deadline = Instant::now() + timeout;
     loop {
         // A partially written trailing record is expected while the collector is still finalizing.
         if let Ok(bytes) = fs::read(path) {
-            if let Ok(records) = jonoffcpu_native::capture::decode(&bytes) {
-                for record in records.iter().rev() {
-                    let row = jonoffcpu_native::capture::to_json(record);
-                    if row["recordType"] == "captureEnd" {
-                        return Ok(row);
+            if let Ok(records) = capture::decode(&bytes) {
+                for record in records.into_iter().rev() {
+                    if let Some(Record::CaptureEnd(end)) = record.record {
+                        return Ok(end);
                     }
                 }
             }
@@ -266,41 +285,33 @@ fn wait_for_capture_end(path: &str, timeout: Duration) -> Result<Value> {
     }
 }
 
-fn capture_end_count(path: &str) -> Result<usize> {
-    record_type_count(path, "captureEnd")
-}
-
-fn record_type_count(path: &str, record_type: &str) -> Result<usize> {
-    Ok(fs::read_to_string(path)?
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|row| row["recordType"] == record_type)
+fn record_count(path: &str, matches: impl Fn(&Record) -> bool) -> Result<usize> {
+    Ok(capture::decode(&fs::read(path)?)?
+        .iter()
+        .filter_map(|record| record.record.as_ref())
+        .filter(|record| matches(record))
         .count())
 }
 
-fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<Value> {
-    let (status, value) = call_result(operation)?;
+fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<CollectorReply> {
+    let (status, reply) = call_collector(operation)?;
     if status != 0 {
-        bail!("native call failed ({status}): {value}");
+        bail!(
+            "native call failed ({status}): {}",
+            serde_json::to_string(&reply)?
+        );
     }
-    Ok(value)
+    Ok(reply)
 }
 
-fn call_error(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<Value> {
-    let (status, value) = call_result(operation)?;
-    if status == 0 {
-        bail!("native call unexpectedly succeeded: {value}");
+fn call_error(
+    operation: impl FnOnce(*mut JonoffcpuResult) -> i32,
+) -> Result<capture::CollectorError> {
+    let (status, reply) = call_collector(operation)?;
+    match reply.result {
+        Some(Reply::Error(error)) if status != 0 => Ok(error),
+        other => bail!("native call unexpectedly succeeded: {other:?}"),
     }
-    Ok(value)
-}
-
-fn call_result(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<(i32, Value)> {
-    let mut result = JonoffcpuResult::default();
-    let status = operation(&mut result);
-    let bytes = unsafe { std::slice::from_raw_parts(result.json.cast::<u8>(), result.json_len) };
-    let value: Value = serde_json::from_slice(bytes)?;
-    unsafe { jonoffcpu_result_free(&mut result) };
-    Ok((status, value))
 }
 
 fn install_signal_handler(signal: i32) -> Result<()> {

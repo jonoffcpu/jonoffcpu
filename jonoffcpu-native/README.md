@@ -86,11 +86,45 @@ for that exactly counted loss in its population estimate (see
 
 The reusable collector exports the C ABI in `include/jonoffcpu_collector.h` from
 `libjonoffcpu_native.so`. Its lifecycle is disabled `prepare`, configured `enable`,
-quiesce/detach/drain `stop`, then `close`. The drain thread never observes
-itself, and a `prepare` request carrying `"excludeCallingThread": true` also
-excludes the calling thread (the agent's controller); both TIDs are compared
-inside the target's PID namespace. Run the complete lifecycle and durable
-NDJSON smoke fixture with:
+quiesce/detach/drain `stop`, then `close`. ABI version 2 exchanges encoded
+protobuf messages defined once in
+[`jonoffcpu-collector.proto`](../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-collector.proto):
+`prepare` takes an encoded `PrepareRequest` and `enable` an `EnableRequest`
+(each at most 64 KiB), `stop` and `close` take the handle (and the stop timeout)
+as plain arguments, and every call fills a `jonoffcpu_result` with an encoded
+`CollectorReply` of at most 64 KiB, which `jonoffcpu_result_free` releases. The
+reply carries the ABI version, the collector's state, and either the call's
+result (`Prepared`, `Enabled`, `Stopped` with state `COMPLETE` or `INCOMPLETE`,
+`Closed`) or a `CollectorError` with a `CollectorErrorCode`. An error reply's
+state is `STOPPING` or `CLOSING` for a stop or close that timed out and may be
+retried, and `ERROR` otherwise. The returned status is zero exactly when the
+reply is not an error; a nonzero status keeps the ABI version 1 numbering
+(1 invalid config, 2 invalid handle, 3 invalid state or target exited, 4 BPF
+unsupported, 5 I/O error, 6 internal error, 7 stop or close timeout). Errors are
+classified where they happen, by a code attached as error context, never by
+matching message text; a panic is caught and reported as an internal error.
+The JNI bridge copies these bytes to and from Java byte arrays and interprets
+none of them.
+
+The collector validates each request before acting on it: a nonzero target
+PID and output path; switch-out reasons that are nonempty, distinct and in
+canonical order; strict bounds; a uniform threshold in 1..=2^32 or a
+proportional `recordAllAboveMicros` of at least 1, without overflow in
+nanoseconds; a time-split source of `OFF` or `SCHED_INFO`; a canonical
+lowercase UUID session id; and a signal delivery that matches the signal's
+category, never left unspecified. The `none` admission is rejected, because it
+runs no off-CPU source. `enable` must repeat the prepared `sampling` and
+`timeSplit` messages exactly, and the collector echoes the messages it received
+unchanged in its replies and in `captureStart`. The proof tools print records
+and replies in the proto3 JSON mapping (generated with pbjson), and the stream
+is the protobuf format in
+[`jonoffcpu-capture.proto`](../jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto),
+format version 2.
+
+The drain thread never observes itself, and a `PrepareRequest` with
+`exclude_calling_thread` set also excludes the calling thread (the agent's
+controller); both TIDs are compared inside the target's PID namespace. Run the
+complete lifecycle and durable capture-stream smoke fixture with:
 
 ```sh
 tools/run-collector-smoke.sh
@@ -105,7 +139,7 @@ tools/run-task-lifetime-proof.sh
 An enabled collector polls its prepared pidfd in the same bounded worker loop as
 ring consumption. Target exit immediately closes the BPF gate, detaches both
 links, drains the ring and fsyncs an incomplete `captureEnd` with
-`targetExited=true` and `incompleteReason=target_exited`; it does not wait for a
+`targetExited=true` and `incompleteReason=INCOMPLETE_REASON_TARGET_EXITED`; it does not wait for a
 controller request or rediscover identity from a numeric PID. Later `stop` calls
 return the cached terminal witness. Run the real child-target fixture with:
 
@@ -117,9 +151,10 @@ Terminal publication freezes one `captureEnd` before its first append and tracks
 append, flush, and fsync separately. A transient flush or fsync failure resumes
 only that durability step when `stop` or `close` arrives; an ambiguous append
 failure is never retried. Automatic exit finalization does not spin after an I/O
-failure. The process-level fault fixture injects one fsync `EIO` and verifies one
-terminal row, a single explicit durability retry, and identical repeated `stop`
-responses:
+failure. `Stopped.terminalPublication` reports whether the stop was automatic,
+the append, flush and fsync attempts, and the first failure. The process-level
+fault fixture injects one fsync `EIO` and verifies one terminal record, a single
+explicit durability retry, and identical repeated `stop` replies:
 
 ```sh
 tools/run-target-exit-fsync-fault.sh
@@ -144,9 +179,10 @@ tools/run-time-namespace-negative.sh
 Both `captureStart` and `captureEnd` contain `wallClockCalibration`. The collector
 takes nine consecutive `CLOCK_MONOTONIC`-before, `CLOCK_REALTIME`, and
 `CLOCK_MONOTONIC`-after triples and retains the first sample with the narrowest
-monotonic bracket. The object records all selected timestamps, the floor midpoint,
-signed realtime-minus-midpoint offset, bracket width, and ceil-half midpoint
-uncertainty as decimal nanosecond strings. The bracket bounds uncertainty about
+monotonic bracket. The message records all selected timestamps, the floor midpoint,
+signed realtime-minus-midpoint offset (a `sint64`, converted with an overflow
+check), bracket width, and ceil-half midpoint uncertainty in nanoseconds. The
+bracket bounds uncertainty about
 where the realtime read occurred; it does not hide wall-clock adjustment between
 the independent start and end calibrations. A clock error or reversed monotonic
 bracket fails enable/stop instead of emitting an estimated value. End calibration
@@ -159,7 +195,7 @@ capture backend; production code does not hardcode SIGPROF.
 
 `captureStart` records a bounded signal-environment snapshot immediately before
 the gate is armed, and `captureEnd` records another after both BPF links detach.
-The snapshots include the selected signal/class and runtime real-time range,
+The snapshots include the selected signal, its delivery and the runtime real-time range,
 target `RLIMIT_SIGPENDING`, shared-user `SigQ`, and a maximum 4096-thread
 `SigBlk` audit with at most 32 blocked and unknown examples. They identify TIDs
 as names from the collector's procfs PID namespace, record the target PID
@@ -176,7 +212,7 @@ also exercise a real-time signal:
 ```sh
 tools/run-collector-pidns-proof.sh
 JONOFFCPU_SMOKE_SIGNAL=42 \
-  JONOFFCPU_SMOKE_OUTPUT=/evidence/jonoffcpu-native-signal-environment-rt-source.ndjson \
+  JONOFFCPU_SMOKE_OUTPUT=/evidence/jonoffcpu-native-signal-environment-rt-source.pb \
   tools/run-collector-pidns-proof.sh
 ```
 

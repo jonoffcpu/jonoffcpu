@@ -12,8 +12,12 @@ import os
 import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
+
+
 def capture_rows(jdk, classpath, source):
-    """The capture stream as JSON rows; the stream itself is length-delimited protobuf."""
+    """The capture stream's records in the proto3 JSON mapping, one {"<recordKind>": {...}} object
+    per record as the correlator's dump prints them; the stream itself is length-delimited
+    protobuf. 64-bit integers are decimal strings and enums are their value names."""
     dumped = subprocess.run(
         [str(jdk / "bin/java"), "-cp", classpath,
          "io.github.lhotari.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
@@ -21,7 +25,14 @@ def capture_rows(jdk, classpath, source):
     return [json.loads(line) for line in dumped.splitlines()]
 
 
+def records_of(rows, kind):
+    return [row[kind] for row in rows if kind in row]
+
+
 DELIVERIES = ("queued", "coalescing")
+DELIVERY_ENUMS = {"queued": "SIGNAL_DELIVERY_QUEUED", "coalescing": "SIGNAL_DELIVERY_COALESCING"}
+MATCHED = "CLASSIFICATION_MATCHED"
+DELAY_REJECTED = "ROW_REASON_HANDLER_DELAY_LIMIT_EXCEEDED"
 DELAY_LIMIT_NS = 5_000_000
 SIGPENDING_LIMIT = 64
 QUEUED_SIGNAL = 42
@@ -99,15 +110,25 @@ def reconcile(report):
         raise RuntimeError("Offline classifications do not reconcile")
 
 
+def row_cookie(row):
+    """A classified row's stream and exact cookie: a source row carries its observation, a JFR row
+    its sample, and either names the cookie as an unsigned decimal string."""
+    if "source" in row:
+        return "source", row["source"].get("observation", {}).get("correlationId")
+    if "jfr" in row:
+        return "jfr", row["jfr"].get("correlationId")
+    return None, None
+
+
 def exact_cookie_check(records, allow_delay_rejections):
     grouped = defaultdict(dict)
     for row in records:
-        cookie = row["record"].get("correlationId")
+        stream, cookie = row_cookie(row)
         if cookie is None:
             raise RuntimeError("Classified row has no cookie")
-        if row["stream"] in grouped[cookie]:
+        if stream in grouped[cookie]:
             raise RuntimeError("Duplicate stream/cookie in classified output")
-        grouped[cookie][row["stream"]] = row
+        grouped[cookie][stream] = row
 
     reasons = Counter()
     identifier_reasons = Counter()
@@ -119,23 +140,21 @@ def exact_cookie_check(records, allow_delay_rejections):
         for row in pair.values():
             if row.get("reason"):
                 reasons[row["reason"]] += 1
-                if "identity" in row["reason"] or "cookie" in row["reason"]:
+                if "IDENTITY" in row["reason"] or "COOKIE" in row["reason"]:
                     identifier_reasons[row["reason"]] += 1
         if source and sample:
-            if source["record"]["correlationId"] != sample["record"]["correlationId"]:
+            if row_cookie(source)[1] != row_cookie(sample)[1]:
                 shifted.append(cookie)
-            if source["classification"] == "matched" and sample["classification"] != "matched":
+            if source["classification"] == MATCHED and sample["classification"] != MATCHED:
                 shifted.append(cookie)
-            if sample["classification"] == "matched" and source["classification"] != "matched":
+            if sample["classification"] == MATCHED and source["classification"] != MATCHED:
                 shifted.append(cookie)
-            if source.get("reason") == "handler-delay-limit-exceeded" \
-                    or sample.get("reason") == "handler-delay-limit-exceeded":
-                if (source.get("reason") != "handler-delay-limit-exceeded"
-                        or sample.get("reason") != "handler-delay-limit-exceeded"):
+            if source.get("reason") == DELAY_REJECTED or sample.get("reason") == DELAY_REJECTED:
+                if source.get("reason") != DELAY_REJECTED or sample.get("reason") != DELAY_REJECTED:
                     shifted.append(cookie)
                 delay_pairs += 1
-        elif (source and source["classification"] == "matched") \
-                or (sample and sample["classification"] == "matched"):
+        elif (source and source["classification"] == MATCHED) \
+                or (sample and sample["classification"] == MATCHED):
             shifted.append(cookie)
     if shifted:
         raise RuntimeError("One-sided or shifted exact-cookie classification")
@@ -172,25 +191,27 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
         raise RuntimeError("Exact analysis contains orphan, invalid, or unverified rows")
 
     source_rows = rows(jdk, classpath, case / "jonoffcpu-capture.pb")
-    start = next(row for row in source_rows if row.get("recordType") == "captureStart")
-    end = next(row for row in source_rows if row.get("recordType") == "captureEnd")
-    footer = source_rows[-1]
-    if footer.get("recordType") != "captureFinalized" or footer.get("state") != "complete":
+    start = records_of(source_rows, "captureStart")[0]
+    end = records_of(source_rows, "captureEnd")[0]
+    footer = source_rows[-1].get("captureFinalized")
+    if footer is None or footer.get("state") != "FINALIZED_STATE_COMPLETE":
         raise RuntimeError("Missing complete captureFinalized footer")
-    if start["signal"] != signo or start["signalDelivery"] != delivery:
+    if start["signal"] != signo or start["signalDelivery"] != DELIVERY_ENUMS[delivery]:
         raise RuntimeError("Effective native signal policy differs from requested policy")
-    kernel = end["counters"]["kernel"]
-    userspace = end["counters"]["userspace"]
+    kernel = end["kernelCounters"]
+    userspace = end["userspaceCounters"]
     if int(kernel["ringReserveFailures"]) or int(kernel["targetNamespaceFailures"]):
         raise RuntimeError("Native source overflowed or lost namespace identity")
     if int(userspace["receivedObservations"]) != exact["sourceRows"]:
         raise RuntimeError("Native observation and offline source counts differ")
 
     environment = end["signalEnvironment"]
-    if environment["selectedSignal"] != signo or environment["signalDelivery"] != delivery:
+    if environment["selectedSignal"] != signo \
+            or environment["signalDelivery"] != DELIVERY_ENUMS[delivery]:
         raise RuntimeError("Terminal signal diagnostics have the wrong policy")
     limit = environment["rlimitSigpending"]
-    if limit["status"] != "ok" or limit["soft"] != str(SIGPENDING_LIMIT):
+    if limit["status"] != "DIAGNOSTIC_STATUS_OK" \
+            or limit.get("soft", {}).get("limit") != str(SIGPENDING_LIMIT):
         raise RuntimeError("Constrained RLIMIT_SIGPENDING was not observed")
     workload = json.loads((case / "workload.json").read_text())
     audit_tid = workload["targetTids"]["jonoffcpu-pressure-audit-blocked"]
@@ -221,9 +242,9 @@ def analyze_case(module, ap, jdk, case, delivery, signo):
         "schemaVersion": 1,
         "delivery": delivery,
         "signal": signo,
-        "signalClass": environment["signalClass"],
+        "signalClass": "realtime" if delivery == "queued" else "standard",
         "sigpendingLimit": SIGPENDING_LIMIT,
-        "sigQAtDetach": environment["sigQ"],
+        "sigQAtDetach": environment["signalQueue"],
         "blockedAuditTid": audit_tid,
         "blockedThreadsAtDetach": mask_audit["blockedThreads"],
         "selectedIntervals": selected,

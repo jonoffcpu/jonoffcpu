@@ -7,7 +7,7 @@ repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 workspace_dir=$(dirname "$repo_dir")
 evidence_dir="$workspace_dir/pulsar-profiling/generic-signal-jfr-implementation/logs"
 image=jonoffcpu-cookie-bpf-toolchain:rust-1.85-libbpf-0.27.1
-smoke_output=${JONOFFCPU_SMOKE_OUTPUT:-/evidence/jonoffcpu-native-collector-pidns-source.ndjson}
+smoke_output=${JONOFFCPU_SMOKE_OUTPUT:-/evidence/jonoffcpu-native-collector-pidns-source.pb}
 
 docker build -t "$image" -f "$repo_dir/jonoffcpu-native/tools/Dockerfile.bpf" "$repo_dir/jonoffcpu-native/tools"
 # Deliberately omit --pid=host. The target sees its container PID while BPF

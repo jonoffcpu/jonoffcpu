@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 use anyhow::{Context, Result, bail};
+use jonoffcpu_native::capture::collector_reply::Result as Reply;
+use jonoffcpu_native::capture::record::Record;
+use jonoffcpu_native::capture::{self, CollectorReply};
 use jonoffcpu_native::{
-    JonoffcpuResult, jonoffcpu_collector_close, jonoffcpu_collector_enable,
-    jonoffcpu_collector_prepare, jonoffcpu_collector_stop, jonoffcpu_result_free,
+    JonoffcpuResult, call_collector, jonoffcpu_collector_close, jonoffcpu_collector_enable,
+    jonoffcpu_collector_prepare, jonoffcpu_collector_stop,
 };
-use serde_json::{Value, json};
+use prost::Message;
+use serde_json::json;
 use std::fs;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
@@ -49,44 +53,62 @@ fn main() -> Result<()> {
     });
     let blocked_tid = blocked_tid_rx.recv()?;
     let output = std::env::var("JONOFFCPU_SMOKE_OUTPUT").unwrap_or_else(|_| {
-        format!("/tmp/jonoffcpu-native-smoke-{}.ndjson", unsafe {
+        format!("/tmp/jonoffcpu-native-smoke-{}.pb", unsafe {
             libc::getpid()
         })
     });
     let _ = fs::remove_file(&output);
-    let prepare = call(|out| unsafe {
-        let json = json!({
-            "targetPid": libc::getpid(),
-            "outputPath": output,
-            "sampling": {
-                "reasons": ["blocked", "runnable", "preempted"],
-                "minOffCpuMicros": null,
-                "maxOffCpuMicros": null,
-                "admission": {
-                    "policy": "uniform",
-                    "probability": "1",
-                    "probabilityThreshold": 4_294_967_296_u64,
-                },
+    let sampling = capture::Sampling {
+        reasons: vec![
+            capture::OffCpuReason::Blocked as i32,
+            capture::OffCpuReason::Runnable as i32,
+            capture::OffCpuReason::Preempted as i32,
+        ],
+        min_off_cpu_micros: None,
+        max_off_cpu_micros: None,
+        admission: Some(capture::sampling::Admission::Uniform(
+            capture::UniformAdmission {
+                probability: "1".to_string(),
+                probability_threshold: 1 << 32,
             },
-            "timeSplit": {"source": "schedInfo"},
-        })
-        .to_string();
-        jonoffcpu_collector_prepare(json.as_ptr().cast(), json.len(), out)
-    })?;
-    let handle = u64::from_str_radix(
-        prepare["handle"]
-            .as_str()
-            .context("prepare response missing handle")?,
-        16,
-    )?;
+        )),
+    };
+    let time_split = capture::TimeSplit {
+        source: capture::TimeSplitSource::SchedInfo as i32,
+    };
+    let prepare_request = capture::PrepareRequest {
+        target_pid: unsafe { libc::getpid() } as u32,
+        output_path: output.clone(),
+        sampling: Some(sampling.clone()),
+        time_split: Some(time_split),
+        exclude_calling_thread: false,
+    }
+    .encode_to_vec();
+    let prepared = match call(|out| unsafe {
+        jonoffcpu_collector_prepare(prepare_request.as_ptr(), prepare_request.len(), out)
+    })?
+    .result
+    {
+        Some(Reply::Prepared(prepared)) => prepared,
+        other => bail!("prepare did not return Prepared: {other:?}"),
+    };
+    let handle = prepared.handle;
+    let delivery = if signal >= libc::SIGRTMIN() && signal <= libc::SIGRTMAX() {
+        capture::SignalDelivery::Queued
+    } else {
+        capture::SignalDelivery::Coalescing
+    };
+    let enable_request = capture::EnableRequest {
+        session_id: "12345678-1234-4abc-8def-123456789abc".to_string(),
+        capture_epoch: 2_147_483_649,
+        signal,
+        signal_delivery: delivery as i32,
+        sampling: Some(sampling),
+        time_split: Some(time_split),
+    }
+    .encode_to_vec();
     call(|out| unsafe {
-        let json = json!({
-            "sessionId":"12345678-1234-4abc-8def-123456789abc",
-            "captureEpoch":2_147_483_649_u32,
-            "signal":signal,
-        })
-        .to_string();
-        jonoffcpu_collector_enable(handle, json.as_ptr().cast(), json.len(), out)
+        jonoffcpu_collector_enable(handle, enable_request.as_ptr(), enable_request.len(), out)
     })?;
     for _ in 0..20 {
         thread::sleep(Duration::from_millis(2));
@@ -96,7 +118,7 @@ fn main() -> Result<()> {
     }
     let stop = call(|out| unsafe { jonoffcpu_collector_stop(handle, 5_000, out) })?;
     let stop_retry = call(|out| unsafe { jonoffcpu_collector_stop(handle, 5_000, out) })?;
-    if stop_retry["captureEnd"] != stop["captureEnd"] {
+    if stop_retry != stop {
         bail!("idempotent stop did not return the cached terminal witness");
     }
     keep_blocked_thread.store(false, Ordering::Relaxed);
@@ -124,118 +146,98 @@ fn main() -> Result<()> {
             .open(&output)
             .context("source artifact was not appendable after close")?,
     );
-    let rows = jonoffcpu_native::capture::decode(&fs::read(&output)?)?
-        .iter()
-        .map(jonoffcpu_native::capture::to_json)
-        .collect::<Vec<_>>();
-    if rows.first().and_then(|row| row["recordType"].as_str()) != Some("captureStart")
-        || rows.last().and_then(|row| row["recordType"].as_str()) != Some("captureEnd")
-    {
-        bail!("source artifact does not have start/end control rows");
-    }
-    for control in [rows.first().unwrap(), rows.last().unwrap()] {
-        verify_wall_clock_calibration(&control["wallClockCalibration"])?;
-        let environment = &control["signalEnvironment"];
-        let audit = &environment["threadMaskAudit"];
-        let expected_class = if signal >= libc::SIGRTMIN() && signal <= libc::SIGRTMAX() {
-            "realtime"
-        } else {
-            "standard"
-        };
-        if environment["selectedSignal"].as_i64() != Some(signal as i64)
-            || environment["signalClass"] != expected_class
-            || environment["rlimitSigpending"]["status"] != "ok"
-            || environment["sigQ"]["status"] != "ok"
-            || audit["status"] == "unavailable"
-            || audit["blockedThreads"]
-                .as_str()
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_none_or(|value| value == 0)
-            || !audit["blockedTidExamples"]
-                .as_array()
-                .is_some_and(|examples| {
-                    examples
-                        .iter()
-                        .any(|tid| tid.as_u64() == Some(blocked_tid as u64))
-                })
+    let records = capture::decode(&fs::read(&output)?)?;
+    let (Some(Record::CaptureStart(start)), Some(Record::CaptureEnd(end))) = (
+        records.first().and_then(|record| record.record.as_ref()),
+        records.last().and_then(|record| record.record.as_ref()),
+    ) else {
+        bail!("source artifact does not have start/end control records");
+    };
+    for (calibration, environment) in [
+        (&start.wall_clock_calibration, &start.signal_environment),
+        (&end.wall_clock_calibration, &end.signal_environment),
+    ] {
+        verify_wall_clock_calibration(
+            calibration
+                .as_ref()
+                .context("control record has no wall-clock calibration")?,
+        )?;
+        let environment = environment
+            .as_ref()
+            .context("control record has no signal environment")?;
+        let ok = capture::DiagnosticStatus::Ok;
+        let audit = environment.thread_mask_audit.clone().unwrap_or_default();
+        if environment.selected_signal != signal
+            || environment.signal_delivery() != delivery
+            || environment
+                .rlimit_sigpending
+                .as_ref()
+                .is_none_or(|limit| limit.status() != ok)
+            || environment
+                .signal_queue
+                .as_ref()
+                .is_none_or(|queue| queue.status() != ok)
+            || audit.status() == capture::DiagnosticStatus::Unavailable
+            || audit.status() == capture::DiagnosticStatus::Unspecified
+            || audit.blocked_threads == 0
+            || !audit.blocked_tid_examples.contains(&blocked_tid)
         {
             bail!("source artifact did not retain the blocked-thread signal environment audit");
         }
     }
-    let observation_rows = rows
+    let observations = records
         .iter()
-        .filter(|row| row["recordType"] == "observation")
+        .filter_map(|record| match &record.record {
+            Some(Record::Observation(observation)) => Some(observation),
+            _ => None,
+        })
         .collect::<Vec<_>>();
-    let observations = observation_rows.len();
-    if observations == 0 || COOKIE.load(Ordering::Relaxed) & (1u64 << 63) == 0 {
+    if observations.is_empty() || COOKIE.load(Ordering::Relaxed) & (1u64 << 63) == 0 {
         bail!("collector did not deliver a bit-63 cookie observation");
     }
-    let target_pid = unsafe { libc::getpid() } as u64;
-    if observation_rows.iter().any(|row| {
-        row["targetTgid"].as_u64() != Some(target_pid)
-            || row["targetTid"].as_u64().is_none_or(|tid| tid == 0)
-    }) {
+    let target_pid = unsafe { libc::getpid() } as u32;
+    if observations
+        .iter()
+        .any(|row| row.target_tgid != target_pid || row.target_tid == 0)
+    {
         bail!("collector did not persist exact target-namespace process/thread IDs");
     }
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
-            "prepare":prepare,
-            "stop":stop,
-            "idempotentStopAndConcurrentClose":true,
-            "sourcePath":output,
-            "rows":rows.len(),
-            "observations":observations,
-            "targetNamespaceTgid":target_pid,
-            "targetNamespaceMapped":observation_rows.len(),
-            "blockedAuditTid":blocked_tid,
-            "cookie":format!("{:016x}", COOKIE.load(Ordering::Relaxed)),
-            "appendableAfterClose":true,
+            "prepare": prepared,
+            "stop": stop,
+            "idempotentStopAndConcurrentClose": true,
+            "sourcePath": output,
+            "records": records.len(),
+            "observations": observations.len(),
+            "targetNamespaceTgid": target_pid,
+            "targetNamespaceMapped": observations.len(),
+            "blockedAuditTid": blocked_tid,
+            "cookie": format!("{:016x}", COOKIE.load(Ordering::Relaxed)),
+            "appendableAfterClose": true,
         }))?
     );
     Ok(())
 }
 
-fn verify_wall_clock_calibration(calibration: &Value) -> Result<()> {
-    let decimal_u64 = |field: &str| -> Result<u64> {
-        calibration[field]
-            .as_str()
-            .with_context(|| format!("wall-clock calibration missing {field}"))?
-            .parse::<u64>()
-            .with_context(|| format!("wall-clock calibration invalid {field}"))
-    };
-    if calibration["schemaVersion"] != 1
-        || calibration["method"] != "clock_gettime-bracket-v1"
-        || calibration["sampleCount"] != 9
-        || calibration["selectedSampleIndex"]
-            .as_u64()
-            .is_none_or(|index| index >= 9)
-        || calibration["monotonicClock"] != "CLOCK_MONOTONIC"
-        || calibration["wallClock"] != "CLOCK_REALTIME"
-    {
-        bail!("wall-clock calibration schema mismatch");
+fn verify_wall_clock_calibration(calibration: &capture::WallClockCalibration) -> Result<()> {
+    if calibration.sample_count != 9 || calibration.selected_sample_index >= 9 {
+        bail!("wall-clock calibration sample mismatch");
     }
-    let before = decimal_u64("monotonicBeforeNanos")?;
-    let realtime = decimal_u64("realtimeNanos")?;
-    let after = decimal_u64("monotonicAfterNanos")?;
-    let midpoint = decimal_u64("monotonicMidpointNanos")?;
-    let width = decimal_u64("bracketWidthNanos")?;
-    let uncertainty = decimal_u64("midpointUncertaintyNanos")?;
-    let offset = calibration["realtimeMinusMonotonicNanos"]
-        .as_str()
-        .context("wall-clock calibration missing signed offset")?
-        .parse::<i128>()
-        .context("wall-clock calibration invalid signed offset")?;
-    if after.checked_sub(before) != Some(width)
+    let before = calibration.monotonic_before_nanos;
+    let midpoint = calibration.monotonic_midpoint_nanos;
+    let width = calibration.bracket_width_nanos;
+    if calibration.monotonic_after_nanos.checked_sub(before) != Some(width)
         || midpoint != before + width / 2
-        || uncertainty != width / 2 + width % 2
-        || offset != i128::from(realtime) - i128::from(midpoint)
+        || calibration.midpoint_uncertainty_nanos != width / 2 + width % 2
+        || i128::from(calibration.realtime_minus_monotonic_nanos)
+            != i128::from(calibration.realtime_nanos) - i128::from(midpoint)
     {
         bail!("wall-clock calibration derived values disagree");
     }
     Ok(())
 }
-
 fn block_signal(signal: i32) -> Result<()> {
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
@@ -251,16 +253,15 @@ fn block_signal(signal: i32) -> Result<()> {
     Ok(())
 }
 
-fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<Value> {
-    let mut result = JonoffcpuResult::default();
-    let status = operation(&mut result);
-    let bytes = unsafe { std::slice::from_raw_parts(result.json.cast::<u8>(), result.json_len) };
-    let value: Value = serde_json::from_slice(bytes)?;
-    unsafe { jonoffcpu_result_free(&mut result) };
+fn call(operation: impl FnOnce(*mut JonoffcpuResult) -> i32) -> Result<CollectorReply> {
+    let (status, reply) = call_collector(operation)?;
     if status != 0 {
-        bail!("native call failed ({status}): {value}");
+        bail!(
+            "native call failed ({status}): {}",
+            serde_json::to_string(&reply)?
+        );
     }
-    Ok(value)
+    Ok(reply)
 }
 
 fn install_signal_handler(signal: i32) -> Result<()> {
