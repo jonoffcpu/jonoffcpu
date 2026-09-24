@@ -1,5 +1,4 @@
-# Every library and plugin version of the build, declared once. The embedded libraries' SHA-256 digests are pinned
-# next to their use in the module build scripts, which verify them before shading.
+# Every library and plugin version of the build, declared once.
 [versions]
 protobuf = "4.33.1"
 jmc-writer = "9.1.2"
