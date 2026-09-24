@@ -14,12 +14,12 @@
 
 syntax = "proto3";
 
-package io.github.jonoffcpu.jonoffcpu.report.v1;
+package io.github.jonoffcpu.report.v1;
 
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-signals.proto";
 
-option java_package = "io.github.jonoffcpu.jonoffcpu.offline";
+option java_package = "io.github.jonoffcpu.offline";
 option java_outer_classname = "ReportProto";
 
 // ---------------------------------------------------------------------------------------------------
@@ -37,7 +37,7 @@ message Report {
   optional uint64 kept_source_rows = 5;
   optional uint64 observed_kept_duration_nanos = 6;
   // The footer's copy, verbatim.
-  io.github.jonoffcpu.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 7;
+  io.github.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 7;
   SourceCounters source_counters = 8;
   // async-profiler's `stopped-at`, from its stop reply.
   uint64 ap_stopped_at_nanos = 9;
@@ -71,8 +71,8 @@ message Report {
 }
 
 message SourceCounters {
-  io.github.jonoffcpu.jonoffcpu.capture.v1.KernelCounters kernel = 1;
-  io.github.jonoffcpu.jonoffcpu.capture.v1.UserspaceCounters userspace = 2;
+  io.github.jonoffcpu.capture.v1.KernelCounters kernel = 1;
+  io.github.jonoffcpu.capture.v1.UserspaceCounters userspace = 2;
 }
 
 message SourceThinning {
@@ -161,7 +161,7 @@ message SyntheticJfr {
 message OffCpuReasons {
   string semantics = 1;
   // The reasons the kernel kept, from the capture's sampling.
-  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason selected = 2;
+  repeated io.github.jonoffcpu.capture.v1.OffCpuReason selected = 2;
   // One entry per selected reason, in the canonical order.
   repeated ReasonTotals matched = 3;
   TimeSplitReport time_split = 4;
@@ -172,7 +172,7 @@ message OffCpuReasons {
 }
 
 message ReasonTotals {
-  io.github.jonoffcpu.jonoffcpu.capture.v1.OffCpuReason reason = 1;
+  io.github.jonoffcpu.capture.v1.OffCpuReason reason = 1;
   uint64 intervals = 2;
   uint64 observed_nanos = 3;
   uint64 sleeping_nanos = 4;
@@ -181,7 +181,7 @@ message ReasonTotals {
 }
 
 message TimeSplitReport {
-  io.github.jonoffcpu.jonoffcpu.capture.v1.TimeSplitSource source = 1;
+  io.github.jonoffcpu.capture.v1.TimeSplitSource source = 1;
   bool available = 2;
   string rule = 3;
   UnsplitIntervals unsplit_intervals = 4;
@@ -280,16 +280,16 @@ message ClassifiedRecord {
   optional RowReason reason = 3;
   oneof record {
     ClassifiedObservation source = 4;
-    io.github.jonoffcpu.jonoffcpu.signals.v1.SignalSample jfr = 5;
+    io.github.jonoffcpu.signals.v1.SignalSample jfr = 5;
   }
 }
 
 // An observation with both of its interned native stacks expanded, so the row is self-contained.
 message ClassifiedObservation {
-  io.github.jonoffcpu.jonoffcpu.capture.v1.Observation observation = 1;
+  io.github.jonoffcpu.capture.v1.Observation observation = 1;
   // Empty when the observation carries the stack's error instead.
-  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.Frame kernel_frames = 2;
-  repeated io.github.jonoffcpu.jonoffcpu.capture.v1.Frame user_frames = 3;
+  repeated io.github.jonoffcpu.capture.v1.Frame kernel_frames = 2;
+  repeated io.github.jonoffcpu.capture.v1.Frame user_frames = 3;
 }
 
 enum Classification {
@@ -355,12 +355,12 @@ message PartialReport {
   ArtifactVerification artifact_verification = 8;
   FooterVerification clock_verification = 9;
   FooterVerification ap_stop_verification = 10;
-  io.github.jonoffcpu.jonoffcpu.capture.v1.CaptureStart observed_source_capture = 11;
+  io.github.jonoffcpu.capture.v1.CaptureStart observed_source_capture = 11;
   // Each set when the prefix holds it.
-  io.github.jonoffcpu.jonoffcpu.capture.v1.CaptureEnd observed_source_end = 12;
-  io.github.jonoffcpu.jonoffcpu.capture.v1.CaptureFinalized observed_finalization = 13;
-  io.github.jonoffcpu.jonoffcpu.signals.v1.SignalCapture observed_jfr_capture = 14;
-  io.github.jonoffcpu.jonoffcpu.signals.v1.SignalCaptureStats observed_ap_stats = 15;
+  io.github.jonoffcpu.capture.v1.CaptureEnd observed_source_end = 12;
+  io.github.jonoffcpu.capture.v1.CaptureFinalized observed_finalization = 13;
+  io.github.jonoffcpu.signals.v1.SignalCapture observed_jfr_capture = 14;
+  io.github.jonoffcpu.signals.v1.SignalCaptureStats observed_ap_stats = 15;
   JfrParse jfr_parse = 16;
   Window window = 17;
   uint64 source_rows = 18;

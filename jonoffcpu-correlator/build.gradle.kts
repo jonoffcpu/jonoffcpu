@@ -65,7 +65,7 @@ val generateVersionResource =
             val file =
                 outputDir
                     .get()
-                    .file("io/github/jonoffcpu/jonoffcpu/offline/version.properties")
+                    .file("io/github/jonoffcpu/offline/version.properties")
                     .asFile
             file.parentFile.mkdirs()
             file.writeText("version=$version\nasyncProfilerCommit=${commit.get()}\n")
@@ -121,12 +121,12 @@ val compileJmcWriterPatch =
 val jmcWriterPatchClasses = compileJmcWriterPatch.flatMap { it.destinationDirectory }
 
 tasks.shadowJar {
-    relocate("com.google.protobuf", "io.github.jonoffcpu.jonoffcpu.correlator.internal.shaded.protobuf")
-    relocate("com.google.gson", "io.github.jonoffcpu.jonoffcpu.correlator.internal.shaded.gson")
-    relocate("org.openjdk.jmc", "io.github.jonoffcpu.jonoffcpu.correlator.internal.shaded.jmc")
-    relocate("picocli", "io.github.jonoffcpu.jonoffcpu.correlator.internal.shaded.picocli")
+    relocate("com.google.protobuf", "io.github.jonoffcpu.correlator.internal.shaded.protobuf")
+    relocate("com.google.gson", "io.github.jonoffcpu.correlator.internal.shaded.gson")
+    relocate("org.openjdk.jmc", "io.github.jonoffcpu.correlator.internal.shaded.jmc")
+    relocate("picocli", "io.github.jonoffcpu.correlator.internal.shaded.picocli")
     manifest {
-        attributes("Main-Class" to "io.github.jonoffcpu.jonoffcpu.offline.OffCpuCorrelator")
+        attributes("Main-Class" to "io.github.jonoffcpu.offline.OffCpuCorrelator")
     }
     from(jmcWriterPatchClasses)
 }
@@ -142,21 +142,21 @@ val verifyRuntimeJar =
                 "META-INF/LICENSE",
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-LICENSE.txt",
                 "META-INF/licenses/org.openjdk.jmc-flightrecorder.writer-THIRD_PARTY_LICENSES.txt",
-                "io/github/jonoffcpu/jonoffcpu/offline/OffCpuCorrelator.class",
-                "io/github/jonoffcpu/jonoffcpu/offline/SignalJfrExporter.class",
-                "io/github/jonoffcpu/jonoffcpu/offline/ReportProto.class",
-                "io/github/jonoffcpu/jonoffcpu/capture/ProtoJson.class",
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
+                "io/github/jonoffcpu/offline/OffCpuCorrelator.class",
+                "io/github/jonoffcpu/offline/SignalJfrExporter.class",
+                "io/github/jonoffcpu/offline/ReportProto.class",
+                "io/github/jonoffcpu/capture/ProtoJson.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/protobuf/CodedInputStream.class",
                 // Every JSON output is printed by JsonFormat, which parses with the relocated Gson.
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/protobuf/util/JsonFormat.class",
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/gson/JsonParser.class",
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class",
-                "io/github/jonoffcpu/jonoffcpu/correlator/internal/shaded/picocli/CommandLine.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/protobuf/util/JsonFormat.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/gson/JsonParser.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/api/Recordings.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/jmc/flightrecorder/writer/ConstantPool.class",
+                "io/github/jonoffcpu/correlator/internal/shaded/picocli/CommandLine.class",
             )
         // Unrelocated dependencies, and the agent's classes.
         forbiddenPrefixes =
-            listOf("com/google/gson/", "org/openjdk/jmc/", "com/google/protobuf/", "picocli/", "io/github/jonoffcpu/jonoffcpu/agent/")
+            listOf("com/google/gson/", "org/openjdk/jmc/", "com/google/protobuf/", "picocli/", "io/github/jonoffcpu/agent/")
     }
 tasks.check {
     dependsOn(verifyRuntimeJar)
@@ -168,8 +168,8 @@ tasks.check {
 tasks.withType<Test>().configureEach {
     jvmArgs(
         "-XX:CompileCommand=quiet",
-        "-XX:CompileCommand=exclude,io.github.jonoffcpu.jonoffcpu.offline.ScaleFixture::*",
-        "-XX:CompileCommand=dontinline,io.github.jonoffcpu.jonoffcpu.offline.ScaleFixture::*",
+        "-XX:CompileCommand=exclude,io.github.jonoffcpu.offline.ScaleFixture::*",
+        "-XX:CompileCommand=dontinline,io.github.jonoffcpu.offline.ScaleFixture::*",
     )
 }
 
@@ -216,5 +216,5 @@ tasks.check {
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
 // classpath leaves out on purpose, so the packaged-JAR tests are also named.
 tasks.named<Test>("packagedJarTest") {
-    filter { includeTestsMatching("io.github.jonoffcpu.jonoffcpu.packaging.*") }
+    filter { includeTestsMatching("io.github.jonoffcpu.packaging.*") }
 }

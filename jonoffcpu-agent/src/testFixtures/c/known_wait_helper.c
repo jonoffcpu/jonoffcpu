@@ -8,14 +8,14 @@
 #include <unistd.h>
 
 JNIEXPORT jlong JNICALL
-Java_io_github_jonoffcpu_jonoffcpu_agent_KnownWaitHelper_currentTid(JNIEnv *env, jclass type) {
+Java_io_github_jonoffcpu_agent_KnownWaitHelper_currentTid(JNIEnv *env, jclass type) {
     (void)env;
     (void)type;
     return (jlong)syscall(SYS_gettid);
 }
 
 JNIEXPORT jlong JNICALL
-Java_io_github_jonoffcpu_jonoffcpu_agent_KnownWaitHelper_monotonicNanos(JNIEnv *env, jclass type) {
+Java_io_github_jonoffcpu_agent_KnownWaitHelper_monotonicNanos(JNIEnv *env, jclass type) {
     (void)type;
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
@@ -29,7 +29,7 @@ Java_io_github_jonoffcpu_jonoffcpu_agent_KnownWaitHelper_monotonicNanos(JNIEnv *
 }
 
 JNIEXPORT jint JNICALL
-Java_io_github_jonoffcpu_jonoffcpu_agent_KnownWaitHelper_nativeWaitNanos(JNIEnv *env, jclass type, jlong duration_nanos) {
+Java_io_github_jonoffcpu_agent_KnownWaitHelper_nativeWaitNanos(JNIEnv *env, jclass type, jlong duration_nanos) {
     (void)env;
     (void)type;
     if (duration_nanos <= 0) {

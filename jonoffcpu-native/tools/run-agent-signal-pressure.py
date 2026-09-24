@@ -20,7 +20,7 @@ def capture_rows(jdk, classpath, source):
     protobuf. 64-bit integers are decimal strings and enums are their value names."""
     dumped = subprocess.run(
         [str(jdk / "bin/java"), "-cp", classpath,
-         "io.github.jonoffcpu.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
+         "io.github.jonoffcpu.offline.OffCpuCorrelator", "--dump", "--source", str(source)],
         check=True, capture_output=True, text=True).stdout
     return [json.loads(line) for line in dumped.splitlines()]
 
@@ -90,7 +90,7 @@ def java_command(module, ap, jdk, case, delivery, signo, blocked_ms, recovery_ms
         "-Djonoffcpu.signalMaskLibrary=/agent/test-lib/libjonoffcpu_signal_mask.so",
         f"-agentpath:/agent/lib/libjonoffcpu.so={options}",
         "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes",
-        "io.github.jonoffcpu.jonoffcpu.agent.SignalPressureWorkload", str(signo), str(blocked_ms), str(recovery_ms),
+        "io.github.jonoffcpu.agent.SignalPressureWorkload", str(signo), str(blocked_ms), str(recovery_ms),
         "/out/workload.json",
     ]
 
@@ -167,11 +167,11 @@ def exact_cookie_check(records, allow_delay_rejections):
 
 def analyze_case(module, ap, jdk, case, delivery, signo):
     classpath = f"{module / 'build/jonoffcpu-agent.jar'}:{module / 'build/test-classes'}"
-    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.jonoffcpu.agent.MixedRecordingCheck",
+    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.agent.MixedRecordingCheck",
          case / "jonoffcpu-capture.jfr", case / "event-counts.json"], case / "category-check.log")
     for name, extra in (("analysis-exact", []),
                         ("analysis-delay-filtered", ["--max-handler-delay-ns", str(DELAY_LIMIT_NS)])):
-        run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.jonoffcpu.offline.OffCpuCorrelator",
+        run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.OffCpuCorrelator",
              "--source", case / "jonoffcpu-capture.pb", "--jfr", case / "jonoffcpu-capture.jfr",
              "--output", case / name, "--max-retained-bytes", str(1024 * 1024 * 1024),
              "--audit", "full", *extra], case / f"{name}.log")
@@ -331,7 +331,7 @@ def main():
     helper = compile_mask_helper(module, jdk, output / "mask-helper-build.log")
     build_required = (module / "build/lib/libjonoffcpu.so", module / "build/lib/libjonoffcpu_native.so",
                       module / "build/jonoffcpu-agent.jar",
-                      module / "build/test-classes/io/github/jonoffcpu/jonoffcpu/agent/SignalPressureWorkload.class", helper)
+                      module / "build/test-classes/io/github/jonoffcpu/agent/SignalPressureWorkload.class", helper)
     for file in build_required:
         if not file.is_file():
             parser.error(f"Missing built artifact: {file}")

@@ -68,8 +68,8 @@ def main():
             output / "agent-build.log", module)
     compile_helper(module, jdk, output / "helper-build.log")
     required = (module / "build/lib/libjonoffcpu.so", module / "build/jonoffcpu-agent.jar",
-                module / "build/test-classes/io/github/jonoffcpu/jonoffcpu/agent/KnownWaitAttributionWorkload.class",
-                module / "build/test-classes/io/github/jonoffcpu/jonoffcpu/offline/KnownWaitAttributionCheck.class")
+                module / "build/test-classes/io/github/jonoffcpu/agent/KnownWaitAttributionWorkload.class",
+                module / "build/test-classes/io/github/jonoffcpu/offline/KnownWaitAttributionCheck.class")
     for file in required:
         if not file.is_file():
             raise RuntimeError(f"Missing built fixture artifact: {file}")
@@ -97,7 +97,7 @@ def main():
         "-XX:ActiveProcessorCount=2", "-Djonoffcpu.knownWaitLibrary=/agent/test-lib/libjonoffcpu_known_wait.so",
         f"-agentpath:/agent/lib/libjonoffcpu.so={options}",
         "-cp", "/agent/jonoffcpu-agent.jar:/agent/test-classes",
-        "io.github.jonoffcpu.jonoffcpu.agent.KnownWaitAttributionWorkload", str(args.iterations), str(args.wait_nanos),
+        "io.github.jonoffcpu.agent.KnownWaitAttributionWorkload", str(args.iterations), str(args.wait_nanos),
         "/out/workload.json",
     ]
     (output / "command.json").write_text(json.dumps(command, indent=2) + "\n")
@@ -107,10 +107,10 @@ def main():
         make_readable(output)
 
     classpath = f"{build / 'jonoffcpu-agent.jar'}:{build / 'test-classes'}"
-    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.jonoffcpu.offline.OffCpuCorrelator",
+    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.OffCpuCorrelator",
          "--source", output / "jonoffcpu-capture.pb", "--jfr", output / "jonoffcpu-capture.jfr",
          "--output", output / "analysis"], output / "analysis.log")
-    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.jonoffcpu.offline.KnownWaitAttributionCheck",
+    run([jdk / "bin/java", "-cp", classpath, "io.github.jonoffcpu.offline.KnownWaitAttributionCheck",
          output / "jonoffcpu-capture.pb", output / "jonoffcpu-capture.jfr", output / "workload.json",
          output / "known-wait-report.json"], output / "known-wait-check.log")
     report = json.loads((output / "known-wait-report.json").read_text())

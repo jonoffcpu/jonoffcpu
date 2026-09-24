@@ -142,13 +142,13 @@ val generateNativeChecksums =
 
 tasks.shadowJar {
     dependsOn(generateNativeChecksums)
-    relocate("com.google.protobuf", "io.github.jonoffcpu.jonoffcpu.internal.shaded.protobuf")
-    relocate("com.google.gson", "io.github.jonoffcpu.jonoffcpu.internal.shaded.gson")
-    relocate("org.yaml.snakeyaml", "io.github.jonoffcpu.jonoffcpu.internal.shaded.snakeyaml")
+    relocate("com.google.protobuf", "io.github.jonoffcpu.internal.shaded.protobuf")
+    relocate("com.google.gson", "io.github.jonoffcpu.internal.shaded.gson")
+    relocate("org.yaml.snakeyaml", "io.github.jonoffcpu.internal.shaded.snakeyaml")
     manifest {
         attributes(
-            "Premain-Class" to "io.github.jonoffcpu.jonoffcpu.agent.SignalCaptureAgent",
-            "Agent-Class" to "io.github.jonoffcpu.jonoffcpu.agent.SignalCaptureAgent",
+            "Premain-Class" to "io.github.jonoffcpu.agent.SignalCaptureAgent",
+            "Agent-Class" to "io.github.jonoffcpu.agent.SignalCaptureAgent",
             "Can-Redefine-Classes" to "false",
             "Can-Retransform-Classes" to "false",
         )
@@ -175,10 +175,10 @@ val verifyRuntimeJar =
             listOf(
                 "META-INF/LICENSE",
                 "META-INF/licenses/async-profiler-LICENSE",
-                "io/github/jonoffcpu/jonoffcpu/internal/shaded/gson/Gson.class",
-                "io/github/jonoffcpu/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
-                "io/github/jonoffcpu/jonoffcpu/internal/shaded/protobuf/util/JsonFormat.class",
-                "io/github/jonoffcpu/jonoffcpu/internal/shaded/snakeyaml/Yaml.class",
+                "io/github/jonoffcpu/internal/shaded/gson/Gson.class",
+                "io/github/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
+                "io/github/jonoffcpu/internal/shaded/protobuf/util/JsonFormat.class",
+                "io/github/jonoffcpu/internal/shaded/snakeyaml/Yaml.class",
             )
         forbiddenPrefixes =
             listOf(
@@ -187,8 +187,8 @@ val verifyRuntimeJar =
                 "org/yaml/snakeyaml/",
                 "com/google/protobuf/",
                 "one/profiler/",
-                "io/github/jonoffcpu/jonoffcpu/offline/",
-                "io/github/jonoffcpu/jonoffcpu/jfr/",
+                "io/github/jonoffcpu/offline/",
+                "io/github/jonoffcpu/jfr/",
                 "org/openjdk/jmc/",
             )
     }
@@ -295,5 +295,5 @@ if (integrationTestsInContainer) {
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this
 // classpath leaves out on purpose, so the packaged-JAR tests are also named.
 tasks.named<Test>("packagedJarTest") {
-    filter { includeTestsMatching("io.github.jonoffcpu.jonoffcpu.agent.ShadedAgentJarTest") }
+    filter { includeTestsMatching("io.github.jonoffcpu.agent.ShadedAgentJarTest") }
 }
