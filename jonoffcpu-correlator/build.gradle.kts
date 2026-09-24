@@ -127,7 +127,6 @@ tasks.check {
 }
 
 tasks.named<Test>("integrationTest") {
-    classpath = classpath + files(correlatorJar)
     // The specs' reference numbers, on recordings kept outside the repository: -PjonoffcpuFixtures=DIR runs them.
     systemProperty("jonoffcpu.fixtures", providers.gradleProperty("jonoffcpuFixtures").getOrElse(""))
     (options as JUnitPlatformOptions).excludeTags("scale")
