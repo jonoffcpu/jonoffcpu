@@ -1,5 +1,6 @@
 plugins {
     id("jonoffcpu.shaded-jar-conventions")
+    id("jonoffcpu.protobuf-conventions")
 }
 
 jonoffcpu {
@@ -15,6 +16,7 @@ dependencies {
     embeddedRuntime(project(":jonoffcpu-capture-codec"))
     embeddedRuntime(libs.protobuf.java)
     embeddedRuntime(libs.protobuf.java.util)
+    // Not used by the agent's own code: protobuf-java-util's JsonFormat, which prints the manifest, needs it at run time.
     embeddedRuntime(libs.gson)
     embeddedRuntime(libs.snakeyaml)
 }
@@ -175,6 +177,7 @@ val verifyRuntimeJar =
                 "META-INF/licenses/async-profiler-LICENSE",
                 "io/github/lhotari/jonoffcpu/internal/shaded/gson/Gson.class",
                 "io/github/lhotari/jonoffcpu/internal/shaded/protobuf/CodedInputStream.class",
+                "io/github/lhotari/jonoffcpu/internal/shaded/protobuf/util/JsonFormat.class",
                 "io/github/lhotari/jonoffcpu/internal/shaded/snakeyaml/Yaml.class",
             )
         forbiddenPrefixes =

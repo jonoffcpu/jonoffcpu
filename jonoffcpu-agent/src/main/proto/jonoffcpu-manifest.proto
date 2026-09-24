@@ -1,0 +1,172 @@
+// SPDX-License-Identifier: MIT
+//
+// The agent's audit manifest, `jonoffcpu-capture.manifest.json` beside the capture stream. The agent
+// rewrites it atomically at every lifecycle step as this message's proto3 JSON mapping, printed by
+// protobuf's JsonFormat (lowerCamelCase names, 64-bit integers as decimal strings, enums by their value
+// names). It is an audit record for people and tools: the correlator never reads it, and the capture's
+// authoritative inputs stay the JFR and the finalized stream.
+
+syntax = "proto3";
+
+package io.github.lhotari.jonoffcpu.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+import "jonoffcpu-capture.proto";
+import "jonoffcpu-collector.proto";
+
+option java_package = "io.github.lhotari.jonoffcpu.agent";
+option java_outer_classname = "ManifestProto";
+
+message Manifest {
+  string session_id = 1;
+  // True exactly when `state` is `MANIFEST_STATE_COMPLETE`, published last.
+  bool complete = 2;
+  ManifestState state = 3;
+  CaptureMode mode = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp completed_at = 6;
+  ArtifactPaths artifact_paths = 7;
+  uint32 target_pid = 8;
+  string jdk_version = 9;
+  ThreadPolicy thread_policy = 10;
+  // The resolved configuration, as sent to the collector and written into the stream.
+  io.github.lhotari.jonoffcpu.capture.v1.Sampling sampling = 11;
+  io.github.lhotari.jonoffcpu.capture.v1.TimeSplit time_split = 12;
+  AsyncProfiler async_profiler = 13;
+
+  // The collector's replies, verbatim, as each call returned them.
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_prepare = 14;
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_enable = 15;
+  // The latest stop and close replies; a retried call replaces the earlier one.
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_stop = 16;
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_close = 17;
+  // Cleanup after a failed start.
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_cleanup_stop = 18;
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorReply native_cleanup_close = 19;
+  optional string native_cleanup_failure = 20;
+
+  AsyncProfilerStop async_profiler_stop = 21;
+  // async-profiler's reply to the stop issued while cleaning up a failed start, or why it failed.
+  optional string async_profiler_cleanup = 22;
+  optional string async_profiler_cleanup_failure = 23;
+
+  // The verified terminal record of the stream, once it is verified.
+  io.github.lhotari.jonoffcpu.capture.v1.CaptureEnd source_capture_end = 24;
+  ProcessStartTime process_start_time = 25;
+  // The finalized stream, footer included.
+  io.github.lhotari.jonoffcpu.capture.v1.FileArtifact correlation_artifact = 26;
+  // A copy of the footer's analysis inputs, set when the capture completes.
+  io.github.lhotari.jonoffcpu.capture.v1.AnalysisInputs analysis_inputs = 27;
+  // Set while the capture is failed or incomplete; cleared on completion.
+  Failure failure = 28;
+}
+
+// The lifecycle step the capture last reached, in order.
+enum ManifestState {
+  MANIFEST_STATE_UNSPECIFIED = 0;
+  MANIFEST_STATE_PREPARING = 1;
+  // The collector is prepared, disabled.
+  MANIFEST_STATE_PREPARED = 2;
+  // async-profiler started and its signal-capture identity was verified.
+  MANIFEST_STATE_AP_STARTED_AND_VERIFIED = 3;
+  MANIFEST_STATE_SOURCE_ENABLED = 4;
+  // `sampling.admission` is `none`: async-profiler runs alone.
+  MANIFEST_STATE_PROFILER_ONLY = 5;
+  MANIFEST_STATE_STOPPING_SOURCE = 6;
+  MANIFEST_STATE_SOURCE_STOPPED = 7;
+  // The collector closed, but its capture is not complete.
+  MANIFEST_STATE_SOURCE_INCOMPLETE = 8;
+  MANIFEST_STATE_AP_FINALIZED = 9;
+  MANIFEST_STATE_COMPLETE = 10;
+  // Starting the capture failed; `failure` says why.
+  MANIFEST_STATE_FAILED = 11;
+  // Stopping the capture failed; `failure` says why.
+  MANIFEST_STATE_INCOMPLETE = 12;
+}
+
+enum CaptureMode {
+  CAPTURE_MODE_UNSPECIFIED = 0;
+  // The off-CPU collector records intervals that async-profiler correlates by signal.
+  CAPTURE_MODE_SIGNAL_CAPTURE = 1;
+  // No collector is loaded; the JFR is the only measurement.
+  CAPTURE_MODE_PROFILER_ONLY = 2;
+}
+
+message ArtifactPaths {
+  string source = 1;
+  string jfr = 2;
+  string manifest = 3;
+}
+
+message ThreadPolicy {
+  string controller_worker = 1;
+  bool controller_worker_daemon = 2;
+  uint32 source_runtime_workers = 3;
+  string signal_targets = 4;
+}
+
+message AsyncProfiler {
+  string requested_library_path = 1;
+  string requested_options = 2;
+  // The command protocol, "signal-capture-v1".
+  string protocol = 3;
+  ActualIdentity actual_identity = 4;
+  // The capture identity async-profiler negotiated and the agent verified; unset in profiler-only mode.
+  NegotiatedCapture capture = 5;
+  // Profiler-only mode: async-profiler's reply to the plain start command.
+  optional string start_response = 6;
+}
+
+message NegotiatedCapture {
+  string session_id = 1;
+  uint32 capture_epoch = 2;
+  int32 signal = 3;
+  io.github.lhotari.jonoffcpu.capture.v1.SignalDelivery signal_delivery = 4;
+}
+
+message ActualIdentity {
+  string version = 1;
+  string cookie_protocol = 2;
+  bool singleton_capability_verified = 3;
+}
+
+// async-profiler's stop reply. In profiler-only mode only `response` is set: the plain stop has no
+// signal-capture receipt.
+message AsyncProfilerStop {
+  // The reply line, verbatim but for surrounding whitespace.
+  string response = 1;
+  optional bool finalized = 2;
+  optional uint64 stopped_at_monotonic_nanos = 3;
+  string reason = 4;
+  io.github.lhotari.jonoffcpu.capture.v1.AsyncProfilerStats counters = 5;
+}
+
+message ProcessStartTime {
+  int64 value_millis = 1;
+  // Where the value comes from; informational only, never a proof of the process generation.
+  string source = 2;
+  bool kernel_generation_proof = 3;
+}
+
+message Failure {
+  FailureCode code = 1;
+  // The exception's class, for the codes that do not name the cause precisely.
+  string exception = 2;
+  // At most 4096 characters.
+  string message = 3;
+  // Set when the collector reported the failure.
+  io.github.lhotari.jonoffcpu.capture.v1.CollectorError collector_error = 4;
+  google.protobuf.Timestamp recorded_at = 5;
+}
+
+enum FailureCode {
+  FAILURE_CODE_UNSPECIFIED = 0;
+  // The collector returned an error reply; `collector_error` holds it.
+  FAILURE_CODE_COLLECTOR_ERROR = 1;
+  // A reply, a response or an artifact broke the protocol or failed verification.
+  FAILURE_CODE_INVALID_STATE = 2;
+  FAILURE_CODE_INVALID_ARGUMENT = 3;
+  FAILURE_CODE_IO_ERROR = 4;
+  FAILURE_CODE_INTERRUPTED = 5;
+  FAILURE_CODE_INTERNAL_ERROR = 6;
+}

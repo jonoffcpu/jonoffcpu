@@ -3,12 +3,14 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorErrorCode;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorReply;
+import io.github.lhotari.jonoffcpu.capture.CollectorProto.CollectorState;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 
-/** The JNI bridge's control envelope, through the collector library of the embedded bundle. */
+/** The JNI bridge's encoded replies, through the collector library of the embedded bundle. */
 @Tag("host-native")
 class NativeCollectorJniTest {
     /** The collector of the bundle the agent JAR embeds for this JVM, which binds it once per JVM. */
@@ -18,22 +20,17 @@ class NativeCollectorJniTest {
     }
 
     @Test
-    void invalidPrepareIsRejected() {
-        JsonObject invalid = JsonSupport.controlEnvelope(NativeCollector.prepare("{}"), "prepare");
-        assertThat(invalid.get("ok").getAsBoolean())
-                .as("invalid prepare succeeded")
-                .isFalse();
-        assertThat(JsonSupport.requireString(JsonSupport.requireObject(invalid, "error"), "code"))
-                .isEqualTo("invalid_config");
+    void emptyPrepareIsRejected() {
+        CollectorReply invalid = SignalCaptureController.reply(NativeCollector.prepare(new byte[0]), "prepare");
+        assertThat(invalid.hasError()).as("an empty prepare request succeeded").isTrue();
+        assertThat(invalid.getState()).isEqualTo(CollectorState.COLLECTOR_STATE_ERROR);
+        assertThat(invalid.getError().getCode()).isEqualTo(CollectorErrorCode.COLLECTOR_ERROR_CODE_INVALID_CONFIG);
     }
 
     @Test
     void unknownHandleCloseIsRejected() {
-        JsonObject unknown = JsonSupport.controlEnvelope(NativeCollector.close(0x8000000000000001L), "close");
-        assertThat(unknown.get("ok").getAsBoolean())
-                .as("unknown close succeeded")
-                .isFalse();
-        assertThat(JsonSupport.requireString(JsonSupport.requireObject(unknown, "error"), "code"))
-                .isEqualTo("invalid_handle");
+        CollectorReply unknown = SignalCaptureController.reply(NativeCollector.close(0x8000000000000001L), "close");
+        assertThat(unknown.hasError()).as("closing an unknown handle succeeded").isTrue();
+        assertThat(unknown.getError().getCode()).isEqualTo(CollectorErrorCode.COLLECTOR_ERROR_CODE_INVALID_HANDLE);
     }
 }

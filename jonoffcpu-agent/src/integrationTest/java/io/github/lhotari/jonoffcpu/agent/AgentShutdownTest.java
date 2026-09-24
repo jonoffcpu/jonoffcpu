@@ -3,7 +3,7 @@ package io.github.lhotari.jonoffcpu.agent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureFinalized;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -77,11 +77,11 @@ class AgentShutdownTest {
     }
 
     private static void verifyFinalized(Path out, Path analysis) throws Exception {
-        JsonObject footer = CaptureChecks.completeFooter(out);
-        assertThat(footer.get("analysisInputs"))
+        CaptureFinalized footer = CaptureChecks.completeFooter(out);
+        assertThat(footer.getAnalysisInputs())
                 .as("the footer's analysis inputs")
-                .isNotNull();
-        assertThat(footer.get("apStopResponse").getAsString())
+                .isEqualTo(CaptureChecks.completeManifest(out).getAnalysisInputs());
+        assertThat(footer.getApStopResponse())
                 .as("the footer's async-profiler receipt")
                 .startsWith("signal-capture-v1 stopped ")
                 .contains(" finalized=true ");

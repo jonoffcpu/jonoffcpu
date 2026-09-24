@@ -207,7 +207,7 @@ Capture, written by the agent next to `correlationOutput` (the examples assume
 | File | Contents | Name comes from |
 | --- | --- | --- |
 | `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as NDJSON | `correlationOutput` |
-| `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag | the stem of `correlationOutput` + `.manifest.json` |
+| `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag, the native collector's replies, and the failure of an incomplete capture. The proto3 JSON of the `Manifest` message defined by [`jonoffcpu-agent/src/main/proto/jonoffcpu-manifest.proto`](jonoffcpu-agent/src/main/proto/jonoffcpu-manifest.proto) | the stem of `correlationOutput` + `.manifest.json` |
 | `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
 
 Analysis, written by the correlator into `--output`:
@@ -973,7 +973,7 @@ are listed in [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#stack-profile).
 | `sampling.admission.policy` | Required. `proportional`, `uniform`, or `none`. |
 | `sampling.admission.recordAllAboveMicros` | `proportional` only. Intervals at least this long are always recorded; shorter ones with probability `length / recordAllAboveMicros`. |
 | `sampling.admission.probability` | `uniform` only. `"0.000"` through `"1.000"`; every eligible interval is recorded with this probability. `"0"` is the same as policy `none`. Quote the value to keep its exact spelling in the capture metadata. |
-| `timeSplit.source` | `schedInfo` (default) records each interval's run-queue part from the scheduler's `sched_info.run_delay`, splitting its time into sleeping and run-queue time; `off` reads nothing, for a kernel without `CONFIG_SCHED_INFO`. See [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
+| `timeSplit.source` | `schedInfo` (default) records each interval's run-queue part from the scheduler's `sched_info.run_delay`, splitting its time into sleeping and run-queue time; `"off"` (quoted, since YAML reads a bare `off` as a boolean) reads nothing, for a kernel without `CONFIG_SCHED_INFO`. See [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
 | `signalDelivery` | `queued` (default) uses a dedicated real-time signal and never merges notifications. `coalescing` uses a standard signal and may merge them, trading lost samples for a bounded pending-signal queue. |
 | `nativeStopTimeoutMillis` | Budget for detaching the eBPF source and draining the ring buffer at stop. Default 30000. |
 | `deliveryGraceMillis` | Time allowed after detach for already-requested signals to arrive. Default 100. |
@@ -1107,8 +1107,8 @@ Set `sampling.admission.policy: none` to run plain async-profiler through the
 same `-javaagent` line. The agent then loads no eBPF program, negotiates no signal,
 and needs no BPF privileges; async-profiler is started with
 `asyncProfilerOptions` exactly as given, so the JFR contains only its ordinary
-events. The correlation path still receives a one-line stream whose
-`captureFinalized` row has `state: "profilerOnly"`, so the correlator reports
+events. The correlation path still receives a one-record stream whose
+`captureFinalized` record has state `FINALIZED_STATE_PROFILER_ONLY`, so the correlator reports
 that there is nothing to correlate instead of failing on a missing file. This
 lets a deployment keep one configuration and flip off-CPU capture on or off.
 

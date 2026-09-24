@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.GsonBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -133,8 +132,7 @@ public final class SignalPressureWorkload {
         Map<String, Long> parkCounts = new TreeMap<>();
         parks.forEach((name, count) -> parkCounts.put(name, count.get()));
         output.put("parkCounts", parkCounts);
-        Files.writeString(
-                metadata, new GsonBuilder().setPrettyPrinting().create().toJson(output) + "\n");
+        Files.writeString(metadata, FixtureJson.pretty(output));
         System.out.println("Signal pressure capture finalized: " + manifest);
     }
 

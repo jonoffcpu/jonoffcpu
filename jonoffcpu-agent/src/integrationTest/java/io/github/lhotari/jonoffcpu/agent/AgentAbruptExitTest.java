@@ -5,8 +5,9 @@ import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.JFR;
 import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.SOURCE;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import java.nio.charset.StandardCharsets;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Manifest;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.ManifestState;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Record;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -89,14 +90,12 @@ class AgentAbruptExitTest {
         Path source = out.resolve(SOURCE);
         assertThat(source).as("the partial capture stream").isNotEmptyFile();
         assertThat(out.resolve(JFR)).as("the partial recording").exists();
-        assertThat(new String(Files.readAllBytes(source), StandardCharsets.ISO_8859_1))
+        assertThat(CaptureChecks.captureRecords(out, true))
                 .as("an abrupt exit publishes no footer")
-                .doesNotContain("captureFinalized");
-        JsonObject manifest = CaptureChecks.manifest(out);
-        assertThat(manifest.get("complete").getAsBoolean())
-                .as("manifest complete")
-                .isFalse();
-        assertThat(manifest.get("state").getAsString()).as("manifest state").isNotEqualTo("complete");
+                .noneMatch(Record::hasCaptureFinalized);
+        Manifest manifest = CaptureChecks.manifest(out);
+        assertThat(manifest.getComplete()).as("manifest complete").isFalse();
+        assertThat(manifest.getState()).as("manifest state").isNotEqualTo(ManifestState.MANIFEST_STATE_COMPLETE);
         CaptureChecks.Run run = CaptureChecks.correlator(
                 "--source", source.toString(), "--jfr", out.resolve(JFR).toString(), "--output", analysis.toString());
         assertThat(run.exitCode())

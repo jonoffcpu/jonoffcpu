@@ -1,195 +1,113 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonNull;
-import com.google.gson.JsonObject;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.NoAdmission;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.OffCpuReason;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.ProportionalAdmission;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Sampling;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.UniformAdmission;
 import java.math.BigDecimal;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * The resolved sampling policy: the switch-out reasons whose intervals are eligible, optional strict duration
- * bounds, and the admission policy applied to the intervals inside them. {@link #json()} is the single
- * representation sent to the native collector, echoed by it, written into the capture stream and manifest, and
- * compared structurally by the correlator.
+ * Resolves the configuration's {@code sampling} block into the {@link Sampling} message: the switch-out reasons whose
+ * intervals are eligible, optional strict duration bounds, and the admission policy applied to the intervals inside
+ * them. The resolved message is the single representation sent to the native collector, echoed by it, written into
+ * the capture stream and manifest, and compared as a message by every consumer.
+ *
+ * <p>The configuration keeps its own friendly spellings ({@code reasons: [blocked, runnable]}, {@code policy:
+ * uniform}); only this class maps them to the schema's enums.
  */
-record SamplingConfig(Set<OffCpuReason> reasons, Long minOffCpuMicros, Long maxOffCpuMicros, Admission admission) {
+final class SamplingConfig {
     static final long CERTAIN_ADMISSION = 1L << 32;
     private static final Set<String> KEYS = Set.of("reasons", "minOffCpuMicros", "maxOffCpuMicros", "admission");
     private static final long MAX_MICROS = Long.MAX_VALUE / 1000;
     /** Blocked intervals only: preemptions are far more frequent, and recording one costs a signal and a stack walk. */
-    static final Set<OffCpuReason> DEFAULT_REASONS = EnumSet.of(OffCpuReason.BLOCKED);
+    static final List<OffCpuReason> DEFAULT_REASONS = List.of(OffCpuReason.OFF_CPU_REASON_BLOCKED);
 
-    /**
-     * Why the scheduler took a thread off the CPU, as the kernel classifies it at switch-out: {@code blocked}
-     * when it left in a waiting state, {@code runnable} when it left at an ordinary scheduling point while still
-     * running (how a user-space thread is preempted by the scheduler tick, and {@code sched_yield}), and
-     * {@code preempted} when the kernel preempted it inside the kernel. Declaration order is the canonical
-     * serialization order.
-     */
-    enum OffCpuReason {
-        BLOCKED,
-        RUNNABLE,
-        PREEMPTED;
+    private SamplingConfig() {}
 
-        String json() {
-            return name().toLowerCase(Locale.ROOT);
-        }
-
-        static OffCpuReason parse(String value) {
-            for (OffCpuReason reason : values()) {
-                if (reason.json().equals(value)) return reason;
-            }
-            throw new IllegalArgumentException("Unknown off-CPU reason: " + value);
-        }
+    /** The configuration's name of a reason: {@code blocked}, {@code runnable} or {@code preempted}. */
+    static String reasonName(OffCpuReason reason) {
+        return switch (reason) {
+            case OFF_CPU_REASON_BLOCKED -> "blocked";
+            case OFF_CPU_REASON_RUNNABLE -> "runnable";
+            case OFF_CPU_REASON_PREEMPTED -> "preempted";
+            default -> throw new IllegalArgumentException("Not an off-CPU reason: " + reason);
+        };
     }
 
-    SamplingConfig {
-        reasons = reasons == null ? null : Set.copyOf(EnumSet.copyOf(reasons));
-    }
-
-    sealed interface Admission permits None, Uniform, Proportional {
-        String policy();
-
-        JsonObject json();
-
-        /** The 32-bit-scaled threshold the kernel draws against for an interval of the given length. */
-        long admissionThreshold(long durationNanos);
-    }
-
-    /** Async-profiler only: no eBPF source is loaded. Never sent to the native collector. */
-    record None() implements Admission {
-        @Override
-        public String policy() {
-            return "none";
+    static OffCpuReason parseReason(String value) {
+        for (OffCpuReason reason :
+                EnumSet.range(OffCpuReason.OFF_CPU_REASON_BLOCKED, OffCpuReason.OFF_CPU_REASON_PREEMPTED)) {
+            if (reasonName(reason).equals(value)) return reason;
         }
-
-        @Override
-        public JsonObject json() {
-            JsonObject value = new JsonObject();
-            value.addProperty("policy", policy());
-            return value;
-        }
-
-        @Override
-        public long admissionThreshold(long durationNanos) {
-            throw new IllegalStateException("Admission policy none records no intervals");
-        }
-    }
-
-    /** Every eligible interval is admitted with the same probability {@code probabilityThreshold / 2^32}. */
-    record Uniform(BigDecimal probability, long probabilityThreshold) implements Admission {
-        @Override
-        public String policy() {
-            return "uniform";
-        }
-
-        @Override
-        public JsonObject json() {
-            JsonObject value = new JsonObject();
-            value.addProperty("policy", policy());
-            value.addProperty("probability", probability.toPlainString());
-            value.addProperty("probabilityThreshold", probabilityThreshold);
-            return value;
-        }
-
-        @Override
-        public long admissionThreshold(long durationNanos) {
-            return probabilityThreshold;
-        }
+        throw new IllegalArgumentException("Unknown off-CPU reason: " + value);
     }
 
     /**
-     * An interval of at least {@code recordAllAboveMicros} is always admitted; a shorter one with probability
-     * {@code duration / recordAllAboveMicros}, so below the reference the expected number of samples follows
-     * off-CPU time rather than interval count, and the signal rate is bounded by the total off-CPU time
-     * divided by the reference.
+     * The kernel's classification of a switch-out from the raw {@code sched_switch} arguments: preemption wins, then
+     * a zero task state is TASK_RUNNING.
      */
-    record Proportional(long recordAllAboveMicros) implements Admission {
-        @Override
-        public String policy() {
-            return "proportional";
-        }
-
-        @Override
-        public JsonObject json() {
-            JsonObject value = new JsonObject();
-            value.addProperty("policy", policy());
-            value.addProperty("recordAllAboveMicros", recordAllAboveMicros);
-            return value;
-        }
-
-        long recordAllAboveNanos() {
-            return recordAllAboveMicros * 1000;
-        }
-
-        @Override
-        public long admissionThreshold(long durationNanos) {
-            return SamplingConfig.admissionThreshold(durationNanos, recordAllAboveNanos());
-        }
+    static OffCpuReason classify(boolean preempted, int prevTaskState) {
+        if (preempted) return OffCpuReason.OFF_CPU_REASON_PREEMPTED;
+        return prevTaskState == 0 ? OffCpuReason.OFF_CPU_REASON_RUNNABLE : OffCpuReason.OFF_CPU_REASON_BLOCKED;
     }
 
-    static SamplingConfig parse(JsonObject value) {
-        for (String key : value.keySet()) {
-            if (!KEYS.contains(key)) throw new IllegalArgumentException("Unknown sampling key: " + key);
-        }
+    /** Resolves the {@code sampling} mapping of the configuration. */
+    static Sampling parse(Map<?, ?> value) {
+        ConfigValues.requireKeys(value, KEYS, "sampling");
         Long minimum = optionalMicros(value, "minOffCpuMicros");
         Long maximum = optionalMicros(value, "maxOffCpuMicros");
         if (minimum != null && maximum != null && minimum >= maximum) {
             throw new IllegalArgumentException("minOffCpuMicros must be less than maxOffCpuMicros");
         }
-        Admission admission = parseAdmission(JsonSupport.requireObject(value, "admission"));
-        if (admission instanceof None && (minimum != null || maximum != null)) {
-            throw new IllegalArgumentException("Duration bounds have no effect with admission policy none");
-        }
-        JsonElement reasons = value.get("reasons");
-        if (admission instanceof None) {
-            if (reasons != null && !reasons.isJsonNull()) {
+        Sampling.Builder sampling = Sampling.newBuilder();
+        parseAdmission(ConfigValues.requireMap(value, "admission"), sampling);
+        if (sampling.hasNone()) {
+            if (minimum != null || maximum != null) {
+                throw new IllegalArgumentException("Duration bounds have no effect with admission policy none");
+            }
+            if (value.get("reasons") != null) {
                 throw new IllegalArgumentException("Switch-out reasons have no effect with admission policy none");
             }
-            return new SamplingConfig(null, null, null, admission);
+            return sampling.build();
         }
-        return new SamplingConfig(parseReasons(reasons), minimum, maximum, admission);
+        if (minimum != null) sampling.setMinOffCpuMicros(minimum);
+        if (maximum != null) sampling.setMaxOffCpuMicros(maximum);
+        return sampling.addAllReasons(parseReasons(value.get("reasons"))).build();
     }
 
-    /** Absent means the default; otherwise a non-empty list without duplicates, in any order. */
-    private static Set<OffCpuReason> parseReasons(JsonElement element) {
-        if (element == null || element.isJsonNull()) return DEFAULT_REASONS;
-        if (!element.isJsonArray()) throw new IllegalArgumentException("sampling.reasons must be a list");
+    /** Absent means the default; otherwise a non-empty list without duplicates, in any order, kept canonical. */
+    private static List<OffCpuReason> parseReasons(Object element) {
+        if (element == null) return DEFAULT_REASONS;
+        if (!(element instanceof List<?> items)) throw new IllegalArgumentException("sampling.reasons must be a list");
         EnumSet<OffCpuReason> reasons = EnumSet.noneOf(OffCpuReason.class);
-        for (JsonElement item : element.getAsJsonArray()) {
-            if (!item.isJsonPrimitive() || !item.getAsJsonPrimitive().isString()) {
+        for (Object item : items) {
+            if (!(item instanceof String name)) {
                 throw new IllegalArgumentException("sampling.reasons must list reason names");
             }
-            if (!reasons.add(OffCpuReason.parse(item.getAsString()))) {
-                throw new IllegalArgumentException("Duplicate off-CPU reason: " + item.getAsString());
+            if (!reasons.add(parseReason(name))) {
+                throw new IllegalArgumentException("Duplicate off-CPU reason: " + name);
             }
         }
         if (reasons.isEmpty()) throw new IllegalArgumentException("sampling.reasons must not be empty");
+        // EnumSet iterates in declaration order, which is the schema's canonical order.
+        return List.copyOf(reasons);
+    }
+
+    /** The flat {@code sampling-reasons=blocked+runnable} option spelling, as the list the mapping form holds. */
+    static List<String> reasonsOption(String key, String value) {
+        List<String> reasons = List.of(value.split("\\+", -1));
+        if (reasons.contains("")) throw new IllegalArgumentException("Empty off-CPU reason in option: " + key);
         return reasons;
     }
 
-    /** The flat {@code sampling-reasons=blocked+runnable} option spelling. */
-    static JsonArray reasonsOption(String key, String value) {
-        JsonArray reasons = new JsonArray();
-        for (String reason : value.split("\\+", -1)) {
-            if (reason.isEmpty()) throw new IllegalArgumentException("Empty off-CPU reason in option: " + key);
-            reasons.add(reason);
-        }
-        return reasons;
-    }
-
-    /** The selected reasons in canonical order: blocked, runnable, preempted. */
-    List<OffCpuReason> orderedReasons() {
-        return reasons == null ? List.of() : List.copyOf(EnumSet.copyOf(reasons));
-    }
-
-    private static Admission parseAdmission(JsonObject value) {
-        String policy = JsonSupport.requireString(value, "policy");
+    private static void parseAdmission(Map<?, ?> value, Sampling.Builder sampling) {
+        String policy = ConfigValues.requireString(value, "policy");
         Set<String> allowed =
                 switch (policy) {
                     case "none" -> Set.of("policy");
@@ -197,21 +115,27 @@ record SamplingConfig(Set<OffCpuReason> reasons, Long minOffCpuMicros, Long maxO
                     case "proportional" -> Set.of("policy", "recordAllAboveMicros");
                     default -> throw new IllegalArgumentException("Unknown admission policy: " + policy);
                 };
-        for (String key : value.keySet()) {
+        for (Object key : value.keySet()) {
             if (!allowed.contains(key)) {
                 throw new IllegalArgumentException("Admission policy " + policy + " does not accept key: " + key);
             }
         }
-        return switch (policy) {
-            case "none" -> new None();
-            case "uniform" -> uniform(parseProbability(value));
-            default -> new Proportional(JsonSupport.requireNumber(value, "recordAllAboveMicros", 1, MAX_MICROS));
-        };
+        switch (policy) {
+            case "none" -> sampling.setNone(NoAdmission.getDefaultInstance());
+            case "uniform" -> uniform(parseProbability(value), sampling);
+            default ->
+                sampling.setProportional(ProportionalAdmission.newBuilder()
+                        .setRecordAllAboveMicros(
+                                ConfigValues.requireInteger(value, "recordAllAboveMicros", 1, MAX_MICROS)));
+        }
     }
 
     /** A zero probability is the explicit off switch; a positive one must keep at least one draw in 2^32. */
-    static Admission uniform(BigDecimal probability) {
-        if (probability.signum() == 0) return new None();
+    static void uniform(BigDecimal probability, Sampling.Builder sampling) {
+        if (probability.signum() == 0) {
+            sampling.setNone(NoAdmission.getDefaultInstance());
+            return;
+        }
         long threshold = probability
                 .multiply(new BigDecimal(CERTAIN_ADMISSION))
                 .toBigInteger()
@@ -220,15 +144,18 @@ record SamplingConfig(Set<OffCpuReason> reasons, Long minOffCpuMicros, Long maxO
             throw new IllegalArgumentException(
                     "probability is too small to admit any interval; use admission policy none to disable the source");
         }
-        return new Uniform(probability, threshold);
+        sampling.setUniform(UniformAdmission.newBuilder()
+                .setProbability(probability.toPlainString())
+                .setProbabilityThreshold(threshold));
     }
 
-    private static BigDecimal parseProbability(JsonObject value) {
-        JsonElement element = value.get("probability");
-        if (element == null || !element.isJsonPrimitive()) {
+    private static BigDecimal parseProbability(Map<?, ?> value) {
+        Object element = value.get("probability");
+        // YAML reads an unquoted probability as a number; its decimal text is what is checked and kept.
+        if (!(element instanceof String) && !(element instanceof Number)) {
             throw new IllegalArgumentException("Missing/decimal field probability");
         }
-        return parseProbability("probability", element.getAsString());
+        return parseProbability("probability", element.toString());
     }
 
     static BigDecimal parseProbability(String key, String value) {
@@ -242,37 +169,23 @@ record SamplingConfig(Set<OffCpuReason> reasons, Long minOffCpuMicros, Long maxO
         return probability;
     }
 
-    private static Long optionalMicros(JsonObject value, String name) {
-        JsonElement element = value.get(name);
-        if (element == null || element.isJsonNull()) return null;
-        return JsonSupport.requireNumber(value, name, 0, MAX_MICROS);
+    private static Long optionalMicros(Map<?, ?> value, String name) {
+        return value.get(name) == null ? null : ConfigValues.requireInteger(value, name, 0, MAX_MICROS);
     }
 
-    boolean profilerOnly() {
-        return admission instanceof None;
+    /** Admission policy {@code none}: no eBPF source is loaded, and async-profiler runs alone. */
+    static boolean profilerOnly(Sampling sampling) {
+        return sampling.hasNone();
     }
 
-    long admissionThreshold(long durationNanos) {
-        return admission.admissionThreshold(durationNanos);
-    }
-
-    JsonObject json() {
-        JsonObject value = new JsonObject();
-        if (reasons == null) {
-            value.add("reasons", JsonNull.INSTANCE);
-        } else {
-            JsonArray names = new JsonArray();
-            for (OffCpuReason reason : orderedReasons()) names.add(reason.json());
-            value.add("reasons", names);
-        }
-        value.add("minOffCpuMicros", nullable(minOffCpuMicros));
-        value.add("maxOffCpuMicros", nullable(maxOffCpuMicros));
-        value.add("admission", admission.json());
-        return value;
-    }
-
-    private static JsonElement nullable(Long number) {
-        return number == null ? JsonNull.INSTANCE : JsonSupport.GSON.toJsonTree(number);
+    /** The 32-bit-scaled threshold the kernel draws against for an interval of the given length. */
+    static long admissionThreshold(Sampling sampling, long durationNanos) {
+        return switch (sampling.getAdmissionCase()) {
+            case UNIFORM -> sampling.getUniform().getProbabilityThreshold();
+            case PROPORTIONAL ->
+                admissionThreshold(durationNanos, sampling.getProportional().getRecordAllAboveMicros() * 1000);
+            default -> throw new IllegalStateException("Admission policy none records no intervals");
+        };
     }
 
     /**

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.GsonBuilder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -117,8 +116,7 @@ public final class KnownWaitAttributionWorkload {
         metadata.put("workloadEndMonotonicNanos", Long.toUnsignedString(workloadEnd));
         metadata.put("targetTids", new TreeMap<>(targetTids));
         metadata.put("operations", records);
-        Files.writeString(
-                metadataPath, new GsonBuilder().setPrettyPrinting().create().toJson(metadata) + "\n");
+        Files.writeString(metadataPath, FixtureJson.pretty(metadata));
         System.out.println("Known-wait capture finalized: " + manifest);
     }
 

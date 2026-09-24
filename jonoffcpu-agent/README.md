@@ -2,8 +2,9 @@
 
 The agent owns one source/async-profiler capture and writes two authoritative
 artifacts: the original JFR and a self-contained correlation stream. The
-last correlation row is written only after source drain, an identity-guarded AP
-stop, clean public-JDK JFR parsing, and matching terminal counters.
+last correlation record, `captureFinalized`, is written only after source drain,
+an identity-guarded AP stop, clean public-JDK JFR parsing, and matching terminal
+counters.
 
 Build with Amazon Corretto 25, Docker buildx, and the checked-out async-profiler
 submodule:
@@ -75,11 +76,31 @@ sampling:
 The agent writes the manifest next to the stream as `<stem>.manifest.json`
 (`/data/jonoffcpu-capture.manifest.json` above) and, when `file=` is omitted,
 records the JFR as `<stem>.jfr`; the stem is `correlationOutput` without its
-final extension. Naming the stream `jonoffcpu-capture.ndjson` therefore keeps
+final extension. Naming the stream `jonoffcpu-capture.pb` therefore keeps
 every capture file recognisable.
 
+The manifest is an audit record for people and tools, rewritten atomically at
+every lifecycle step (at most 1 MiB). Its single definition is the
+`io.github.lhotari.jonoffcpu.agent.v1.Manifest` message in
+[`src/main/proto/jonoffcpu-manifest.proto`](src/main/proto/jonoffcpu-manifest.proto),
+printed in protobuf's proto3 JSON mapping: lowerCamelCase field names, 64-bit
+integers as decimal strings, enums by their value names (`"state":
+"MANIFEST_STATE_COMPLETE"`), and every field without presence printed even at
+its default. It records the lifecycle `state` and `complete` flag, the capture
+`mode`, the resolved `sampling` and `timeSplit`, async-profiler's identity and
+stop receipt, every reply of the native collector verbatim as a
+`CollectorReply` (`nativePrepare`, `nativeEnable`, `nativeStop`, `nativeClose`,
+and the cleanup replies after a failed start), the verified `sourceCaptureEnd`,
+the `analysisInputs` the footer carries, and, while a capture is failed or
+incomplete, a `failure` with its `FailureCode` and, when the collector reported
+it, the collector's `CollectorError`. The correlator never reads the manifest.
+
 The agent uses SnakeYAML's safe constructor, rejects duplicate and unknown keys,
-and does not allow aliases. The `sampling` block is required; the top-level
+and does not allow aliases. The configuration keeps its own spellings
+(`reasons: [blocked, runnable]`, `policy: uniform`, `source: schedInfo`,
+`signalDelivery: queued`); the agent maps them to the capture schema's messages
+and enums, and rejects the schema's enum names (`OFF_CPU_REASON_BLOCKED`) there.
+Integers must be YAML integers, not quoted or decimal. The `sampling` block is required; the top-level
 README's [Choosing what to sample](../README.md#choosing-what-to-sample)
 explains its policies. Quote a `uniform` policy's `probability` when its exact
 decimal spelling should be retained in capture metadata.
@@ -138,46 +159,56 @@ Options before `asprofpath` belong to JONOFFCPU:
 
 Policy `none` selects profiler-only mode: the eBPF source is never prepared or
 enabled, async-profiler runs without `signalcookie`, and the correlation output
-holds a single `captureFinalized` row with `state: "profilerOnly"`.
+holds a single `captureFinalized` record with state
+`FINALIZED_STATE_PROFILER_ONLY` and no source artifact in its `analysisInputs`.
 
 The source applies the reason filter first: only intervals whose switch-out
 reason is in `sampling.reasons` (`blocked` unless configured) are eligible, and
 the others are counted by reason in `captureEnd` (`switchOutsBlocked`,
 `switchOutsRunnable`, `switchOutsPreempted`, `reasonRejections`,
-`reasonRejectedDurationMicros`). The resolved list is serialized in the order
+`reasonRejectedDurationMicros`). The resolved list is kept in the order
 `blocked`, `runnable`, `preempted` whatever order it was given in. Each
-observation row carries its `reason` next to the raw `sched_switch` arguments
+observation record carries its `reason` next to the raw `sched_switch` arguments
 it was derived from, `prevTaskState` and `preempted`; the agent recomputes the
-reason and checks it was selected for every row at stop, as it does the
+reason and checks it was selected for every record at stop, as it does the
 admission threshold.
 
-The resolved `timeSplit` object (`{"source": "schedInfo"}` unless configured) is
-sent to the source, echoed by it and written into the manifest, `captureStart`
-and `analysisInputs` like `sampling`. Under `schedInfo` each observation row
-carries `runqueueNanos`, the growth of the scheduler's `sched_info.run_delay`
-across the interval, from which the correlator splits the interval into
-sleeping and run-queue time; `captureEnd` counts readings the kernel dropped in
-`runqueueInversions`. The agent rejects a row that carries a reading under
-`off`. A capture is written at control `schemaVersion` 4.
+The resolved `timeSplit` message (source `TIME_SPLIT_SOURCE_SCHED_INFO` unless
+configured) is sent to the source, echoed by it and written into the manifest,
+`captureStart` and `analysisInputs` like `sampling`. Under `schedInfo` each
+observation record carries `runqueueNanos`, the growth of the scheduler's
+`sched_info.run_delay` across the interval, from which the correlator splits the
+interval into sleeping and run-queue time; `captureEnd` counts readings the
+kernel dropped in `runqueueInversions`. The agent rejects a record that carries
+a reading under `off`.
+
+The agent talks to the native collector through its JNI bridge in encoded
+`jonoffcpu-collector.proto` messages: `prepare` takes a `PrepareRequest`,
+`enable` an `EnableRequest`, and every call returns a `CollectorReply` of ABI
+version 2. The agent checks each reply as a message: the echoed `sampling`,
+`timeSplit` and `verifiedIdentity` must equal what it sent or what `prepare`
+returned, and the `captureEnd` the collector reports must equal the one in the
+stream. An error reply with state `COLLECTOR_STATE_STOPPING` or
+`COLLECTOR_STATE_CLOSING` keeps the handle owned for a retry.
 
 The source applies the duration bounds before the admission policy. A duration
 is eligible only when it is strictly greater than the configured minimum and
 strictly less than the configured maximum; omitting either bound leaves that
-side unbounded. The resolved `sampling` object is sent to the native source,
+side unbounded. The resolved `sampling` message is sent to the native source,
 echoed back by it, and written unchanged into the manifest, the `captureStart`
-row, and the `captureFinalized` footer's `analysisInputs`, so every consumer
-compares the same value. Each distinct native stack is symbolized once and
-written as its own `stack` row; observations reference it through
+record, and the `captureFinalized` footer's `analysisInputs`, so every consumer
+compares the same message. Each distinct native stack is symbolized once and
+written as its own `stack` record; observations reference it through
 `kernelStackId` and `userStackId`, or carry `kernelStackError`/`userStackError`
-when the kernel could not produce one. A stack row always precedes the first
-observation that references it. Each observation row carries `admissionThreshold`,
+when the kernel could not produce one. A stack record always precedes the first
+observation that references it. Each observation record carries `admissionThreshold`,
 the exact 32-bit-scaled threshold the kernel drew against for that interval
 (`4294967296` means certain admission). Under `uniform` it is the policy's
 `probabilityThreshold`; under `proportional` it is `2^32` for a duration at
 or above `recordAllAboveMicros` and otherwise `duration * 2^32 / reference`
 computed in 64-bit arithmetic with the nanosecond reference shifted right until
 it fits in 32 bits (and the duration shifted by the same amount). The agent
-recomputes it for every row at stop and rejects a stream where any row
+recomputes it for every record at stop and rejects a stream where any record
 disagrees.
 
 `queued` requests a dedicated real-time signal from async-profiler. `coalescing`
@@ -234,7 +265,8 @@ flow, Central Portal setup, and signing configuration.
 
 `src/test` holds unit tests, which run on any platform with Java and need no native code. `src/integrationTest`
 holds the tests that need the native bundle, the packaged JARs or a Linux kernel. `src/testFixtures` holds what both
-share: the capture stream fixture and the workloads the end-to-end tests launch. `check` runs both suites:
+share: the workloads the end-to-end tests launch. Capture streams are written and read with the capture codec's
+`CaptureRecordFixture`. `check` runs both suites:
 
 ```sh
 ./gradlew :jonoffcpu-agent:check
@@ -242,7 +274,7 @@ share: the capture stream fixture and the workloads the end-to-end tests launch.
 
 The integration tests come in three kinds, by JUnit tag:
 
-- `host-native` tests load the bundle for the host's architecture into the test JVM: JNI control envelopes,
+- `host-native` tests load the bundle for the host's architecture into the test JVM: JNI collector replies,
   extraction and the async-profiler C API, and C-library detection. On a Linux host whose C library is selected
   (`-PnativeLibcs=glibc` on a glibc host) they run in the test JVM. With `-PintegrationTestsInContainer=true`, the
   default on any other host, including macOS, they run inside a Corretto container of each selected C library

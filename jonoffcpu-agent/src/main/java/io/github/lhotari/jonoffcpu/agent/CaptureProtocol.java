@@ -1,53 +1,42 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.AsyncProfilerStats;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.SignalDelivery;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Set;
 import java.util.regex.Pattern;
 
+/** async-profiler's {@code signal-capture-v1} command replies, parsed strictly. */
 public final class CaptureProtocol {
     private static final String VERSION = "signal-capture-v1";
-    private static final Set<String> COUNTERS = Set.of(
-            "admitted",
-            "invalid-code",
-            "zero-cookie",
-            "zero-sequence",
-            "stale-epoch",
-            "accepted",
-            "capture-failures",
-            "submitted");
     private static final Pattern REASON = Pattern.compile("[a-z0-9][a-z0-9_-]{0,63}");
 
-    public record Active(String sessionId, int signal, long epoch, String delivery) {}
+    public record Active(String sessionId, int signal, long epoch, SignalDelivery delivery) {}
 
     public record Stopped(
             String sessionId,
             int signal,
             long epoch,
-            String delivery,
+            SignalDelivery delivery,
             boolean finalized,
-            String stoppedAt,
+            long stoppedAtMonotonicNanos,
             String reason,
-            Map<String, String> counters) {
-        public Map<String, String> manifestCounters() {
-            return Map.of(
-                    "admittedSignals", counters.get("admitted"),
-                    "invalidSignalCode", counters.get("invalid-code"),
-                    "zeroCookie", counters.get("zero-cookie"),
-                    "zeroSequence", counters.get("zero-sequence"),
-                    "staleEpoch", counters.get("stale-epoch"),
-                    "acceptedCookies", counters.get("accepted"),
-                    "captureFailures", counters.get("capture-failures"),
-                    "submittedSamples", counters.get("submitted"));
-        }
+            AsyncProfilerStats counters) {}
+
+    /** The protocol's name of a delivery policy, which the agent configuration also uses. */
+    public static String deliveryName(SignalDelivery delivery) {
+        return switch (delivery) {
+            case SIGNAL_DELIVERY_QUEUED -> "queued";
+            case SIGNAL_DELIVERY_COALESCING -> "coalescing";
+            default -> throw new IllegalArgumentException("Not a signal delivery policy: " + delivery);
+        };
     }
 
-    public static String requireDelivery(String value) {
-        if (!"queued".equals(value) && !"coalescing".equals(value)) {
-            throw new IllegalArgumentException("Invalid signal delivery policy: " + value);
-        }
-        return value;
+    public static SignalDelivery parseDelivery(String value) {
+        if ("queued".equals(value)) return SignalDelivery.SIGNAL_DELIVERY_QUEUED;
+        if ("coalescing".equals(value)) return SignalDelivery.SIGNAL_DELIVERY_COALESCING;
+        throw new IllegalArgumentException("Invalid signal delivery policy: " + value);
     }
 
     private CaptureProtocol() {}
@@ -61,7 +50,7 @@ public final class CaptureProtocol {
         String id = required(parsed.values, "id");
         int signal = decimalInt(required(parsed.values, "signal"), "signal", 1, 64);
         long epoch = decimalLong(required(parsed.values, "epoch"), "epoch", 1, 0xffffffffL);
-        return new Active(id, signal, epoch, requireDelivery(required(parsed.values, "delivery")));
+        return new Active(id, signal, epoch, parseDelivery(required(parsed.values, "delivery")));
     }
 
     public static Stopped parseStopped(String response) {
@@ -73,25 +62,32 @@ public final class CaptureProtocol {
         if (!finalizedText.equals("true") && !finalizedText.equals("false")) {
             throw new IllegalArgumentException("Invalid AP finalized field");
         }
-        String stoppedAt = required(parsed.values, "stopped-at");
-        decimalUnsigned(stoppedAt, "stopped-at");
+        long stoppedAt = decimalUnsigned(required(parsed.values, "stopped-at"), "stopped-at");
         String reason = required(parsed.values, "reason");
         if (!REASON.matcher(reason).matches()) throw new IllegalArgumentException("Invalid AP stop reason");
-        Map<String, String> counters = new LinkedHashMap<>();
-        for (String key : COUNTERS) {
-            String value = required(parsed.values, key);
-            decimalUnsigned(value, key);
-            counters.put(key, value);
-        }
+        AsyncProfilerStats counters = AsyncProfilerStats.newBuilder()
+                .setAdmittedSignals(counter(parsed, "admitted"))
+                .setInvalidSignalCode(counter(parsed, "invalid-code"))
+                .setZeroCookie(counter(parsed, "zero-cookie"))
+                .setZeroSequence(counter(parsed, "zero-sequence"))
+                .setStaleEpoch(counter(parsed, "stale-epoch"))
+                .setAcceptedCookies(counter(parsed, "accepted"))
+                .setCaptureFailures(counter(parsed, "capture-failures"))
+                .setSubmittedSamples(counter(parsed, "submitted"))
+                .build();
         return new Stopped(
                 id,
                 signal,
                 epoch,
-                requireDelivery(required(parsed.values, "delivery")),
+                parseDelivery(required(parsed.values, "delivery")),
                 Boolean.parseBoolean(finalizedText),
                 stoppedAt,
                 reason,
-                Map.copyOf(counters));
+                counters);
+    }
+
+    private static long counter(Parsed parsed, String key) {
+        return decimalUnsigned(required(parsed.values, key), key);
     }
 
     private static Parsed parse(String response, String expectedWord) {
@@ -159,14 +155,15 @@ public final class CaptureProtocol {
         return result;
     }
 
-    private static void decimalUnsigned(String value, String name) {
+    /** An unsigned 64-bit decimal, returned in a long's bits. */
+    private static long decimalUnsigned(String value, String name) {
         if (value.isEmpty()
                 || (value.length() > 1 && value.charAt(0) == '0')
                 || !value.chars().allMatch(c -> c >= '0' && c <= '9')) {
             throw new IllegalArgumentException("Invalid decimal AP capture field: " + name);
         }
         try {
-            Long.parseUnsignedLong(value);
+            return Long.parseUnsignedLong(value);
         } catch (NumberFormatException error) {
             throw new IllegalArgumentException("Out-of-range AP capture field: " + name, error);
         }

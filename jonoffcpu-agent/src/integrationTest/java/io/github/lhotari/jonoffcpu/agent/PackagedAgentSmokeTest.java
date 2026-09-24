@@ -5,8 +5,10 @@ import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.JFR;
 import static io.github.lhotari.jonoffcpu.agent.CaptureChecks.SOURCE;
 import static org.assertj.core.api.Assertions.assertThat;
 
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.google.protobuf.Struct;
+import com.google.protobuf.Value;
+import io.github.lhotari.jonoffcpu.agent.ManifestProto.Manifest;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.OffCpuReason;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -58,41 +60,45 @@ class PackagedAgentSmokeTest {
             runtime.makeReadable(out);
         }
 
-        JsonObject manifest = CaptureChecks.completeManifest(out);
+        Manifest manifest = CaptureChecks.completeManifest(out);
         assertThat(out.resolve(SOURCE)).isNotEmptyFile();
         assertThat(out.resolve(JFR)).isNotEmptyFile();
         // The configuration names no reasons, so the resolved policy records blocked intervals only.
-        assertThat(manifest.getAsJsonObject("sampling").get("reasons"))
+        assertThat(manifest.getSampling().getReasonsList())
                 .as("the default switch-out reasons")
-                .isEqualTo(JsonParser.parseString("[\"blocked\"]"));
+                .containsExactly(OffCpuReason.OFF_CPU_REASON_BLOCKED);
         // Nor does it name a time-split source, so each interval's run-queue part is read from sched_info.
-        assertThat(manifest.get("timeSplit"))
-                .as("the default time-split source")
-                .isEqualTo(JsonParser.parseString("{\"source\":\"schedInfo\"}"));
+        assertThat(manifest.getTimeSplit()).as("the default time-split source").isEqualTo(TimeSplitConfig.DEFAULT);
+        // The collector echoed the policy it was sent, and the footer carries the inputs the manifest recorded.
+        assertThat(manifest.getNativeEnable().getEnabled().getSampling()).isEqualTo(manifest.getSampling());
+        assertThat(CaptureChecks.completeFooter(out).getAnalysisInputs()).isEqualTo(manifest.getAnalysisInputs());
         CaptureChecks.checkMixedRecording(out.resolve(JFR));
 
         Path analysis = dir.resolve("analysis");
-        JsonObject report = CaptureChecks.correlateVerified(out, analysis);
-        assertThat(report.get("identityUnverified").getAsLong())
+        Struct report = CaptureChecks.correlateVerified(out, analysis);
+        assertThat(CaptureChecks.number(report, "identityUnverified"))
                 .as("identity-unverified samples")
                 .isZero();
-        long matched = report.get("matched").getAsLong();
+        long matched = CaptureChecks.number(report, "matched");
         // Every matched interval is classified by its switch-out reason, and only selected reasons appear.
-        JsonObject reasons = report.getAsJsonObject("offCpuReasons");
-        JsonObject matchedByReason = reasons.getAsJsonObject("matched");
-        assertThat(matchedByReason.keySet())
+        Struct reasons = CaptureChecks.object(report, "offCpuReasons");
+        List<Struct> matchedByReason = CaptureChecks.value(reasons, "matched").getListValue().getValuesList().stream()
+                .map(Value::getStructValue)
+                .toList();
+        assertThat(matchedByReason)
                 .as("reasons of the matched intervals")
-                .containsExactly("blocked");
-        JsonObject blocked = matchedByReason.getAsJsonObject("blocked");
-        assertThat(blocked.get("intervals").getAsLong())
+                .extracting(entry -> CaptureChecks.string(entry, "reason"))
+                .containsExactly(OffCpuReason.OFF_CPU_REASON_BLOCKED.name());
+        Struct blocked = matchedByReason.get(0);
+        assertThat(CaptureChecks.number(blocked, "intervals"))
                 .as("blocked matched intervals")
                 .isEqualTo(matched);
-        assertThat(reasons.getAsJsonObject("kernelSwitchOuts").get("blocked").getAsLong())
+        assertThat(CaptureChecks.number(reasons, "kernelSwitchOuts", "blocked"))
                 .as("blocked switch-outs the kernel counted")
                 .isPositive();
         assertThat(analysis.resolve("jonoffcpu-offcpu-profile.pb")).isNotEmptyFile();
         // The digest is written by default, and the report names it rather than an error.
-        assertThat(report.getAsJsonObject("digest").get("path").getAsString()).isEqualTo("jonoffcpu-summary.md");
+        assertThat(CaptureChecks.string(report, "digest", "path")).isEqualTo("jonoffcpu-summary.md");
         assertThat(analysis.resolve("jonoffcpu-summary.md")).isRegularFile();
 
         // The profile renders back to the collapsed stacks the correlator wrote.
@@ -104,22 +110,20 @@ class PackagedAgentSmokeTest {
                 .hasSameBinaryContentAs(analysis.resolve("jonoffcpu-offcpu-stacks.collapsed"));
 
         // Every matched interval carries its run-queue part, so its time splits into sleeping and run-queue time.
-        JsonObject timeSplit = reasons.getAsJsonObject("timeSplit");
-        assertThat(timeSplit.get("source").getAsString()).isEqualTo("schedInfo");
-        assertThat(timeSplit.get("available").getAsBoolean())
+        Struct timeSplit = CaptureChecks.object(reasons, "timeSplit");
+        assertThat(CaptureChecks.string(timeSplit, "source")).isEqualTo("TIME_SPLIT_SOURCE_SCHED_INFO");
+        assertThat(CaptureChecks.value(timeSplit, "available").getBoolValue())
                 .as("time split available")
                 .isTrue();
-        JsonObject unsplit = timeSplit.getAsJsonObject("unsplitIntervals");
-        assertThat(unsplit.get("withoutReading").getAsLong())
+        assertThat(CaptureChecks.number(timeSplit, "unsplitIntervals", "withoutReading"))
                 .as("intervals without a reading")
                 .isZero();
-        assertThat(unsplit.get("readingExceedsInterval").getAsLong())
+        assertThat(CaptureChecks.number(timeSplit, "unsplitIntervals", "readingExceedsInterval"))
                 .as("intervals whose reading exceeds them")
                 .isZero();
-        assertThat(blocked.get("sleepingNanos").getAsLong()
-                        + blocked.get("runqueueNanos").getAsLong())
+        assertThat(CaptureChecks.number(blocked, "sleepingNanos") + CaptureChecks.number(blocked, "runqueueNanos"))
                 .as("blocked sleeping and run-queue time add up")
-                .isEqualTo(blocked.get("observedNanos").getAsLong());
+                .isEqualTo(CaptureChecks.number(blocked, "observedNanos"));
 
         // The split slice renders the same total, one [sleeping] or [runqueue] leaf per part.
         long[] totals = new long[2];
@@ -137,7 +141,7 @@ class PackagedAgentSmokeTest {
                     dir.resolve(time + ".collapsed").toString(),
                     "--summary",
                     summary.toString());
-            totals[index] = CaptureChecks.json(summary).get("totalNanos").getAsLong();
+            totals[index] = CaptureChecks.number(CaptureChecks.json(summary), "totalNanos");
         }
         assertThat(totals[1]).as("the split slice adds up to the total").isEqualTo(totals[0]);
         assertThat(Files.readAllLines(dir.resolve("split.collapsed")))

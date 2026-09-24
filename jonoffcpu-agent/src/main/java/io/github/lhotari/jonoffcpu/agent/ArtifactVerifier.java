@@ -1,13 +1,30 @@
 // SPDX-License-Identifier: MIT
 package io.github.lhotari.jonoffcpu.agent;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import io.github.lhotari.jonoffcpu.capture.CaptureProto;
+import com.google.protobuf.Descriptors.FieldDescriptor;
+import io.github.lhotari.jonoffcpu.capture.CaptureFormat;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.AsyncProfilerStats;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureEnd;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureFinalized;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureStart;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.CaptureState;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.FileArtifact;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.KernelCounters;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Observation;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.OffCpuReason;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Record;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Sampling;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.SignalDelivery;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.SourceArtifact;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.Stack;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplit;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.TimeSplitSource;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.UserspaceCounters;
+import io.github.lhotari.jonoffcpu.capture.CaptureProto.VerifiedIdentity;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -16,223 +33,142 @@ import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import java.util.Set;
 import jdk.jfr.consumer.RecordedEvent;
 import jdk.jfr.consumer.RecordingFile;
 
+/**
+ * Verifies what the collector and async-profiler produced before the agent vouches for it: the capture stream,
+ * record by record, against the identity and policy the controller negotiated, and the JFR's signal-capture events
+ * against async-profiler's stop receipt. Then it appends the finalization footer, covering the verified prefix.
+ */
 final class ArtifactVerifier {
-    private static final int MAX_LINE_BYTES = 1024 * 1024;
-    /**
-     * Version 2 interns stacks: each distinct stack is one record that observations reference by id. Version 3
-     * classifies every observation by its switch-out reason and adds {@code sampling.reasons}. Version 4 adds
-     * {@code timeSplit} and each observation's run-queue part.
-     */
-    static final int SCHEMA_VERSION = 4;
+    private static final int MAX_RECORD_BYTES = 1024 * 1024;
+    /** The largest footer the agent appends; it holds only identities, counters and artifact digests. */
+    static final int MAX_FOOTER_BYTES = 64 * 1024;
+
+    static final String SOURCE_ID = "jonoffcpu.offcpu.v1";
 
     private static final int MAX_STACK_FRAMES = 4096;
-    private static final BigInteger MAX_U64 = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE);
 
-    record Artifact(String path, String bytes, String sha256) {
-        JsonObject json() {
-            JsonObject result = new JsonObject();
-            result.addProperty("path", path);
-            result.addProperty("bytes", bytes);
-            result.addProperty("sha256", sha256);
-            return result;
-        }
-    }
+    record JfrResult(long processId, long processStartTimeMillis) {}
 
-    record RawArtifact(String path, String rawBytes, String rawSha256) {
-        JsonObject json() {
-            JsonObject result = new JsonObject();
-            result.addProperty("path", path);
-            result.addProperty("rawBytes", rawBytes);
-            result.addProperty("rawSha256", rawSha256);
-            return result;
-        }
-    }
-
-    record JfrResult(long processId, long processStartTimeMillis, Map<String, String> counters) {}
-
-    private ArtifactVerifier() {}
-
-    static JsonObject verifySource(
-            Path source,
-            JsonObject stop,
+    /** What the stream must agree with: the negotiated capture identity, the resolved policy and the prepared ids. */
+    record Expected(
             String sessionId,
             long epoch,
             int signal,
-            String delivery,
-            SamplingConfig sampling,
-            TimeSplitConfig timeSplit,
-            long hostTgid,
-            long targetPid,
-            JsonObject verifiedIdentity)
-            throws IOException {
-        JsonObject expectedEnd = JsonSupport.requireObject(stop, "captureEnd");
-        JsonObject start = null;
-        JsonObject end = null;
+            SignalDelivery delivery,
+            Sampling sampling,
+            TimeSplit timeSplit,
+            int hostTgid,
+            int targetPid,
+            VerifiedIdentity verifiedIdentity) {}
+
+    private ArtifactVerifier() {}
+
+    /**
+     * Reads the collector's closed stream and returns its terminal record, which must equal the one the collector
+     * reported when it stopped.
+     */
+    static CaptureEnd verifySource(Path source, CaptureEnd expectedEnd, Expected expected) throws IOException {
+        CaptureStart start = null;
+        CaptureEnd end = null;
         long observations = 0;
         Set<Long> announcedStacks = new HashSet<>();
         try (InputStream input = new BufferedInputStream(Files.newInputStream(source))) {
-            CaptureStream.readHeader(input);
-            CaptureProto.Record record;
-            while ((record = CaptureStream.next(input, MAX_LINE_BYTES)) != null) {
-                String type = CaptureStream.recordType(record);
-                JsonObject row =
-                        switch (record.getRecordCase()) {
-                            case STACK -> CaptureStream.stackRow(record.getStack());
-                            case OBSERVATION -> CaptureStream.observationRow(record.getObservation());
-                            default ->
-                                JsonSupport.parseObject(
-                                        CaptureStream.controlJson(record), "source control record", MAX_LINE_BYTES);
-                        };
-                if (record.getRecordCase() != CaptureProto.Record.RecordCase.STACK
-                        && record.getRecordCase() != CaptureProto.Record.RecordCase.OBSERVATION) {
-                    JsonSupport.requireNumber(row, "schemaVersion", SCHEMA_VERSION, SCHEMA_VERSION);
-                }
+            CaptureFormat.readHeader(input);
+            CaptureFormat.Framed framed;
+            while ((framed = CaptureFormat.next(input, MAX_RECORD_BYTES)) != null) {
+                if (framed.truncated()) throw new IOException("Source stream ends inside a record");
+                Record record = framed.record();
                 if (end != null) {
-                    throw new IOException("Source rows follow captureEnd");
+                    throw new IOException("Source records follow captureEnd");
                 }
-                switch (type) {
-                    case "captureStart" -> {
+                switch (record.getRecordCase()) {
+                    case CAPTURE_START -> {
                         if (start != null || observations != 0)
                             throw new IOException("Duplicate/out-of-order captureStart");
-                        requireIdentity(row, sessionId, epoch);
-                        JsonSupport.requireEqual(
-                                "sourceId", "jonoffcpu.offcpu.v1", JsonSupport.requireString(row, "sourceId"));
-                        JsonSupport.requireEqual(
-                                "signal",
-                                (long) signal,
-                                JsonSupport.requireNumber(row, "signal", 1, Integer.MAX_VALUE));
-                        JsonSupport.requireEqual(
-                                "signalDelivery", delivery, JsonSupport.requireString(row, "signalDelivery"));
-                        JsonSupport.requireEqual(
-                                "sampling", sampling.json(), JsonSupport.requireObject(row, "sampling"));
-                        JsonSupport.requireEqual(
-                                "timeSplit", timeSplit.json(), JsonSupport.requireObject(row, "timeSplit"));
-                        JsonSupport.requireEqual(
-                                "hostTgid", hostTgid, JsonSupport.requireNumber(row, "hostTgid", 1, 0xffffffffL));
-                        JsonSupport.requireEqual(
-                                "targetPid", targetPid, JsonSupport.requireNumber(row, "targetPid", 1, 0xffffffffL));
-                        JsonSupport.requireEqual(
-                                "registrationToken",
-                                JsonSupport.requireString(verifiedIdentity, "registrationToken"),
-                                JsonSupport.requireString(row, "registrationToken"));
-                        JsonSupport.requireEqual(
-                                "processGenerationNs",
-                                JsonSupport.requireDecimal(verifiedIdentity, "processGenerationNs"),
-                                JsonSupport.requireDecimal(row, "processGenerationNs"));
-                        JsonSupport.requireEqual(
-                                "timeNamespaceInode",
-                                JsonSupport.requireDecimal(verifiedIdentity, "timeNamespaceInode"),
-                                JsonSupport.requireDecimal(row, "timeNamespaceInode"));
-                        for (String key : new String[] {"pidNamespaceDevice", "pidNamespaceInode"}) {
-                            BigInteger expected = requireU64(verifiedIdentity, key);
-                            if (expected.signum() == 0) throw new IOException("Invalid namespace identity: " + key);
-                            JsonSupport.requireEqual(key, expected, requireU64(row, key));
-                        }
-                        start = row;
+                        start = record.getCaptureStart();
+                        verifyStart(start, expected);
                     }
-                    case "stack" -> {
+                    case STACK -> {
                         if (start == null) throw new IOException("Stack before captureStart");
-                        long stackId = JsonSupport.requireNumber(row, "stackId", 0, Integer.MAX_VALUE);
-                        if (!announcedStacks.add(stackId)) {
-                            throw new IOException("Duplicate stack record: " + stackId);
+                        Stack stack = record.getStack();
+                        if (stack.getId() < 0 || stack.getId() > Integer.MAX_VALUE) {
+                            throw new IOException("Invalid stack id: " + stack.getId());
                         }
-                        JsonElement frames = row.get("frames");
-                        if (frames == null || !frames.isJsonArray()) throw new IOException("Missing stack frames");
-                        if (frames.getAsJsonArray().size() > MAX_STACK_FRAMES) {
-                            throw new IOException("Stack record exceeds the frame limit: " + stackId);
+                        if (!announcedStacks.add(stack.getId())) {
+                            throw new IOException("Duplicate stack record: " + stack.getId());
+                        }
+                        if (stack.getFrameCount() > MAX_STACK_FRAMES) {
+                            throw new IOException("Stack record exceeds the frame limit: " + stack.getId());
                         }
                     }
-                    case "observation" -> {
+                    case OBSERVATION -> {
                         if (start == null) throw new IOException("Observation before captureStart");
-                        validateObservation(
-                                row,
-                                sessionId,
-                                epoch,
-                                sampling,
-                                timeSplit,
-                                hostTgid,
-                                targetPid,
-                                verifiedIdentity,
-                                announcedStacks);
+                        validateObservation(record.getObservation(), expected, announcedStacks);
                         observations++;
                     }
-                    case "captureEnd" -> {
+                    case CAPTURE_END -> {
                         if (start == null) throw new IOException("captureEnd before captureStart");
-                        requireIdentity(row, sessionId, epoch);
-                        JsonSupport.requireEqual(
-                                "source end state", "complete", JsonSupport.requireString(row, "state"));
-                        end = row;
+                        end = record.getCaptureEnd();
+                        requireIdentity(end.getSessionId(), end.getCaptureEpoch(), expected);
+                        if (end.getState() != CaptureState.CAPTURE_STATE_COMPLETE) {
+                            throw new IOException("Source end state is not complete: " + end.getState());
+                        }
                     }
-                    default -> throw new IOException("Unknown source record type: " + type);
+                    case CAPTURE_FINALIZED -> throw new IOException("Source stream is already finalized");
+                    default -> throw new IOException("Unknown source record");
                 }
             }
         }
         if (start == null || end == null) throw new IOException("Incomplete source stream");
         if (!end.equals(expectedEnd)) throw new IOException("Source captureEnd differs from native stop response");
-        JsonObject counters = JsonSupport.requireObject(end, "counters");
-        JsonObject kernel = JsonSupport.requireObject(counters, "kernel");
-        for (String key : new String[] {
-            "switchOuts",
-            "schedulerExitSwitches",
-            "schedulerExitNoSwitches",
-            "lifetimeRejections",
-            "eligibleIntervals",
-            "eligibleDurationMicros",
-            "admissionRejections",
-            "selectedIntervals",
-            "sequenceExhaustions",
-            "sequenceContentions",
-            "threadStateFailures",
-            "kernelStackFailures",
-            "userStackFailures",
-            "signalFailures",
-            "ringReserveFailures",
-            "switchOutsBlocked",
-            "switchOutsRunnable",
-            "switchOutsPreempted",
-            "reasonRejections",
-            "reasonRejectedDurationMicros",
-            "runqueueInversions"
-        }) {
-            requireU64(kernel, key);
-        }
-        if (requireU64(kernel, "targetNamespaceFailures").signum() != 0) {
+        KernelCounters kernel = end.getKernelCounters();
+        if (kernel.getTargetNamespaceFailures() != 0) {
             throw new IOException("Source target namespace mapping failed");
         }
-        JsonObject userspace = JsonSupport.requireObject(counters, "userspace");
-        BigInteger received = requireU64(userspace, "receivedObservations");
-        BigInteger written = requireU64(userspace, "writtenObservations");
-        if (!written.equals(BigInteger.valueOf(observations))) {
+        UserspaceCounters userspace = end.getUserspaceCounters();
+        if (userspace.getWrittenObservations() != observations) {
             throw new IOException("Source written observation count mismatch");
         }
-        if (!received.equals(written)) throw new IOException("Source received/written observation count mismatch");
-        // Missing native stacks remain explicit observations; they do not mean the source file was
-        // lost.
-        requireU64(userspace, "symbolizationFailures");
-        for (String key : new String[] {"writeFailures", "pollFailures", "drainTimedOut"}) {
-            if (requireU64(userspace, key).signum() != 0) {
-                throw new IOException("Source " + key + " is nonzero");
-            }
+        if (userspace.getReceivedObservations() != userspace.getWrittenObservations()) {
+            throw new IOException("Source received/written observation count mismatch");
         }
-        if (JsonSupport.requireBoolean(end, "drainTimedOut")) throw new IOException("Source drain timed out");
-        BigInteger started = requireU64(end, "startedMonotonicNanos");
-        BigInteger stopped = requireU64(end, "stoppedMonotonicNanos");
-        BigInteger detached = requireU64(end, "detachedMonotonicNanos");
-        BigInteger drained = requireU64(end, "drainCompletedMonotonicNanos");
-        if (started.compareTo(stopped) > 0 || stopped.compareTo(detached) > 0 || detached.compareTo(drained) > 0) {
+        // Missing native stacks remain explicit observations (symbolizationFailures); they do not mean the source
+        // file was lost.
+        if (userspace.getWriteFailures() != 0) throw new IOException("Source writeFailures is nonzero");
+        if (userspace.getPollFailures() != 0) throw new IOException("Source pollFailures is nonzero");
+        if (userspace.getDrainTimedOut() != 0) throw new IOException("Source drainTimedOut is nonzero");
+        if (end.getDrainTimedOut()) throw new IOException("Source drain timed out");
+        if (Long.compareUnsigned(end.getStartedMonotonicNanos(), end.getStoppedMonotonicNanos()) > 0
+                || Long.compareUnsigned(end.getStoppedMonotonicNanos(), end.getDetachedMonotonicNanos()) > 0
+                || Long.compareUnsigned(end.getDetachedMonotonicNanos(), end.getDrainCompletedMonotonicNanos()) > 0) {
             throw new IOException("Source lifecycle timestamps are out of order");
         }
         return end;
     }
 
+    private static void verifyStart(CaptureStart start, Expected expected) throws IOException {
+        requireIdentity(start.getSessionId(), start.getCaptureEpoch(), expected);
+        requireEqual("sourceId", SOURCE_ID, start.getSourceId());
+        requireEqual("signal", expected.signal(), start.getSignal());
+        requireEqual("signalDelivery", expected.delivery(), start.getSignalDelivery());
+        requireEqual("sampling", expected.sampling(), start.getSampling());
+        requireEqual("timeSplit", expected.timeSplit(), start.getTimeSplit());
+        requireEqual("hostTgid", expected.hostTgid(), start.getHostTgid());
+        requireEqual("targetPid", expected.targetPid(), start.getTargetPid());
+        requireEqual("verifiedIdentity", expected.verifiedIdentity(), start.getVerifiedIdentity());
+    }
+
     static JfrResult verifyJfr(
-            Path jfr, String sessionId, long epoch, int signal, String delivery, Map<String, String> expectedCounters)
+            Path jfr,
+            String sessionId,
+            long epoch,
+            int signal,
+            SignalDelivery delivery,
+            AsyncProfilerStats expectedCounters)
             throws IOException {
         JfrValidation validation = new JfrValidation(sessionId, epoch, signal, delivery, expectedCounters);
         try (RecordingFile recording = new RecordingFile(jfr)) {
@@ -256,16 +192,18 @@ final class ArtifactVerifier {
     }
 
     /** Creates a correlation stream that holds only a finalization footer, for captures without an eBPF source. */
-    static void writeFooterOnly(Path source, JsonObject footer) throws IOException {
-        byte[] bytes = CaptureStream.footerStream(footer);
+    static void writeFooterOnly(Path source, CaptureFinalized footer) throws IOException {
+        ByteArrayOutputStream stream = new ByteArrayOutputStream();
+        stream.write(CaptureFormat.header());
+        stream.write(footerRecord(footer));
         try (FileChannel file = FileChannel.open(source, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-            ByteBuffer buffer = ByteBuffer.wrap(bytes);
+            ByteBuffer buffer = ByteBuffer.wrap(stream.toByteArray());
             while (buffer.hasRemaining()) file.write(buffer);
             file.force(true);
         }
     }
 
-    static Artifact artifact(Path directory, Path path) throws IOException {
+    static FileArtifact artifact(Path directory, Path path) throws IOException {
         if (!Files.isRegularFile(path)) throw new IOException("Artifact is not a regular file: " + path);
         MessageDigest digest;
         try {
@@ -273,29 +211,40 @@ final class ArtifactVerifier {
         } catch (NoSuchAlgorithmException impossible) {
             throw new AssertionError(impossible);
         }
+        long size = 0;
         try (InputStream input = Files.newInputStream(path)) {
             byte[] buffer = new byte[64 * 1024];
             int count;
             while ((count = input.read(buffer)) >= 0) {
                 digest.update(buffer, 0, count);
+                size += count;
             }
         }
-        return new Artifact(
-                directory.relativize(path).toString(), Long.toString(Files.size(path)), hex(digest.digest()));
+        if (size != Files.size(path)) throw new IOException("Artifact changed while it was digested: " + path);
+        return FileArtifact.newBuilder()
+                .setPath(directory.relativize(path).toString())
+                .setBytes(size)
+                .setSha256(hex(digest.digest()))
+                .build();
     }
 
-    static RawArtifact rawArtifact(Path directory, Path path) throws IOException {
-        Artifact artifact = artifact(directory, path);
-        return new RawArtifact(artifact.path(), artifact.bytes(), artifact.sha256());
+    static SourceArtifact rawArtifact(Path directory, Path path) throws IOException {
+        FileArtifact artifact = artifact(directory, path);
+        return SourceArtifact.newBuilder()
+                .setPath(artifact.getPath())
+                .setRawBytes(artifact.getBytes())
+                .setRawSha256(artifact.getSha256())
+                .build();
     }
 
-    static void appendFinalized(Path source, RawArtifact raw, JsonObject footer) throws IOException {
-        RawArtifact current = rawArtifact(source.getParent(), source);
-        if (!raw.rawBytes().equals(current.rawBytes()) || !raw.rawSha256().equals(current.rawSha256())) {
+    /** Appends the footer to a stream whose prefix must still be exactly the one the footer's digest covers. */
+    static void appendFinalized(Path source, SourceArtifact raw, CaptureFinalized footer) throws IOException {
+        SourceArtifact current = rawArtifact(source.getParent(), source);
+        if (raw.getRawBytes() != current.getRawBytes() || !raw.getRawSha256().equals(current.getRawSha256())) {
             throw new IOException("Correlation file changed after native finalization validation");
         }
-        byte[] bytes = CaptureStream.footerRecord(footer);
-        long expected = Long.parseLong(raw.rawBytes());
+        byte[] bytes = footerRecord(footer);
+        long expected = raw.getRawBytes();
         try (FileChannel file = FileChannel.open(source, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
             if (file.size() != expected || file.position() != expected) {
                 throw new IOException("Correlation file changed before finalization footer append");
@@ -309,91 +258,88 @@ final class ArtifactVerifier {
         }
     }
 
-    private static void requireIdentity(JsonObject value, String sessionId, long epoch) {
-        JsonSupport.requireEqual("sessionId", sessionId, JsonSupport.requireString(value, "sessionId"));
-        JsonSupport.requireEqual(
-                "captureEpoch", epoch, JsonSupport.requireNumber(value, "captureEpoch", 1, 0xffffffffL));
+    /** The footer as one length-delimited record. */
+    private static byte[] footerRecord(CaptureFinalized footer) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        CaptureFormat.write(
+                bytes, Record.newBuilder().setCaptureFinalized(footer).build());
+        if (bytes.size() > MAX_FOOTER_BYTES) throw new IOException("captureFinalized footer exceeds 64 KiB");
+        return bytes.toByteArray();
     }
 
-    private static BigInteger requireU64(JsonObject object, String key) {
-        String value = JsonSupport.requireDecimal(object, key);
-        BigInteger number = new BigInteger(value);
-        if (number.compareTo(MAX_U64) > 0) throw new IllegalArgumentException("u64 overflow: " + key);
-        return number;
+    private static void requireIdentity(String sessionId, int epoch, Expected expected) {
+        requireEqual("sessionId", expected.sessionId(), sessionId);
+        requireEqual("captureEpoch", expected.epoch(), Integer.toUnsignedLong(epoch));
     }
 
-    private static void validateObservation(
-            JsonObject row,
-            String sessionId,
-            long epoch,
-            SamplingConfig sampling,
-            TimeSplitConfig timeSplit,
-            long hostTgid,
-            long targetPid,
-            JsonObject verifiedIdentity,
-            Set<Long> announcedStacks)
+    static void requireEqual(String field, Object expected, Object actual) {
+        if (!expected.equals(actual)) {
+            throw new IllegalStateException(field + " mismatch: expected " + expected + ", got " + actual);
+        }
+    }
+
+    private static void validateObservation(Observation row, Expected expected, Set<Long> announcedStacks)
             throws IOException {
         // Session, epoch and source id are in captureStart: a record cannot disagree with them.
-        JsonSupport.requireEqual(
-                "observation hostTgid", hostTgid, JsonSupport.requireNumber(row, "hostTgid", 1, 0xffffffffL));
-        JsonSupport.requireNumber(row, "hostTid", 1, 0xffffffffL);
-        JsonSupport.requireEqual(
-                "observation targetTgid", targetPid, JsonSupport.requireNumber(row, "targetTgid", 1, 0xffffffffL));
-        JsonSupport.requireNumber(row, "targetTid", 1, 0xffffffffL);
-        String cookieText = JsonSupport.requireString(row, "correlationId");
-        if (!cookieText.matches("[0-9a-f]{16}")) throw new IOException("Invalid observation cookie");
-        long cookie = Long.parseUnsignedLong(cookieText, 16);
-        if ((cookie >>> 32) != epoch || (cookie & 0xffffffffL) == 0) {
+        requireEqual("observation hostTgid", expected.hostTgid(), row.getHostTgid());
+        if (row.getHostTid() == 0) throw new IOException("Observation has no host thread id");
+        requireEqual("observation targetTgid", expected.targetPid(), row.getTargetTgid());
+        if (row.getTargetTid() == 0) throw new IOException("Observation has no target thread id");
+        long cookie = row.getCorrelationId();
+        if ((cookie >>> 32) != expected.epoch() || (cookie & 0xffffffffL) == 0) {
             throw new IOException("Observation cookie does not belong to capture epoch");
         }
-        JsonSupport.requireEqual(
-                "observation processGenerationNs",
-                JsonSupport.requireDecimal(verifiedIdentity, "processGenerationNs"),
-                JsonSupport.requireDecimal(row, "processGenerationNs"));
-        JsonSupport.requireEqual(
+        requireEqual(
+                "observation processGenerationNanos",
+                expected.verifiedIdentity().getProcessGenerationNanos(),
+                row.getProcessGenerationNanos());
+        requireEqual(
                 "observation registrationToken",
-                JsonSupport.requireString(verifiedIdentity, "registrationToken"),
-                JsonSupport.requireString(row, "registrationToken"));
-        requireU64(row, "threadGenerationNs");
-        BigInteger start = requireU64(row, "startMonotonicNanos");
-        BigInteger end = requireU64(row, "endMonotonicNanos");
-        if (start.compareTo(end) > 0) throw new IOException("Observation has negative duration");
+                expected.verifiedIdentity().getRegistrationToken(),
+                row.getRegistrationToken());
+        long start = row.getStartMonotonicNanos();
+        long end = row.getEndMonotonicNanos();
+        if (Long.compareUnsigned(start, end) > 0) throw new IOException("Observation has negative duration");
         // The kernel records the exact threshold it drew against; recompute it from the policy and duration.
-        JsonSupport.requireEqual(
+        long threshold = row.getAdmissionThreshold();
+        if (threshold < 1 || threshold > SamplingConfig.CERTAIN_ADMISSION) {
+            throw new IOException("Observation admissionThreshold out of range: " + threshold);
+        }
+        requireEqual(
                 "observation admissionThreshold",
-                sampling.admissionThreshold(end.subtract(start).longValueExact()),
-                JsonSupport.requireNumber(row, "admissionThreshold", 1, SamplingConfig.CERTAIN_ADMISSION));
+                SamplingConfig.admissionThreshold(expected.sampling(), end - start),
+                threshold);
         // The kernel derives the reason from the two raw sched_switch arguments it records next to it, and only
         // selected reasons pass its filter; recompute both.
-        String reason = JsonSupport.requireString(row, "offCpuReason");
-        String derived = CaptureStream.classifyOffCpu(
-                JsonSupport.requireBoolean(row, "preempted"),
-                JsonSupport.requireNumber(row, "prevTaskState", 0, 0xffffffffL));
-        JsonSupport.requireEqual("observation offCpuReason", derived, reason);
-        if (!sampling.reasons().contains(SamplingConfig.OffCpuReason.parse(reason))) {
+        OffCpuReason reason = row.getReason();
+        requireEqual("observation reason", SamplingConfig.classify(row.getPreempted(), row.getPrevTaskState()), reason);
+        if (!expected.sampling().getReasonsList().contains(reason)) {
             throw new IOException("Observation reason was not selected by sampling.reasons: " + reason);
         }
         // The run-queue part is the raw growth of the scheduler's run delay; the consumers apply the split rule, so
-        // only its presence is checked here: never without the source, and a well-formed u64 with it.
-        if (row.has("runqueueNanos")) {
-            if (timeSplit.source() == TimeSplitConfig.Source.OFF) {
-                throw new IOException("Observation carries a run-queue part although timeSplit.source is off");
-            }
-            requireU64(row, "runqueueNanos");
+        // only its presence is checked here: never without the source.
+        if (row.hasRunqueueNanos() && expected.timeSplit().getSource() == TimeSplitSource.TIME_SPLIT_SOURCE_OFF) {
+            throw new IOException("Observation carries a run-queue part although timeSplit.source is off");
         }
         // A stack is either announced by an earlier record or explained by an error on this row.
-        for (String stack : new String[] {"kernelStack", "userStack"}) {
-            long stackId = JsonSupport.requireSignedNumber(row, stack + "Id", Integer.MIN_VALUE, Integer.MAX_VALUE);
-            JsonElement error = row.get(stack + "Error");
-            boolean failed = error != null && !error.isJsonNull();
-            if (failed) {
-                // A stack the kernel or the map lookup could not produce has no record of its own.
-                JsonSupport.requireString(row, stack + "Error");
-            } else if (stackId < 0) {
-                throw new IOException("Unexplained negative stack id for " + stack + ": " + stackId);
-            } else if (!announcedStacks.contains(stackId)) {
-                throw new IOException("Observation references an unannounced " + stack + ": " + stackId);
-            }
+        checkStack("kernelStack", row.getKernelStackId(), row.getKernelStackError(), announcedStacks);
+        checkStack("userStack", row.getUserStackId(), row.getUserStackError(), announcedStacks);
+    }
+
+    private static void checkStack(String stack, long stackId, String error, Set<Long> announcedStacks)
+            throws IOException {
+        if (stackId < Integer.MIN_VALUE || stackId > Integer.MAX_VALUE) {
+            throw new IOException("Invalid " + stack + " id: " + stackId);
+        }
+        if (!error.isEmpty()) {
+            // A stack the kernel or the map lookup could not produce has no record of its own.
+            return;
+        }
+        if (stackId < 0) {
+            throw new IOException("Unexplained negative stack id for " + stack + ": " + stackId);
+        }
+        if (!announcedStacks.contains(stackId)) {
+            throw new IOException("Observation references an unannounced " + stack + ": " + stackId);
         }
     }
 
@@ -409,13 +355,17 @@ final class ArtifactVerifier {
         private final String sessionId;
         private final long epoch;
         private final int signal;
-        private final String delivery;
-        private final Map<String, String> expectedCounters;
+        private final SignalDelivery delivery;
+        private final AsyncProfilerStats expectedCounters;
         private JfrContext context;
-        private Map<String, String> counters;
+        private boolean countersSeen;
 
         private JfrValidation(
-                String sessionId, long epoch, int signal, String delivery, Map<String, String> expectedCounters) {
+                String sessionId,
+                long epoch,
+                int signal,
+                SignalDelivery delivery,
+                AsyncProfilerStats expectedCounters) {
             this.sessionId = sessionId;
             this.epoch = epoch;
             this.signal = signal;
@@ -442,7 +392,7 @@ final class ArtifactVerifier {
             if (event.getInt("signal") != signal) {
                 throw new IOException("JFR signal does not match the configured signal");
             }
-            if (!delivery.equals(event.getString("signalDelivery"))) {
+            if (!CaptureProtocol.deliveryName(delivery).equals(event.getString("signalDelivery"))) {
                 throw new IOException("JFR signal delivery does not match the configured policy");
             }
             long processId = event.getLong("processId");
@@ -467,23 +417,22 @@ final class ArtifactVerifier {
             }
         }
 
+        /** The stats event names its fields as the manifest's counters do, so each is compared by that name. */
         private void acceptStats(RecordedEvent event) throws IOException {
             if (context == null) {
                 throw new IOException("Signal capture stats precede JFR capture context");
             }
-            if (counters != null) {
+            if (countersSeen) {
                 throw new IOException("Duplicate JFR stats");
             }
             requireIdentity(event);
-            Map<String, String> found = new LinkedHashMap<>();
-            for (Map.Entry<String, String> expected : expectedCounters.entrySet()) {
-                String value = Long.toUnsignedString(event.getLong(expected.getKey()));
-                if (!expected.getValue().equals(value)) {
-                    throw new IOException("JFR/AP counter mismatch: " + expected.getKey());
+            for (FieldDescriptor field : AsyncProfilerStats.getDescriptor().getFields()) {
+                long expected = (Long) expectedCounters.getField(field);
+                if (event.getLong(field.getJsonName()) != expected) {
+                    throw new IOException("JFR/AP counter mismatch: " + field.getJsonName());
                 }
-                found.put(expected.getKey(), value);
             }
-            counters = Map.copyOf(found);
+            countersSeen = true;
         }
 
         private void requireIdentity(RecordedEvent event) throws IOException {
@@ -495,10 +444,10 @@ final class ArtifactVerifier {
         }
 
         private JfrResult result() throws IOException {
-            if (context == null || counters == null) {
+            if (context == null || !countersSeen) {
                 throw new IOException("Incomplete JFR validation stream");
             }
-            return new JfrResult(context.processId(), context.processStartTimeMillis(), counters);
+            return new JfrResult(context.processId(), context.processStartTimeMillis());
         }
     }
 }
