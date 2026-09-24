@@ -23,6 +23,7 @@ import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -311,7 +312,9 @@ class CommandLineTest {
                 : root.getSubcommands().get(command).getCommandSpec();
     }
 
+    /** Runs in the readmeTest task, the one test whose input is the README. */
     @Test
+    @Tag("readme")
     void readmeMatchesParser() throws IOException {
         String path = System.getProperty("jonoffcpu.readme");
         assumeTrue(path != null, "Skipping the README check: -Djonoffcpu.readme is not set");
