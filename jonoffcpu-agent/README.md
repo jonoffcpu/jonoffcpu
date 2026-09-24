@@ -13,8 +13,8 @@ submodule:
 ./gradlew :jonoffcpu-agent:build
 ```
 
-The build creates the Java 17 compatible
-`io.github.jonoffcpu:jonoffcpu-agent:1.0.0` artifact. It embeds its runtime
+The build creates the Java 17 compatible `io.github.jonoffcpu:jonoffcpu-agent`
+artifact, at the version in `gradle.properties`. It embeds its runtime
 configuration dependencies and builds the native components with Corretto 25 in
 the pinned Rust container for the current host architecture by default. To build
 both Linux x86-64 and aarch64 bundles, use `-PnativeArchitectures=all`. If an
@@ -59,9 +59,9 @@ one architecture explicitly; `-PnativeArchitectures=all` selects both.
 `-PnativeArchitectures=all -PnativeLibcs=all`. Host-native JNI tests run when
 the selection includes the current host's architecture and C library.
 
-The publishable artifact is
-`build/libs/jonoffcpu-agent-1.0.0.jar`. Create a YAML configuration containing the
-output path and the async-profiler options:
+The publishable artifact is `build/libs/jonoffcpu-agent-<version>.jar`, where
+`<version>` is the one in `gradle.properties`, such as `1.0.0-SNAPSHOT`. Create a
+YAML configuration containing the output path and the async-profiler options:
 
 ```yaml
 correlationOutput: /data/jonoffcpu-capture.pb
@@ -108,7 +108,7 @@ decimal spelling should be retained in capture metadata.
 Then start the application with the Java agent:
 
 ```sh
-java -javaagent:/path/to/jonoffcpu-agent-1.0.0.jar=/path/to/jonoffcpu.yaml ...
+java -javaagent:/path/to/jonoffcpu-agent-<version>.jar=/path/to/jonoffcpu.yaml ...
 ```
 
 The agent first loads the embedded async-profiler library through the JVM so

@@ -4,9 +4,9 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Gradle project version used to build and test the Java artifacts
+        description: Release version to build and test the Java artifacts with; empty keeps the version in gradle.properties
         required: false
-        default: 1.0.0
+        default: ""
         type: string
       native_artifact_prefix:
         description: Prefix for the per-architecture, per-libc native bundle artifacts
@@ -53,9 +53,14 @@ jobs:
             bundle-prefix: linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    env:
-      ORG_GRADLE_PROJECT_version: ${{ inputs.version }}
     steps:
+      # Only a release passes a version; every other build keeps the snapshot version in gradle.properties. An empty
+      # ORG_GRADLE_PROJECT_version would set an empty version, so it is exported only when there is one.
+      - name: Use the release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: echo "ORG_GRADLE_PROJECT_version=$RELEASE_VERSION" >> "$GITHUB_ENV"
       - name: Verify native runner architecture
         env:
           EXPECTED_HOST_ARCH: ${{ matrix.host-arch }}
@@ -143,9 +148,14 @@ jobs:
     needs: native-build-and-verify
     runs-on: ubuntu-26.04
     timeout-minutes: 20
-    env:
-      ORG_GRADLE_PROJECT_version: ${{ inputs.version }}
     steps:
+      # Only a release passes a version; every other build keeps the snapshot version in gradle.properties. An empty
+      # ORG_GRADLE_PROJECT_version would set an empty version, so it is exported only when there is one.
+      - name: Use the release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: echo "ORG_GRADLE_PROJECT_version=$RELEASE_VERSION" >> "$GITHUB_ENV"
       - uses: actions/checkout@v7
         with:
           submodules: recursive
