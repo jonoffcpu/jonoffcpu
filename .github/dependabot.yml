@@ -1,0 +1,74 @@
+# Every ecosystem batches its version updates into one weekly pull request and its security updates
+# into another, so alert-driven bumps arrive together instead of one pull request per dependency.
+# A group applies to version updates unless it declares `applies-to: security-updates`. Major
+# updates stay outside the version-update groups and arrive one per pull request. The maintenance
+# label files the pull requests under Maintenance in the release notes (.github/release.yml).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - maintenance
+    groups:
+      github-actions-updates:
+        patterns:
+          - "*"
+      github-actions-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    ignore:
+      # Pinned to the commit of its toolchain-version branch, which must match the `cargo +<version>`
+      # formatting check; Dependabot would move it to a release tag.
+      - dependency-name: dtolnay/rust-toolchain
+
+  # The version catalog (gradle/libs.versions.toml) declares every library and plugin version, the
+  # build-logic plugins included, and the wrapper pins the Gradle version.
+  - package-ecosystem: gradle
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    labels:
+      - dependencies
+      - maintenance
+    groups:
+      gradle-dependency-updates:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      gradle-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # The native collector's crates. CI builds them with the rust-version toolchain in the pinned
+  # native-bundle container, so an update that needs a newer compiler fails its pull request.
+  - package-ecosystem: cargo
+    directory: /jonoffcpu-native
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 14
+    labels:
+      - dependencies
+      - maintenance
+    groups:
+      cargo-dependency-updates:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+      cargo-security-updates:
+        applies-to: security-updates
+        patterns:
+          - "*"

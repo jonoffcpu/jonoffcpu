@@ -1,0 +1,11 @@
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # GitHub's own actions follow their major version tags; every other action is pinned to a
+        # commit SHA, which Dependabot keeps current.
+        actions/*: ref-pin
+        "*": hash-pin
+  self-repository:
+    # actionlint does not know the $/ syntax yet; ./ resolves to the same repository and commit.
+    disable: true
