@@ -43,8 +43,9 @@ breaks busy time without an application frame down by thread pool.
       --app=REGEX            A frame of your application; the deepest one is a stack's boundary.
                                Repeatable.
       --app-from=FILE        Read --app patterns from a file or preset:NAME; repeatable.
-      --idle=REGEX           An interval with a frame matching this is idle, a wait for work: it is
-                               listed in its own table, not dropped. Repeatable.
+      --idle=REGEX           An interval with a frame matching this is idle, a wait for work: top
+                               lists it in its own table, and the digest leaves it out of its
+                               tables. Repeatable.
       --idle-from=FILE       Read --idle patterns from a file or preset:NAME, such as preset:
                                jvm-idle; repeatable. Default for summarize, when no idle pattern is
                                given: preset:jvm-idle.

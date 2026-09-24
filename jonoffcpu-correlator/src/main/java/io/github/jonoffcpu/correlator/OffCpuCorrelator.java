@@ -27,7 +27,8 @@ public final class OffCpuCorrelator {
             Degradation ladder,
             boolean stackProfile,
             StackProfileRenderer.ReasonFrame reasonFrame,
-            boolean digest) {
+            Digest.Options digest) {
+        /** {@code digest} is how the analysis digest is computed, or null to leave it out. */
         public OutputOptions {
             if (reasonFrame == null) throw new IllegalArgumentException("Missing reason frame mode");
             if (audit == null) throw new IllegalArgumentException("Missing audit level");
@@ -35,7 +36,7 @@ public final class OffCpuCorrelator {
             if (ladder == null) throw new IllegalArgumentException("Missing degradation ladder");
         }
 
-        public static OutputOptions defaults() {
+        public static OutputOptions defaults() throws IOException {
             return new OutputOptions(
                     false,
                     AuditLevel.FULL,
@@ -43,7 +44,7 @@ public final class OffCpuCorrelator {
                     Degradation.none(),
                     true,
                     StackProfileRenderer.ReasonFrame.AUTO,
-                    true);
+                    Digest.defaults());
         }
     }
 
@@ -150,7 +151,7 @@ public final class OffCpuCorrelator {
             StackProfileRenderer.ReasonFrame reasonFrame,
             boolean stackProfile,
             ProfileAccumulator.Options profileOptions,
-            boolean digest)
+            Digest.Options digest)
             throws IOException {
         boolean hasJfrRange = from != null || to != null;
         OfflineCorrelator.JfrSelection selection = null;
@@ -302,7 +303,8 @@ public final class OffCpuCorrelator {
                     .addAllDimensionsDropped(profile.header().dimensionsDropped())
                     .setEstimateAvailable(profile.header().estimateAvailable())
                     .setTimeSplitAvailable(profile.header().timeSplitAvailable()));
-            if (options.digest()) report.setDigest(digest(directory, prefix, profile, report.build()));
+            if (options.digest() != null)
+                report.setDigest(digest(directory, prefix, profile, report.build(), options.digest()));
         }
         ReportProto.Report built = report.build();
         if (profile != null) {
@@ -359,13 +361,13 @@ public final class OffCpuCorrelator {
      * convenience: a failure to produce it is reported there, its files are removed, and the correlation goes on.
      */
     private static ReportProto.DigestFiles digest(
-            Path directory, String prefix, StackProfile profile, ReportProto.Report report) {
+            Path directory, String prefix, StackProfile profile, ReportProto.Report report, Digest.Options options) {
         ReportProto.DigestFiles.Builder view = ReportProto.DigestFiles.newBuilder();
         Path json = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_JSON_SUFFIX));
         Path markdown = directory.resolve(OutputFiles.name(prefix, OutputFiles.SUMMARY_MD_SUFFIX));
         try {
             Digest.write(
-                    Digest.of(profile, OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX), report, Digest.defaults()),
+                    Digest.of(profile, OutputFiles.name(prefix, OutputFiles.PROFILE_SUFFIX), report, options),
                     json,
                     markdown);
             view.setPath(markdown.getFileName().toString());

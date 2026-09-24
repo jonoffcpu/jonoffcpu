@@ -214,7 +214,8 @@ message ComparedRow {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it.
+// The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it. Idle intervals, those matching the
+// selection's idle patterns, are counted in where_the_time_went and left out of every table and stack.
 
 message Digest {
   string profile = 1;
@@ -228,7 +229,8 @@ message Digest {
   DigestTable busy = 8;
   // The pool table (with --app), or busy time by pool (without); unset when the profile has no threads.
   DigestTable busy_no_application_frame_by_pool = 9;
-  DigestTable idle = 10;
+  reserved 10;
+  reserved "idle";
   HeaviestStacks heaviest_stacks = 11;
   repeated string warnings = 12;
 }

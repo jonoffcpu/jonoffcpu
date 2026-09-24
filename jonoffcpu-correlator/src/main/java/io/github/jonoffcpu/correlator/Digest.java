@@ -17,9 +17,11 @@ import java.util.Map;
 
 /**
  * The analysis digest, {@code jonoffcpu-summary.json} and {@code .md}: a bounded summary of one capture for people and
- * AI agents, which states the capture's coverage and losses, where the time went, the ranked tables of {@link Top},
- * the heaviest transformed stacks, and for each table the command that reproduces it. The Markdown is rendered from
- * the {@link AnalysisProto.Digest} the JSON prints, so the two cannot disagree.
+ * AI agents, which states the capture's coverage and losses, where the time went, the ranked busy tables of {@link
+ * Top}, the heaviest transformed busy stacks, and for each table the command that reproduces it. Idle intervals, waits
+ * for work, are counted in where the time went and left out of everything else, since they would otherwise dominate
+ * every table. The Markdown is rendered from the {@link AnalysisProto.Digest} the JSON prints, so the two cannot
+ * disagree.
  */
 final class Digest {
     /** What the digest is computed with. {@code app} empty ranks by the collapsed leaf instead of a boundary. */
@@ -33,11 +35,13 @@ final class Digest {
 
     /** The default options: {@code preset:jvm-idle}, {@code preset:jvm-wait-machinery}, no application pattern. */
     static Options defaults() throws IOException {
+        return defaults(Cli.sourced(List.of(), "--idle-from", List.of("preset:jvm-idle")));
+    }
+
+    /** The default options with the given idle patterns, as correlation writes the digest. */
+    static Options defaults(List<StackTransforms.Sourced> idle) throws IOException {
         return new Options(
-                List.of(),
-                Cli.sourced(List.of(), "--idle-from", List.of("preset:jvm-idle")),
-                Cli.sourced(List.of(), "--machinery-from", List.of("preset:jvm-wait-machinery")),
-                20);
+                List.of(), idle, Cli.sourced(List.of(), "--machinery-from", List.of("preset:jvm-wait-machinery")), 20);
     }
 
     /**
@@ -120,10 +124,6 @@ final class Digest {
                     .addAllRows(Top.tables(input, poolOptions, Top.shell(poolCommand))
                             .getRowsList()));
         }
-        digest.setIdle(DigestTable.newBuilder()
-                .setBy(by)
-                .setCommand(Top.shell(topCommand))
-                .addAllRows(tables.getIdleList()));
         digest.setHeaviestStacks(heaviest(profile, profilePath, options, withApp));
         digest.addAllWarnings(tables.getWarningsList());
         return digest.build();
@@ -265,13 +265,17 @@ final class Digest {
                 .append("\n\n");
         if (digest.hasCapture()) capture(digest.getCapture(), text);
 
+        DigestTable busy = digest.getBusy();
         text.append("## Where the time went\n\n| Slice | Entries | Intervals | s |\n|---|---:|---:|---:|\n");
         Top.totalsRows(digest.getWhereTheTimeWent(), true, text);
-        text.append("\nIdle means a frame of the stack matched one of the idle patterns ")
+        text.append("\nThe tables and stacks below cover busy time only. Idle intervals, waits for work, are left out:")
+                .append(" a frame of their stack matched one of the idle patterns ")
                 .append(patterns(digest.getSelection().getIdleList()))
-                .append(". A nonzero over-exclusion check means idle patterns hid waits on a lock or monitor.\n\n");
+                .append(". `")
+                .append(busy.getCommand())
+                .append("` lists them. A nonzero over-exclusion check means idle patterns hid waits on a lock or")
+                .append(" monitor.\n\n");
 
-        DigestTable busy = digest.getBusy();
         boolean boundary = busy.getBy().equals("boundary");
         text.append(
                 boundary
@@ -288,11 +292,9 @@ final class Digest {
                             : "## Busy, by pool\n\n");
             section(digest.getBusyNoApplicationFrameByPool(), "pool", text);
         }
-        text.append(boundary ? "## Idle, by boundary\n\n" : "## Idle, by leaf\n\n");
-        section(digest.getIdle(), boundary ? "boundary" : "key", text);
 
         AnalysisProto.HeaviestStacks heaviest = digest.getHeaviestStacks();
-        text.append("## Heaviest transformed stacks\n\nThe busy slice renders as ")
+        text.append("## Heaviest busy stacks\n\nThe busy slice, transformed, renders as ")
                 .append(heaviest.getLines())
                 .append(" lines at a mean depth of ")
                 .append(heaviest.getMeanDepth())
@@ -312,7 +314,9 @@ final class Digest {
                 text.append("> **Warning:** ").append(warning).append("\n");
         }
         text.append("\n## How to reproduce\n\n");
-        text.append("- Busy and idle tables: `").append(busy.getCommand()).append("`\n");
+        text.append("- Busy tables, and the idle waits left out: `")
+                .append(busy.getCommand())
+                .append("`\n");
         if (digest.hasBusyNoApplicationFrameByPool()
                 && !digest.getBusyNoApplicationFrameByPool().getCommand().equals(busy.getCommand())) {
             text.append("- Pool table: `")

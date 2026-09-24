@@ -537,10 +537,20 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
 
 Correlation writes the **digest**, `jonoffcpu-summary.json` and
 `jonoffcpu-summary.md`, next to the report unless `--summary-output false` is
-given, with `preset:jvm-idle`, `preset:jvm-wait-machinery`, canonical names and
-no application pattern; `summarize` rewrites it with `--app`, taking the capture
-section from the report the profile carries, or from `--report FILE`, which is
-parsed strictly as a `Report`. The report's `digest` object names the files, or
+given, with the idle patterns of `--idle` and `--idle-from` (default
+`preset:jvm-idle`), `preset:jvm-wait-machinery`, canonical names and no
+application pattern; `summarize` rewrites it with `--app` or other idle
+patterns, taking the capture section from the report the profile carries, or
+from `--report FILE`, which is parsed strictly as a `Report`.
+
+The digest is about busy time. An interval with a frame matching an idle
+pattern is a wait for work, such as an event loop in `epoll` or a pool worker
+waiting for a task, and would otherwise dominate every table: the digest counts
+idle intervals in `whereTheTimeWent` and leaves them out of every table and
+stack. The idle patterns only shape the digest; the collapsed stacks, the
+profile and the report keep every interval. An application's own idle waits,
+such as a task queue of its own, belong in an `--idle-from` file of its own,
+next to `preset:jvm-idle`. The report's `digest` object names the files, or
 holds the `error` when the digest could not be written, which never fails the
 correlation. The JSON is a `Digest` message:
 
@@ -550,7 +560,7 @@ correlation. The JSON is a `Digest` message:
 | `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
 | `selection` | As in `top --format json` |
 | `whereTheTimeWent` | `top`'s totals: selected, idle, busy, busy with and without an application frame, over-exclusion |
-| `busy`, `idle` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, and the `rows` of `top` |
+| `busy` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, which also lists the idle waits, and the busy `rows` of `top` |
 | `busyNoApplicationFrameByPool` | The pool table (with `--app`), or busy time by pool (without) |
 | `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines (`top`), and the `command` |
 | `warnings` | As in `top` |
