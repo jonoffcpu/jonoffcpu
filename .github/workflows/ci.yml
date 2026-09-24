@@ -9,17 +9,67 @@ on:
 
 permissions:
   contents: read
-  # The reusable workflow's setup-gradle comments on a pull request whose build fails.
-  pull-requests: write
 
+# A newer push supersedes a pull request's build. Builds of main always finish: only they save the
+# Gradle, configuration and Docker layer caches that every other build restores.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build-and-verify:
     name: Native build and verification
+    # The reusable workflow's setup-gradle comments on a pull request whose build fails.
+    permissions:
+      contents: read
+      pull-requests: write
     uses: ./.github/workflows/build-and-verify.yml
     with:
       native_artifact_prefix: native
       runnable_artifact_name: jonoffcpu-runnable-jars
+    secrets:
+      GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  # actionlint checks the workflows' syntax, expressions and shell scripts (with shellcheck), and
+  # zizmor audits them for security problems such as template injection and excessive permissions.
+  lint-workflows:
+    name: Lint workflows
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Run actionlint
+        run: >-
+          docker run --rm --volume "$PWD:/repo" --workdir /repo
+          rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+          -color
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+          annotations: true
+
+  # The single status check that branch protection requires before a pull request can merge, so
+  # adding or renaming jobs never changes the protection rule. It always runs and fails unless every
+  # job it needs succeeded: a skipped job would otherwise let a skipped check count as passing.
+  all-checks-passed:
+    name: All checks passed
+    needs:
+      - build-and-verify
+      - lint-workflows
+    if: always()
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every needed job to succeed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "$NEEDS")
+          if [[ -n "$failed" ]]; then
+            echo "Jobs that did not succeed:" >&2
+            echo "$failed" >&2
+            exit 1
+          fi
+          echo "All needed jobs succeeded."

@@ -25,6 +25,7 @@ jobs:
         with:
           # The converter module builds from the async-profiler submodule's sources.
           submodules: recursive
+          persist-credentials: false
       - uses: actions/setup-java@v6
         with:
           distribution: corretto
@@ -32,6 +33,7 @@ jobs:
       - name: Generate and submit the dependency graph
         uses: gradle/actions/dependency-submission@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
         with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
           build-scan-publish: true
           build-scan-terms-of-use-url: https://gradle.com/terms-of-service
           build-scan-terms-of-use-agree: "yes"
