@@ -235,12 +235,11 @@ message ComparedRow {
 // The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it. Idle intervals, those matching the
 // selection's idle patterns, are counted in where_the_time_went and left out of every table and stack.
 //
-// Schema 2 adds schema_version (absent, 0, in schema 1), and with --app the application-rooted tables: busy is then by
-// the application method that waited, busy_by_root, busy_by_application_method and
-// heaviest_application_stacks are set, and busy time without an application frame is hidden from them.
+// With --app the tables are application-rooted: busy is by the application method that waited,
+// busy_by_root, busy_by_application_method and heaviest_application_stacks are set, and busy time
+// without an application frame is hidden from them.
 
 message Digest {
-  uint32 schema_version = 17;
   string profile = 1;
   string run = 2;
   bool estimate_available = 3;
@@ -252,8 +251,6 @@ message Digest {
   DigestTable busy = 8;
   // The pool table (with --app), or busy time by pool (without); unset when the profile has no threads.
   DigestTable busy_no_application_frame_by_pool = 9;
-  reserved 10;
-  reserved "idle";
   HeaviestStacks heaviest_stacks = 11;
   repeated string warnings = 12;
   // With --app: busy time by application root (top --by root), by application method (top --by app-method),
@@ -319,14 +316,16 @@ message HeavyStack {
 // `export --format jsonl`: one row per profile entry.
 
 message ExportRow {
-  io.github.jonoffcpu.capture.v1.OffCpuReason reason = 1;
-  uint32 task_state = 2;
-  // Unset when the profile is not grouped by thread, or the thread is unknown.
-  optional string thread = 3;
-  // The stacks joined with ';', root first; unset for an absent stack.
-  optional string java_stack = 4;
-  optional string kernel_stack = 5;
-  optional string user_stack = 6;
+  // --run-label, by default the profile's label, else its first source's session id.
+  string run = 1;
+  // Whether the estimated columns may be used, from the profile header.
+  bool estimate_available = 2;
+  io.github.jonoffcpu.capture.v1.OffCpuReason reason = 3;
+  uint32 task_state = 4;
+  // Unset when the profile is not grouped by thread, or the thread is unknown; the pool is the name with
+  // every digit run replaced by #.
+  optional string thread = 5;
+  optional string thread_pool = 6;
   uint64 intervals = 7;
   uint64 observed_nanos = 8;
   uint64 estimated_nanos = 9;
@@ -336,17 +335,19 @@ message ExportRow {
   uint64 estimated_sleeping_nanos = 13;
   uint64 estimated_runqueue_nanos = 14;
   uint64 estimated_unsplit_nanos = 15;
-  // Each Java-stack frame's kind, "java" or "native", joined like java_stack.
-  optional string java_stack_kinds = 16;
+  // The stacks joined with ';', root first; unset for an absent stack. Each Java-stack frame's kind,
+  // "java" or "native", is joined like java_stack, and canonical_java_stack is java_stack without
+  // generated-class addresses, so stacks of two runs join.
+  optional string java_stack = 16;
+  optional string java_stack_kinds = 17;
+  optional string canonical_java_stack = 18;
+  optional string kernel_stack = 19;
+  optional string user_stack = 20;
   // The same stacks as lists, root first; empty for an absent stack.
-  repeated string java_frames = 17;
-  repeated string java_frame_kinds = 18;
-  repeated string kernel_frames = 19;
-  repeated string user_frames = 20;
-  optional string canonical_java_stack = 21;
-  optional string thread_pool = 22;
-  string run = 23;
-  bool estimate_available = 24;
+  repeated string java_frames = 21;
+  repeated string java_frame_kinds = 22;
+  repeated string kernel_frames = 23;
+  repeated string user_frames = 24;
 }
 
 // `export --run-metadata`: one object describing the profile, joined to its rows on `run`.

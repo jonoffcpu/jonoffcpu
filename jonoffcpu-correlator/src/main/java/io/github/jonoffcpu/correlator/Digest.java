@@ -26,12 +26,9 @@ import java.util.Map;
  * <p>With an application pattern every table and stack is computed from one set of transforms, those of the
  * application-rooted flame graph: canonical names, the {@code hide} frames removed, each stack rooted at its first
  * application frame, busy time without one hidden and counted apart, and the wait machinery collapsed. Without one
- * the tables rank the collapsed leaf, as before schema 2.
+ * the tables rank the collapsed leaf.
  */
 final class Digest {
-    /** The {@link AnalysisProto.Digest#getSchemaVersion() schema} this class writes. */
-    static final int SCHEMA_VERSION = 2;
-
     /**
      * What the digest is computed with. {@code app} empty ranks by the collapsed leaf instead of a boundary, and
      * {@code hide} only applies with an application pattern.
@@ -218,7 +215,6 @@ final class Digest {
     private static AnalysisProto.Digest.Builder header(
             StackProfile profile, String profilePath, ReportProto.Report report) {
         AnalysisProto.Digest.Builder digest = AnalysisProto.Digest.newBuilder()
-                .setSchemaVersion(SCHEMA_VERSION)
                 .setProfile(profilePath)
                 .setRun(StackProfileRenderer.defaultRun(profile))
                 .setEstimateAvailable(profile.header().estimateAvailable())

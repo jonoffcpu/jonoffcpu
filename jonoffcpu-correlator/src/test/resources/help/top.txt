@@ -23,8 +23,8 @@ listed in its own table.
 breaks busy time without an application frame down by thread pool.
       --profile=FILE         The stack profile, such as jonoffcpu-offcpu-profile.pb. Required
                                unless --collapsed-input is given.
-      --reason=REASONS       all, or a comma-separated list of blocked, runnable, preempted and
-                               unspecified. Default: all.
+      --reason=REASONS       all, or a comma-separated list of blocked, runnable and preempted.
+                               Default: all.
       --stack=KINDS          Which stacks a line is made of: java, kernel, user, java+kernel or
                                java+user+kernel. Default: java.
       --weights=WEIGHTS      observed durations, or the estimated inverse-probability population

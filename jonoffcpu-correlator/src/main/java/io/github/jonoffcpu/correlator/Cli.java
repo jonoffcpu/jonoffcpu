@@ -54,11 +54,6 @@ final class Cli {
 
     /** Parses and runs one command line; see the class comment for the exit codes. */
     static int run(String[] args, PrintWriter out, PrintWriter err) throws Exception {
-        // The pre-subcommand spelling of dump, kept as a deprecated alias.
-        if (args.length > 0 && args[0].equals("--dump")) {
-            args = args.clone();
-            args[0] = "dump";
-        }
         CommandLine commandLine = commandLine();
         commandLine.setOut(out);
         commandLine.setErr(err);
@@ -415,7 +410,7 @@ final class Cli {
                 paramLabel = "REASONS",
                 defaultValue = "all",
                 converter = ReasonsConverter.class,
-                description = "all, or a comma-separated list of blocked, runnable, preempted and unspecified."
+                description = "all, or a comma-separated list of blocked, runnable and preempted."
                         + " Default: ${DEFAULT-VALUE}.")
         Reasons reasons;
 
@@ -1490,10 +1485,8 @@ final class Cli {
             name = "dump",
             mixinStandardHelpOptions = true,
             versionProvider = Version.class,
-            description = {
-                "Prints the capture stream as JSON Lines, one record per line as the capture schema defines it.",
-                "`--dump --source FILE` is a deprecated alias."
-            })
+            description =
+                    "Prints the capture stream as JSON Lines, one record per line as the capture schema defines it.")
     static final class Dump implements Callable<Integer> {
         @Option(names = "--source", paramLabel = "FILE", description = "The capture stream. Required.")
         Path source;
@@ -1545,7 +1538,8 @@ final class Cli {
             if (text.equals("all")) return new Reasons(null);
             Set<OffCpuReason> reasons = EnumSet.noneOf(OffCpuReason.class);
             for (String label : text.split(",", -1)) {
-                OffCpuReason reason = choice(label, OffCpuReason.values(), OffCpuReason::label);
+                OffCpuReason reason =
+                        choice(label, OffCpuReason.CLASSIFIED.toArray(OffCpuReason[]::new), OffCpuReason::label);
                 if (!reasons.add(reason)) throw new TypeConversionException("duplicate reason '" + label + "'");
             }
             return new Reasons(reasons);

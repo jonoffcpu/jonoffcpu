@@ -727,7 +727,7 @@ java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
 ```
 
 `--reason` takes `all` (the default) or a comma-separated list of `blocked`,
-`runnable`, `preempted` and `unspecified` (which no current capture records);
+`runnable` and `preempted`;
 a slice with more than one reason starts each line with its
 `[offcpu: <reason>]` frame unless `--reason-frame never` is given. `--stack` is
 `java` (the default), `kernel`, `user`, `java+kernel` or `java+user+kernel`;

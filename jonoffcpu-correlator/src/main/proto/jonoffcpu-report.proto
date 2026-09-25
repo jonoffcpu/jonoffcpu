@@ -59,8 +59,6 @@ message Report {
   // Set with --estimate-population true.
   PopulationEstimate population_estimate = 22;
   HandlerDelays handler_delay_nanos = 23;
-  reserved 24;
-  reserved "synthetic_jfr";
   OffCpuReasons off_cpu_reasons = 25;
   // Always set, with no steps when nothing needed to degrade.
   DegradationReport degradation = 26;
@@ -207,8 +205,6 @@ message DegradationStep {
     DropAuditOutputs drop_audit_outputs = 3;
     NarrowWindow narrow_window = 4;
   }
-  reserved 5, 6;
-  reserved "coarsen_synthetic_quantum", "omit_synthetic_jfr";
 }
 
 message ThinSource {

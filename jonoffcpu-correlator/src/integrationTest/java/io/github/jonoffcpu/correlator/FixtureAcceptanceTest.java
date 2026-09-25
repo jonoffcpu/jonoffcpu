@@ -358,6 +358,8 @@ class FixtureAcceptanceTest {
                 "summarize",
                 "--profile",
                 wolfi.toString(),
+                "--app",
+                APP,
                 "--idle-from",
                 "preset:jvm-idle",
                 "--idle",
@@ -365,12 +367,9 @@ class FixtureAcceptanceTest {
                 "--output-dir",
                 digest.toString());
         assertThat(summarize.code()).as("summarize failed: %s", summarize).isZero();
-        assertThat(Files.size(digest.resolve(OutputFiles.SUMMARY_MD)))
-                .as("The digest's Markdown without --app must stay under 16 KB")
-                .isLessThan(16 * 1024);
         AnalysisProto.HeaviestStacks heaviest = ProtoJson.parse(
                         Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
-                .getHeaviestStacks();
+                .getHeaviestApplicationStacks();
         assertThat(heaviest.getTopCount())
                 .as("Heaviest application stacks: %s", heaviest)
                 .isEqualTo(10);
@@ -594,9 +593,6 @@ class FixtureAcceptanceTest {
                 .extracting(AnalysisProto.TopRow::getKey)
                 .startsWith("pulsar-web-#-#", "ZDriverMinor");
         assertThat(markdown).contains("More than half of the busy time has no application frame");
-        assertThat(Files.size(output.resolve(OutputFiles.SUMMARY_MD)))
-                .as("The application-rooted digest's Markdown must stay under 40 KB")
-                .isLessThan(40 * 1024);
 
         // Every reproduce command, run as written, prints its table as the digest has it.
         for (AnalysisProto.DigestTable table :

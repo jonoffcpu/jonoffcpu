@@ -143,7 +143,7 @@ final class SourceColumns {
         reason[slot] = (byte) value.ordinal();
     }
 
-    /** Why the kernel recorded the thread leaving the CPU; unspecified for a schemaVersion 2 capture. */
+    /** Why the kernel recorded the thread leaving the CPU; unspecified for a row whose reason did not validate. */
     OffCpuReason offCpuReason(int slot) {
         return OffCpuReason.ofOrdinal(offCpuReason[slot]);
     }

@@ -126,6 +126,11 @@ class CommandLineTest {
             List.of("'maybe' is not a boolean", "--partial", "maybe"),
             List.of("expected nanoseconds", "--from-ns", "-1"),
             List.of("duplicate reason 'blocked'", "stacks", "--reason", "blocked,blocked"),
+            List.of(
+                    "expected one of blocked, runnable, preempted but was 'unspecified'",
+                    "stacks",
+                    "--reason",
+                    "unspecified"),
             List.of("Empty profile path", "merge", "--profiles", "a.pb,,b.pb", "--output", "m.pb"),
             List.of(
                     "Population estimates require the unthinned source",
@@ -161,16 +166,15 @@ class CommandLineTest {
         usageError(message, args.toArray(String[]::new));
     }
 
-    /** {@code --dump --source} and {@code dump --source} write the same bytes, and neither closes stdout. */
+    /** dump writes the stream without closing stdout. */
     @Test
     void dumpAlias(@TempDir Path dir) throws Exception {
         Path jfr = CorrelationFixture.recording(dir, 1);
         var observation = CorrelationFixture.observation(CorrelationFixture.sampleThread(jfr));
         Path source = CorrelationFixture.source(dir, jfr, List.of(observation));
-        byte[] alias = stdout("--dump", "--source", source.toString());
-        byte[] command = stdout("dump", "--source", source.toString());
-        assertThat(alias).as("dump must write something").isNotEmpty();
-        assertThat(alias).as("dump and --dump must agree").isEqualTo(command);
+        assertThat(stdout("dump", "--source", source.toString()))
+                .as("dump must write something")
+                .isNotEmpty();
 
         // The pre-picocli spellings used by the README and the Pulsar launcher keep their exit codes, and the default
         // command and its explicit name write the same analysis.

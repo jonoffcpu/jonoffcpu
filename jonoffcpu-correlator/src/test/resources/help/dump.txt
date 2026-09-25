@@ -1,6 +1,5 @@
 Usage: java -jar jonoffcpu-correlator.jar dump [-hV] [--source=FILE]
 Prints the capture stream as JSON Lines, one record per line as the capture schema defines it.
-`--dump --source FILE` is a deprecated alias.
   -h, --help          Show this help message and exit.
       --source=FILE   The capture stream. Required.
   -V, --version       Print version information and exit.

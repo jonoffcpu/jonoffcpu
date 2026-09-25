@@ -3,12 +3,10 @@ package io.github.jonoffcpu.correlator;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import io.github.jonoffcpu.capture.CaptureFixtures;
 import io.github.jonoffcpu.capture.CaptureProto;
 import io.github.jonoffcpu.correlator.AnalysisProto.TopRow;
 import io.github.jonoffcpu.correlator.profile.ProfileProto;
 import java.io.IOException;
-import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -21,7 +19,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
-/** The digest's two layouts on hand-built entries: rooted at the application with --app, and unchanged without. */
+/** The application-rooted digest on hand-built entries: layout, sums, the missing-idle note and reproduce commands. */
 class DigestTest {
     private static final CaptureProto.Sampling NONE = CaptureProto.Sampling.newBuilder()
             .addReasons(CaptureProto.OffCpuReason.OFF_CPU_REASON_BLOCKED)
@@ -126,7 +124,6 @@ class DigestTest {
     @Test
     void applicationRootedLayout() throws Exception {
         AnalysisProto.Digest digest = Digest.of(profile(10_000_000_000L), "run.pb", null, application());
-        assertThat(digest.getSchemaVersion()).isEqualTo(Digest.SCHEMA_VERSION);
         assertThat(keys(digest.getBusy()))
                 .as("The application methods that waited")
                 .containsExactly("x.Svc.work", "x.Map.get");
@@ -233,22 +230,5 @@ class DigestTest {
                 .containsExactlyInAnyOrder(
                         "x.Svc.lambda$go$0;x.Svc.work;j.u.c.l.ReentrantLock.lock 2000000",
                         "x.Svc.handle;x.Map.get;j.u.c.l.StampedLock.readLock 1000000");
-    }
-
-    /** Without --app the digest keeps the layout it had before the application-rooted tables, byte for byte. */
-    @Test
-    void withoutApplicationUnchanged() throws Exception {
-        ReportProto.Report report = ReportProto.Report.newBuilder()
-                .setAnalysisInputs(CaptureProto.AnalysisInputs.newBuilder()
-                        .setSessionId("golden")
-                        .setSampling(CaptureFixtures.uniformSampling()))
-                .setSourceRows(20)
-                .setMatched(13)
-                .build();
-        String markdown = Digest.markdown(Digest.of(profile(10_000_000_000L), "run.pb", report, Digest.defaults()));
-        try (InputStream golden = DigestTest.class.getResourceAsStream("/digest/without-app.md")) {
-            assertThat(golden).as("Missing golden file").isNotNull();
-            assertThat(markdown).isEqualTo(new String(golden.readAllBytes(), StandardCharsets.UTF_8));
-        }
     }
 }

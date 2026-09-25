@@ -17,8 +17,7 @@ records as messages: the `sampling`, `timeSplit` and `verifiedIdentity` copies i
 `captureStart` and the footer's `analysisInputs` must be equal, and a missing or
 unspecified value (an unset sampling policy or time split, an unknown enum
 value) is refused rather than defaulted. Read a capture with
-`java -jar jonoffcpu-correlator.jar dump --source <file>` (formerly `--dump --source`,
-still accepted), which prints one record per line in the schema's proto3 JSON
+`java -jar jonoffcpu-correlator.jar dump --source <file>`, which prints one record per line in the schema's proto3 JSON
 mapping (`{"captureStart":{...}}`, `{"stack":{...}}`, `{"observation":{...}}`, …),
 and a final `{"truncatedTailBytes":"N"}` line when the stream ends in a record
 cut short.
@@ -306,7 +305,7 @@ and refuses a truncated or foreign file. Three subcommands use it:
 
 ```sh
 java -jar jonoffcpu-correlator.jar stacks --profile P --output F
-    [--reason all|blocked,runnable,preempted,unspecified]
+    [--reason all|blocked,runnable,preempted]
     [--stack java|kernel|user|java+kernel|java+user+kernel]
     [--weights observed|estimated] [--reason-frame auto|always|never]
     [--time total|sleeping|runqueue|split] [--package-names full|abbreviate|drop]
@@ -412,8 +411,8 @@ first letter (`io.netty.channel.epoll.Native.epollWait0` becomes
 `i.n.c.e.Native.epollWait0`), and `drop` shows `Class.method`; a hidden class's
 `.0x…` suffix (`Cursor$$Lambda.0x0000000081a16ff8`) stays part of the class. Only
 `JAVA` frames change: a `JFR_NATIVE` frame keeps its library and symbol
-(`libjvm.so.Unsafe_Park`). As a fallback for schema 1 profiles, and as a second
-line of defence, a name that reads as native is also left alone: one with a C++
+(`libjvm.so.Unsafe_Park`). As a second line of defence, and for a collapsed
+input, whose frames have no kinds, a name that reads as native is also left alone: one with a C++
 `::`, a shared-library segment (`.so.`, `.so.6.`), a leading `/` or `[`, or a
 space. That rule can only prevent a rewrite, and a frame that is not a
 package-qualified `Class.method` is left unchanged too. It only changes the
@@ -446,21 +445,21 @@ with different grouping, and thinned profiles, whose weights have no common scal
 It sums the split parts too, so an input without the split contributes its time
 as unsplit and the merged profile has the split when any input has it. Java
 stacks with the same frame names merge whatever kinds their inputs gave them, and
-a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`, so a schema 1 input
-cannot make a native frame rewritable.
-`export` writes one row per entry with expanded stacks, the six split columns and
-`java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack frame's
-kind, `java` or `native`, joined with `;` like `java_stack`. It is for tools such
-as DuckDB. A JSON Lines row is an `ExportRow` message. These columns are followed,
-in this order, by:
+a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`.
+`export` writes one row per entry with its stacks expanded, for tools such as
+DuckDB; a JSON Lines row is an `ExportRow` message. The columns, in order:
 
 | JSON Lines | CSV | Contents |
 | --- | --- | --- |
-| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first, as the joined columns render them; empty for an absent stack, whose joined column is left out. CSV stays flat. |
-| `canonicalJavaStack` | `canonical_java_stack` | `javaStack` without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
-| `threadPool` | `thread_pool` | The thread name with every digit run replaced by `#` |
 | `run` | `run` | `--run-label`, by default the profile's label, else its first source's session id |
 | `estimateAvailable` | `estimate_available` | Whether the estimated columns may be used, from the profile header |
+| `reason`, `taskState` | `reason`, `task_state` | The switch-out reason and the task state it was derived from |
+| `thread`, `threadPool` | `thread`, `thread_pool` | The thread's name, and its pool: the name with every digit run replaced by `#`; empty when the profile is not grouped by thread |
+| `intervals`, `observedNanos`, `estimatedNanos` | `intervals`, `observed_nanos`, `estimated_nanos` | The entry's counters |
+| `sleepingNanos`, `runqueueNanos`, `unsplitNanos` and their `estimated…` forms | `sleeping_nanos`, `runqueue_nanos`, `unsplit_nanos` and their `estimated_…` forms | The six split columns |
+| `javaStack`, `javaStackKinds`, `canonicalJavaStack` | `java_stack`, `java_stack_kinds`, `canonical_java_stack` | The Java stack joined with `;`, root first; each frame's kind, `java` or `native`, joined the same way; and the stack without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
+| `kernelStack`, `userStack` | `kernel_stack`, `user_stack` | The native stacks, joined; left out when absent |
+| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first; empty for an absent stack. CSV stays flat. |
 
 In JSON Lines `reason` is the enum value name (`OFF_CPU_REASON_BLOCKED`, where
 the CSV has `blocked`), `taskState` is a number, and the 64-bit counters
@@ -619,7 +618,6 @@ correlation. The JSON is a `Digest` message:
 
 | Field | Contents |
 | --- | --- |
-| `schemaVersion` | `2`: 1, when absent, is the layout before the application-rooted tables |
 | `profile`, `run`, `estimateAvailable`, `timeSplitAvailable` | What was summarised |
 | `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
 | `selection` | As in `top --format json` |
@@ -632,9 +630,7 @@ correlation. The JSON is a `Digest` message:
 | `heaviestApplicationStacks` | With `--app`: the same for the application-rooted slice, abbreviated package names |
 | `warnings` | As in `top` |
 
-Every table is limited to `--limit` rows (default 20), which keeps the Markdown
-of an Apache Pulsar broker's digest under 16 KB without `--app` and under 40 KB
-with it. The Markdown is rendered from
+Every table is limited to `--limit` rows (default 20). The Markdown is rendered from
 the JSON, so the two cannot disagree, and the same inputs give the same bytes.
 
 ## Degradation

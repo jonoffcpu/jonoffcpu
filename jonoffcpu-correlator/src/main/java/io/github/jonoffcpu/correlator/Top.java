@@ -137,7 +137,7 @@ final class Top {
                                 .toList())
                 .predicate(profile);
         Set<OffCpuReason> reasons =
-                options.reasons() == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(options.reasons());
+                options.reasons() == null ? EnumSet.copyOf(OffCpuReason.CLASSIFIED) : EnumSet.copyOf(options.reasons());
         Thinning thinning = estimated ? Thinning.NONE : header.thinning();
         List<Item> items = new ArrayList<>();
         for (StackProfile.Entry entry : profile.entries()) {

@@ -27,6 +27,10 @@ enum OffCpuReason {
 
     private static final OffCpuReason[] VALUES = values();
 
+    /** The reasons the kernel classifies an interval as: every reason a slice can select. */
+    static final java.util.Set<OffCpuReason> CLASSIFIED =
+            java.util.Collections.unmodifiableSet(java.util.EnumSet.of(BLOCKED, RUNNABLE, PREEMPTED));
+
     String label() {
         return name().toLowerCase(Locale.ROOT);
     }
