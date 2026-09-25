@@ -373,12 +373,39 @@ migration is documented.
 
 ## Using the artifacts as libraries
 
+The artifacts are published to Maven Central under the group id
+[`io.github.jonoffcpu`](https://central.sonatype.com/namespace/io.github.jonoffcpu).
+
 ```kotlin
 dependencies {
     implementation("io.github.jonoffcpu:jonoffcpu-agent:0.7.0")
     implementation("io.github.jonoffcpu:jonoffcpu-correlator:0.7.0")
     implementation("io.github.jonoffcpu:jonoffcpu-jfr-converter:0.7.0")
 }
+```
+
+```xml
+<properties>
+  <jonoffcpu.version>0.7.0</jonoffcpu.version>
+</properties>
+
+<dependencies>
+  <dependency>
+    <groupId>io.github.jonoffcpu</groupId>
+    <artifactId>jonoffcpu-agent</artifactId>
+    <version>${jonoffcpu.version}</version>
+  </dependency>
+  <dependency>
+    <groupId>io.github.jonoffcpu</groupId>
+    <artifactId>jonoffcpu-correlator</artifactId>
+    <version>${jonoffcpu.version}</version>
+  </dependency>
+  <dependency>
+    <groupId>io.github.jonoffcpu</groupId>
+    <artifactId>jonoffcpu-jfr-converter</artifactId>
+    <version>${jonoffcpu.version}</version>
+  </dependency>
+</dependencies>
 ```
 
 The correlator exposes
