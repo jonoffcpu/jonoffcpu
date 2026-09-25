@@ -44,7 +44,7 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build-and-verify:
-    name: Native build and verification
+    name: Build and verify
     needs: version
     # The reusable workflow declares what setup-gradle may need; a tag build has no pull request to comment on.
     permissions:

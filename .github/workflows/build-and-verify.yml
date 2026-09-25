@@ -28,10 +28,11 @@ permissions:
   pull-requests: write
 
 jobs:
-  # Everything that needs only a JDK, once: formatting, every module's unit tests, and the integration tests that need
-  # no native bundle (the correlator's, with DuckDB, and the converter's). The native matrix starts only after it.
-  jvm-checks:
-    name: Formatting and JVM tests
+  # Everything that needs only a JDK, once (jvmCheck): every module's unit tests, the integration tests that need no
+  # native bundle (the correlator's, with DuckDB, and the converter's), and the formatting checks. The native matrix
+  # starts only after it.
+  unit-tests:
+    name: Unit tests
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -79,12 +80,12 @@ jobs:
           fi
           duckdb --version
           echo "JONOFFCPU_REQUIRE_DUCKDB=true" >> "$GITHUB_ENV"
-      - name: Run formatting and JVM tests
+      - name: Run the unit tests
         run: ./gradlew jvmCheck --no-daemon
 
   native-build-and-verify:
     name: Build and verify ${{ matrix.libc }} on ${{ matrix.name }}
-    needs: jvm-checks
+    needs: unit-tests
     # One job per architecture and C library, so all four bundles build in
     # parallel on native runners. The bundle directory is linux-<arch> for glibc
     # and linux-musl-<arch> for musl, matching the agent's META-INF/native layout.
@@ -150,7 +151,7 @@ jobs:
           use: false
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
       # nativeTest builds the job's bundle and runs only the tests that need it;
-      # the JVM tests ran once, in jvm-checks. The host-native tests load the
+      # the JVM tests ran once, in unit-tests. The host-native tests load the
       # bundle into the test JVM: directly for glibc, and in an Alpine container
       # of the same architecture for musl, whose bundle cannot load into the
       # glibc build JVM. The privileged-container ones run the packaged agent
@@ -178,7 +179,7 @@ jobs:
           if-no-files-found: error
 
   package:
-    name: Package combined Java artifacts
+    name: Package combined artifacts
     needs: native-build-and-verify
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -222,7 +223,7 @@ jobs:
             mv "native-bundles/${NATIVE_ARTIFACT_PREFIX}-${bundle}" "jonoffcpu-agent/build/native/${bundle}"
           done
       # The checks that read the agent JAR, which embeds all four bundles. The converter's and the correlator's
-      # tests ran in jvm-checks; their JARs are only built and verified here.
+      # tests ran in unit-tests; their JARs are only built and verified here.
       - name: Package and verify all native bundles
         run: >-
           ./gradlew

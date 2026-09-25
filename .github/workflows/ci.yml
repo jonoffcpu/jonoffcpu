@@ -17,8 +17,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Whether the change touches only documentation, as .github/changes-filter.yaml defines it. A pull request's files
-  # come from the API; a push to main is compared with the commit before the push. A manual run builds everything.
+  # Whether the change touches documentation, and whether it touches only documentation, as
+  # .github/changes-filter.yaml defines it. A pull request's files come from the API; a push to main is compared with
+  # the commit before the push. A manual run builds everything, and its build runs the documentation test too.
   changes:
     name: Detect changes
     runs-on: ubuntu-26.04
@@ -28,6 +29,7 @@ jobs:
       # paths-filter lists a pull request's changed files through the API.
       pull-requests: read
     outputs:
+      docs_changed: ${{ steps.filter.outputs.docs }}
       docs_only: ${{ steps.docs-only.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v7
@@ -55,7 +57,7 @@ jobs:
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
   build-and-verify:
-    name: Native build and verification
+    name: Build and verify
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     # The reusable workflow's setup-gradle comments on a pull request whose build fails.
@@ -69,10 +71,13 @@ jobs:
     secrets:
       GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
 
-  # The README and docs pages against the correlator's parser, and their links. It runs for every change, so that a
-  # documentation-only change, which skips the build, is still checked; the build runs the same test in jvmCheck.
+  # The README and docs pages against the correlator's parser, and their links, for a change that touches
+  # documentation. A documentation-only change skips the build, so this is its only check; the build runs the same test
+  # in jvmCheck, which also covers a code change that breaks the documentation.
   docs:
     name: Documentation check
+    needs: changes
+    if: needs.changes.outputs.docs_changed == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
@@ -121,8 +126,9 @@ jobs:
 
   # The single status check that branch protection requires before a pull request can merge, so
   # adding or renaming jobs never changes the protection rule. It always runs and fails unless every
-  # job it needs succeeded: a skipped job would otherwise let a skipped check count as passing. The one
-  # accepted skip is the build of a documentation-only change.
+  # job it needs succeeded: a skipped job would otherwise let a skipped check count as passing. The accepted
+  # skips are the build of a documentation-only change and the documentation check of a change without
+  # documentation.
   all-checks-passed:
     name: All checks passed
     needs:
@@ -137,12 +143,14 @@ jobs:
       - name: Require every needed job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
+          DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
         run: |
-          failed=$(jq -r --arg docs_only "$DOCS_ONLY" '
+          failed=$(jq -r --arg docs_changed "$DOCS_CHANGED" --arg docs_only "$DOCS_ONLY" '
             to_entries[]
             | select(.value.result != "success")
             | select(.key != "build-and-verify" or .value.result != "skipped" or $docs_only != "true")
+            | select(.key != "docs" or .value.result != "skipped" or $docs_changed == "true")
             | "\(.key): \(.value.result)"' <<< "$NEEDS")
           if [[ -n "$failed" ]]; then
             echo "Jobs that did not succeed:" >&2

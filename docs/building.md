@@ -97,17 +97,20 @@ releases, [`build-and-verify.yml`](../.github/workflows/build-and-verify.yml):
 
 | Job | Runs on | Does |
 | --- | --- | --- |
-| Formatting and JVM tests | x86-64 | `cargo fmt --check` and `./gradlew jvmCheck`, with DuckDB installed and required |
-| Native build and verification | x86-64 and arm64 × glibc and musl, after the JVM job | Builds one native bundle and runs `:jonoffcpu-agent:nativeTest` against it, then uploads the bundle |
-| Package | x86-64, after all four | Assembles the agent JAR from the four bundles, verifies it and the correlator JAR, runs the agent's packaged-JAR test, and uploads the three runnable JARs |
-| Documentation check | x86-64 | `:jonoffcpu-correlator:readmeTest` |
+| Detect changes | x86-64 | Decides whether the change touches documentation, and whether it touches only documentation |
+| Unit tests | x86-64 | `cargo fmt --check` and `./gradlew jvmCheck`: formatting, every test that needs only a JDK, with DuckDB installed and required |
+| Build and verify, per platform | x86-64 and arm64 × glibc and musl, after the unit tests | Builds one native bundle and runs `:jonoffcpu-agent:nativeTest` against it, then uploads the bundle |
+| Package combined artifacts | x86-64, after all four | Assembles the agent JAR from the four bundles, verifies it and the correlator JAR, runs the agent's packaged-JAR test, and uploads the three runnable JARs |
+| Documentation check | x86-64, when documentation changed | `:jonoffcpu-correlator:readmeTest` |
 | Lint workflows | x86-64 | actionlint and zizmor |
 
-A change that touches only documentation — Markdown files outside `src/` and
-anything under `docs/`, as [`.github/changes-filter.yaml`](../.github/changes-filter.yaml)
-defines — skips the build and verification jobs; the documentation check still
-runs. The required status check, *All checks passed*, accepts exactly that
-skip and fails on any other job that did not succeed.
+Documentation means Markdown files outside `src/` and anything under `docs/`,
+as [`.github/changes-filter.yaml`](../.github/changes-filter.yaml) defines it.
+A change that touches only documentation skips the build and verification
+jobs, and the documentation check is its only test. A change without
+documentation skips the documentation check; its unit tests run the same test
+anyway. The required status check, *All checks passed*, accepts exactly those
+skips and fails on any other job that did not succeed.
 
 Every CI run publishes a [Build Scan](https://scans.gradle.com) for each Gradle
 build, and the three JARs as a `jonoffcpu-runnable-jars` workflow artifact:
