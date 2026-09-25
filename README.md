@@ -89,9 +89,12 @@ reasons in depth.
 
 In a small service, a CPU profile and a few thread dumps often find the
 problem. In a system like [Apache Pulsar](https://pulsar.apache.org/) they
-don't. There, millions of events per second flow through hundreds of threads:
-event loops, executor pools, storage clients and the JVM's own threads. Nearly
-all of their off-CPU time is spent waiting for work. The waits that limit
+don't. There, millions of events per second flow through roughly 50 to 200
+threads, depending on the CPU count: event loops, executor pools and storage
+clients size their thread pools from
+`Runtime.getRuntime().availableProcessors()`, often twice that, and the JVM
+adds threads of its own. Nearly all of their off-CPU time is spent waiting for
+work. The waits that limit
 throughput or add latency are a small fraction of that time, invisible in an
 unfiltered flame graph.
 
