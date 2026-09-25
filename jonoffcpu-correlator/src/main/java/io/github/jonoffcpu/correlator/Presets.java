@@ -14,7 +14,7 @@ final class Presets {
     static final String PREFIX = "preset:";
 
     /** Every bundled preset, in the order {@code stacks --list-presets} prints them. */
-    static final List<String> NAMES = List.of("jvm-infra", "jvm-wait-machinery", "jvm-idle");
+    static final List<String> NAMES = List.of("jvm-infra", "jvm-wait-machinery", "jvm-idle", "jvm-dispatch");
 
     private static final String DIRECTORY = "/io/github/jonoffcpu/correlator/presets/";
 

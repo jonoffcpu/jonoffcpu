@@ -29,9 +29,12 @@ import java.util.regex.Pattern;
  * Ranked tables of where off-CPU time went, for people and agents who should not have to read a flame graph: each
  * selected interval is either idle, when any frame of any of its stacks matches an idle pattern, or busy, and busy
  * time is attributed by {@link By} to a row. With {@link By#BOUNDARY} a row is the deepest application frame of the
- * stack and the blocker below it, and busy time without an application frame is broken down by thread pool instead.
- * Idle time is listed in its own table, never silently dropped, and every total adds up: busy and idle make the
- * selection, and application rows and the pool table make the busy time.
+ * stack and the blocker below it, with {@link By#ROOT} the root of the transformed stack, and with {@link
+ * By#APP_METHOD} a call chain of application methods; busy time without an application frame is broken down by
+ * thread pool instead. {@link StackTransforms.UnmatchedRoot#HIDE} leaves busy time without a {@code --root-at} match
+ * out of every mode's rows, into a total and the pool table of its own. Idle time is listed in its own table, never
+ * silently dropped, and every total adds up: busy and idle make the selection, and the rows and the pool table make
+ * the busy time.
  *
  * <p>The result is a {@link TopResult}, printed as JSON; Markdown and CSV are rendered from it, so no format can
  * disagree with another.
@@ -40,6 +43,8 @@ final class Top {
     /** What a row is keyed by. */
     enum By {
         BOUNDARY,
+        ROOT,
+        APP_METHOD,
         SELF,
         METHOD,
         CLASS,
@@ -47,7 +52,12 @@ final class Top {
         POOL;
 
         String label() {
-            return name().toLowerCase(java.util.Locale.ROOT);
+            return name().toLowerCase(java.util.Locale.ROOT).replace('_', '-');
+        }
+
+        /** Whether the rows cover only busy time with an application frame, the rest going to the pool table. */
+        boolean application() {
+            return this == BOUNDARY || this == APP_METHOD;
         }
     }
 
@@ -211,12 +221,23 @@ final class Top {
         BigDecimal runqueue = BigDecimal.ZERO;
         final Map<OffCpuReason, BigDecimal> reasons = new EnumMap<>(OffCpuReason.class);
         final Map<String, BigDecimal> callers = new HashMap<>();
+        /** {@link By#ROOT}: the transformed lines under the root, abbreviated, by weight. */
+        final Map<String, BigDecimal> lines = new HashMap<>();
+        /** {@link By#APP_METHOD}: the chain's methods, root-most first, its self time and distinct stacks. */
+        List<String> methods;
+
+        BigDecimal self = BigDecimal.ZERO;
+        long stacks;
 
         Row(List<String> key) {
             this.key = key;
         }
 
         void add(Item item, String caller) {
+            add(item, caller, null);
+        }
+
+        void add(Item item, String caller, String line) {
             weight = weight.add(item.weight());
             intervals += item.intervals();
             if (item.estimated() != null) estimated = estimated.add(item.estimated());
@@ -224,6 +245,17 @@ final class Top {
             if (item.runqueue() != null) runqueue = runqueue.add(item.runqueue());
             if (item.reason() != null) reasons.merge(item.reason(), item.weight(), BigDecimal::add);
             if (caller != null) callers.merge(caller, item.weight(), BigDecimal::add);
+            if (line != null) lines.merge(line, item.weight(), BigDecimal::add);
+        }
+
+        /** Adds another row's sums, reasons included; its callers and lines are not merged. */
+        void merge(Row other) {
+            weight = weight.add(other.weight);
+            intervals += other.intervals;
+            estimated = estimated.add(other.estimated);
+            sleeping = sleeping.add(other.sleeping);
+            runqueue = runqueue.add(other.runqueue);
+            other.reasons.forEach((reason, value) -> reasons.merge(reason, value, BigDecimal::add));
         }
 
         static String heaviest(Map<String, BigDecimal> weights) {
@@ -264,6 +296,8 @@ final class Top {
         private final StackTransforms.Compiled full;
         private final StackTransforms.Compiled callerPath;
         private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> named = new IdentityHashMap<>();
+        private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> transformed = new IdentityHashMap<>();
+        private final Map<StackProfile.Frame, String> abbreviated = new HashMap<>();
 
         Attribution(Options options) {
             this.options = options;
@@ -277,7 +311,7 @@ final class Top {
                             transforms.hide(),
                             List.of(),
                             List.of(),
-                            false,
+                            StackTransforms.UnmatchedRoot.BUCKET,
                             List.of(),
                             List.of(),
                             false,
@@ -289,7 +323,7 @@ final class Top {
                             transforms.hide(),
                             transforms.trimRoot(),
                             transforms.rootAt(),
-                            true,
+                            StackTransforms.UnmatchedRoot.KEEP,
                             List.of(),
                             List.of(),
                             false,
@@ -300,6 +334,34 @@ final class Top {
         /** The Java stack attribution sees: after canonical names and hidden frames. */
         List<StackProfile.Frame> stack(Item item) {
             return named.computeIfAbsent(item.java(), names::apply);
+        }
+
+        /** The Java stack after every transform, as a flame graph with the same options draws it. */
+        List<StackProfile.Frame> transformed(Item item) {
+            return transformed.computeIfAbsent(item.java(), full::apply);
+        }
+
+        /** Whether {@link StackTransforms.UnmatchedRoot#HIDE} leaves this item out. */
+        boolean hidden(Item item) {
+            return StackTransforms.hidden(item.java(), transformed(item));
+        }
+
+        /** Whether the item has an application frame, as {@code by} decides: a boundary, or one after the transforms. */
+        boolean hasApplication(Item item, By by) {
+            if (by == By.APP_METHOD) {
+                for (StackProfile.Frame frame : transformed(item)) {
+                    if (isApplication(frame)) return true;
+                }
+                return false;
+            }
+            return boundary(stack(item)) >= 0;
+        }
+
+        /** A transformed stack as one line with abbreviated package names, as a flame graph would label it. */
+        String line(List<StackProfile.Frame> stack) {
+            StringBuilder line = new StringBuilder();
+            StackProfileRenderer.appendJava(line, stack, StackProfileRenderer.PackageNames.ABBREVIATE, abbreviated);
+            return line.toString();
         }
 
         boolean isApplication(StackProfile.Frame frame) {
@@ -346,8 +408,16 @@ final class Top {
                                     ? List.of(NO_APPLICATION_FRAME)
                                     : List.of(stack.get(boundary).name(), blocker(stack, boundary)));
                 }
+                case ROOT -> {
+                    List<StackProfile.Frame> transformed = transformed(item);
+                    yield List.of(List.of(
+                            transformed.isEmpty()
+                                    ? hidden(item) ? NO_APPLICATION_FRAME : "[empty stack]"
+                                    : transformed.get(0).name()));
+                }
+                case APP_METHOD -> throw new IllegalArgumentException("Application methods are grouped by chain");
                 case SELF -> {
-                    List<StackProfile.Frame> transformed = full.apply(item.java());
+                    List<StackProfile.Frame> transformed = transformed(item);
                     yield List.of(List.of(
                             transformed.isEmpty()
                                     ? "[empty stack]"
@@ -394,11 +464,15 @@ final class Top {
     }
 
     static List<Row> aggregate(List<Item> items, Attribution attribution, By by, boolean withCallers) {
+        if (by == By.APP_METHOD) return applicationMethods(items, attribution);
         Map<List<String>, Row> rows = new HashMap<>();
         for (Item item : items) {
             String caller = withCallers ? attribution.caller(item) : null;
+            String line = by == By.ROOT && !attribution.transformed(item).isEmpty()
+                    ? attribution.line(attribution.transformed(item))
+                    : null;
             for (List<String> key : attribution.keys(item, by)) {
-                rows.computeIfAbsent(key, Row::new).add(item, caller);
+                rows.computeIfAbsent(key, Row::new).add(item, caller, line);
             }
         }
         List<Row> sorted = new ArrayList<>(rows.values());
@@ -408,6 +482,79 @@ final class Top {
         return sorted;
     }
 
+    /**
+     * {@link By#APP_METHOD}: every distinct application frame of each transformed stack adds the stack's time once
+     * (inclusive), and methods that occur in exactly the same distinct stacks are one call chain, one row. A row's
+     * self time is that of the stacks whose deepest application frame is in the chain, so self times add up to the
+     * items' total. Rows sort by inclusive time, then self time, then the root-most method.
+     */
+    static List<Row> applicationMethods(List<Item> items, Attribution attribution) {
+        Map<List<StackProfile.Frame>, Integer> ids = new HashMap<>();
+        List<Row> stacks = new ArrayList<>();
+        List<String> deepest = new ArrayList<>();
+        Map<String, java.util.BitSet> members = new java.util.LinkedHashMap<>();
+        Map<String, Integer> depth = new HashMap<>();
+        for (Item item : items) {
+            List<StackProfile.Frame> stack = attribution.transformed(item);
+            Integer id = ids.get(stack);
+            if (id == null) {
+                id = stacks.size();
+                ids.put(stack, id);
+                stacks.add(new Row(List.of()));
+                List<String> application = new ArrayList<>();
+                for (StackProfile.Frame frame : stack) {
+                    if (attribution.isApplication(frame)) application.add(frame.name());
+                }
+                deepest.add(application.isEmpty() ? null : application.get(application.size() - 1));
+                int index = 0;
+                for (String method : new LinkedHashSet<>(application)) {
+                    members.computeIfAbsent(method, key -> new java.util.BitSet())
+                            .set(id);
+                    depth.merge(method, index++, Math::min);
+                }
+            }
+            stacks.get(id).add(item, null);
+        }
+        Map<java.util.BitSet, List<String>> chains = new java.util.LinkedHashMap<>();
+        members.forEach((method, in) ->
+                chains.computeIfAbsent(in, key -> new ArrayList<>()).add(method));
+        List<Row> rows = new ArrayList<>();
+        chains.forEach((in, methods) -> {
+            List<String> ordered = new ArrayList<>(methods);
+            ordered.sort(Comparator.comparing(depth::get));
+            Row row = new Row(List.of(ordered.get(0)));
+            row.methods = List.copyOf(ordered);
+            Set<String> chain = Set.copyOf(ordered);
+            in.stream().forEach(id -> {
+                row.merge(stacks.get(id));
+                if (chain.contains(deepest.get(id))) row.self = row.self.add(stacks.get(id).weight);
+            });
+            row.stacks = in.cardinality();
+            rows.add(row);
+        });
+        rows.sort(Comparator.comparing((Row row) -> row.weight)
+                .reversed()
+                .thenComparing(Comparator.comparing((Row row) -> row.self).reversed())
+                .thenComparing(row -> row.key.get(0)));
+        return rows;
+    }
+
+    /** A chain as its row key reads: the method, both ends, or both ends and how many methods it has. */
+    static String chain(List<String> methods) {
+        return switch (methods.size()) {
+            case 1 -> methods.get(0);
+            case 2 -> methods.get(0) + " → " + methods.get(1);
+            default -> methods.get(0) + " → … (" + methods.size() + ") → " + methods.get(methods.size() - 1);
+        };
+    }
+
+    /** An identity set of items, for splitting a list by membership. */
+    private static Set<Item> identities(List<Item> items) {
+        Set<Item> set = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        set.addAll(items);
+        return set;
+    }
+
     // ---- the result ---------------------------------------------------------------------------------------------
 
     /** The ranked tables. */
@@ -415,32 +562,36 @@ final class Top {
         Attribution attribution = new Attribution(options);
         List<Item> busy = input.items().stream().filter(item -> !item.idle()).toList();
         List<Item> idle = input.items().stream().filter(Item::idle).toList();
-        boolean boundary = options.by() == By.BOUNDARY;
-        List<Item> application = busy;
-        List<Item> noApplication = List.of();
-        if (boundary) {
-            application = busy.stream()
-                    .filter(item -> attribution.boundary(attribution.stack(item)) >= 0)
-                    .toList();
-            noApplication = busy.stream()
-                    .filter(item -> attribution.boundary(attribution.stack(item)) < 0)
-                    .toList();
-        }
+        By by = options.by();
+        boolean applicationRanking = by.application();
+        boolean hides = options.transforms().unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
+        List<Item> hidden = hides ? busy.stream().filter(attribution::hidden).toList() : List.of();
+        // The rows' items: busy ones not hidden and, for an application ranking, with an application frame. The rest
+        // of the busy time is in the pool table.
+        List<Item> application = busy.stream()
+                .filter(item -> !hides || !attribution.hidden(item))
+                .filter(item -> !applicationRanking || attribution.hasApplication(item, by))
+                .toList();
+        Set<Item> inRows = identities(application);
+        List<Item> noApplication =
+                busy.stream().filter(item -> !inRows.contains(item)).toList();
         TopResult.Builder result = TopResult.newBuilder()
                 .setCommand(command)
-                .setBy(options.by().label())
+                .setBy(by.label())
                 .setUnit(input.seconds() ? "seconds" : "weight")
                 .setSelection(selection(input, options));
 
         Sum busySum = Sum.of(busy);
+        Sum applicationSum = Sum.of(application);
         TopTotals.Builder totals = TopTotals.newBuilder()
                 .setSelected(sum(Sum.of(input.items()), input))
                 .setIdle(sum(Sum.of(idle), input))
                 .setBusy(sum(busySum, input));
-        if (boundary) {
-            totals.setBusyApplication(sum(Sum.of(application), input));
+        if (applicationRanking) {
+            totals.setBusyApplication(sum(applicationSum, input));
             totals.setBusyNoApplicationFrame(sum(Sum.of(noApplication), input));
         }
+        if (hides) totals.setBusyRootAtUnmatchedHidden(sum(Sum.of(hidden), input));
         totals.setOverExclusion(sum(
                 Sum.of(idle.stream()
                         .filter(item -> item.java().stream()
@@ -450,15 +601,18 @@ final class Top {
                 input));
         result.setTotals(totals);
 
-        List<Row> rows = aggregate(boundary ? application : busy, attribution, options.by(), boundary);
-        result.addAllRows(rows(rows, busySum.weight(), input, options));
-        if (boundary) {
+        // Shares are of the time the rows cover whenever some busy time is left out of them; a boundary ranking
+        // without hiding keeps its shares of all busy time.
+        BigDecimal whole = by == By.BOUNDARY && !hides ? busySum.weight() : applicationSum.weight();
+        List<Row> rows = aggregate(application, attribution, by, by == By.BOUNDARY);
+        result.addAllRows(rows(rows, whole, input, options));
+        if (applicationRanking || hides) {
             List<Row> pools = input.pools()
                     ? aggregate(noApplication, attribution, By.POOL, false)
                     : aggregate(noApplication, attribution, By.BOUNDARY, false);
             result.addAllNoApplicationFrame(rows(pools, busySum.weight(), input, options));
         }
-        List<Row> idleRows = boundary
+        List<Row> idleRows = applicationRanking
                 ? aggregate(idle, attribution, By.BOUNDARY, false).stream()
                         .collect(java.util.stream.Collectors.groupingBy(
                                 row -> row.key.get(0),
@@ -483,9 +637,16 @@ final class Top {
                                 .reversed()
                                 .thenComparing(row -> row.key.get(0)))
                         .toList()
-                : aggregate(idle, attribution, options.by(), false);
+                : aggregate(idle, attribution, by, false);
         result.addAllIdle(rows(idleRows, Sum.of(idle).weight(), input, options));
-        if (boundary && !noApplication.isEmpty() && input.seconds()) {
+        if (by == By.ROOT
+                && options.transforms().rootAt().isEmpty()
+                && options.transforms().trimRoot().isEmpty()) {
+            result.addWarnings("No --root-at or --trim-root is given, so each root is a thread's entry point, such as"
+                    + " Thread.run; give --root-at with your application's patterns to rank where threads entered"
+                    + " your code.");
+        }
+        if ((applicationRanking || hides) && !noApplication.isEmpty() && input.seconds()) {
             result.addWarnings("Busy time without an application frame depends on native symbolization: on a musl"
                     + " image every native frame is /lib/ld-musl-<arch>.so.1, the HotSpot idle patterns cannot match,"
                     + " and idle GC and compiler threads count as busy.");
@@ -537,9 +698,17 @@ final class Top {
         int rank = 0;
         for (Row row : rows) {
             if (rank == options.limit()) break;
-            TopRow.Builder item = TopRow.newBuilder()
-                    .setRank(++rank)
-                    .setKey(options.packages().apply(row.key.get(0)));
+            TopRow.Builder item = TopRow.newBuilder().setRank(++rank);
+            if (row.methods != null) {
+                List<String> methods =
+                        row.methods.stream().map(options.packages()::apply).toList();
+                item.setKey(chain(methods))
+                        .addAllMethods(methods)
+                        .setSelf(value(row.self, input).toPlainString())
+                        .setStacks(row.stacks);
+            } else {
+                item.setKey(options.packages().apply(row.key.get(0)));
+            }
             if (row.key.size() > 1) item.setBlocker(options.packages().apply(row.key.get(1)));
             item.setValue(value(row.weight, input).toPlainString())
                     .setShare(share(row.weight, whole).toPlainString())
@@ -550,9 +719,11 @@ final class Top {
                 item.setSleeping(value(row.sleeping, input).toPlainString());
                 item.setRunqueue(value(row.runqueue, input).toPlainString());
             }
-            if (input.seconds() && row.reason() != null)
+            // An application method's row spans stacks of any reason, so it names none.
+            if (input.seconds() && row.reason() != null && row.methods == null)
                 item.setReason(row.reason().proto());
             if (!row.callers.isEmpty()) item.setCaller(options.packages().apply(Row.heaviest(row.callers)));
+            if (!row.lines.isEmpty()) item.setHeaviestStack(Row.heaviest(row.lines));
             result.add(item.build());
         }
         return result;
@@ -729,19 +900,60 @@ final class Top {
                 .append(" |\n|---|---:|---:|---:|\n");
         totalsRows(totals, false, text);
         text.append('\n');
-        boolean boundary = result.getBy().equals("boundary");
-        text.append(boundary ? "## Busy, by application boundary\n\n" : "## Busy, by " + result.getBy() + "\n\n");
-        table(result.getRowsList(), boundary ? "boundary" : "key", unit, count, seconds, text);
-        if (boundary) {
+        String by = result.getBy();
+        boolean boundary = by.equals("boundary") || by.equals("app-method");
+        text.append("## Busy, by ").append(heading(by)).append("\n\n");
+        rowsTable(result.getRowsList(), by, unit, count, seconds, text);
+        if (boundary || totals.hasBusyRootAtUnmatchedHidden()) {
             text.append("\n## Busy without an application frame, by pool\n\n");
             table(result.getNoApplicationFrameList(), "pool", unit, count, seconds, text);
         }
-        text.append("\n## Idle, by ")
-                .append(boundary ? "boundary" : result.getBy())
-                .append("\n\n");
-        table(result.getIdleList(), boundary ? "boundary" : "key", unit, count, seconds, text);
+        text.append("\n## Idle, by ").append(boundary ? "boundary" : by).append("\n\n");
+        table(result.getIdleList(), boundary ? "boundary" : keyName(by), unit, count, seconds, text);
         warnings(result.getWarningsList(), text);
         return text.toString();
+    }
+
+    /** A ranking's name in a section heading. */
+    static String heading(String by) {
+        return switch (by) {
+            case "boundary" -> "application boundary";
+            case "root" -> "root";
+            case "app-method" -> "application method";
+            default -> by;
+        };
+    }
+
+    /** The key column's heading of a ranking's rows. */
+    static String keyName(String by) {
+        return switch (by) {
+            case "boundary" -> "boundary";
+            case "root" -> "root";
+            case "app-method" -> "application methods";
+            default -> "key";
+        };
+    }
+
+    /**
+     * A ranking's rows as one table, and for application methods each chain's methods in a {@code <details>} block
+     * below it. The digest renders its tables with this too, so a reproduced table reads byte for byte the same.
+     */
+    static void rowsTable(
+            List<TopRow> rows, String by, String unit, String count, boolean seconds, StringBuilder text) {
+        boolean methods = by.equals("app-method");
+        table(rows, keyName(by), unit, count, seconds && !methods, text);
+        if (!methods) return;
+        for (TopRow row : rows) {
+            if (row.getMethodsCount() < 3) continue;
+            text.append("\n<details><summary>")
+                    .append(row.getRank())
+                    .append(": ")
+                    .append(code(row.getKey()))
+                    .append("</summary>\n\n");
+            for (String method : row.getMethodsList())
+                text.append("1. ").append(code(method)).append('\n');
+            text.append("\n</details>\n");
+        }
     }
 
     /**
@@ -770,6 +982,12 @@ final class Top {
         }
         if (totals.hasBusyNoApplicationFrame()) {
             totalsRow(totals.getBusyNoApplicationFrame(), "Busy, no application frame", text);
+        }
+        if (totals.hasBusyRootAtUnmatchedHidden()) {
+            totalsRow(
+                    totals.getBusyRootAtUnmatchedHidden(),
+                    "Busy without an application frame, hidden by --root-at",
+                    text);
         }
     }
 
@@ -805,12 +1023,16 @@ final class Top {
         TopRow first = rows.get(0);
         List<String> columns = new ArrayList<>(List.of("#", capital(keyName)));
         if (first.hasBlocker()) columns.add("Blocker");
-        columns.addAll(List.of(unit, "Share", count));
+        columns.addAll(List.of(unit, "Share"));
+        if (first.hasSelf()) columns.addAll(List.of("Self " + unit, "Stacks"));
+        columns.add(count);
         if (first.hasEstimated()) columns.add("Estimated " + unit);
         if (first.hasSleeping()) columns.addAll(List.of("Sleeping " + unit, "Run queue " + unit));
         if (reasons) columns.add("Reason");
         boolean callers = rows.stream().anyMatch(TopRow::hasCaller);
         if (callers) columns.add("Caller");
+        boolean heaviest = rows.stream().anyMatch(TopRow::hasHeaviestStack);
+        if (heaviest) columns.add("Heaviest stack");
         text.append("| ").append(String.join(" | ", columns)).append(" |\n|");
         for (String column : columns) {
             text.append(
@@ -818,6 +1040,8 @@ final class Top {
                                     || column.startsWith(unit)
                                     || column.equals("Share")
                                     || column.equals(count)
+                                    || column.startsWith("Self")
+                                    || column.equals("Stacks")
                                     || column.startsWith("Estimated")
                                     || column.startsWith("Sleeping")
                                     || column.startsWith("Run queue")
@@ -832,6 +1056,10 @@ final class Top {
             if (first.hasBlocker()) cells.add(row.hasBlocker() ? code(row.getBlocker()) : "");
             cells.add(row.getValue());
             cells.add(percent(row.getShare()));
+            if (first.hasSelf()) {
+                cells.add(row.getSelf());
+                cells.add(Long.toString(row.getStacks()));
+            }
             cells.add(Long.toString(row.getIntervals()));
             if (first.hasEstimated()) cells.add(row.getEstimated());
             if (first.hasSleeping()) {
@@ -840,6 +1068,7 @@ final class Top {
             }
             if (reasons) cells.add(row.hasReason() ? label(row.getReason()) : "");
             if (callers) cells.add(row.hasCaller() ? code(row.getCaller()) : "");
+            if (heaviest) cells.add(row.hasHeaviestStack() ? code(row.getHeaviestStack()) : "");
             text.append("| ").append(String.join(" | ", cells)).append(" |\n");
         }
     }
@@ -877,8 +1106,10 @@ final class Top {
         boolean seconds = result.getUnit().equals("seconds");
         text.append("table,rank,key,blocker,value,share,")
                 .append(seconds ? "intervals" : "lines")
-                .append(",estimated,sleeping,runqueue,reason,caller\n");
-        boolean boundary = result.getBy().equals("boundary");
+                .append(",estimated,sleeping,runqueue,reason,caller,heaviest_stack,self,stacks,methods\n");
+        boolean boundary = result.getBy().equals("boundary")
+                || result.getBy().equals("app-method")
+                || result.getTotals().hasBusyRootAtUnmatchedHidden();
         List<Map.Entry<String, List<TopRow>>> tables = new ArrayList<>();
         tables.add(Map.entry("rows", result.getRowsList()));
         if (boundary) tables.add(Map.entry("noApplicationFrame", result.getNoApplicationFrameList()));
@@ -898,7 +1129,11 @@ final class Top {
                                 row.getSleeping(),
                                 row.getRunqueue(),
                                 row.hasReason() ? label(row.getReason()) : "",
-                                csvCell(row.getCaller())))
+                                csvCell(row.getCaller()),
+                                csvCell(row.getHeaviestStack()),
+                                row.getSelf(),
+                                row.hasStacks() ? Long.toString(row.getStacks()) : "",
+                                csvCell(String.join(";", row.getMethodsList()))))
                         .append('\n');
             }
         }

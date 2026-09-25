@@ -20,6 +20,29 @@ final class CommandLineFixture {
         return new Invocation(code, out.toString(), err.toString());
     }
 
+    /**
+     * A reproduce command's words after {@code java -jar jonoffcpu-correlator.jar}, as a shell splits what {@link
+     * Top#shell} quoted, to run it in-process.
+     */
+    static String[] words(String command) {
+        assertThat(command).startsWith(Cli.NAME + " ");
+        java.util.List<String> words = new java.util.ArrayList<>();
+        StringBuilder word = new StringBuilder();
+        boolean quoted = false;
+        for (char c : command.substring(Cli.NAME.length() + 1).toCharArray()) {
+            if (c == '\'') {
+                quoted = !quoted;
+            } else if (c == ' ' && !quoted) {
+                words.add(word.toString());
+                word.setLength(0);
+            } else {
+                word.append(c);
+            }
+        }
+        words.add(word.toString());
+        return words.toArray(String[]::new);
+    }
+
     /** Checks that a command line is refused as a usage error, with its usage and without a stack trace. */
     static Invocation usageError(String message, String... args) throws Exception {
         Invocation invocation = invoke(args);

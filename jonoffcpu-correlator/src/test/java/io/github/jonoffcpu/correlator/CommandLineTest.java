@@ -266,6 +266,36 @@ class CommandLineTest {
         idleWithoutDigest.addAll(List.of(
                 "--output", dir.resolve("idle-without-digest").toString(), "--summary-output", "false", "--idle", "."));
         CommandLineFixture.usageError("--summary-output false leaves out", idleWithoutDigest.toArray(String[]::new));
+        // --app roots the digest at the application and changes no other output.
+        Path appDigest = dir.resolve("app-digest");
+        List<String> withApp = new ArrayList<>(common);
+        withApp.addAll(List.of("--output", appDigest.toString(), "--app", "."));
+        assertThat(OffCpuCorrelator.run(withApp.toArray(String[]::new)))
+                .as("Correlation with an application pattern")
+                .isZero();
+        for (String file : List.of(OutputFiles.COLLAPSED, OutputFiles.PROFILE)) {
+            assertThat(Files.readAllBytes(appDigest.resolve(file)))
+                    .as("--app must not change %s", file)
+                    .isEqualTo(Files.readAllBytes(first.resolve(file)));
+        }
+        AnalysisProto.Digest app = CorrelationFixture.parse(
+                        appDigest.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+                .build();
+        assertThat(app.getSelection().getTransforms().getHide(0).getSource())
+                .as("--app hides preset:jvm-dispatch by default: %s", app.getSelection())
+                .isEqualTo("preset:jvm-dispatch");
+        assertThat(app.hasBusyByRoot())
+                .as("The digest is rooted at the application")
+                .isTrue();
+        for (List<String> refused : List.of(
+                List.of("--summary-output", "false", "--app", "."),
+                List.of("--summary-output", "false", "--hide", "."),
+                List.of("--hide-from", "preset:jvm-dispatch"))) {
+            List<String> args = new ArrayList<>(common);
+            args.addAll(List.of("--output", dir.resolve("refused").toString()));
+            args.addAll(refused);
+            CommandLineFixture.usageError("--hide", args.toArray(String[]::new));
+        }
         Path slice = dir.resolve("slice.collapsed");
         Path patterns = Files.writeString(dir.resolve("idle.txt"), "epollWait\n");
         assertThat(OffCpuCorrelator.run(new String[] {

@@ -314,7 +314,7 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--include REGEX]... [--exclude REGEX]...
     [--include-from FILE]... [--exclude-from FILE]...
     [--canonical-names] [--hide REGEX]... [--trim-root REGEX]...
-    [--root-at REGEX]... [--root-at-unmatched bucket|keep] [--leaf-at REGEX]...
+    [--root-at REGEX]... [--root-at-unmatched bucket|keep|hide] [--leaf-at REGEX]...
     [--collapse-leaf REGEX]... [--collapse-leaf-label frame|category]
     [--thread-frame none|name|pool]    (each REGEX option also has a -from FILE form)
 java -jar jonoffcpu-correlator.jar stacks --collapsed-input C --output F [filters and transforms]
@@ -354,8 +354,10 @@ therefore always match the full, untransformed stacks, in this order:
    run stops at the first frame that does not match, so deeper matches stay,
    and a stack that matches throughout keeps its leaf.
 4. `--root-at` starts the stack at its root-most matching frame. A stack
-   without one becomes the single frame `[no application frame]`, or stays as
-   it is with `--root-at-unmatched keep`.
+   without one becomes the single frame `[no application frame]`, stays as
+   it is with `--root-at-unmatched keep`, or with `--root-at-unmatched hide` is
+   left out of the lines, as described below. `hide` without `--root-at` is
+   refused, since nothing can be unmatched.
 5. `--leaf-at` cuts the callees of the leaf-most matching frame and keeps the
    match; a stack without one is unchanged.
 6. `--collapse-leaf` replaces the longest leaf-side run of matching frames by
@@ -368,13 +370,25 @@ every digit run replaced by `#`, as a frame after any reason frame) are then
 applied as display. With `--stack java+kernel` or `java+user+kernel` the native
 stacks are appended unchanged after the transformed Java stack. Lines that read
 the same after transforming merge, adding their intervals and nanoseconds, so
-no transform changes a total. Each `REGEX` option repeats, and has a
+no transform changes a total, with one exception: `--root-at-unmatched hide`
+leaves an entry without a `--root-at` match out of the lines and out of the
+slice's totals, and the `--summary` file reports it as
+`rootAtUnmatchedHidden` (`intervals` and `totalNanos`, or `inputLines` and
+`totalWeight` for a collapsed input), so the kept and hidden totals add up to
+the slice rendered without hiding; its `noApplicationFrame` is then the hidden
+weight, and its share of that sum. Hiding is decided per entry after the
+filters and before `--reason-frame auto`. Each `REGEX` option repeats, and has a
 `-from FILE` form that reads patterns as `--exclude-from` does. Every `-from`
 option, the filters' included, also accepts `preset:NAME`, a list bundled with
 the correlator: `jvm-infra` (thread, executor and Netty entry points, for
 `--trim-root` or `--hide`), `jvm-wait-machinery` (lock, park and monitor
-internals down to libc and the kernel, for `--collapse-leaf`) and `jvm-idle`
-(waits for work, for `--exclude-from`); `stacks --list-presets` prints them with
+internals down to libc and the kernel, for `--collapse-leaf`), `jvm-idle`
+(waits for work, for `--exclude-from`) and `jvm-dispatch` (generated lambda
+classes' methods, `Executors$RunnableAdapter.call`, `FutureTask.run` and
+`runAndReset`, `CompletableFuture`'s async tasks and Guava's listenable future
+tasks: frames that only forward to the code a task runs, for `--hide`, so that
+`--root-at` lands on the work; hidden anywhere in the stack, since they carry
+no information mid-stack either); `stacks --list-presets` prints them with
 their caveats. When any transform is in effect the `--summary` file gains a
 `transforms` object: each option with its patterns and their source (`inline`, a
 file, or `preset:NAME`), `linesBefore`/`linesAfter`, the weight-averaged depth
@@ -485,12 +499,12 @@ file's) time went, with the selection, filter and transform options of
 
 ```sh
 java -jar jonoffcpu-correlator.jar top (--profile P | --collapsed-input F)
-    [--by boundary|self|method|class|package|pool] [--app REGEX]... [--app-from FILE]...
+    [--by boundary|root|app-method|self|method|class|package|pool] [--app REGEX]... [--app-from FILE]...
     [--idle REGEX]... [--idle-from FILE]... [--machinery-from FILE]...
     [--weights observed|estimated] [--limit N] [--format md|json|csv] [--output FILE]
     [--baseline P2 [--units X --baseline-units Y]]
 java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REGEX]...
-    [--idle-from FILE]... [--limit N] [--output-dir D]
+    [--hide-from FILE]... [--idle-from FILE]... [--limit N] [--output-dir D]
 ```
 
 - **Idle or busy.** An entry is idle when any frame of any of its stacks
@@ -502,17 +516,41 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
   leaf-side run below the boundary that matches the wait machinery
   (`--machinery-from`, default `preset:jvm-wait-machinery`), or the leaf when
   there is none. Busy entries without an application frame go to a table by
-  thread pool (the name with digit runs as `#`). `self` is the leaf after the
+  thread pool (the name with digit runs as `#`). `root` is the first frame of
+  the stack after every transform, the root box of the flame graph rendered
+  with the same options; without `--root-at` or `--trim-root` it is a thread's
+  entry point, and the output warns. `app-method` (which needs `--app`) takes
+  the distinct application frames of each transformed stack, hidden frames
+  being gone by then, and adds the stack's time to each once (inclusive, so a
+  recursive method counts once); methods that occur in exactly the same
+  distinct transformed stacks are one call chain and one row, keyed
+  `A → … (n) → Z` for `n` methods, root-most first, with every method in
+  `methods`. Its busy entries without an application frame go to the pool
+  table, as for `boundary`. `self` is the leaf after the
   transforms, `method`, `class` and `package` count every distinct one in the
   stack once per entry (inclusive), and `pool` is the thread's pool.
+- **Hidden entries.** With `--root-at-unmatched hide` a busy entry without a
+  `--root-at` match is left out of every mode's rows; `totals` reports it as
+  `busyRootAtUnmatchedHidden` (Markdown: "Busy without an application frame,
+  hidden by --root-at") and the pool table lists it by pool.
 - **Columns**: rank, key (and blocker), seconds to three decimals, share of the
   busy total (of the idle total in the idle table), intervals, estimated
   seconds when the profile's estimate is available, sleeping and run-queue
   seconds when it has the split, the dominant reason, and for boundary rows the
   heaviest root-most application frame (the caller, after `--trim-root` and
-  `--root-at`). Rows sort by weight, then key.
-- **Totals** add up: busy and idle make the selection, and application rows and
-  the pool table make the busy total. The over-exclusion check counts idle
+  `--root-at`). Root rows add `heaviestStack`, the heaviest transformed line
+  under the root with abbreviated package names. Application-method rows add
+  `self` (the time of the stacks whose deepest application frame is in the
+  chain, the same boundary as `--by boundary`, so self times add up to the
+  rows' total) and `stacks` (the distinct transformed stacks), and name no
+  reason; they sort by inclusive time, then self time, then the root-most
+  method. Other rows sort by weight, then key. A share is of the busy total,
+  except that `app-method` shares are of the busy time with an application
+  frame (and add up to more than 100 %), and with `--root-at-unmatched hide`
+  every share is of the busy time the rows cover.
+- **Totals** add up: busy and idle make the selection, and the rows (their
+  `busyApplication` total for `boundary` and `app-method`) and the pool table
+  make the busy total. The over-exclusion check counts idle
   entries with a `java.util.concurrent.locks.*.lock*`/`acquire*` or
   `complete_monitor_locking` frame, the waits an idle list may hide by mistake.
 - **Weights.** `observed` by default; `estimated` needs the profile's
@@ -533,15 +571,40 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
   (or `comparisonTotals` and `comparison`), and `warnings`. A row's `key` is
   the boundary, the pool or the `--by` key; seconds and shares are decimal
   strings, and `reason` an `OFF_CPU_REASON_…` value. `md` and `csv` (one row
-  per table row, with a `table` column) are rendered from it.
+  per table row, with a `table` column, and `heaviest_stack`, `self`, `stacks`
+  and `methods` appended after `caller`) are rendered from it; the Markdown
+  lists each chain of three or more methods in a `<details>` block below its
+  table.
 
 Correlation writes the **digest**, `jonoffcpu-summary.json` and
 `jonoffcpu-summary.md`, next to the report unless `--summary-output false` is
 given, with the idle patterns of `--idle` and `--idle-from` (default
-`preset:jvm-idle`), `preset:jvm-wait-machinery`, canonical names and no
-application pattern; `summarize` rewrites it with `--app` or other idle
-patterns, taking the capture section from the report the profile carries, or
-from `--report FILE`, which is parsed strictly as a `Report`.
+`preset:jvm-idle`), the application patterns of `--app` and `--app-from`, the
+hidden frames of `--hide` and `--hide-from` (default, with `--app`,
+`preset:jvm-dispatch`; refused without `--app`), `preset:jvm-wait-machinery`
+and canonical names. Like the idle options they are refused with
+`--summary-output false` and in partial mode. `summarize` rewrites it with
+other patterns, taking the capture section from the report the profile
+carries, or from `--report FILE`, which is parsed strictly as a `Report`.
+
+Without `--app` the digest ranks busy time by the stack's leaf after
+collapsing the wait machinery, and by pool. With `--app` every table is
+computed from one set of transforms, those of the application-rooted flame
+graph: `--exclude-from <idle>` as the filter, then `--canonical-names
+--hide-from <hide> --root-at-from <app> --root-at-unmatched hide
+--collapse-leaf-from preset:jvm-wait-machinery`. The Markdown opens with the
+busy time with an application frame, its share of the busy time and the time
+left out, then, in order: busy time by the application method that waited
+(`top --by boundary`), by application root (`top --by root`), the ten
+heaviest application stacks (abbreviated package names; the reproduce
+command is the `stacks` command of the flame graph), by application method
+(`top --by app-method`), where the time went, busy time without an
+application frame by pool, the capture, and one reproduce command per table.
+The boundary and root tables each sum to the busy time with an application
+frame. When more than half of the busy time has no application frame, the
+opening and the pool section say that the idle patterns probably miss some
+waits for work. Input paths are named as they were given, so a digest written
+with relative paths keeps working when its directory moves.
 
 The digest is about busy time. An interval with a frame matching an idle
 pattern is a wait for work, such as an event loop in `epoll` or a pool worker
@@ -556,17 +619,22 @@ correlation. The JSON is a `Digest` message:
 
 | Field | Contents |
 | --- | --- |
+| `schemaVersion` | `2`: 1, when absent, is the layout before the application-rooted tables |
 | `profile`, `run`, `estimateAvailable`, `timeSplitAvailable` | What was summarised |
 | `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
 | `selection` | As in `top --format json` |
 | `whereTheTimeWent` | `top`'s totals: selected, idle, busy, busy with and without an application frame, over-exclusion |
-| `busy` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, which also lists the idle waits, and the busy `rows` of `top` |
+| `busy` | `by` (`boundary`, the application method that waited, with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, which also lists the idle waits, and the busy `rows` of `top` |
+| `busyByRoot`, `busyByApplicationMethod` | With `--app`: the rows of `top --by root` and `top --by app-method`, each with its `command`; a method row carries its chain's `methods` |
 | `busyNoApplicationFrameByPool` | The pool table (with `--app`), or busy time by pool (without) |
-| `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines (`top`), and the `command` |
+| `busyWithoutApplicationFrame` | With `--app`: the busy time the tables leave out, also in `whereTheTimeWent` |
+| `heaviestStacks` | Without `--app`: the busy slice with `--trim-root-from preset:jvm-infra` and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines (`top`), and the `command` |
+| `heaviestApplicationStacks` | With `--app`: the same for the application-rooted slice, abbreviated package names |
 | `warnings` | As in `top` |
 
 Every table is limited to `--limit` rows (default 20), which keeps the Markdown
-of an Apache Pulsar broker's digest under 16 KB. The Markdown is rendered from
+of an Apache Pulsar broker's digest under 16 KB without `--app` and under 40 KB
+with it. The Markdown is rendered from
 the JSON, so the two cannot disagree, and the same inputs give the same bytes.
 
 ## Degradation

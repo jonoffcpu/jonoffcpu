@@ -22,13 +22,25 @@ import java.util.Map;
  * for work, are counted in where the time went and left out of everything else, since they would otherwise dominate
  * every table. The Markdown is rendered from the {@link AnalysisProto.Digest} the JSON prints, so the two cannot
  * disagree.
+ *
+ * <p>With an application pattern every table and stack is computed from one set of transforms, those of the
+ * application-rooted flame graph: canonical names, the {@code hide} frames removed, each stack rooted at its first
+ * application frame, busy time without one hidden and counted apart, and the wait machinery collapsed. Without one
+ * the tables rank the collapsed leaf, as before schema 2.
  */
 final class Digest {
-    /** What the digest is computed with. {@code app} empty ranks by the collapsed leaf instead of a boundary. */
+    /** The {@link AnalysisProto.Digest#getSchemaVersion() schema} this class writes. */
+    static final int SCHEMA_VERSION = 2;
+
+    /**
+     * What the digest is computed with. {@code app} empty ranks by the collapsed leaf instead of a boundary, and
+     * {@code hide} only applies with an application pattern.
+     */
     record Options(
             List<StackTransforms.Sourced> app,
             List<StackTransforms.Sourced> idle,
             List<StackTransforms.Sourced> machinery,
+            List<StackTransforms.Sourced> hide,
             int limit) {}
 
     private Digest() {}
@@ -41,7 +53,11 @@ final class Digest {
     /** The default options with the given idle patterns, as correlation writes the digest. */
     static Options defaults(List<StackTransforms.Sourced> idle) throws IOException {
         return new Options(
-                List.of(), idle, Cli.sourced(List.of(), "--machinery-from", List.of("preset:jvm-wait-machinery")), 20);
+                List.of(),
+                idle,
+                Cli.sourced(List.of(), "--machinery-from", List.of("preset:jvm-wait-machinery")),
+                List.of(),
+                20);
     }
 
     /**
@@ -50,7 +66,7 @@ final class Digest {
      */
     static AnalysisProto.Digest of(StackProfile profile, String profilePath, ReportProto.Report report, Options options)
             throws IOException {
-        boolean withApp = !options.app().isEmpty();
+        if (!options.app().isEmpty()) return application(profile, profilePath, report, options);
         List<StackTransforms.Sourced> collapse = options.machinery();
         // Canonical names keep generated-class addresses out of the callers, and out of a comparison between runs.
         StackTransforms transforms = new StackTransforms(
@@ -58,13 +74,136 @@ final class Digest {
                 List.of(),
                 List.of(),
                 List.of(),
-                false,
+                StackTransforms.UnmatchedRoot.BUCKET,
                 List.of(),
-                withApp ? List.of() : collapse,
+                collapse,
                 false,
                 StackTransforms.ThreadFrame.NONE);
-        Top.Options topOptions = new Top.Options(
-                withApp ? Top.By.BOUNDARY : Top.By.SELF,
+        Top.Options topOptions = topOptions(Top.By.SELF, options, transforms);
+        List<String> topCommand = new ArrayList<>(List.of(Cli.NAME, "top", "--profile", profilePath));
+        topCommand.addAll(patternOptions("--idle", "--idle-from", options.idle()));
+        topCommand.add("--canonical-names");
+        topCommand.addAll(List.of("--by", "self"));
+        topCommand.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", collapse));
+        topCommand.addAll(List.of("--limit", Integer.toString(options.limit()), "--format", "md"));
+        Top.Input input = Top.fromProfile(Path.of(profilePath), profile, topOptions);
+        TopResult tables = Top.tables(input, topOptions, Top.shell(topCommand));
+
+        AnalysisProto.Digest.Builder digest = header(profile, profilePath, report);
+        digest.setSelection(tables.getSelection()).setWhereTheTimeWent(tables.getTotals());
+        digest.setBusy(DigestTable.newBuilder()
+                .setBy("self")
+                .setCommand(Top.shell(topCommand))
+                .addAllRows(tables.getRowsList()));
+        if (input.pools()) {
+            List<String> poolCommand = new ArrayList<>(topCommand);
+            int byIndex = poolCommand.indexOf("--by");
+            poolCommand.set(byIndex + 1, "pool");
+            Top.Options poolOptions = topOptions(Top.By.POOL, options, transforms);
+            digest.setBusyNoApplicationFrameByPool(DigestTable.newBuilder()
+                    .setBy("pool")
+                    .setCommand(Top.shell(poolCommand))
+                    .addAllRows(Top.tables(input, poolOptions, Top.shell(poolCommand))
+                            .getRowsList()));
+        }
+        StackTransforms trimmed = new StackTransforms(
+                true,
+                List.of(),
+                Cli.sourced(List.of(), "--trim-root-from", List.of("preset:jvm-infra")),
+                List.of(),
+                StackTransforms.UnmatchedRoot.BUCKET,
+                List.of(),
+                options.machinery(),
+                false,
+                StackTransforms.ThreadFrame.NONE);
+        List<String> command = new ArrayList<>(List.of(Cli.NAME, "stacks", "--profile", profilePath));
+        command.addAll(patternOptions("--exclude", "--exclude-from", options.idle()));
+        command.addAll(List.of("--trim-root-from", "preset:jvm-infra"));
+        command.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", options.machinery()));
+        command.addAll(List.of("--canonical-names", "--package-names", "drop", "--output", "busy.collapsed"));
+        digest.setHeaviestStacks(
+                heaviest(profile, options, trimmed, StackProfileRenderer.PackageNames.DROP, Top.shell(command)));
+        digest.addAllWarnings(tables.getWarningsList());
+        return digest.build();
+    }
+
+    /**
+     * The application-rooted digest: every table from the transforms of the application-rooted flame graph, the busy
+     * time without an application frame hidden from them and counted by pool.
+     */
+    private static AnalysisProto.Digest application(
+            StackProfile profile, String profilePath, ReportProto.Report report, Options options) throws IOException {
+        StackTransforms transforms = new StackTransforms(
+                true,
+                options.hide(),
+                List.of(),
+                options.app(),
+                StackTransforms.UnmatchedRoot.HIDE,
+                List.of(),
+                options.machinery(),
+                false,
+                StackTransforms.ThreadFrame.NONE);
+        // The transforms as the command line spells them, shared by every reproduce command.
+        List<String> transformWords = new ArrayList<>(List.of("--canonical-names"));
+        transformWords.addAll(patternOptions("--hide", "--hide-from", options.hide()));
+        transformWords.addAll(patternOptions("--root-at", "--root-at-from", options.app()));
+        transformWords.addAll(List.of("--root-at-unmatched", "hide"));
+        transformWords.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", options.machinery()));
+
+        Top.Options boundaryOptions = topOptions(Top.By.BOUNDARY, options, transforms);
+        Top.Input input = Top.fromProfile(Path.of(profilePath), profile, boundaryOptions);
+        AnalysisProto.Digest.Builder digest = header(profile, profilePath, report);
+        java.util.Set<String> warnings = new java.util.LinkedHashSet<>();
+        TopResult boundary = null;
+        for (Top.By by : List.of(Top.By.BOUNDARY, Top.By.ROOT, Top.By.APP_METHOD)) {
+            List<String> command = new ArrayList<>(List.of(Cli.NAME, "top", "--profile", profilePath));
+            command.addAll(patternOptions("--app", "--app-from", options.app()));
+            command.addAll(patternOptions("--idle", "--idle-from", options.idle()));
+            if (!isDefaultMachinery(options.machinery())) {
+                command.addAll(patternOptions("--machinery", "--machinery-from", options.machinery()));
+            }
+            command.addAll(transformWords);
+            command.addAll(List.of("--by", by.label(), "--limit", Integer.toString(options.limit()), "--format", "md"));
+            TopResult tables = Top.tables(input, topOptions(by, options, transforms), Top.shell(command));
+            warnings.addAll(tables.getWarningsList());
+            DigestTable table = DigestTable.newBuilder()
+                    .setBy(by.label())
+                    .setCommand(tables.getCommand())
+                    .addAllRows(tables.getRowsList())
+                    .build();
+            switch (by) {
+                case BOUNDARY -> {
+                    boundary = tables;
+                    digest.setBusy(table);
+                    digest.setBusyNoApplicationFrameByPool(DigestTable.newBuilder()
+                            .setBy("pool")
+                            .setCommand(tables.getCommand())
+                            .addAllRows(tables.getNoApplicationFrameList()));
+                }
+                case ROOT -> digest.setBusyByRoot(table);
+                default -> digest.setBusyByApplicationMethod(table);
+            }
+        }
+        digest.setSelection(boundary.getSelection())
+                .setWhereTheTimeWent(boundary.getTotals())
+                .setBusyWithoutApplicationFrame(boundary.getTotals().getBusyNoApplicationFrame());
+        List<String> command = new ArrayList<>(List.of(Cli.NAME, "stacks", "--profile", profilePath));
+        command.addAll(patternOptions("--exclude", "--exclude-from", options.idle()));
+        command.addAll(transformWords);
+        command.addAll(List.of("--package-names", "abbreviate", "--output", "busy-app.collapsed"));
+        digest.setHeaviestApplicationStacks(heaviest(
+                profile, options, transforms, StackProfileRenderer.PackageNames.ABBREVIATE, Top.shell(command)));
+        digest.addAllWarnings(warnings);
+        return digest.build();
+    }
+
+    private static boolean isDefaultMachinery(List<StackTransforms.Sourced> machinery) {
+        return machinery.stream().allMatch(pattern -> pattern.source().equals("preset:jvm-wait-machinery"));
+    }
+
+    private static Top.Options topOptions(Top.By by, Options options, StackTransforms transforms) {
+        return new Top.Options(
+                by,
                 options.app(),
                 options.idle(),
                 options.machinery(),
@@ -74,59 +213,18 @@ final class Digest {
                 StackProfileRenderer.Weights.OBSERVED,
                 null,
                 StackProfileRenderer.Filter.NONE);
-        List<String> topCommand = new ArrayList<>(List.of(Cli.NAME, "top", "--profile", profilePath));
-        topCommand.addAll(patternOptions("--app", "--app-from", options.app()));
-        topCommand.addAll(patternOptions("--idle", "--idle-from", options.idle()));
-        topCommand.add("--canonical-names");
-        if (!withApp) {
-            topCommand.addAll(List.of("--by", "self"));
-            topCommand.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", collapse));
-        }
-        topCommand.addAll(List.of("--limit", Integer.toString(options.limit()), "--format", "md"));
-        Top.Input input = Top.fromProfile(Path.of(profilePath), profile, topOptions);
-        TopResult tables = Top.tables(input, topOptions, Top.shell(topCommand));
-        String by = withApp ? "boundary" : "self";
+    }
 
+    private static AnalysisProto.Digest.Builder header(
+            StackProfile profile, String profilePath, ReportProto.Report report) {
         AnalysisProto.Digest.Builder digest = AnalysisProto.Digest.newBuilder()
+                .setSchemaVersion(SCHEMA_VERSION)
                 .setProfile(profilePath)
                 .setRun(StackProfileRenderer.defaultRun(profile))
                 .setEstimateAvailable(profile.header().estimateAvailable())
                 .setTimeSplitAvailable(profile.header().timeSplitAvailable());
         if (report != null) digest.setCapture(capture(report));
-        digest.setSelection(tables.getSelection()).setWhereTheTimeWent(tables.getTotals());
-        digest.setBusy(DigestTable.newBuilder()
-                .setBy(by)
-                .setCommand(Top.shell(topCommand))
-                .addAllRows(tables.getRowsList()));
-        if (withApp) {
-            digest.setBusyNoApplicationFrameByPool(DigestTable.newBuilder()
-                    .setBy("pool")
-                    .setCommand(Top.shell(topCommand))
-                    .addAllRows(tables.getNoApplicationFrameList()));
-        } else if (input.pools()) {
-            List<String> poolCommand = new ArrayList<>(topCommand);
-            int byIndex = poolCommand.indexOf("--by");
-            poolCommand.set(byIndex + 1, "pool");
-            Top.Options poolOptions = new Top.Options(
-                    Top.By.POOL,
-                    options.app(),
-                    options.idle(),
-                    options.machinery(),
-                    options.limit(),
-                    transforms,
-                    StackProfileRenderer.PackageNames.FULL,
-                    StackProfileRenderer.Weights.OBSERVED,
-                    null,
-                    StackProfileRenderer.Filter.NONE);
-            digest.setBusyNoApplicationFrameByPool(DigestTable.newBuilder()
-                    .setBy("pool")
-                    .setCommand(Top.shell(poolCommand))
-                    .addAllRows(Top.tables(input, poolOptions, Top.shell(poolCommand))
-                            .getRowsList()));
-        }
-        digest.setHeaviestStacks(heaviest(profile, profilePath, options, withApp));
-        digest.addAllWarnings(tables.getWarningsList());
-        return digest.build();
+        return digest;
     }
 
     private static List<String> patternOptions(String inline, String fromFile, List<StackTransforms.Sourced> patterns) {
@@ -179,30 +277,14 @@ final class Digest {
         return capture.build();
     }
 
-    /** The heaviest busy stacks after the transforms that make them short, ten lines. */
+    /** The ten heaviest busy lines after {@code transforms}, rendered as {@code command} renders them. */
     private static AnalysisProto.HeaviestStacks heaviest(
-            StackProfile profile, String profilePath, Options options, boolean withApp) throws IOException {
-        StackTransforms transforms = withApp
-                ? new StackTransforms(
-                        true,
-                        List.of(),
-                        List.of(),
-                        options.app(),
-                        false,
-                        List.of(),
-                        options.machinery(),
-                        false,
-                        StackTransforms.ThreadFrame.NONE)
-                : new StackTransforms(
-                        true,
-                        List.of(),
-                        Cli.sourced(List.of(), "--trim-root-from", List.of("preset:jvm-infra")),
-                        List.of(),
-                        false,
-                        List.of(),
-                        options.machinery(),
-                        false,
-                        StackTransforms.ThreadFrame.NONE);
+            StackProfile profile,
+            Options options,
+            StackTransforms transforms,
+            StackProfileRenderer.PackageNames packages,
+            String command)
+            throws IOException {
         StackProfileRenderer.Filter filter = StackProfileRenderer.Filter.of(
                 List.of(),
                 options.idle().stream().map(StackTransforms.Sourced::pattern).toList());
@@ -214,19 +296,10 @@ final class Digest {
                 StackProfileRenderer.ReasonFrame.AUTO,
                 StackProfileRenderer.Time.TOTAL,
                 filter,
-                StackProfileRenderer.PackageNames.DROP,
+                packages,
                 transforms);
-        List<String> command = new ArrayList<>(List.of(Cli.NAME, "stacks", "--profile", profilePath));
-        command.addAll(patternOptions("--exclude", "--exclude-from", options.idle()));
-        if (withApp) {
-            command.addAll(patternOptions("--root-at", "--root-at-from", options.app()));
-        } else {
-            command.addAll(List.of("--trim-root-from", "preset:jvm-infra"));
-        }
-        command.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", options.machinery()));
-        command.addAll(List.of("--canonical-names", "--package-names", "drop", "--output", "busy.collapsed"));
         AnalysisProto.HeaviestStacks.Builder heaviest = AnalysisProto.HeaviestStacks.newBuilder()
-                .setCommand(Top.shell(command))
+                .setCommand(command)
                 .setLines(slice.nanos().size())
                 .setMeanDepth(
                         Cli.meanDepth(slice.nanos(), profile.header().label().length())
@@ -251,18 +324,8 @@ final class Digest {
     /** The digest as Markdown, rendered from its message. */
     static String markdown(AnalysisProto.Digest digest) {
         StringBuilder text = new StringBuilder();
-        text.append("# jonoffcpu analysis digest\n\n");
-        text.append("Profile `").append(digest.getProfile()).append("`");
-        if (!digest.getRun().isEmpty()) {
-            text.append(", run `").append(digest.getRun()).append('`');
-        }
-        text.append(". Times are observed seconds of off-CPU time")
-                .append(
-                        digest.getEstimateAvailable()
-                                ? "; the population estimate is available (top --weights estimated)."
-                                : "; the population estimate is unavailable, so under proportional or uniform sampling short"
-                                        + " waits are under-weighted.")
-                .append("\n\n");
+        intro(digest, text);
+        if (digest.hasBusyByRoot()) return application(digest, text);
         if (digest.hasCapture()) capture(digest.getCapture(), text);
 
         DigestTable busy = digest.getBusy();
@@ -324,12 +387,169 @@ final class Digest {
                     .append("`\n");
         }
         text.append("- Heaviest stacks: `").append(heaviest.getCommand()).append("`\n");
+        exportLine(digest, text);
+        return text.toString();
+    }
+
+    private static void intro(AnalysisProto.Digest digest, StringBuilder text) {
+        text.append("# jonoffcpu analysis digest\n\n");
+        text.append("Profile `").append(digest.getProfile()).append("`");
+        if (!digest.getRun().isEmpty()) {
+            text.append(", run `").append(digest.getRun()).append('`');
+        }
+        text.append(". Times are observed seconds of off-CPU time")
+                .append(
+                        digest.getEstimateAvailable()
+                                ? "; the population estimate is available (top --weights estimated)."
+                                : "; the population estimate is unavailable, so under proportional or uniform sampling short"
+                                        + " waits are under-weighted.")
+                .append("\n\n");
+    }
+
+    private static void exportLine(AnalysisProto.Digest digest, StringBuilder text) {
         text.append("- Any other question: `")
                 .append(Cli.NAME)
                 .append(" export --profile ")
                 .append(digest.getProfile())
                 .append(" --format jsonl --output entries.jsonl`\n");
+    }
+
+    /**
+     * Whether most of the busy time has no application frame, which usually means the idle patterns miss some waits
+     * for work.
+     */
+    static boolean mostlyWithoutApplication(AnalysisProto.TopTotals totals) {
+        BigDecimal busy = new BigDecimal(totals.getBusy().getValue());
+        BigDecimal without = new BigDecimal(totals.getBusyNoApplicationFrame().getValue());
+        return without.multiply(BigDecimal.valueOf(2)).compareTo(busy) > 0;
+    }
+
+    /**
+     * The application-rooted digest: the tables that say where to look first, then where the time went, the busy
+     * time the tables leave out, the capture and how to reproduce each table.
+     */
+    private static String application(AnalysisProto.Digest digest, StringBuilder text) {
+        AnalysisProto.TopTotals totals = digest.getWhereTheTimeWent();
+        BigDecimal busy = new BigDecimal(totals.getBusy().getValue());
+        BigDecimal application = new BigDecimal(totals.getBusyApplication().getValue());
+        boolean mostlyWithout = mostlyWithoutApplication(totals);
+        text.append("Busy with an application frame: ")
+                .append(totals.getBusyApplication().getValue())
+                .append(" s, ")
+                .append(Top.percent(Top.share(application, busy)))
+                .append(" of the ")
+                .append(totals.getBusy().getValue())
+                .append(" s busy. Left out of the tables: ")
+                .append(totals.getBusyNoApplicationFrame().getValue())
+                .append(" s busy without an application frame and ")
+                .append(totals.getIdle().getValue())
+                .append(" s idle (see [Where the time went](#where-the-time-went)).\n\n");
+        if (mostlyWithout) {
+            text.append("More than half of the busy time has no application frame: the idle patterns probably miss")
+                    .append(" some waits for work, or the JVM itself waited. See [Busy without an application frame,")
+                    .append(" by pool](#busy-without-an-application-frame-by-pool) and extend the idle patterns.\n\n");
+        }
+
+        DigestTable waited = digest.getBusy();
+        text.append("## Busy, by the application method that waited\n\nEach row is the last application method")
+                .append(" before the blocking call (its boundary) and what it blocked on: the leaf side of each tower")
+                .append(" of the application-rooted flame graph. The rows sum to the busy time with an application")
+                .append(" frame, and shares are of it.\n\n");
+        section(waited, "boundary", text);
+
+        text.append("## Busy, by application root\n\nEach row is the first application frame once the dispatch")
+                .append(" frames are hidden, where a thread entered the application: the root side of the same")
+                .append(" towers, with the heaviest line under it. The rows sum to the busy time with an application")
+                .append(" frame.\n\n");
+        section(digest.getBusyByRoot(), "root", text);
+
+        AnalysisProto.HeaviestStacks heaviest = digest.getHeaviestApplicationStacks();
+        text.append("## Heaviest application stacks\n\nThe busy time with an application frame, rooted at the")
+                .append(" application, renders as ")
+                .append(heaviest.getLines())
+                .append(" lines at a mean depth of ")
+                .append(heaviest.getMeanDepth())
+                .append(" frames; the heaviest ten, each a path from a root to what it blocked on. Reproduce, the")
+                .append(" application-rooted flame graph's input: `")
+                .append(heaviest.getCommand())
+                .append("`\n\n| s | Stack |\n|---:|---|\n");
+        for (AnalysisProto.HeavyStack line : heaviest.getTopList()) {
+            text.append("| ")
+                    .append(line.getSeconds())
+                    .append(" | ")
+                    .append(Top.code(line.getStack()))
+                    .append(" |\n");
+        }
+        text.append('\n');
+
+        text.append("## Busy, by application method\n\nApplication methods ranked across all stacks: each has the")
+                .append(" time of every stack it is in, so shares add up to more than 100 %. Methods that are always")
+                .append(" in the same stacks are one call chain, root-most first. Self time is that of the stacks")
+                .append(" whose deepest application method is in the row.\n\n");
+        section(digest.getBusyByApplicationMethod(), "app-method", text);
+
+        text.append("## Where the time went\n\n| Slice | Entries | Intervals | s |\n|---|---:|---:|---:|\n");
+        tableSum(totals.getBusyApplication(), "Busy with an application frame", text);
+        tableSum(
+                totals.getBusyNoApplicationFrame(),
+                "Busy without an application frame, hidden from the tables above",
+                text);
+        tableSum(totals.getIdle(), "Idle, left out", text);
+        tableSum(totals.getSelected(), "All selected", text);
+        tableSum(totals.getOverExclusion(), "Over-exclusion check: idle entries with a lock-acquire frame", text);
+        text.append("\nIdle intervals, waits for work, are left out of every table: a frame of their stack matched")
+                .append(" one of the idle patterns ")
+                .append(patterns(digest.getSelection().getIdleList()))
+                .append(". `")
+                .append(waited.getCommand())
+                .append("` lists them. A nonzero over-exclusion check means idle patterns hid waits on a lock or")
+                .append(" monitor.\n\n");
+
+        text.append("## Busy without an application frame, by pool\n\nBusy time without a frame of the application,")
+                .append(" left out of the tables above: waits for work the idle patterns miss, or the JVM itself")
+                .append(" waiting. Native symbolization matters here: on musl every native frame is")
+                .append(" /lib/ld-musl-<arch>.so.1, and idle JVM threads count as busy.");
+        if (mostlyWithout) {
+            text.append(" It is more than half of the busy time: add the waits for work of its heaviest pools to the")
+                    .append(" idle patterns.");
+        }
+        text.append("\n\n");
+        section(digest.getBusyNoApplicationFrameByPool(), "pool", text);
+
+        if (digest.hasCapture()) capture(digest.getCapture(), text);
+        if (digest.getWarningsCount() > 0) {
+            for (String warning : digest.getWarningsList())
+                text.append("> **Warning:** ").append(warning).append("\n");
+            text.append('\n');
+        }
+        text.append("## How to reproduce\n\n");
+        text.append("- By the application method that waited, the busy time without an application frame by pool, and")
+                .append(" the idle waits left out: `")
+                .append(waited.getCommand())
+                .append("`\n");
+        text.append("- By application root: `")
+                .append(digest.getBusyByRoot().getCommand())
+                .append("`\n");
+        text.append("- By application method: `")
+                .append(digest.getBusyByApplicationMethod().getCommand())
+                .append("`\n");
+        text.append("- Heaviest application stacks: `")
+                .append(heaviest.getCommand())
+                .append("`\n");
+        exportLine(digest, text);
         return text.toString();
+    }
+
+    private static void tableSum(AnalysisProto.TableSum sum, String label, StringBuilder text) {
+        text.append("| ")
+                .append(label)
+                .append(" | ")
+                .append(sum.getEntries())
+                .append(" | ")
+                .append(sum.getIntervals())
+                .append(" | ")
+                .append(sum.getValue())
+                .append(" |\n");
     }
 
     private static String patterns(List<AnalysisProto.SourcedPattern> patterns) {
@@ -342,10 +562,18 @@ final class Digest {
         return sources.isEmpty() ? "(none)" : String.join(", ", sources);
     }
 
-    private static void section(DigestTable section, String keyName, StringBuilder text) {
+    /**
+     * One table, as {@code top --format md} renders it: {@code by} names a ranking, whose rows render as {@link
+     * Top#rowsTable}, or else the key column's heading.
+     */
+    private static void section(DigestTable section, String by, StringBuilder text) {
         List<TopRow> rows = section.getRowsList();
         StringBuilder table = new StringBuilder();
-        Top.table(rows, keyName, "s", "Intervals", true, table);
+        if (List.of("boundary", "root", "app-method").contains(by)) {
+            Top.rowsTable(rows, by, "s", "Intervals", true, table);
+        } else {
+            Top.table(rows, by, "s", "Intervals", true, table);
+        }
         text.append(table).append('\n');
     }
 

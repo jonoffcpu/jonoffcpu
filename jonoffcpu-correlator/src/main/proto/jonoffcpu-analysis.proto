@@ -32,7 +32,7 @@ message Transforms {
   repeated SourcedPattern hide = 2;
   repeated SourcedPattern trim_root = 3;
   repeated SourcedPattern root_at = 4;
-  // "bucket" or "keep".
+  // "bucket", "keep" or "hide".
   string root_at_unmatched = 5;
   repeated SourcedPattern leaf_at = 6;
   repeated SourcedPattern collapse_leaf = 7;
@@ -45,7 +45,8 @@ message Transforms {
   optional uint64 lines_after = 11;
   optional string frames_before = 12;
   optional string frames_after = 13;
-  // Set with --root-at: the weight that had no application frame, and its share of the total.
+  // Set with --root-at: the weight that had no application frame, and its share of the total. With
+  // --root-at-unmatched hide it is the hidden weight, and its share of the total before hiding.
   NoApplicationFrame no_application_frame = 14;
 }
 
@@ -79,6 +80,9 @@ message SliceSummary {
   string label = 15;
   uint32 sources = 16;
   Transforms transforms = 17;
+  // Set with --root-at-unmatched hide: the kept entries without a --root-at match, left out of the lines and
+  // of the totals above. Add it back to reconcile with the slice rendered without hiding.
+  FilteredSlice root_at_unmatched_hidden = 18;
 }
 
 message FilteredSlice {
@@ -97,6 +101,8 @@ message CollapsedSliceSummary {
   repeated string exclude = 6;
   FilteredLines filtered = 7;
   Transforms transforms = 8;
+  // Set with --root-at-unmatched hide: the kept lines without a --root-at match, left out of the totals above.
+  FilteredLines root_at_unmatched_hidden = 9;
 }
 
 message FilteredLines {
@@ -110,7 +116,7 @@ message FilteredLines {
 message TopResult {
   // The command that reproduces this result.
   string command = 1;
-  // --by: "boundary", "self", "method", "class", "package" or "pool".
+  // --by: "boundary", "root", "app-method", "self", "method", "class", "package" or "pool".
   string by = 2;
   // "seconds", "seconds per unit" (a comparison with --units), or "weight" (a collapsed input's unit).
   string unit = 3;
@@ -119,7 +125,8 @@ message TopResult {
   TopTotals totals = 5;
   // Busy rows: by boundary, or by --by.
   repeated TopRow rows = 6;
-  // --by boundary: busy time without an application frame, by pool.
+  // --by boundary and app-method: busy time without an application frame, by pool; with
+  // --root-at-unmatched hide, the busy time it hid, by pool.
   repeated TopRow no_application_frame = 7;
   repeated TopRow idle = 8;
   // A comparison with --baseline; unset for a ranking.
@@ -159,11 +166,14 @@ message TopTotals {
   TableSum selected = 1;
   TableSum idle = 2;
   TableSum busy = 3;
-  // --by boundary only.
+  // --by boundary and app-method, and any ranking with --root-at-unmatched hide: the busy time the rows
+  // cover, and the rest.
   TableSum busy_application = 4;
   TableSum busy_no_application_frame = 5;
   // Idle entries with a lock-acquire frame: waits an idle list may hide by mistake.
   TableSum over_exclusion = 6;
+  // --root-at-unmatched hide: busy entries without a --root-at match, left out of the rows.
+  TableSum busy_root_at_unmatched_hidden = 7;
 }
 
 message TableSum {
@@ -176,12 +186,13 @@ message TableSum {
 
 message TopRow {
   uint32 rank = 1;
-  // The boundary, the pool, or the --by key.
+  // The boundary, the pool, or the --by key; for app-method the chain, "A → … (n) → Z" for n methods.
   string key = 2;
   // --by boundary: the entry frame of the wait machinery below the boundary, or the leaf.
   optional string blocker = 3;
   string value = 4;
-  // Of the busy total, or of the idle total in the idle table.
+  // Of the busy total, or of the idle total in the idle table. With an application pattern (boundary,
+  // app-method) or --root-at-unmatched hide, of the busy time the rows cover.
   string share = 5;
   uint64 intervals = 6;
   // Set when the profile's estimate is available and observed weights are ranked.
@@ -193,6 +204,13 @@ message TopRow {
   optional io.github.jonoffcpu.capture.v1.OffCpuReason reason = 10;
   // --by boundary: the heaviest root-most application frame.
   optional string caller = 11;
+  // --by root: the heaviest transformed line under the root, abbreviated package names.
+  optional string heaviest_stack = 12;
+  // --by app-method: the chain's methods, root-most first; time whose deepest application frame is one of
+  // them; and the distinct transformed stacks it occurs in.
+  repeated string methods = 13;
+  optional string self = 14;
+  optional uint64 stacks = 15;
 }
 
 message ComparisonTotals {
@@ -216,8 +234,13 @@ message ComparedRow {
 // ---------------------------------------------------------------------------------------------------
 // The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it. Idle intervals, those matching the
 // selection's idle patterns, are counted in where_the_time_went and left out of every table and stack.
+//
+// Schema 2 adds schema_version (absent, 0, in schema 1), and with --app the application-rooted tables: busy is then by
+// the application method that waited, busy_by_root, busy_by_application_method and
+// heaviest_application_stacks are set, and busy time without an application frame is hidden from them.
 
 message Digest {
+  uint32 schema_version = 17;
   string profile = 1;
   string run = 2;
   bool estimate_available = 3;
@@ -233,6 +256,13 @@ message Digest {
   reserved "idle";
   HeaviestStacks heaviest_stacks = 11;
   repeated string warnings = 12;
+  // With --app: busy time by application root (top --by root), by application method (top --by app-method),
+  // the heaviest lines of the application-rooted slice, and the busy time without an application frame
+  // that all of them leave out.
+  DigestTable busy_by_root = 13;
+  DigestTable busy_by_application_method = 14;
+  HeaviestStacks heaviest_application_stacks = 15;
+  TableSum busy_without_application_frame = 16;
 }
 
 message DigestCapture {
@@ -266,7 +296,7 @@ message CollectorLoss {
 }
 
 message DigestTable {
-  // "boundary" with --app, "self" without, or "pool".
+  // "boundary" with --app, "self" without, "root", "app-method", or "pool".
   string by = 1;
   string command = 2;
   repeated TopRow rows = 3;

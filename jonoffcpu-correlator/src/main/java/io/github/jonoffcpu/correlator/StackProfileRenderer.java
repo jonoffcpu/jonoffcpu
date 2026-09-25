@@ -270,7 +270,8 @@ final class StackProfileRenderer {
      * The collapsed lines of one slice and the totals behind them, for a summary a reader can reconcile. The
      * filtered totals are what the slice's filter removed: an unfiltered slice's totals less the kept ones. The
      * unsplit total is the part of the kept entries' time that has no sleeping/run-queue split, which a
-     * {@code sleeping} or {@code runqueue} slice leaves out.
+     * {@code sleeping} or {@code runqueue} slice leaves out. The hidden totals are the kept entries that
+     * {@link StackTransforms.UnmatchedRoot#HIDE} left out of the lines, and out of every other total.
      */
     record Slice(
             Map<String, BigInteger> nanos,
@@ -278,7 +279,9 @@ final class StackProfileRenderer {
             BigInteger totalNanos,
             long filteredIntervals,
             BigInteger filteredNanos,
-            BigInteger unsplitNanos) {}
+            BigInteger unsplitNanos,
+            long hiddenIntervals,
+            BigInteger hiddenNanos) {}
 
     private static final Pattern OFFSET = Pattern.compile("\\+0x[0-9a-fA-F]+$");
     /**
@@ -343,7 +346,9 @@ final class StackProfileRenderer {
                 kept.totalNanos(),
                 Math.subtractExact(all.intervals(), kept.intervals()),
                 all.totalNanos().subtract(kept.totalNanos()),
-                kept.unsplitNanos());
+                kept.unsplitNanos(),
+                kept.hiddenIntervals(),
+                kept.hiddenNanos());
     }
 
     private static Slice project(
@@ -381,8 +386,22 @@ final class StackProfileRenderer {
         Set<OffCpuReason> selected = reasons == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(reasons);
         List<StackProfile.Entry> entries = new ArrayList<>();
         Set<OffCpuReason> present = EnumSet.noneOf(OffCpuReason.class);
+        long hiddenIntervals = 0;
+        BigInteger hidden = BigInteger.ZERO;
+        boolean hides = transforms.unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
         for (StackProfile.Entry entry : profile.entries()) {
             if (!selected.contains(entry.reason()) || !keeps.test(entry)) continue;
+            // A hidden entry is left out before anything else, so the slice reads as if it had none.
+            if (hides
+                    && StackTransforms.hidden(
+                            entry.javaStack(), transformed.computeIfAbsent(entry.javaStack(), transform::apply))) {
+                hiddenIntervals = Math.addExact(hiddenIntervals, entry.intervals());
+                hidden = hidden.add(U64.big(
+                        time.part != null
+                                ? entry.split().nanos(time.part, estimated)
+                                : estimated ? entry.estimatedNanos() : entry.observedNanos()));
+                continue;
+            }
             entries.add(entry);
             // Only reasons that contribute a line count, as in the correlator's own collapsed file.
             long contributes =
@@ -440,7 +459,8 @@ final class StackProfileRenderer {
             total = total.add(value);
         }
         BigInteger unsplitTotal = thinning.active() ? thinning.scale(unsplit) : BigInteger.valueOf(unsplit);
-        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO, unsplitTotal);
+        BigInteger hiddenTotal = thinning.active() ? thinning.scale(hidden.longValueExact()) : hidden;
+        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO, unsplitTotal, hiddenIntervals, hiddenTotal);
     }
 
     /** The leaf frame naming one part of an interval's time in a {@link Time#SPLIT} slice. */
@@ -561,6 +581,14 @@ final class StackProfileRenderer {
         summary.setLabel(profile.header().label())
                 .setSources(profile.header().sources().size());
         return summary;
+    }
+
+    /** What {@link StackTransforms.UnmatchedRoot#HIDE} left out of a slice, for its summary. */
+    static AnalysisProto.FilteredSlice hidden(Slice slice) {
+        return AnalysisProto.FilteredSlice.newBuilder()
+                .setIntervals(slice.hiddenIntervals())
+                .setTotalNanos(slice.hiddenNanos().toString())
+                .build();
     }
 
     static List<String> patterns(List<Pattern> patterns) {

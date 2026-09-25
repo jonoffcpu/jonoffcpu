@@ -25,7 +25,8 @@ import org.junit.jupiter.params.provider.FieldSource;
  * The reference numbers the 0.5.0 specs were written against, measured on recordings of an Apache Pulsar broker. The
  * recordings are not part of the repository; run with {@code -Djonoffcpu.fixtures=DIR} (Gradle:
  * {@code -PjonoffcpuFixtures=DIR}) pointing at a directory holding {@code pulsar-broker-2026-09-23-wolfi/} and
- * {@code pulsar-broker-2026-09-23-wolfi-cpu/}, and it is skipped otherwise.
+ * {@code pulsar-broker-2026-09-23-wolfi-cpu/}, and it is skipped otherwise. The digest-application-roots spec's
+ * numbers are measured on {@code pulsar-broker-2026-09-25-key-shared/}.
  */
 class FixtureAcceptanceTest {
     static final String IDLE_BOOKKEEPER =
@@ -357,8 +358,6 @@ class FixtureAcceptanceTest {
                 "summarize",
                 "--profile",
                 wolfi.toString(),
-                "--app",
-                APP,
                 "--idle-from",
                 "preset:jvm-idle",
                 "--idle",
@@ -367,16 +366,248 @@ class FixtureAcceptanceTest {
                 digest.toString());
         assertThat(summarize.code()).as("summarize failed: %s", summarize).isZero();
         assertThat(Files.size(digest.resolve(OutputFiles.SUMMARY_MD)))
-                .as("The digest's Markdown must stay under 16 KB")
+                .as("The digest's Markdown without --app must stay under 16 KB")
                 .isLessThan(16 * 1024);
         AnalysisProto.HeaviestStacks heaviest = ProtoJson.parse(
                         Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
                 .getHeaviestStacks();
-        assertThat(heaviest.getLines())
-                .as("Heaviest transformed stacks: %s", heaviest)
-                .isEqualTo(78);
-        assertThat(heaviest.getMeanDepth())
-                .as("Heaviest transformed stacks: %s", heaviest)
-                .isEqualTo("4.1");
+        assertThat(heaviest.getTopCount())
+                .as("Heaviest application stacks: %s", heaviest)
+                .isEqualTo(10);
+    }
+
+    static final String KEY_SHARED = "pulsar-broker-2026-09-25-key-shared";
+
+    /** The key-shared fixture's application-rooted options, in --package-names drop for short keys. */
+    static List<String> applicationRooted(Path fixture, String... more) {
+        List<String> args = new ArrayList<>(List.of(
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--idle-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--canonical-names",
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--root-at",
+                APP,
+                "--root-at-unmatched",
+                "hide",
+                "--package-names",
+                "drop",
+                "--limit",
+                "100"));
+        args.addAll(List.of(more));
+        return args;
+    }
+
+    private static List<String> rows(AnalysisProto.TopResult result, boolean blocker) {
+        List<String> rows = new ArrayList<>();
+        for (AnalysisProto.TopRow row : result.getRowsList()) {
+            rows.add(row.getKey() + (blocker ? " [" + row.getBlocker() + "]" : "") + " " + row.getValue() + " "
+                    + Top.percent(row.getShare()));
+        }
+        return rows;
+    }
+
+    static final List<String> HIDDEN_FRAMES = List.of(
+            "$$Lambda",
+            "SingleThreadExecutor.run",
+            "SingleThreadExecutor.safeRunTask",
+            "FutureTask.",
+            "Runnables$CatchingAndLoggingRunnable",
+            "PulsarFlowControlHandler",
+            "PulsarDecoder.channelRead");
+
+    /** Spec digest-application-roots, change 1: hiding moves the unattributed busy time to a total of its own. */
+    @Test
+    void rootAtUnmatchedHide(@TempDir Path dir) throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        List<String> common = List.of(
+                "stacks",
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--exclude-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--canonical-names",
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--root-at",
+                APP);
+        List<String> bucket = new ArrayList<>(common);
+        bucket.addAll(List.of("--summary", dir.resolve("bucket.json").toString()));
+        run(dir.resolve("bucket.collapsed"), bucket);
+        List<String> hide = new ArrayList<>(common);
+        hide.addAll(List.of(
+                "--root-at-unmatched",
+                "hide",
+                "--summary",
+                dir.resolve("hide.json").toString()));
+        run(dir.resolve("hide.collapsed"), hide);
+        AnalysisProto.SliceSummary all = ProtoJson.parse(
+                        Files.readString(dir.resolve("bucket.json")), AnalysisProto.SliceSummary.newBuilder())
+                .build();
+        AnalysisProto.SliceSummary kept = ProtoJson.parse(
+                        Files.readString(dir.resolve("hide.json")), AnalysisProto.SliceSummary.newBuilder())
+                .build();
+        assertThat(all.getIntervals()).as("Busy intervals").isEqualTo(291);
+        assertThat(seconds(all.getTotalNanos())).as("Busy seconds").isEqualTo("40.566");
+        assertThat(seconds(kept.getTotalNanos()))
+                .as("With an application frame")
+                .isEqualTo("0.297");
+        assertThat(seconds(kept.getRootAtUnmatchedHidden().getTotalNanos()))
+                .as("Without an application frame, hidden")
+                .isEqualTo("40.269");
+        assertThat(new BigDecimal(kept.getTotalNanos())
+                        .add(new BigDecimal(kept.getRootAtUnmatchedHidden().getTotalNanos())))
+                .as("Kept and hidden add up to the unhidden total exactly")
+                .isEqualTo(new BigDecimal(all.getTotalNanos()));
+        assertThat(Files.readString(dir.resolve("hide.collapsed")))
+                .doesNotContain(StackTransforms.NO_APPLICATION_FRAME);
+    }
+
+    private static String seconds(String nanos) {
+        return new BigDecimal(nanos)
+                .movePointLeft(9)
+                .setScale(3, RoundingMode.HALF_EVEN)
+                .toPlainString();
+    }
+
+    /** Spec digest-application-roots, changes 3 to 5: the root, application method and boundary tables. */
+    @Test
+    void applicationTables() throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        AnalysisProto.TopResult roots = topJson(applicationRooted(fixture, "--by", "root"));
+        assertThat(rows(roots, false).subList(0, 8))
+                .containsExactly(
+                        "PersistentDispatcherMultipleConsumers.lambda$readMoreEntriesAsync$0 0.094 31.5 %",
+                        "ServerCnx.handleSend 0.087 29.1 %",
+                        "ServerCnx.handleAck 0.027 9.1 %",
+                        "PulsarCommandSenderImpl.lambda$sendMessagesToConsumer$0 0.024 8.0 %",
+                        "ZKSessionWatcher.checkConnectionStatus 0.023 7.8 %",
+                        "PerChannelBookieClient.lambda$writeAndFlush$5 0.018 6.0 %",
+                        "ModularLoadManagerImpl.updateAll 0.012 3.9 %",
+                        "BookieProtoEncoding$ResponseDecoder.channelRead 0.008 2.7 %");
+        assertThat(roots.getRows(roots.getRowsCount() - 1).getKey()).isEqualTo("ManagedLedgerImpl.runAddBatch");
+        assertThat(roots.getTotals().getBusyRootAtUnmatchedHidden().getValue()).isEqualTo("40.269");
+        for (AnalysisProto.TopRow row : roots.getRowsList()) {
+            assertThat(row.getKey()).as("A root is never a dispatch frame").doesNotContain(HIDDEN_FRAMES);
+        }
+
+        AnalysisProto.TopResult methods = topJson(applicationRooted(fixture, "--by", "app-method", "--app", APP));
+        assertThat(methods.getRowsCount()).as("Chains").isEqualTo(27);
+        assertThat(methods.getRowsList().stream()
+                        .mapToInt(AnalysisProto.TopRow::getMethodsCount)
+                        .sum())
+                .as("Distinct application methods")
+                .isEqualTo(96);
+        List<String> first = new ArrayList<>();
+        for (AnalysisProto.TopRow row : methods.getRowsList().subList(0, 4)) {
+            first.add(row.getKey() + " " + row.getValue() + " " + Top.percent(row.getShare()) + " " + row.getSelf()
+                    + " " + row.getStacks());
+        }
+        assertThat(first)
+                .containsExactly(
+                        "PersistentDispatcherMultipleConsumers.lambda$readMoreEntriesAsync$0 → … (3) →"
+                                + " PersistentDispatcherMultipleConsumers.internalReadMoreEntries 0.094 31.5 % 0.012 6",
+                        "ServerCnx.handleSend → … (6) → MessageDeduplication.isDuplicateNormal 0.087 29.1 % 0.087 1",
+                        "ManagedCursorImpl.asyncReadEntriesWithSkipOrWait → … (4) →"
+                                + " ManagedLedgerImpl.internalReadFromLedger 0.082 27.7 % 0.000 5",
+                        "ManagedLedgerImpl.asyncReadEntry → … (4) → RangeEntryCacheImpl.asyncReadEntriesByPosition"
+                                + " 0.043 14.5 % 0.000 4");
+        BigDecimal self = BigDecimal.ZERO;
+        for (AnalysisProto.TopRow row : methods.getRowsList()) {
+            self = self.add(new BigDecimal(row.getSelf()));
+            assertThat(row.getMethodsList())
+                    .as("No hidden frame is an application method")
+                    .allSatisfy(method -> assertThat(method).doesNotContain(HIDDEN_FRAMES));
+        }
+        assertThat(self)
+                .as("Self times add up, within the rows' rounding to milliseconds")
+                .isCloseTo(new BigDecimal("0.297"), within(new BigDecimal("0.0135")));
+
+        AnalysisProto.TopResult boundaries = topJson(applicationRooted(fixture, "--app", APP));
+        assertThat(rows(boundaries, true).subList(0, 8))
+                .containsExactly(
+                        "MessageDeduplication.isDuplicateNormal [C2 Runtime complete_monitor_locking] 0.087 29.1 %",
+                        "ManagedCursorImpl.isMessageDeleted [ReentrantReadWriteLock$ReadLock.lock] 0.039 13.2 %",
+                        "ManagedCursorImpl.filterReadEntries [ReentrantReadWriteLock$ReadLock.lock] 0.029 9.6 %",
+                        "ZKSessionWatcher.checkConnectionStatus [ForkJoinPool.managedBlock] 0.023 7.8 %",
+                        "InMemoryRedeliveryTracker.getRedeliveryCount [StampedLock.readLock] 0.023 7.8 %",
+                        "ManagedCursorImpl.asyncDelete [ReentrantReadWriteLock$WriteLock.lock] 0.022 7.4 %",
+                        "ConcurrentOpenHashMap$Section.get [StampedLock.readLock] 0.018 6.0 %",
+                        "PendingAcksMap.addPendingAckIfAllowed [ReentrantReadWriteLock$WriteLock.lock] 0.012 4.1 %");
+        assertThat(rows(boundaries, true))
+                .as("Collections stay boundaries")
+                .contains(
+                        "ConcurrentOpenHashMap$Section.remove [StampedLock.writeLock] 0.004 1.4 %",
+                        "GrowableBatchedArrayBlockingQueue.offer [ReentrantLock.lock] 0.004 1.3 %");
+        for (AnalysisProto.TopResult result : List.of(roots, boundaries)) {
+            assertThat(result.getRowsList())
+                    .as("No boundary or root is an executor submit frame")
+                    .noneMatch(row -> row.getKey().contains("SingleThreadExecutor.execute")
+                            || row.getKey().contains("executeOrdered"));
+        }
+    }
+
+    /** Spec digest-application-roots, change 6: the digest leads with the application methods that waited. */
+    @Test
+    void applicationDigest(@TempDir Path dir) throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        Path output = dir.resolve("digest");
+        CommandLineFixture.Invocation summarize = CommandLineFixture.invoke(
+                "summarize",
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--app",
+                APP,
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--idle-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--output-dir",
+                output.toString());
+        assertThat(summarize.code()).as("summarize failed: %s", summarize).isZero();
+        AnalysisProto.Digest digest = ProtoJson.parse(
+                        Files.readString(output.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
+                .build();
+        String markdown = Files.readString(output.resolve(OutputFiles.SUMMARY_MD));
+        AnalysisProto.TopRow first = digest.getBusy().getRows(0);
+        assertThat(first.getKey())
+                .isEqualTo("org.apache.pulsar.broker.service.persistent.MessageDeduplication.isDuplicateNormal");
+        assertThat(first.getValue() + " " + Top.percent(first.getShare())).isEqualTo("0.087 29.1 %");
+        assertThat(markdown.indexOf("## Busy, by the application method that waited"))
+                .as("The first table")
+                .isLessThan(markdown.indexOf("| # |"));
+        String application = digest.getWhereTheTimeWent().getBusyApplication().getValue();
+        assertThat(application).isEqualTo("0.297");
+        for (AnalysisProto.DigestTable table : List.of(digest.getBusy(), digest.getBusyByRoot())) {
+            assertThat(table.getRowsList().stream()
+                            .map(row -> new BigDecimal(row.getValue()))
+                            .reduce(BigDecimal.ZERO, BigDecimal::add))
+                    .as("The %s rows sum to the busy time with an application frame", table.getBy())
+                    .isCloseTo(new BigDecimal(application), within(new BigDecimal("0.005")));
+        }
+        assertThat(digest.getBusyByRoot().toString() + digest.getHeaviestApplicationStacks())
+                .as("The root table and heaviest stacks hold no unattributed time")
+                .doesNotContain("pulsar-web", "ZDriver");
+        assertThat(digest.getBusyNoApplicationFrameByPool().getRowsList())
+                .extracting(AnalysisProto.TopRow::getKey)
+                .startsWith("pulsar-web-#-#", "ZDriverMinor");
+        assertThat(markdown).contains("More than half of the busy time has no application frame");
+        assertThat(Files.size(output.resolve(OutputFiles.SUMMARY_MD)))
+                .as("The application-rooted digest's Markdown must stay under 40 KB")
+                .isLessThan(40 * 1024);
+
+        // Every reproduce command, run as written, prints its table as the digest has it.
+        for (AnalysisProto.DigestTable table :
+                List.of(digest.getBusy(), digest.getBusyByRoot(), digest.getBusyByApplicationMethod())) {
+            CommandLineFixture.Invocation top = CommandLineFixture.invoke(CommandLineFixture.words(table.getCommand()));
+            StringBuilder rendered = new StringBuilder();
+            Top.rowsTable(table.getRowsList(), table.getBy(), "s", "Intervals", true, rendered);
+            assertThat(markdown).contains(rendered);
+            assertThat(top.out())
+                    .as("%s reproduces its table", table.getCommand())
+                    .contains(rendered);
+        }
     }
 }

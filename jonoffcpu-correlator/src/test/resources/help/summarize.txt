@@ -1,11 +1,15 @@
 Usage: java -jar jonoffcpu-correlator.jar summarize [-hV] [--limit=N] [--output-dir=DIR]
-       [--profile=FILE] [--report=FILE] [--app=REGEX]... [--app-from=FILE]... [--idle=REGEX]...
-       [--idle-from=FILE]... [--machinery-from=FILE]...
+       [--profile=FILE] [--report=FILE] [--app=REGEX]... [--app-from=FILE]... [--hide=REGEX]...
+       [--hide-from=FILE]... [--idle=REGEX]... [--idle-from=FILE]... [--machinery-from=FILE]...
 Writes the analysis digest, jonoffcpu-summary.md and jonoffcpu-summary.json: the capture's coverage
 and losses, where the time went, the busy time ranked and its heaviest transformed stacks with the
 idle waits left out, and the command that reproduces each table.
-Correlation writes it by default, with its own --idle patterns; this command rewrites it with an
-application pattern or other idle patterns.
+With --app every table is rooted at the application, as its flame graph with --hide-from and
+--root-at-unmatched hide is: the application method that waited, where threads entered the
+application, the heaviest application stacks and application methods across stacks, with busy time
+without an application frame counted by pool.
+Correlation writes it by default, with its own --idle and --app patterns; this command rewrites it
+with other patterns.
       --profile=FILE     The stack profile. Required.
       --report=FILE      A correlation report (jonoffcpu-report.json) for the capture section.
                            Default: the report the profile carries; a merged profile has none.
@@ -24,5 +28,10 @@ application pattern or other idle patterns.
                          The wait machinery below a boundary whose entry frame is the blocker, from
                            a file or preset:NAME; repeatable. Default: preset:jvm-wait-machinery.
       --limit=N          Rows per table. Default: 20.
+      --hide=REGEX       For the digest with --app: remove matching frames, such as executors that
+                           only run a task, before each stack is rooted at the application.
+                           Repeatable.
+      --hide-from=FILE   Read --hide patterns from a file or preset:NAME; repeatable. Default, with
+                           --app and no hide pattern: preset:jvm-dispatch.
   -h, --help             Show this help message and exit.
   -V, --version          Print version information and exit.

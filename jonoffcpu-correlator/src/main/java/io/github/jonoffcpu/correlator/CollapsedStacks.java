@@ -29,8 +29,17 @@ final class CollapsedStacks {
     /** One input line: its frames, root first, and its weight. */
     record Line(List<StackProfile.Frame> frames, BigDecimal weight) {}
 
-    /** The rendered lines, the kept total, and what the filter removed. */
-    record Slice(Map<String, BigDecimal> weights, BigDecimal total, long filteredLines, BigDecimal filteredWeight) {}
+    /**
+     * The rendered lines, the kept total, what the filter removed, and the kept lines that {@link
+     * StackTransforms.UnmatchedRoot#HIDE} left out of the rendered lines and the total.
+     */
+    record Slice(
+            Map<String, BigDecimal> weights,
+            BigDecimal total,
+            long filteredLines,
+            BigDecimal filteredWeight,
+            long hiddenLines,
+            BigDecimal hiddenWeight) {}
 
     private static final Pattern JAVA_MARKER = Pattern.compile("_\\[[ji01]\\]$");
 
@@ -100,6 +109,8 @@ final class CollapsedStacks {
         BigDecimal total = BigDecimal.ZERO;
         long filteredLines = 0;
         BigDecimal filteredWeight = BigDecimal.ZERO;
+        long hiddenLines = 0;
+        BigDecimal hiddenWeight = BigDecimal.ZERO;
         for (Line line : lines) {
             if (!filter.keeps(
                     line.frames().stream().map(StackProfile.Frame::name).toList())) {
@@ -107,12 +118,18 @@ final class CollapsedStacks {
                 filteredWeight = filteredWeight.add(line.weight());
                 continue;
             }
+            List<StackProfile.Frame> stack = transform.apply(line.frames());
+            if (StackTransforms.hidden(line.frames(), stack)) {
+                hiddenLines++;
+                hiddenWeight = hiddenWeight.add(line.weight());
+                continue;
+            }
             StringBuilder key = new StringBuilder();
-            StackProfileRenderer.appendJava(key, transform.apply(line.frames()), packages, shown);
+            StackProfileRenderer.appendJava(key, stack, packages, shown);
             weights.merge(key.toString(), line.weight(), BigDecimal::add);
             total = total.add(line.weight());
         }
-        return new Slice(weights, total, filteredLines, filteredWeight);
+        return new Slice(weights, total, filteredLines, filteredWeight, hiddenLines, hiddenWeight);
     }
 
     static void write(Slice slice, BufferedWriter writer) throws IOException {

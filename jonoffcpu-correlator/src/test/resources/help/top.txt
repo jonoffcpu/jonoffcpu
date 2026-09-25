@@ -36,10 +36,13 @@ breaks busy time without an application frame down by thread pool.
                                drop. Default: full.
       --collapsed-input=FILE Rank any collapsed file instead of --profile; values keep the file's
                                unit.
-      --by=KEY               What a row is: boundary (deepest --app frame and its blocker), self
-                               (the leaf, after --collapse-leaf), method, class or package (every
-                               distinct one in the stack, inclusive), or pool (the thread name with
-                               digit runs as #). Default: boundary.
+      --by=KEY               What a row is: boundary (deepest --app frame and its blocker), root
+                               (the first frame after the transforms, with the heaviest line under
+                               it), app-method (every distinct --app frame after the transforms,
+                               inclusive, call chains grouped, with self time), self (the leaf,
+                               after --collapse-leaf), method, class or package (every distinct one
+                               in the stack, inclusive), or pool (the thread name with digit runs
+                               as #). Default: boundary.
       --app=REGEX            A frame of your application; the deepest one is a stack's boundary.
                                Repeatable.
       --app-from=FILE        Read --app patterns from a file or preset:NAME; repeatable.
@@ -82,7 +85,9 @@ breaks busy time without an application frame down by thread pool.
       --root-at-from=FILE    Read --root-at patterns from a file or preset:NAME; repeatable.
       --root-at-unmatched=MODE
                              A stack without a --root-at match: bucket (becomes the single frame
-                               [no application frame]) or keep (unchanged). Default: bucket.
+                               [no application frame]), keep (unchanged) or hide (left out of the
+                               lines and the rows, and reported as a total of its own). Default:
+                               bucket.
       --leaf-at=REGEX        Cut the callees of the leaf-most matching frame, keeping the match.
                                Repeatable.
       --leaf-at-from=FILE    Read --leaf-at patterns from a file or preset:NAME; repeatable.

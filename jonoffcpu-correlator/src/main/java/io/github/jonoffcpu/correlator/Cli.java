@@ -338,6 +338,23 @@ final class Cli {
         List<String> idleFrom = new ArrayList<>();
 
         @Option(
+                names = "--app",
+                paramLabel = "REGEX",
+                description = "For the digest: a frame of your application. Its tables then start each stack at the"
+                        + " first one and name the last one before each wait, and count busy time without one apart,"
+                        + " by pool. Repeatable.")
+        List<String> app = new ArrayList<>();
+
+        @Option(
+                names = "--app-from",
+                paramLabel = "FILE",
+                description = "Read --app patterns from a file or preset:NAME; repeatable.")
+        List<String> appFrom = new ArrayList<>();
+
+        @Mixin
+        DigestHideOptions hide;
+
+        @Option(
                 names = "--max-profile-entries",
                 paramLabel = "N",
                 defaultValue = "2000000",
@@ -351,6 +368,36 @@ final class Cli {
 
         ParameterException usage(String message) {
             return new ParameterException(mixee.commandLine(), message);
+        }
+    }
+
+    /**
+     * The digest's hidden frames, which {@code correlate} and {@code summarize} share: with {@code --app} the digest
+     * is rooted at the application, and these frames are removed first so that the root is the work itself.
+     */
+    static final class DigestHideOptions {
+        @Option(
+                names = "--hide",
+                paramLabel = "REGEX",
+                description = "For the digest with --app: remove matching frames, such as executors that only run"
+                        + " a task, before each stack is rooted at the application. Repeatable.")
+        List<String> hide = new ArrayList<>();
+
+        @Option(
+                names = "--hide-from",
+                paramLabel = "FILE",
+                description = "Read --hide patterns from a file or preset:NAME; repeatable. Default, with --app and"
+                        + " no hide pattern: preset:jvm-dispatch.")
+        List<String> hideFrom = new ArrayList<>();
+
+        boolean given() {
+            return !hide.isEmpty() || !hideFrom.isEmpty();
+        }
+
+        /** The patterns, or with an application pattern and none given, {@code preset:jvm-dispatch}. */
+        List<StackTransforms.Sourced> patterns(boolean app) throws IOException {
+            if (app && !given()) return sourced(List.of(), "--hide-from", List.of("preset:jvm-dispatch"));
+            return sourced(hide, "--hide-from", hideFrom);
         }
     }
 
@@ -449,6 +496,9 @@ final class Cli {
      * which intervals are kept; the filters see the untransformed stack.
      */
     static final class TransformOptions {
+        @Spec(Spec.Target.MIXEE)
+        CommandSpec mixee;
+
         @Option(
                 names = "--canonical-names",
                 description = "Remove generated-class addresses ($$Lambda.0x..., LambdaForm$MH/0x...), so two runs'"
@@ -501,9 +551,9 @@ final class Cli {
                 defaultValue = "bucket",
                 converter = UnmatchedConverter.class,
                 description = "A stack without a --root-at match: bucket (becomes the single frame"
-                        + " " + StackTransforms.NO_APPLICATION_FRAME + ") or keep (unchanged)."
-                        + " Default: ${DEFAULT-VALUE}.")
-        String rootAtUnmatched;
+                        + " " + StackTransforms.NO_APPLICATION_FRAME + "), keep (unchanged) or hide (left out of"
+                        + " the lines and the rows, and reported as a total of its own). Default: ${DEFAULT-VALUE}.")
+        StackTransforms.UnmatchedRoot rootAtUnmatched;
 
         @Option(
                 names = "--leaf-at",
@@ -551,12 +601,18 @@ final class Cli {
         StackTransforms.ThreadFrame threadFrame;
 
         StackTransforms transforms() throws IOException {
+            if (rootAtUnmatched == StackTransforms.UnmatchedRoot.HIDE && rootAt.isEmpty() && rootAtFrom.isEmpty()) {
+                throw new ParameterException(
+                        mixee.commandLine(),
+                        "--root-at-unmatched hide needs --root-at or --root-at-from: without them nothing is"
+                                + " unmatched");
+            }
             return new StackTransforms(
                     canonicalNames,
                     sourced(hide, "--hide-from", hideFrom),
                     sourced(trimRoot, "--trim-root-from", trimRootFrom),
                     sourced(rootAt, "--root-at-from", rootAtFrom),
-                    rootAtUnmatched.equals("keep"),
+                    rootAtUnmatched,
                     sourced(leafAt, "--leaf-at-from", leafAtFrom),
                     sourced(collapseLeaf, "--collapse-leaf-from", collapseLeafFrom),
                     collapseLeafLabel.equals("category"),
@@ -701,6 +757,10 @@ final class Cli {
                     || options.given("--summary-output")
                     || options.given("--idle")
                     || options.given("--idle-from")
+                    || options.given("--app")
+                    || options.given("--app-from")
+                    || options.given("--hide")
+                    || options.given("--hide-from")
                     || options.given("--max-accounted-loss")) {
                 throw options.usage("Partial mode supports diagnostics or labelled collapsed output;"
                         + " the other outputs and population estimates require complete analysis");
@@ -721,6 +781,14 @@ final class Cli {
         if (idleGiven && !options.summaryOutput) {
             throw options.usage("--idle and --idle-from shape the digest, which --summary-output false leaves out");
         }
+        boolean appGiven = !options.app.isEmpty() || !options.appFrom.isEmpty();
+        if ((appGiven || options.hide.given()) && !options.summaryOutput) {
+            throw options.usage("--app, --app-from, --hide and --hide-from shape the digest, which --summary-output"
+                    + " false leaves out");
+        }
+        if (options.hide.given() && !appGiven) {
+            throw options.usage("--hide and --hide-from shape the digest's application tables; give --app too");
+        }
         ProfileAccumulator.Options profileOptions;
         Thinning thinning;
         Digest.Options digest = null;
@@ -730,10 +798,16 @@ final class Cli {
             thinning = options.thinning != null ? Thinning.of(options.thinning, options.thinningSeed) : Thinning.NONE;
             // Resolved before correlating, so that a bad pattern fails at once rather than after the analysis.
             if (options.summaryOutput) {
-                digest = Digest.defaults(
+                Digest.Options digestDefaults = Digest.defaults(
                         idleGiven
                                 ? sourced(options.idle, "--idle-from", options.idleFrom)
                                 : sourced(List.of(), "--idle-from", List.of("preset:jvm-idle")));
+                digest = new Digest.Options(
+                        sourced(options.app, "--app-from", options.appFrom),
+                        digestDefaults.idle(),
+                        digestDefaults.machinery(),
+                        options.hide.patterns(appGiven),
+                        digestDefaults.limit());
             }
         } catch (IllegalArgumentException invalid) {
             throw options.usage(invalid.getMessage());
@@ -772,7 +846,8 @@ final class Cli {
                 "",
                 "Per kept entry, in this order: --canonical-names, --hide, --trim-root, --root-at, --leaf-at,"
                         + " --collapse-leaf, then --package-names and --thread-frame as display. Filters see the"
-                        + " untransformed stacks, and lines that transform alike merge, so totals never change."
+                        + " untransformed stacks, and lines that transform alike merge, so totals never change,"
+                        + " except that --root-at-unmatched hide moves unmatched entries to a total of their own."
                         + " Every -from option also takes preset:NAME; --list-presets prints them."
             })
     static final class Stacks implements Callable<Integer> {
@@ -856,6 +931,8 @@ final class Cli {
                     slice.time,
                     filter,
                     slice.packageNames);
+            boolean hides = transforms.unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
+            if (hides) json.setRootAtUnmatchedHidden(StackProfileRenderer.hidden(rendered));
             if (transforms.active() || transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
                 StackProfileRenderer.Slice before = render(profile, filter, StackTransforms.NONE);
                 json.setTransforms(transformsReport(
@@ -863,7 +940,8 @@ final class Cli {
                         profile.header().label().length(),
                         before.nanos(),
                         rendered.nanos(),
-                        rendered.totalNanos()));
+                        rendered.totalNanos(),
+                        rendered.hiddenNanos()));
             }
             writeSummary(json.build());
             System.out.println("Wrote " + rendered.nanos().size() + " collapsed stacks to " + output + ": "
@@ -873,6 +951,10 @@ final class Cli {
                             ? "; filtered out " + rendered.filteredIntervals() + " intervals, "
                                     + rendered.filteredNanos() + " ns, matching "
                                     + String.join(",", StackProfileRenderer.Filter.scope(profile)) + " stacks"
+                            : "")
+                    + (hides
+                            ? "; hid " + rendered.hiddenIntervals() + " intervals, " + rendered.hiddenNanos()
+                                    + " ns without a --root-at match"
                             : ""));
             return OK;
         }
@@ -908,11 +990,22 @@ final class Cli {
                     .setFiltered(AnalysisProto.FilteredLines.newBuilder()
                             .setInputLines(rendered.filteredLines())
                             .setTotalWeight(rendered.filteredWeight().toPlainString()));
+            boolean hides = transforms.unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
+            if (hides) {
+                json.setRootAtUnmatchedHidden(AnalysisProto.FilteredLines.newBuilder()
+                        .setInputLines(rendered.hiddenLines())
+                        .setTotalWeight(rendered.hiddenWeight().toPlainString()));
+            }
             if (transforms.active()) {
                 CollapsedStacks.Slice before =
                         CollapsedStacks.render(lines, filter, StackTransforms.NONE, slice.packageNames);
-                json.setTransforms(
-                        transformsReport(transforms, 0, before.weights(), rendered.weights(), rendered.total()));
+                json.setTransforms(transformsReport(
+                        transforms,
+                        0,
+                        before.weights(),
+                        rendered.weights(),
+                        rendered.total(),
+                        rendered.hiddenWeight()));
             }
             writeSummary(json.build());
             System.out.println("Wrote " + rendered.weights().size() + " collapsed stacks to " + output + ": weight "
@@ -920,6 +1013,10 @@ final class Cli {
                     + (filter.active()
                             ? "; filtered out " + rendered.filteredLines() + " input lines, weight "
                                     + rendered.filteredWeight().toPlainString()
+                            : "")
+                    + (hides
+                            ? "; hid " + rendered.hiddenLines() + " input lines, weight "
+                                    + rendered.hiddenWeight().toPlainString() + ", without a --root-at match"
                             : ""));
             return OK;
         }
@@ -932,15 +1029,17 @@ final class Cli {
 
     /**
      * The transforms in effect with what they did: lines and weight-averaged depth before and after, and for
-     * {@code --root-at} the weight and share of {@link StackTransforms#NO_APPLICATION_FRAME}. {@code prefix} is the
-     * length of the label every line starts with, which is not a frame.
+     * {@code --root-at} the weight and share of {@link StackTransforms#NO_APPLICATION_FRAME}, or with {@code
+     * --root-at-unmatched hide} of the {@code hidden} weight, a share of the total before hiding. {@code prefix} is
+     * the length of the label every line starts with, which is not a frame.
      */
     static AnalysisProto.Transforms transformsReport(
             StackTransforms transforms,
             int prefix,
             Map<String, ? extends Number> before,
             Map<String, ? extends Number> after,
-            Number total) {
+            Number total,
+            Number hidden) {
         AnalysisProto.Transforms.Builder report = transforms
                 .report()
                 .setLinesBefore(before.size())
@@ -948,7 +1047,8 @@ final class Cli {
                 .setFramesBefore(meanDepth(before, prefix).toPlainString())
                 .setFramesAfter(meanDepth(after, prefix).toPlainString());
         if (!transforms.rootAt().isEmpty()) {
-            java.math.BigDecimal bucket = java.math.BigDecimal.ZERO;
+            java.math.BigDecimal hiddenWeight = new java.math.BigDecimal(hidden.toString());
+            java.math.BigDecimal bucket = hiddenWeight;
             for (var line : after.entrySet()) {
                 String frames = line.getKey().substring(prefix);
                 if (frames.equals(StackTransforms.NO_APPLICATION_FRAME)
@@ -956,7 +1056,7 @@ final class Cli {
                     bucket = bucket.add(new java.math.BigDecimal(line.getValue().toString()));
                 }
             }
-            java.math.BigDecimal all = new java.math.BigDecimal(total.toString());
+            java.math.BigDecimal all = new java.math.BigDecimal(total.toString()).add(hiddenWeight);
             report.setNoApplicationFrame(AnalysisProto.NoApplicationFrame.newBuilder()
                     .setWeight(bucket.toPlainString())
                     .setShare((all.signum() == 0
@@ -1081,9 +1181,11 @@ final class Cli {
                 paramLabel = "KEY",
                 defaultValue = "boundary",
                 converter = ByConverter.class,
-                description = "What a row is: boundary (deepest --app frame and its blocker), self (the leaf, after"
-                        + " --collapse-leaf), method, class or package (every distinct one in the stack, inclusive),"
-                        + " or pool (the thread name with digit runs as #). Default: ${DEFAULT-VALUE}.")
+                description = "What a row is: boundary (deepest --app frame and its blocker), root (the first frame"
+                        + " after the transforms, with the heaviest line under it), app-method (every distinct --app"
+                        + " frame after the transforms, inclusive, call chains grouped, with self time), self (the"
+                        + " leaf, after --collapse-leaf), method, class or package (every distinct one in the stack,"
+                        + " inclusive), or pool (the thread name with digit runs as #). Default: ${DEFAULT-VALUE}.")
         Top.By by;
 
         @Mixin
@@ -1149,9 +1251,10 @@ final class Cli {
             if (baseline != null && by != Top.By.BOUNDARY) {
                 throw new ParameterException(spec.commandLine(), "--baseline compares boundaries; use --by boundary");
             }
-            if (by == Top.By.BOUNDARY && ranking.app.isEmpty() && ranking.appFrom.isEmpty()) {
+            if (by.application() && ranking.app.isEmpty() && ranking.appFrom.isEmpty()) {
                 throw new ParameterException(
-                        spec.commandLine(), "--by boundary needs --app or --app-from; or rank with --by self");
+                        spec.commandLine(),
+                        "--by " + by.label() + " needs --app or --app-from; or rank with --by self");
             }
             Top.Options options = new Top.Options(
                     by,
@@ -1232,8 +1335,12 @@ final class Cli {
                         + ": the capture's coverage and losses, where the time went, the busy time ranked and"
                         + " its heaviest transformed stacks with the idle waits left out, and the command that"
                         + " reproduces each table.",
-                "Correlation writes it by default, with its own --idle patterns; this command rewrites it with an"
-                        + " application pattern or other idle patterns."
+                "With --app every table is rooted at the application, as its flame graph with --hide-from and"
+                        + " --root-at-unmatched hide is: the application method that waited, where threads entered"
+                        + " the application, the heaviest application stacks and application methods across stacks,"
+                        + " with busy time without an application frame counted by pool.",
+                "Correlation writes it by default, with its own --idle and --app patterns; this command rewrites it"
+                        + " with other patterns."
             })
     static final class Summarize implements Callable<Integer> {
         @Option(names = "--profile", paramLabel = "FILE", description = "The stack profile. Required.")
@@ -1256,8 +1363,20 @@ final class Cli {
         @Mixin
         RankingOptions ranking;
 
+        @Mixin
+        DigestHideOptions hide;
+
+        @Spec
+        CommandSpec spec;
+
         @Override
         public Integer call() throws Exception {
+            boolean appGiven = !ranking.app.isEmpty() || !ranking.appFrom.isEmpty();
+            if (hide.given() && !appGiven) {
+                throw new ParameterException(
+                        spec.commandLine(),
+                        "--hide and --hide-from shape the digest's application tables; give --app too");
+            }
             StackProfile read = StackProfile.read(profile);
             // The profile carries the report it was produced with; a report file is parsed strictly, so a file
             // that is not a report is refused rather than summarised as empty.
@@ -1265,8 +1384,8 @@ final class Cli {
                     ? read.header().report()
                     : ProtoJson.parse(java.nio.file.Files.readString(report), ReportProto.Report.newBuilder())
                             .build();
-            Digest.Options options =
-                    new Digest.Options(ranking.app(), ranking.idle(true), ranking.machinery(), ranking.limit);
+            Digest.Options options = new Digest.Options(
+                    ranking.app(), ranking.idle(true), ranking.machinery(), hide.patterns(appGiven), ranking.limit);
             AnalysisProto.Digest digest = Digest.of(read, profile.toString(), captured, options);
             Path directory = outputDirectory == null ? Path.of("") : outputDirectory;
             java.nio.file.Files.createDirectories(directory.toAbsolutePath());
@@ -1482,10 +1601,10 @@ final class Cli {
         }
     }
 
-    static final class UnmatchedConverter implements ITypeConverter<String> {
+    static final class UnmatchedConverter implements ITypeConverter<StackTransforms.UnmatchedRoot> {
         @Override
-        public String convert(String text) {
-            return choice(text, new String[] {"bucket", "keep"}, Function.identity());
+        public StackTransforms.UnmatchedRoot convert(String text) {
+            return choice(text, StackTransforms.UnmatchedRoot.values(), StackTransforms.UnmatchedRoot::label);
         }
     }
 

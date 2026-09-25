@@ -218,7 +218,7 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
 | `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
 | `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto) |
-| `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: coverage and losses, where the time went, and the busy time ranked by leaf or boundary and by pool with its heaviest stacks, idle waits left out (see `--idle-from`), each with the command that reproduces it. The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
+| `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: with `--app`, the busy time by the application method that waited, by application root and by application method, with the heaviest application stacks; without it, by leaf and by pool. Then where the time went, and coverage and losses, idle waits left out (see `--idle-from`), each table with the command that reproduces it. The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
 | `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
 | `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
 | `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
@@ -589,8 +589,17 @@ java -jar jonoffcpu-correlator.jar \
   --source /tmp/jonoffcpu-capture.pb \
   --jfr /tmp/jonoffcpu-capture.jfr \
   --output /tmp/jonoffcpu-analysis \
-  --estimate-population true
+  --estimate-population true \
+  --app '^com\.example\.'
 ```
+
+`--app` names your application's frames, and roots the digest at them: its
+tables name the application method that waited and what it blocked on, where
+each thread entered your code, and the application methods the time passed
+through, with executors and lambda bridges hidden first (`--hide-from`, by
+default `preset:jvm-dispatch`) and the busy time that has no application frame
+counted apart, by thread pool. Without it the digest ranks the leaves of the
+stacks, which name the wait mechanism rather than the code that waited.
 
 `--estimate-population true` keeps the inverse-probability estimates valid,
 which comparisons between runs need when sampling is proportional or uniform:
@@ -704,6 +713,14 @@ java -jar jonoffcpu-correlator.jar stacks \
   --exclude-from preset:jvm-idle --root-at '^com\.example\.' \
   --collapse-leaf-from preset:jvm-wait-machinery --output busy-app.collapsed
 
+# The application-rooted flame graph: executors and lambda bridges hidden, so each stack
+# starts at the work it ran, and busy time without an application frame left out and reported
+java -jar jonoffcpu-correlator.jar stacks \
+  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
+  --exclude-from preset:jvm-idle --canonical-names --hide-from preset:jvm-dispatch \
+  --root-at '^com\.example\.' --root-at-unmatched hide \
+  --collapse-leaf-from preset:jvm-wait-machinery --output busy-app-root.collapsed
+
 # The same transforms on any collapsed file, such as the recording's CPU view
 java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
   --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
@@ -762,10 +779,13 @@ that starts with `#`), and every other line is taken verbatim, spaces included.
 A file with no patterns, or with an invalid one, is refused, naming the line.
 
 Filters keep or drop whole intervals; transforms change the frames of the
-intervals kept, and never a total. `--trim-root` strips the longest root-side
-run of matching frames (thread, executor and event-loop entry points),
-`--root-at` starts each stack at its root-most matching frame and puts stacks
-without one under `[no application frame]`, `--leaf-at` cuts below the
+intervals kept, and never a total, except `--root-at-unmatched hide`, which
+moves the unmatched intervals to a total of their own. `--trim-root` strips
+the longest root-side run of matching frames (thread, executor and event-loop
+entry points), `--root-at` starts each stack at its root-most matching frame
+and puts stacks without one under `[no application frame]` (or keeps them with
+`--root-at-unmatched keep`, or leaves them out, reported in the summary's
+`rootAtUnmatchedHidden`, with `hide`), `--leaf-at` cuts below the
 leaf-most match, `--collapse-leaf` replaces the lock, park and monitor
 internals under a wait with the frame that entered them (or a category such as
 `[lock]` with `--collapse-leaf-label category`), `--hide` removes matching
@@ -773,7 +793,9 @@ frames anywhere, `--canonical-names` removes generated-class addresses so two
 runs compare, and `--thread-frame name|pool` starts each line with the thread
 or its pool. Each has a `-from FILE` form, and every `-from` option, the
 filters' included, also takes a bundled `preset:jvm-infra`,
-`preset:jvm-wait-machinery` or `preset:jvm-idle` (`stacks --list-presets`).
+`preset:jvm-wait-machinery`, `preset:jvm-idle` or `preset:jvm-dispatch`, the
+lambda bridges and executor adapters that only forward to a task, for `--hide`
+(`stacks --list-presets` prints them).
 Filters always see the untransformed stack. On an Apache Pulsar broker's busy
 waits, `--root-at` with `--collapse-leaf` turns 164 lines at a mean depth of 23
 frames into 78 lines of about 4. `--collapsed-input FILE` applies the same
@@ -855,6 +877,15 @@ lock and park internals under the blocker with the blocker itself. Finally,
 `--time split` shows whether a row's time was spent asleep or waiting for a
 CPU after the wakeup.
 
+The flame graph's other end is ranked too. With `--hide-from
+preset:jvm-dispatch --root-at '^com\.example\.' --root-at-unmatched hide`,
+`top --by root` lists where threads entered your code, each root with the
+heaviest line under it, and `top --by app-method --app '^com\.example\.'`
+ranks every application method across the stacks it is in, methods that are
+always called together grouped into one call chain, with the time of the
+stacks that end in them as their self time. With hiding, their shares and
+those of `--by boundary` are of the busy time that has an application frame.
+
 To compare two runs, give `top` the earlier profile as `--baseline` and each
 run's work as units, for example millions of messages; it lists each boundary's
 time per unit in both runs and warns when the runs are not comparable:
@@ -868,8 +899,9 @@ java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
 ## Analyzing with AI agents
 
 Give an agent the digest first: `jonoffcpu-summary.md` in the analysis
-directory (or `summarize --profile …`, which takes the capture section from the
-report the profile carries). It is bounded in size,
+directory (or `summarize --profile … --app …`, which takes the capture section
+from the report the profile carries), written with `--app` so that its tables
+name your code. It is bounded in size,
 states the capture's coverage and losses, and holds the ranked tables with the
 exact command that reproduces each one, so the agent can drill down with
 `top --format json` or `stacks` instead of reading raw stacks. For custom
@@ -1149,6 +1181,8 @@ The generated help is the reference: `java -jar jonoffcpu-correlator.jar help
 | `--profile-output true\|false` | Whether to write `jonoffcpu-offcpu-profile.pb`. Default `true`. |
 | `--summary-output true\|false` | Whether to write the digest, `jonoffcpu-summary.md` and `.json`. Default `true`. |
 | `--idle <regex>`, `--idle-from <file>` | The idle waits, waits for work, that the digest leaves out of its tables and stacks: an interval with a frame matching one is idle. Default `preset:jvm-idle`; add an application's own idle waits with a file of your own. The other outputs keep every interval. |
+| `--app <regex>`, `--app-from <file>` | Your application's frames, for the digest: its tables are then rooted at the application, as the application-rooted flame graph is (see [Find what to optimize](#6-find-what-to-optimize)), and busy time without an application frame is counted by pool instead. Recommended; without it the digest ranks stack leaves. |
+| `--hide <regex>`, `--hide-from <file>` | With `--app`, the frames the digest removes before rooting each stack at the application, such as executors that only run a task. Default `preset:jvm-dispatch`; give your own executors in a file of your own, next to the preset. |
 | `--profile-group-by <list>` | Which optional dimensions the profile keeps besides the Java stack and the reason: any of `kernel`, `user`, `thread`, or `none`. Default all three. |
 | `--max-profile-entries <n>` | Entry limit for the profile. Past it the thread, then the user stack, then the kernel stack are dropped from the grouping, which merges entries and changes no total; the report names what was dropped. Default 2,000,000. |
 

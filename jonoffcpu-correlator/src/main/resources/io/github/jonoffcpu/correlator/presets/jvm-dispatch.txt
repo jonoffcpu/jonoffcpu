@@ -1,0 +1,13 @@
+# jvm-dispatch: JVM and library frames that only forward to the code a task runs - generated
+# lambda classes, JDK executor adapters and futures, and Guava's listenable futures. For --hide,
+# so that --root-at lands on the work instead of the executor or bridge that ran it.
+#
+# --hide removes these frames anywhere in the stack, not only at its root; they carry no
+# information mid-stack either. A lambda class's method only forwards to its lambda$... body (or
+# the referenced method), which stays; the pattern matches with and without --canonical-names.
+# An application's own executors and pipeline plumbing belong in a --hide-from file of its own.
+\$\$Lambda(\.0x\p{XDigit}+)?\.[^.$]+$
+^java\.util\.concurrent\.Executors\$RunnableAdapter\.call$
+^java\.util\.concurrent\.FutureTask\.(run|runAndReset)$
+^java\.util\.concurrent\.CompletableFuture\$(AsyncRun|AsyncSupply)\.(run|exec)$
+^com\.google\.common\.util\.concurrent\.(TrustedListenableFutureTask(\$TrustedFutureInterruptibleTask)?\.(run|runInterruptibly)|InterruptibleTask\.run)$
