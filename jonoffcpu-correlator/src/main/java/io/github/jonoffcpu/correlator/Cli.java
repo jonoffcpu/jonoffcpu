@@ -274,8 +274,8 @@ final class Cli {
                 paramLabel = "POLICY",
                 defaultValue = "degrade",
                 converter = LimitPolicyConverter.class,
-                description = "What to do when the retained-bytes budget is reached: degrade (coarsen, drop audit,"
-                        + " thin, narrow, reporting each step), fail, or truncate (narrow the window directly)."
+                description = "What to do when the retained-bytes budget is reached: degrade (drop audit, thin,"
+                        + " narrow, reporting each step), fail, or truncate (narrow the window directly)."
                         + " Default: ${DEFAULT-VALUE}.")
         Degradation.Policy onLimit;
 

@@ -45,7 +45,8 @@ standard `version` project property.
 
 ## Validate locally
 
-Run the complete build before tagging:
+Run the complete build before tagging. `check` covers both test categories
+that CI runs separately, `jvmCheck` and `:jonoffcpu-agent:nativeTest`:
 
 ```sh
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check \
@@ -104,9 +105,10 @@ git push origin v1.2.3
 
 The [release workflow](.github/workflows/release.yml) then:
 
-1. builds and verifies the x86-64 glibc and musl bundles on `ubuntu-26.04`
-   and the arm64 glibc and musl bundles on `ubuntu-26.04-arm`, as four
-   parallel matrix jobs;
+1. runs formatting and the JVM tests once (`jvmCheck`), then builds the
+   x86-64 glibc and musl bundles on `ubuntu-26.04` and the arm64 glibc and musl
+   bundles on `ubuntu-26.04-arm` as four parallel matrix jobs, each running the
+   native tests of its bundle (`:jonoffcpu-agent:nativeTest`);
 2. combines all four verified bundles into the universal Java agent;
 3. signs and publishes the artifacts with
    `publishAndReleaseToMavenCentral`, waiting for Central Portal validation; and
@@ -117,7 +119,8 @@ The [release workflow](.github/workflows/release.yml) then:
    off-CPU profile; and
 5. creates the GitHub Release with generated notes and all three JAR downloads
    only after publication succeeds; and
-6. rewrites the Maven coordinates and the example download tag in `README.md`
+6. rewrites the Gradle coordinates, the Maven `jonoffcpu.version` property and
+   the example download tag in `README.md`
    on the default branch to the released version and commits that as
    "Update version numbers for latest release vX.Y.Z in README".
 

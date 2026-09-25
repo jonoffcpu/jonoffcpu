@@ -50,9 +50,9 @@ produces. Without a subcommand it correlates, with the options below.
                                reweight by 1/Q, deterministically in the cookie. Default: chosen
                                automatically, and 1 whenever the input fits.
       --thinning-seed=N      Changes the deterministic draw --thinning uses. Default: 0.
-      --on-limit=POLICY      What to do when the retained-bytes budget is reached: degrade
-                               (coarsen, drop audit, thin, narrow, reporting each step), fail, or
-                               truncate (narrow the window directly). Default: degrade.
+      --on-limit=POLICY      What to do when the retained-bytes budget is reached: degrade (drop
+                               audit, thin, narrow, reporting each step), fail, or truncate (narrow
+                               the window directly). Default: degrade.
       --partial=true|false   Inspect an interrupted capture: writes INCOMPLETE-jonoffcpu-* files
                                and jonoffcpu-partial.json, exits with status 2, and never writes
                                jonoffcpu-complete.json. Default: false.

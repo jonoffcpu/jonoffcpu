@@ -172,16 +172,14 @@ events in it remain available to other tools.
 
 `--audit full|matches|none` controls how much per-row audit output is written.
 The CLI defaults to `matches`: `jonoffcpu-matches.jsonl` is written but
-`jonoffcpu-classified-records.jsonl` is **not**, which is a backward-incompatible
-change from earlier releases that always wrote both. Anything that reads
+`jonoffcpu-classified-records.jsonl` is **not**. Anything that reads
 `jonoffcpu-classified-records.jsonl` — including
 the agent's `AsyncProfilerFirstStopTest`
 and
 [`jonoffcpu-native/tools/run-agent-signal-pressure.py`](../jonoffcpu-native/tools/run-agent-signal-pressure.py)
-— must now pass `--audit full` explicitly. `--audit none` writes neither audit
+— passes `--audit full` explicitly. `--audit none` writes neither audit
 file. The *library* API (`OffCpuCorrelator.correlate`, and `OfflineCorrelator`'s
-`OutputOptions.defaults()`) keeps the old `full` default, so embedding the
-correlator as a dependency is unaffected.
+`OutputOptions.defaults()`) defaults to `full` and writes both.
 
 The audit outputs are produced by a second read of the same two files, so they
 describe the rows the correlation actually kept, not every row in the inputs. Under
@@ -246,8 +244,9 @@ contention count does not explain, or one beside any other nonzero failure
 counter, keeps `nonzero-sequenceContentions` and
 `selected-source-row-count-mismatch` as before.
 
-This is an inverse-probability estimate under the recorded
-random admission policy; it is not a confidence interval or an adjustment for
+This is an inverse-probability estimate, the
+[Horvitz–Thompson estimator](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator),
+under the recorded random admission policy; it is not a confidence interval or an adjustment for
 missing Java stacks. Under `proportional`, a rare short interval that was admitted
 carries a weight of up to the full reference duration, so per-stack estimates for
 rare stacks are noisy even when the total is unbiased.
@@ -703,8 +702,10 @@ every step in the report's `degradation` object (a `DegradationReport`):
 1. **Drop the audit outputs.** `--audit matches`, then `--audit none`. They cost the
    most and contribute nothing to the flame graph.
 2. **Thin the source and reweight.** Each recorded interval is kept with probability
-   `q`, decided by hashing its cookie, and the duration it contributes is scaled by the
-   exact reciprocal of the realised probability. The result is an unbiased estimate of
+   `q`, decided by hashing its cookie
+   ([Bernoulli sampling](https://en.wikipedia.org/wiki/Bernoulli_sampling)), and the
+   duration it contributes is scaled by the exact reciprocal of the realised
+   probability. The result is an unbiased estimate of
    the same per-stack totals over the whole requested window. Because the cookie is the
    join key, an observation and its JFR sample are dropped together, so every count in
    the report describes one coherent subsample. `--thinning <q>` pins it and
@@ -715,8 +716,8 @@ every step in the report's `degradation` object (a `DegradationReport`):
 4. **Fail**, naming the limit, the steps already tried and the flag that would allow the
    next one.
 
-`--on-limit fail` restores the old behaviour. `--on-limit truncate` skips thinning and
-goes straight to narrowing.
+`--on-limit fail` refuses at the limit instead, naming it. `--on-limit truncate` skips
+thinning and goes straight to narrowing.
 
 The two degradations are labelled differently because they differ:
 
@@ -785,9 +786,8 @@ relative seconds or epoch timestamps. Either bound can be omitted. A matching
 handler event outside the interval still identifies an overlapping source interval.
 `--from-ns`, `--to-ns` and `--max-handler-delay-ns` are held as signed `long`
 nanoseconds in the engine's columns, so each is rejected with `Time boundary
-outside signed 64-bit nanoseconds` when it is negative or at or above `2^63`;
-values in `[2^63, 2^64)` that an earlier release accepted now fail fast instead of
-wrapping.
+outside signed 64-bit nanoseconds` when it is negative or at or above `2^63`,
+rather than wrapping.
 
 Default admission limits are a hundred million total source/JFR records, 1 MiB per
 source record, 4,096 frames per stack record and per JFR sample, and a retained-bytes
@@ -809,7 +809,7 @@ JFR samples) asserts a bound of 400 MiB on peak retained bytes and has measured
 comfortably inside it; the exact figure moves with the engine's structures and is
 not a number to plan against.
 
-A real Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
+A real Apache Pulsar broker capture (1,121,421 source rows, 890,086 matched, 10,631
 distinct Java stacks) measured 271 MiB (284,167,413 bytes) of peak retained
 bytes — about 253 bytes per recorded interval, roughly 2.5x the 103-byte
 column-only figure above, against 260 MiB (272,115,381 bytes) for the same

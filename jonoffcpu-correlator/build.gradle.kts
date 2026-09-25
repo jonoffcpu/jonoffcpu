@@ -115,17 +115,21 @@ tasks.test {
     (options as JUnitPlatformOptions).excludeTags("readme")
 }
 
-// The README's option tables are checked against the parser, so documentation and help cannot drift. The check is a
-// target of its own of the unit test suite because the README is its input: editing the README reruns this one test,
-// not the unit tests.
+// The README and the docs pages are checked against the parser, so documentation and help cannot drift, and their
+// links and anchors must resolve. The check is a target of its own of the unit test suite because the Markdown files
+// are its input: editing a page reruns this one test, not the unit tests. CI also runs it alone for a change that
+// touches only documentation.
 testing.suites.named<JvmTestSuite>("test") {
     targets.register("readmeTest") {
         testTask.configure {
-            description = "Checks the README's correlator option tables against the command-line parser."
+            description = "Checks the README and the docs pages against the command-line parser and resolves their links."
             (options as JUnitPlatformOptions).includeTags("readme")
-            val readme = rootDirectory.file("README.md")
-            inputs.file(readme).withPropertyName("readme").withPathSensitivity(PathSensitivity.NONE)
-            systemProperty("jonoffcpu.readme", readme.asFile.absolutePath)
+            val documentation =
+                objects.newInstance<DocumentationFiles>().apply {
+                    root = rootDirectory
+                    files.from(rootDirectory.asFileTree.matching { include("*.md", "docs/**/*.md", "jonoffcpu-*/*.md") })
+                }
+            jvmArgumentProviders.add(documentation)
             shouldRunAfter(tasks.test)
         }
     }

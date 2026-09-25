@@ -17,8 +17,49 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Whether the change touches documentation, and whether it touches only documentation, as
+  # .github/changes-filter.yaml defines it. A pull request's files come from the API; a push to main is compared with
+  # the commit before the push. A manual run builds everything, and its build runs the documentation test too.
+  changes:
+    name: Detect changes
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # paths-filter lists a pull request's changed files through the API.
+      pull-requests: read
+    outputs:
+      docs_changed: ${{ steps.filter.outputs.docs }}
+      docs_only: ${{ steps.docs-only.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Only the counts are used, never the file names, so no file name reaches a shell.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          filters: .github/changes-filter.yaml
+          predicate-quantifier: some-with-excludes
+      - name: Decide whether the change is documentation only
+        id: docs-only
+        env:
+          ALL_COUNT: ${{ steps.filter.outputs.all_count }}
+          DOCS_COUNT: ${{ steps.filter.outputs.docs_count }}
+        run: |
+          if [[ "${ALL_COUNT:-0}" -gt 0 && "$ALL_COUNT" == "$DOCS_COUNT" ]]; then
+            docs_only=true
+          else
+            docs_only=false
+          fi
+          echo "Changed files: ${ALL_COUNT:-unknown}, documentation: ${DOCS_COUNT:-unknown}, documentation only: $docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
+
   build-and-verify:
-    name: Native build and verification
+    name: Build and verify
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     # The reusable workflow's setup-gradle comments on a pull request whose build fails.
     permissions:
       contents: read
@@ -29,6 +70,39 @@ jobs:
       runnable_artifact_name: jonoffcpu-runnable-jars
     secrets:
       GRADLE_ENCRYPTION_KEY: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+
+  # The README and docs pages against the correlator's parser, and their links, for a change that touches
+  # documentation. A documentation-only change skips the build, so this is its only check; the build runs the same test
+  # in jvmCheck, which also covers a code change that breaks the documentation.
+  docs:
+    name: Documentation check
+    needs: changes
+    if: needs.changes.outputs.docs_changed == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      # No submodules: the correlator reads only the async-profiler gitlink.
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: corretto
+          java-version: 25
+      # As in build-and-verify.yml: caches are saved only from the default branch, and a failed build is summarized
+      # on the pull request.
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          build-scan-publish: true
+          build-scan-terms-of-use-url: https://gradle.com/terms-of-service
+          build-scan-terms-of-use-agree: "yes"
+          add-job-summary-as-pr-comment: on-failure
+      - name: Check the documentation
+        run: ./gradlew :jonoffcpu-correlator:readmeTest --no-daemon
 
   # actionlint checks the workflows' syntax, expressions and shell scripts (with shellcheck), and
   # zizmor audits them for security problems such as template injection and excessive permissions.
@@ -52,11 +126,15 @@ jobs:
 
   # The single status check that branch protection requires before a pull request can merge, so
   # adding or renaming jobs never changes the protection rule. It always runs and fails unless every
-  # job it needs succeeded: a skipped job would otherwise let a skipped check count as passing.
+  # job it needs succeeded: a skipped job would otherwise let a skipped check count as passing. The accepted
+  # skips are the build of a documentation-only change and the documentation check of a change without
+  # documentation.
   all-checks-passed:
     name: All checks passed
     needs:
+      - changes
       - build-and-verify
+      - docs
       - lint-workflows
     if: always()
     runs-on: ubuntu-26.04
@@ -65,11 +143,22 @@ jobs:
       - name: Require every needed job to succeed
         env:
           NEEDS: ${{ toJSON(needs) }}
+          DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
         run: |
-          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"' <<< "$NEEDS")
+          failed=$(jq -r --arg docs_changed "$DOCS_CHANGED" --arg docs_only "$DOCS_ONLY" '
+            to_entries[]
+            | select(.value.result != "success")
+            | select(.key != "build-and-verify" or .value.result != "skipped" or $docs_only != "true")
+            | select(.key != "docs" or .value.result != "skipped" or $docs_changed == "true")
+            | "\(.key): \(.value.result)"' <<< "$NEEDS")
           if [[ -n "$failed" ]]; then
             echo "Jobs that did not succeed:" >&2
             echo "$failed" >&2
             exit 1
           fi
-          echo "All needed jobs succeeded."
+          if [[ "$DOCS_ONLY" == "true" ]]; then
+            echo "Documentation-only change: the build was skipped, and every other needed job succeeded."
+          else
+            echo "All needed jobs succeeded."
+          fi

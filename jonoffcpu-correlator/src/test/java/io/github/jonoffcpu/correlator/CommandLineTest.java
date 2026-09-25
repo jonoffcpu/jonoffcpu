@@ -5,11 +5,9 @@ import static io.github.jonoffcpu.correlator.CommandLineFixture.invoke;
 import static io.github.jonoffcpu.correlator.CommandLineFixture.usageError;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 import io.github.jonoffcpu.correlator.CommandLineFixture.Invocation;
 import java.io.ByteArrayOutputStream;
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
@@ -17,27 +15,19 @@ import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.LinkedHashSet;
 import java.util.List;
-import java.util.Set;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Stream;
-import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.FieldSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import picocli.CommandLine;
-import picocli.CommandLine.Model.CommandSpec;
-import picocli.CommandLine.Model.OptionSpec;
 
 /**
  * The command line's contract: help per command matches its checked-in snapshot, usage errors return 64 with the
- * message and usage and no stack trace, {@code run} never exits, and the README's option names and defaults are the
- * parser's. Run with {@code -Djonoffcpu.updateHelp=DIR} to rewrite the snapshots into {@code DIR}.
+ * message and usage and no stack trace, and {@code run} never exits. The documentation's options are checked by
+ * {@link DocumentationTest}. Run with {@code -Djonoffcpu.updateHelp=DIR} to rewrite the snapshots into {@code DIR}.
  */
 class CommandLineTest {
     /** Every command with its own help, the top-level one as the empty name. */
@@ -398,91 +388,5 @@ class CommandLineTest {
             System.setOut(original);
         }
         return bytes.toByteArray();
-    }
-
-    // ---- README against the parser ---------------------------------------------------------------
-
-    private static final Pattern OPTION = Pattern.compile("(?<![\\w-])--[a-z][a-z0-9-]*");
-    private static final Pattern DEFAULT = Pattern.compile("Default `([^`]+)`");
-
-    /** The lines of the README section starting at {@code heading}, up to the next heading of its level or above. */
-    static List<String> section(List<String> readme, String heading) {
-        int start = readme.indexOf(heading);
-        assertThat(start).as("README has no section %s", heading).isNotNegative();
-        int level = heading.indexOf(' ');
-        List<String> lines = new ArrayList<>();
-        boolean fenced = false;
-        for (String line : readme.subList(start + 1, readme.size())) {
-            if (line.startsWith("```")) fenced = !fenced;
-            if (!fenced && line.startsWith("#") && line.indexOf(' ') <= level) break;
-            lines.add(line);
-        }
-        return lines;
-    }
-
-    private static Set<String> options(String text) {
-        Set<String> options = new LinkedHashSet<>();
-        Matcher matcher = OPTION.matcher(text);
-        while (matcher.find()) options.add(matcher.group());
-        return options;
-    }
-
-    private static CommandSpec spec(String command) {
-        CommandLine root = Cli.commandLine();
-        return command.isEmpty()
-                ? root.getCommandSpec()
-                : root.getSubcommands().get(command).getCommandSpec();
-    }
-
-    /** Runs in the readmeTest task, the one test whose input is the README. */
-    @Test
-    @Tag("readme")
-    void readmeMatchesParser() throws IOException {
-        String path = System.getProperty("jonoffcpu.readme");
-        assumeTrue(path != null, "Skipping the README check: -Djonoffcpu.readme is not set");
-        List<String> readme = Files.readAllLines(Path.of(path), StandardCharsets.UTF_8);
-        CommandSpec correlate = spec("");
-        // Each table row names its options in the first column; a stated default must be the parser's.
-        for (String line : section(readme, "### Correlator options")) {
-            if (!line.startsWith("| `--")) continue;
-            String[] columns = line.split("(?<!\\\\)\\|");
-            Set<String> names = options(columns[1]);
-            for (String name : names) {
-                assertThat(correlate.findOption(name))
-                        .as("README option %s is not a correlate option", name)
-                        .isNotNull();
-            }
-            Matcher stated = DEFAULT.matcher(columns[2]);
-            if (names.size() == 1 && stated.find()) {
-                OptionSpec option = correlate.findOption(names.iterator().next());
-                assertThat(stated.group(1))
-                        .as("README default of %s must be the parser's", option.longestName())
-                        .isEqualTo(option.defaultValue());
-            }
-        }
-        for (String name : options(String.join("\n", section(readme, "### Correlator options")))) {
-            assertThat(correlate.findOption(name))
-                    .as("README mentions unknown correlate option %s", name)
-                    .isNotNull();
-        }
-        // The slicing section's commands: every option it names belongs to one of them.
-        List<CommandSpec> profileCommands =
-                List.of(spec("stacks"), spec("top"), spec("summarize"), spec("merge"), spec("export"));
-        for (String heading : List.of(
-                "### 5. Slice and filter with the stack profile",
-                "### 6. Find what to optimize",
-                "## Analyzing with AI agents",
-                "## Analyzing with SQL")) {
-            for (String name : options(String.join("\n", section(readme, heading)))) {
-                assertThat(profileCommands)
-                        .as("README section %s mentions unknown option %s", heading, name)
-                        .anyMatch(command -> command.findOption(name) != null);
-            }
-        }
-        for (String name : options(String.join("\n", section(readme, "### 3. Correlate")))) {
-            assertThat(correlate.findOption(name))
-                    .as("README correlate step mentions unknown option %s", name)
-                    .isNotNull();
-        }
     }
 }

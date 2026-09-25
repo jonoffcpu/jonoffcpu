@@ -28,8 +28,64 @@ permissions:
   pull-requests: write
 
 jobs:
+  # Everything that needs only a JDK, once (jvmCheck): every module's unit tests, the integration tests that need no
+  # native bundle (the correlator's, with DuckDB, and the converter's), and the formatting checks. The native matrix
+  # starts only after it.
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      # Only a release passes a version; every other build keeps the snapshot version in gradle.properties. An empty
+      # ORG_GRADLE_PROJECT_version would set an empty version, so it is exported only when there is one.
+      - name: Use the release version
+        if: inputs.version != ''
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: echo "ORG_GRADLE_PROJECT_version=$RELEASE_VERSION" >> "$GITHUB_ENV"
+      # The converter compiles from the async-profiler submodule's sources.
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: corretto
+          java-version: 25
+      - uses: dtolnay/rust-toolchain@8d8cc9a8e0d47b64af669de71110e76860d6afbd # 1.91.0
+        with:
+          components: rustfmt
+      # The default (enhanced) cache provider is free for public repositories. It saves the Gradle User
+      # Home, the local build cache included, only from the default branch; other runs restore it read-only.
+      # Every build publishes a Build Scan, and a failed one is summarized on the pull request.
+      - uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+        with:
+          cache-encryption-key: ${{ secrets.GRADLE_ENCRYPTION_KEY }}
+          build-scan-publish: true
+          build-scan-terms-of-use-url: https://gradle.com/terms-of-service
+          build-scan-terms-of-use-agree: "yes"
+          add-job-summary-as-pr-comment: on-failure
+      - name: Check native collector formatting
+        run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
+      # The export's DuckDB checks fail rather than skip once JONOFFCPU_REQUIRE_DUCKDB is set; the runner image ships
+      # Homebrew to install it with.
+      - name: Install DuckDB
+        run: |
+          if ! command -v duckdb >/dev/null; then
+            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
+            brew install duckdb
+            brew_bin="$(brew --prefix)/bin"
+            echo "$brew_bin" >> "$GITHUB_PATH"
+            export PATH="$brew_bin:$PATH"
+          fi
+          duckdb --version
+          echo "JONOFFCPU_REQUIRE_DUCKDB=true" >> "$GITHUB_ENV"
+      - name: Run the unit tests
+        run: ./gradlew jvmCheck --no-daemon
+
   native-build-and-verify:
     name: Build and verify ${{ matrix.libc }} on ${{ matrix.name }}
+    needs: unit-tests
     # One job per architecture and C library, so all four bundles build in
     # parallel on native runners. The bundle directory is linux-<arch> for glibc
     # and linux-musl-<arch> for musl, matching the agent's META-INF/native layout.
@@ -73,10 +129,6 @@ jobs:
         with:
           distribution: corretto
           java-version: 25
-      - uses: dtolnay/rust-toolchain@8d8cc9a8e0d47b64af669de71110e76860d6afbd # 1.91.0
-        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
-        with:
-          components: rustfmt
       # The default (enhanced) cache provider is free for public repositories. It saves the Gradle User
       # Home, the local build cache included, only from the default branch; other runs restore it read-only.
       # Every build publishes a Build Scan, and a failed one is summarized on the pull request.
@@ -87,24 +139,6 @@ jobs:
           build-scan-terms-of-use-url: https://gradle.com/terms-of-service
           build-scan-terms-of-use-agree: "yes"
           add-job-summary-as-pr-comment: on-failure
-      - name: Check native collector formatting
-        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
-        run: cargo +1.91.0 fmt --manifest-path jonoffcpu-native/Cargo.toml --all -- --check
-      # The export's DuckDB checks run where DuckDB is on the path; one job is
-      # enough, and only the x86-64 runner image ships Homebrew. They fail rather
-      # than skip once JONOFFCPU_REQUIRE_DUCKDB is set.
-      - name: Install DuckDB
-        if: matrix.native-architecture == 'x86_64' && matrix.libc == 'glibc'
-        run: |
-          if ! command -v duckdb >/dev/null; then
-            eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"
-            brew install duckdb
-            brew_bin="$(brew --prefix)/bin"
-            echo "$brew_bin" >> "$GITHUB_PATH"
-            export PATH="$brew_bin:$PATH"
-          fi
-          duckdb --version
-          echo "JONOFFCPU_REQUIRE_DUCKDB=true" >> "$GITHUB_ENV"
       # Docker layer caching in the GitHub Actions cache: a docker-container buildx
       # builder, which the native bundle and runtime image builds select through
       # BUILDX_BUILDER, and the Actions runtime environment that its gha cache
@@ -116,13 +150,14 @@ jobs:
         with:
           use: false
       - uses: crazy-max/ghaction-github-runtime@04d248b84655b509d8c44dc1d6f990c879747487 # v4.0.0
-      # check runs the unit tests and both kinds of integration tests. The
-      # host-native ones load the bundle into the test JVM: directly for glibc,
-      # and in an Alpine container of the same architecture for musl, whose
-      # bundle cannot load into the glibc build JVM. The privileged-container
-      # ones run the packaged agent and correlator end to end in Testcontainers
-      # against the runner's kernel, in the Corretto image of the job's libc.
-      - name: Build and run checks
+      # nativeTest builds the job's bundle and runs only the tests that need it;
+      # the JVM tests ran once, in unit-tests. The host-native tests load the
+      # bundle into the test JVM: directly for glibc, and in an Alpine container
+      # of the same architecture for musl, whose bundle cannot load into the
+      # glibc build JVM. The privileged-container ones run the packaged agent
+      # and correlator end to end in Testcontainers against the runner's kernel,
+      # in the Corretto image of the job's libc.
+      - name: Build the native bundle and run its tests
         env:
           NATIVE_ARCHITECTURE: ${{ matrix.native-architecture }}
           NATIVE_LIBC: ${{ matrix.libc }}
@@ -130,7 +165,7 @@ jobs:
           BUILDX_BUILDER: ${{ steps.buildx.outputs.name }}
           DOCKER_CACHE_WRITE: ${{ github.ref == 'refs/heads/main' }}
         run: >-
-          ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
+          ./gradlew :jonoffcpu-agent:nativeTest
           -PnativeArchitectures="$NATIVE_ARCHITECTURE"
           -PnativeLibcs="$NATIVE_LIBC"
           -PintegrationTestsInContainer="$IN_CONTAINER"
@@ -144,7 +179,7 @@ jobs:
           if-no-files-found: error
 
   package:
-    name: Package combined Java artifacts
+    name: Package combined artifacts
     needs: native-build-and-verify
     runs-on: ubuntu-26.04
     timeout-minutes: 20
@@ -187,12 +222,15 @@ jobs:
           for bundle in linux-x86_64 linux-aarch64 linux-musl-x86_64 linux-musl-aarch64; do
             mv "native-bundles/${NATIVE_ARTIFACT_PREFIX}-${bundle}" "jonoffcpu-agent/build/native/${bundle}"
           done
+      # The checks that read the agent JAR, which embeds all four bundles. The converter's and the correlator's
+      # tests ran in unit-tests; their JARs are only built and verified here.
       - name: Package and verify all native bundles
         run: >-
           ./gradlew
           :jonoffcpu-agent:verifyRuntimeJar
+          :jonoffcpu-agent:packagedJarTest
           :jonoffcpu-correlator:verifyRuntimeJar
-          :jonoffcpu-jfr-converter:check
+          :jonoffcpu-jfr-converter:verifyRuntimeJar
           -PprebuiltNative=true
           -PnativeArchitectures=all
           -PnativeLibcs=all

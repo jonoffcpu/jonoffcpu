@@ -1,0 +1,11 @@
+# The file categories ci.yml tells apart, in dorny/paths-filter's syntax (picomatch globs, matched with
+# predicate-quantifier: some-with-excludes, so a file belongs to a filter when it matches one of its patterns and none
+# of its `!` patterns). A change is documentation only when every changed file is in `docs`; CI then skips the build
+# and verification jobs and still runs the documentation check.
+all:
+  - '**'
+docs:
+  - '**/*.md'
+  - 'docs/**'
+  # Markdown under src/ is test input, such as the digest's golden files.
+  - '!**/src/**'
