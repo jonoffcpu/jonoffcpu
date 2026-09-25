@@ -157,8 +157,8 @@ system like it. The steps toward that:
   compete with JFR tooling or with the tooling emerging for AI agents. It
   complements them, and may integrate with them through their plugin
   mechanisms.
-  - Its recording is an ordinary JFR file, which JDK Mission Control and JFR
-    libraries read. For example, [Jafar](https://github.com/btraceio/jafar) is
+  - Its recording is an ordinary JFR file, which
+    [JDK Mission Control](https://adoptium.net/jmc) and JFR libraries read. For example, [Jafar](https://github.com/btraceio/jafar) is
     a fast JFR parser with an MCP server that lets AI agents analyze JFR
     recordings.
   - Its derived outputs are documented protobuf messages with a JSON view, so
