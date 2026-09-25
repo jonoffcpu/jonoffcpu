@@ -11,6 +11,7 @@ syntax = "proto3";
 
 package io.github.jonoffcpu.correlator.signals.v1;
 
+import "google/protobuf/struct.proto";
 import "google/protobuf/timestamp.proto";
 import "jonoffcpu-capture.proto";
 
@@ -23,6 +24,8 @@ message SignalRecord {
     SignalSample sample = 2;
     SignalCaptureStats stats = 3;
     SignalEnd end = 4;
+    // What the recording says about the process and machine, once before `end`.
+    JfrRecording recording = 5;
   }
 }
 
@@ -74,6 +77,24 @@ message SignalCaptureStats {
   uint32 capture_epoch = 2;
   google.protobuf.Timestamp start_time = 3;
   io.github.jonoffcpu.capture.v1.AsyncProfilerStats counters = 4;
+}
+
+// A compact snapshot of the process and machine the recording came from: the chunk headers, async-profiler's
+// jdk.ActiveRecording, and the first jdk.JVMInformation, jdk.OSInformation, jdk.CPUInformation and
+// jdk.ContainerConfiguration events with every field, as the JFR has them, plus the
+// jdk.InitialSystemProperty and jdk.InitialEnvironmentVariable values. The command line (JVMInformation's
+// jvmArguments and javaArguments), the system properties and the environment variables can hold secrets:
+// the report keeps them only with --process-details true.
+message JfrRecording {
+  // The first chunk's start and the last chunk's end.
+  google.protobuf.Timestamp start = 1;
+  google.protobuf.Timestamp end = 2;
+  optional string async_profiler_version = 3;
+  // By event type name, such as "jdk.OSInformation": each field by name, a timestamp or a duration as its
+  // ISO-8601 text, a nested object as a nested struct.
+  map<string, google.protobuf.Struct> events = 4;
+  map<string, string> system_properties = 5;
+  map<string, string> environment_variables = 6;
 }
 
 // Written once the whole recording was read: the parse completed, with these event counts.

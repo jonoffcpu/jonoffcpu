@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.List;
 
 /** Runs the command line in-process, as the tests of every command do. */
 final class CommandLineFixture {
@@ -26,21 +27,8 @@ final class CommandLineFixture {
      */
     static String[] words(String command) {
         assertThat(command).startsWith(Cli.NAME + " ");
-        java.util.List<String> words = new java.util.ArrayList<>();
-        StringBuilder word = new StringBuilder();
-        boolean quoted = false;
-        for (char c : command.substring(Cli.NAME.length() + 1).toCharArray()) {
-            if (c == '\'') {
-                quoted = !quoted;
-            } else if (c == ' ' && !quoted) {
-                words.add(word.toString());
-                word.setLength(0);
-            } else {
-                word.append(c);
-            }
-        }
-        words.add(word.toString());
-        return words.toArray(String[]::new);
+        List<String> words = Top.words(command);
+        return words.subList(1, words.size()).toArray(String[]::new);
     }
 
     /** Checks that a command line is refused as a usage error, with its usage and without a stack trace. */

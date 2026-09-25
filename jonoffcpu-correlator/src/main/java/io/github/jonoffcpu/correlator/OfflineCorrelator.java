@@ -184,7 +184,8 @@ final class OfflineCorrelator {
             List<ReportProto.ClassifiedRecord> records,
             List<Match> matches,
             ReportProto.PopulationEstimate populationEstimate,
-            ReportProto.JfrSelection jfrSelection) {}
+            ReportProto.JfrSelection jfrSelection,
+            SignalProto.JfrRecording recording) {}
 
     /**
      * A recovered prefix is never interchangeable with a complete Analysis. All pairs are provisional; {@code
@@ -291,7 +292,8 @@ final class OfflineCorrelator {
                 List.copyOf(collector.records()),
                 List.copyOf(collector.matches()),
                 result.populationEstimate(),
-                result.selectionMetadata());
+                result.selectionMetadata(),
+                result.capture().recording);
     }
 
     /** The collector's counters from {@code capture_end}, or null without one. */

@@ -132,6 +132,19 @@ class CommandLineTest {
                     "--reason",
                     "unspecified"),
             List.of("Empty profile path", "merge", "--profiles", "a.pb,,b.pb", "--output", "m.pb"),
+            // The busy/idle spellings are gone: --idle is an unknown option, jvm-idle an unknown preset.
+            List.of("Unknown options: '--idle'", "summarize", "--profile", "p.pb", "--idle", "x"),
+            List.of("Unknown options: '--idle-from'", "top", "--profile", "p.pb", "--idle-from", "preset:jvm-waiting"),
+            List.of(
+                    "Unknown options: '--idle-from'",
+                    "--source",
+                    "a",
+                    "--jfr",
+                    "b",
+                    "--output",
+                    "o",
+                    "--idle-from",
+                    "x"),
             List.of(
                     "Population estimates require the unthinned source",
                     "--source",
@@ -240,36 +253,81 @@ class CommandLineTest {
         assertThat(Files.readString(withoutDigest.resolve(OutputFiles.REPORT)))
                 .as("--summary-output false must write no digest")
                 .doesNotContain("\"digest\"");
-        // --idle-from shapes the digest alone: an idle pattern matching every frame leaves no busy time there, and
+        // --waiting-from shapes the digest alone: a waiting pattern matching every frame leaves no blocked time there,
+        // and
         // every other output is the default one.
-        Path everythingIdle = Files.writeString(dir.resolve("everything-idle.txt"), "# Every frame\n.\n");
-        Path idleDigest = dir.resolve("idle-digest");
-        List<String> withIdle = new ArrayList<>(common);
-        withIdle.addAll(List.of("--output", idleDigest.toString(), "--idle-from", everythingIdle.toString()));
-        assertThat(OffCpuCorrelator.run(withIdle.toArray(String[]::new)))
-                .as("Correlation with idle patterns")
+        Path everythingWaiting = Files.writeString(dir.resolve("everything-waiting.txt"), "# Every frame\n.\n");
+        Path waitingDigest = dir.resolve("waiting-digest");
+        List<String> withWaiting = new ArrayList<>(common);
+        withWaiting.addAll(
+                List.of("--output", waitingDigest.toString(), "--waiting-from", everythingWaiting.toString()));
+        assertThat(OffCpuCorrelator.run(withWaiting.toArray(String[]::new)))
+                .as("Correlation with waiting patterns")
                 .isZero();
         for (String file : List.of(OutputFiles.COLLAPSED, OutputFiles.PROFILE)) {
-            assertThat(Files.readAllBytes(idleDigest.resolve(file)))
-                    .as("--idle-from must not change %s", file)
+            assertThat(Files.readAllBytes(waitingDigest.resolve(file)))
+                    .as("--waiting-from must not change %s", file)
                     .isEqualTo(Files.readAllBytes(first.resolve(file)));
         }
-        AnalysisProto.Digest idle = CorrelationFixture.parse(
-                        idleDigest.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
+        AnalysisProto.Digest waiting = CorrelationFixture.parse(
+                        waitingDigest.resolve(OutputFiles.SUMMARY_JSON), AnalysisProto.Digest.newBuilder())
                 .build();
-        assertThat(idle.getWhereTheTimeWent().getBusy().getIntervals())
-                .as("Every interval matched the idle pattern: %s", idle.getWhereTheTimeWent())
+        assertThat(waiting.getWhereTheTimeWent().getBlocked().getIntervals())
+                .as("Every interval matched the waiting pattern: %s", waiting.getWhereTheTimeWent())
                 .isZero();
-        assertThat(idle.getWhereTheTimeWent().getIdle().getIntervals())
-                .as("Every interval matched the idle pattern: %s", idle.getWhereTheTimeWent())
-                .isEqualTo(idle.getWhereTheTimeWent().getSelected().getIntervals());
-        assertThat(Files.readString(idleDigest.resolve(OutputFiles.SUMMARY_MD)))
-                .as("The digest names the idle patterns it left out")
-                .contains(everythingIdle.toString());
-        List<String> idleWithoutDigest = new ArrayList<>(common);
-        idleWithoutDigest.addAll(List.of(
-                "--output", dir.resolve("idle-without-digest").toString(), "--summary-output", "false", "--idle", "."));
-        CommandLineFixture.usageError("--summary-output false leaves out", idleWithoutDigest.toArray(String[]::new));
+        assertThat(waiting.getWhereTheTimeWent().getWaiting().getIntervals())
+                .as("Every interval matched the waiting pattern: %s", waiting.getWhereTheTimeWent())
+                .isEqualTo(waiting.getWhereTheTimeWent().getSelected().getIntervals());
+        assertThat(Files.readString(waitingDigest.resolve(OutputFiles.SUMMARY_MD)))
+                .as("The digest names the waiting patterns it left out")
+                .contains(everythingWaiting.toString());
+        List<String> waitingWithoutDigest = new ArrayList<>(common);
+        waitingWithoutDigest.addAll(List.of(
+                "--output",
+                dir.resolve("waiting-without-digest").toString(),
+                "--summary-output",
+                "false",
+                "--waiting",
+                "."));
+        CommandLineFixture.usageError("--summary-output false leaves out", waitingWithoutDigest.toArray(String[]::new));
+        // The report describes the process from the JFR, and keeps the command line only with --process-details true.
+        SignalProto.JfrRecording recording =
+                CorrelationFixture.report(first.resolve(OutputFiles.REPORT)).getRecording();
+        assertThat(recording.getAsyncProfilerVersion())
+                .as("async-profiler's recording name")
+                .isEqualTo("0.0-test");
+        assertThat(recording.getEventsMap())
+                .as("The JDK's own events, whole")
+                .containsKeys("jdk.JVMInformation", "jdk.OSInformation", "jdk.CPUInformation");
+        assertThat(recording.getEventsMap().get("jdk.JVMInformation").getFieldsMap())
+                .containsKeys("jvmName", "jvmVersion", "pid")
+                .doesNotContainKeys("jvmArguments", "javaArguments");
+        assertThat(recording.getSystemPropertiesMap())
+                .as("No system properties by default")
+                .isEmpty();
+        assertThat(recording.getEnvironmentVariablesMap())
+                .as("No environment by default")
+                .isEmpty();
+        assertThat(recording.hasStart() && recording.hasEnd())
+                .as("The chunk bounds")
+                .isTrue();
+        Path detailed = dir.resolve("detailed");
+        List<String> withDetails = new ArrayList<>(common);
+        withDetails.addAll(List.of("--output", detailed.toString(), "--process-details", "true"));
+        assertThat(OffCpuCorrelator.run(withDetails.toArray(String[]::new))).isZero();
+        SignalProto.JfrRecording details =
+                CorrelationFixture.report(detailed.resolve(OutputFiles.REPORT)).getRecording();
+        assertThat(details.getEventsMap().get("jdk.JVMInformation").getFieldsMap())
+                .containsKeys("jvmArguments", "javaArguments");
+        assertThat(details.getSystemPropertiesMap()).containsKey("java.vm.version");
+        assertThat(Files.readString(detailed.resolve(OutputFiles.SUMMARY_MD)))
+                .as("The digest shows them")
+                .contains("**Command line** (jdk.JVMInformation):", "System properties (");
+        assertThat(Files.readString(first.resolve(OutputFiles.SUMMARY_MD)))
+                .as("The digest describes the recording, without the command line")
+                .contains("- **Recorded:** ", "- **Analysed:** ", "- **Process:** PID ", "async-profiler 0.0-test")
+                .doesNotContain("Command line", "System properties");
+
         // --app roots the digest at the application and changes no other output.
         Path appDigest = dir.resolve("app-digest");
         List<String> withApp = new ArrayList<>(common);
@@ -288,7 +346,7 @@ class CommandLineTest {
         assertThat(app.getSelection().getTransforms().getHide(0).getSource())
                 .as("--app hides preset:jvm-dispatch by default: %s", app.getSelection())
                 .isEqualTo("preset:jvm-dispatch");
-        assertThat(app.hasBusyByRoot())
+        assertThat(app.hasBlockedByRoot())
                 .as("The digest is rooted at the application")
                 .isTrue();
         for (List<String> refused : List.of(
@@ -301,7 +359,7 @@ class CommandLineTest {
             CommandLineFixture.usageError("--hide", args.toArray(String[]::new));
         }
         Path slice = dir.resolve("slice.collapsed");
-        Path patterns = Files.writeString(dir.resolve("idle.txt"), "epollWait\n");
+        Path patterns = Files.writeString(dir.resolve("waiting.txt"), "epollWait\n");
         assertThat(OffCpuCorrelator.run(new String[] {
                     "stacks",
                     "--profile",

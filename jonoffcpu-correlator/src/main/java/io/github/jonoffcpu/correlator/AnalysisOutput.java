@@ -59,6 +59,9 @@ interface AnalysisOutput {
 
     ReportProto.JfrSelection jfrSelection();
 
+    /** The process and machine the JFR describes, with every detail; null when the JFR pass did not produce one. */
+    SignalProto.JfrRecording recording();
+
     ReportProto.PopulationEstimate populationEstimate();
 
     /** Every matched pair's delivery delay, ascending, for the report's percentiles. */
@@ -192,6 +195,11 @@ interface AnalysisOutput {
             @Override
             public ReportProto.JfrSelection jfrSelection() {
                 return analysis.jfrSelection();
+            }
+
+            @Override
+            public SignalProto.JfrRecording recording() {
+                return analysis.recording();
             }
 
             @Override
@@ -347,6 +355,11 @@ interface AnalysisOutput {
             @Override
             public ReportProto.JfrSelection jfrSelection() {
                 return result.selectionMetadata();
+            }
+
+            @Override
+            public SignalProto.JfrRecording recording() {
+                return result.capture().recording;
             }
 
             @Override

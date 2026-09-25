@@ -23,7 +23,8 @@ final class JfrTimeRange {
         }
     }
 
-    private record RecordingBounds(Instant start, Instant end) {
+    /** The first chunk's start and the last chunk's end. */
+    record RecordingBounds(Instant start, Instant end) {
         Instant exclusiveEnd() {
             return end.equals(Instant.MAX) ? end : end.plusNanos(1);
         }
@@ -70,7 +71,7 @@ final class JfrTimeRange {
         }
     }
 
-    private static RecordingBounds recordingBounds(Path recording) throws IOException {
+    static RecordingBounds recordingBounds(Path recording) throws IOException {
         long firstStart = Long.MAX_VALUE;
         long lastEnd = Long.MIN_VALUE;
         try (FileChannel channel = FileChannel.open(recording, StandardOpenOption.READ)) {

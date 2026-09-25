@@ -569,7 +569,7 @@ class PartialCorrelatorTest {
         "--estimate-population, true, Partial mode supports",
         "--thinning, 0.5, Partial mode supports",
         "--audit, none, Partial mode supports",
-        "--idle-from, preset:jvm-idle, Partial mode supports",
+        "--waiting-from, preset:jvm-waiting, Partial mode supports",
         "--app, ., Partial mode supports",
         "--hide-from, preset:jvm-dispatch, Partial mode supports",
         "--format, jfr, 'expected one of collapsed, diagnostics'",

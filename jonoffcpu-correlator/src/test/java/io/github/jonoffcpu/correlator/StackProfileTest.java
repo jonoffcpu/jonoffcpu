@@ -1145,7 +1145,7 @@ class StackProfileTest {
 
         // Pattern files hold one pattern per line, skipping blank and '#' lines, and add to the inline patterns.
         Path includes = dir.resolve("includes.txt");
-        Files.writeString(includes, "# idle-free waits\nfutex_wait\n\n   \nsched_yield\r\n");
+        Files.writeString(includes, "# waiting-free waits\nfutex_wait\n\n   \nsched_yield\r\n");
         assertThat(stacks(profile, dir.resolve("include-from.collapsed"), "--include-from", includes.toString()))
                 .as("A pattern file must read like repeated --include options")
                 .isEqualTo(union);

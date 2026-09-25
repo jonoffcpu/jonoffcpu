@@ -16,6 +16,7 @@ package io.github.jonoffcpu.correlator.analysis.v1;
 import "jonoffcpu-capture.proto";
 import "jonoffcpu-profile.proto";
 import "jonoffcpu-report.proto";
+import "jonoffcpu-signals.proto";
 
 option java_package = "io.github.jonoffcpu.correlator";
 option java_outer_classname = "AnalysisProto";
@@ -123,16 +124,19 @@ message TopResult {
   TopSelection selection = 4;
   // A ranking's totals; unset for a comparison.
   TopTotals totals = 5;
-  // Busy rows: by boundary, or by --by.
+  // Blocked rows: by boundary, or by --by.
   repeated TopRow rows = 6;
-  // --by boundary and app-method: busy time without an application frame, by pool; with
-  // --root-at-unmatched hide, the busy time it hid, by pool.
+  // --by boundary and app-method: blocked time without an application frame, by pool; with
+  // --root-at-unmatched hide, the blocked time it hid, by pool.
   repeated TopRow no_application_frame = 7;
-  repeated TopRow idle = 8;
+  repeated TopRow waiting = 8;
   // A comparison with --baseline; unset for a ranking.
   ComparisonTotals comparison_totals = 9;
   repeated ComparedRow comparison = 10;
   repeated string warnings = 11;
+  // Whether runnable or preempted intervals are selected, so that the blocked slice is "blocked or in
+  // the run queue".
+  bool run_queue = 12;
 }
 
 message TopSelection {
@@ -144,7 +148,7 @@ message TopSelection {
   repeated io.github.jonoffcpu.capture.v1.OffCpuReason reasons = 4;
   string weights = 5;
   repeated SourcedPattern app = 6;
-  repeated SourcedPattern idle = 7;
+  repeated SourcedPattern waiting = 7;
   repeated SourcedPattern machinery = 8;
   repeated string include = 9;
   repeated string exclude = 10;
@@ -164,16 +168,16 @@ message TopInput {
 
 message TopTotals {
   TableSum selected = 1;
-  TableSum idle = 2;
-  TableSum busy = 3;
-  // --by boundary and app-method, and any ranking with --root-at-unmatched hide: the busy time the rows
+  TableSum waiting = 2;
+  TableSum blocked = 3;
+  // --by boundary and app-method, and any ranking with --root-at-unmatched hide: the blocked time the rows
   // cover, and the rest.
-  TableSum busy_application = 4;
-  TableSum busy_no_application_frame = 5;
-  // Idle entries with a lock-acquire frame: waits an idle list may hide by mistake.
+  TableSum blocked_application = 4;
+  TableSum blocked_no_application_frame = 5;
+  // Waiting entries with a lock-acquire frame: waits a waiting list may hide by mistake.
   TableSum over_exclusion = 6;
-  // --root-at-unmatched hide: busy entries without a --root-at match, left out of the rows.
-  TableSum busy_root_at_unmatched_hidden = 7;
+  // --root-at-unmatched hide: blocked entries without a --root-at match, left out of the rows.
+  TableSum blocked_root_at_unmatched_hidden = 7;
 }
 
 message TableSum {
@@ -182,6 +186,9 @@ message TableSum {
   uint64 intervals = 2;
   // In the result's unit, to three decimals.
   string value = 3;
+  // Shares of the blocked total (for the blocked slices) and of the selection, as decimal fractions.
+  optional string share_of_blocked = 4;
+  optional string share_of_selected = 5;
 }
 
 message TopRow {
@@ -191,8 +198,8 @@ message TopRow {
   // --by boundary: the entry frame of the wait machinery below the boundary, or the leaf.
   optional string blocker = 3;
   string value = 4;
-  // Of the busy total, or of the idle total in the idle table. With an application pattern (boundary,
-  // app-method) or --root-at-unmatched hide, of the busy time the rows cover.
+  // Of the blocked total, or of the waiting total in the waiting table. With an application pattern (boundary,
+  // app-method) or --root-at-unmatched hide, of the blocked time the rows cover.
   string share = 5;
   uint64 intervals = 6;
   // Set when the profile's estimate is available and observed weights are ranked.
@@ -214,10 +221,10 @@ message TopRow {
 }
 
 message ComparisonTotals {
-  string baseline_busy = 1;
-  string busy = 2;
-  string baseline_busy_application = 3;
-  string busy_application = 4;
+  string baseline_blocked = 1;
+  string blocked = 2;
+  string baseline_blocked_application = 3;
+  string blocked_application = 4;
 }
 
 message ComparedRow {
@@ -232,11 +239,11 @@ message ComparedRow {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it. Idle intervals, those matching the
-// selection's idle patterns, are counted in where_the_time_went and left out of every table and stack.
+// The digest, jonoffcpu-summary.json; jonoffcpu-summary.md is rendered from it. Waiting intervals, those matching the
+// selection's waiting patterns, are counted in where_the_time_went and left out of every table and stack.
 //
-// With --app the tables are application-rooted: busy is by the application method that waited,
-// busy_by_root, busy_by_application_method and heaviest_application_stacks are set, and busy time
+// With --app the tables are application-rooted: blocked is by the application method that waited,
+// blocked_by_root and blocked_by_application_method are set, and blocked time
 // without an application frame is hidden from them.
 
 message Digest {
@@ -248,18 +255,38 @@ message Digest {
   DigestCapture capture = 5;
   TopSelection selection = 6;
   TopTotals where_the_time_went = 7;
-  DigestTable busy = 8;
-  // The pool table (with --app), or busy time by pool (without); unset when the profile has no threads.
-  DigestTable busy_no_application_frame_by_pool = 9;
-  HeaviestStacks heaviest_stacks = 11;
+  DigestTable blocked = 8;
+  // The pool table (with --app), or blocked time by pool (without); unset when the profile has no threads.
+  DigestTable blocked_no_application_frame_by_pool = 9;
   repeated string warnings = 12;
-  // With --app: busy time by application root (top --by root), by application method (top --by app-method),
-  // the heaviest lines of the application-rooted slice, and the busy time without an application frame
-  // that all of them leave out.
-  DigestTable busy_by_root = 13;
-  DigestTable busy_by_application_method = 14;
-  HeaviestStacks heaviest_application_stacks = 15;
-  TableSum busy_without_application_frame = 16;
+  // With --app: blocked time by application root (top --by root) and by application method (top --by
+  // app-method), and the blocked time without an application frame that they leave out.
+  DigestTable blocked_by_root = 13;
+  DigestTable blocked_by_application_method = 14;
+  TableSum blocked_without_application_frame = 16;
+  // The stacks command whose output is the flame graph's input: application-rooted with --app.
+  string flame_graph_command = 17;
+  // The command that lists the waiting intervals the tables leave out.
+  string waiting_command = 18;
+  // The process and machine, from the report; see JfrRecording.
+  io.github.jonoffcpu.correlator.signals.v1.JfrRecording recording = 19;
+  // The window the tables cover.
+  DigestWindow analysed = 20;
+  // Whether runnable or preempted intervals are selected (see TopResult.run_queue).
+  bool run_queue = 21;
+  // Whether sampling kept only some intervals, so that observed time under-weights short waits.
+  bool sampled = 22;
+  // The correlator that wrote the digest, such as "jonoffcpu-correlator 1.0.0".
+  string written_by = 23;
+}
+
+message DigestWindow {
+  // RFC 3339; unset when unknown.
+  optional string from = 1;
+  optional string to = 2;
+  optional string seconds = 3;
+  // True when no --from/--to selected part of the recording.
+  bool whole_recording = 4;
 }
 
 message DigestCapture {
@@ -279,6 +306,11 @@ message DigestCapture {
   io.github.jonoffcpu.correlator.report.v1.KernelSwitchOuts kernel_switch_outs = 14;
   io.github.jonoffcpu.correlator.report.v1.PopulationEstimate population_estimate = 15;
   repeated io.github.jonoffcpu.correlator.report.v1.DegradationStep degradation_steps = 16;
+  // The target: its PID in its own namespace and its TGID on the host; the JFR the samples came from.
+  uint32 target_pid = 17;
+  uint32 host_tgid = 18;
+  string jfr_path = 19;
+  string jfr_sha256 = 20;
 }
 
 // The collector's selection and loss counters.
@@ -299,18 +331,6 @@ message DigestTable {
   repeated TopRow rows = 3;
 }
 
-message HeaviestStacks {
-  string command = 1;
-  uint64 lines = 2;
-  string mean_depth = 3;
-  // The ten heaviest lines.
-  repeated HeavyStack top = 4;
-}
-
-message HeavyStack {
-  string stack = 1;
-  string seconds = 2;
-}
 
 // ---------------------------------------------------------------------------------------------------
 // `export --format jsonl`: one row per profile entry.

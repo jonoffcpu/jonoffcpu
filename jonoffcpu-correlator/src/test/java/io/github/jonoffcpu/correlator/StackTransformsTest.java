@@ -264,7 +264,7 @@ class StackTransformsTest {
                         "pool-1-thread-2",
                         3,
                         3000),
-                entry(java("java.lang.Thread.run", "io.netty.Idle.wait"), "event-loop-7", 5, 7000),
+                entry(java("java.lang.Thread.run", "io.netty.Waiting.wait"), "event-loop-7", 5, 7000),
                 entry(java("x.Other$$Lambda.0x0000000081a06030.run", "x.App.n"), "worker-1", 1, 1000),
                 entry(java("x.Other$$Lambda.0x00000000819ed250.run", "x.App.n"), "worker-2", 1, 1500));
         Path profile = dir.resolve("profile.pb");
@@ -362,7 +362,7 @@ class StackTransformsTest {
                 profile.toString(),
                 "--canonical-names",
                 "--hide",
-                "Idle",
+                "Waiting",
                 "--trim-root-from",
                 "preset:jvm-infra",
                 "--root-at",
@@ -400,11 +400,18 @@ class StackTransformsTest {
         assertThat(listing.code()).as("--list-presets failed: %s", listing).isZero();
         assertThat(listing.out())
                 .as("--list-presets must list every preset")
-                .contains("preset:jvm-infra", "preset:jvm-wait-machinery", "preset:jvm-idle", "preset:jvm-dispatch");
-        String idle = stacks(
-                dir, "idle", "--profile", profile.toString(), "--exclude-from", "preset:jvm-idle", "--include", "x\\.");
-        assertThat(idle)
-                .as("preset:jvm-idle must be accepted by --exclude-from")
+                .contains("preset:jvm-infra", "preset:jvm-wait-machinery", "preset:jvm-waiting", "preset:jvm-dispatch");
+        String waiting = stacks(
+                dir,
+                "waiting",
+                "--profile",
+                profile.toString(),
+                "--exclude-from",
+                "preset:jvm-waiting",
+                "--include",
+                "x\\.");
+        assertThat(waiting)
+                .as("preset:jvm-waiting must be accepted by --exclude-from")
                 .isNotEmpty();
         assertThatThrownBy(() -> stacks(dir, "unknown", "--profile", profile.toString(), "--hide-from", "preset:nope"))
                 .as("An unknown preset must be refused")
@@ -425,7 +432,7 @@ class StackTransformsTest {
     void rootAtUnmatchedHide(@TempDir Path dir) throws Exception {
         List<StackProfile.Entry> entries = List.of(
                 entry(java("java.lang.Thread.run", "x.App.m", "x.App.park"), "pool-1-thread-1", 2, 2000),
-                entry(java("java.lang.Thread.run", "io.netty.Idle.wait"), "event-loop-7", 5, 7000),
+                entry(java("java.lang.Thread.run", "io.netty.Waiting.wait"), "event-loop-7", 5, 7000),
                 entry(java("libjvm.so.ZDriver::run"), "ZDriverMinor", 1, 500));
         Path profile = dir.resolve("profile.pb");
         new StackProfile(

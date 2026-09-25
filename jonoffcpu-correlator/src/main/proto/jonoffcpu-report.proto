@@ -66,6 +66,9 @@ message Report {
   StackProfileSummary stack_profile = 27;
   // Set when the digest was asked for.
   DigestFiles digest = 28;
+  // The process and machine the recording came from; without --process-details true, no command line,
+  // system properties or environment variables.
+  io.github.jonoffcpu.correlator.signals.v1.JfrRecording recording = 29;
 }
 
 message SourceCounters {

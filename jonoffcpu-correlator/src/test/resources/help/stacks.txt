@@ -48,7 +48,7 @@ converter wrote.
       --include-from=FILE    Read --include patterns from a file, one per line, or a bundled preset:
                                NAME; repeatable.
       --exclude-from=FILE    Read --exclude patterns from a file, one per line, or a bundled preset:
-                               NAME such as preset:jvm-idle; repeatable.
+                               NAME such as preset:jvm-waiting; repeatable.
       --canonical-names      Remove generated-class addresses ($Lambda.0x..., LambdaForm$MH/0x...),
                                so two runs' stacks compare.
       --hide=REGEX           Remove every frame that matches, anywhere in the stack; a stack of

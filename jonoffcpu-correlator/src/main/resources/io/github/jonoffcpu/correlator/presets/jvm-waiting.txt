@@ -1,15 +1,15 @@
-# jvm-idle: waits for work, not on it - event loops in epoll or select, pool workers waiting for a
+# jvm-waiting: waits for work, not on it - event loops in epoll or select, pool workers waiting for a
 # task, timer wheels, reference handling, and the JVM's own service, compiler and GC threads. For
-# --exclude-from (drop idle intervals) or top --idle-from (list them in their own table).
+# --exclude-from (drop waiting intervals) or top --waiting-from (list them in their own table).
 #
 # Caveats:
 # - Application-specific queues (such as BookKeeper's GrowableArrayBlockingQueue.take) are not
 #   here; add them with a file of your own.
 # - libjvm.so.WorkerThread::run also parents a GC worker's task, so a worker blocked inside a task
-#   is excluded as idle too (33 ms of a Pulsar broker run).
+#   is excluded as waiting too (33 ms of a Pulsar broker run).
 # - The libjvm.so and libasyncProfiler.so lines match only symbolized native frames (glibc
 #   images). On musl every native frame is /lib/ld-musl-<arch>.so.1, so these lines never match
-#   and the JVM's idle GC and compiler threads count as busy.
+#   and the JVM's GC and compiler threads waiting for work count as blocked.
 ^io\.netty\.channel\.epoll\.Native\.epollWait0?$
 ^io\.netty\.util\.HashedWheelTimer\$Worker\.waitForNextTick$
 ^sun\.nio\.ch\.SelectorImpl\.select$

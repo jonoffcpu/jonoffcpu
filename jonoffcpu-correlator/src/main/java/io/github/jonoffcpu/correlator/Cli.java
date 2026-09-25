@@ -318,25 +318,25 @@ final class Cli {
         boolean summaryOutput;
 
         @Option(
-                names = "--idle",
+                names = "--waiting",
                 paramLabel = "REGEX",
-                description = "For the digest: an interval with a frame matching this is idle, a wait for work, and"
+                description = "For the digest: an interval with a frame matching this is waiting, a wait for work, and"
                         + " the digest's tables and stacks leave it out. The other outputs keep every interval."
                         + " Repeatable.")
-        List<String> idle = new ArrayList<>();
+        List<String> waiting = new ArrayList<>();
 
         @Option(
-                names = "--idle-from",
+                names = "--waiting-from",
                 paramLabel = "FILE",
-                description = "Read --idle patterns from a file or preset:NAME; repeatable. Default, when no idle"
-                        + " pattern is given: preset:jvm-idle.")
-        List<String> idleFrom = new ArrayList<>();
+                description = "Read --waiting patterns from a file or preset:NAME; repeatable. Default, when no waiting"
+                        + " pattern is given: preset:jvm-waiting.")
+        List<String> waitingFrom = new ArrayList<>();
 
         @Option(
                 names = "--app",
                 paramLabel = "REGEX",
                 description = "For the digest: a frame of your application. Its tables then start each stack at the"
-                        + " first one and name the last one before each wait, and count busy time without one apart,"
+                        + " first one and name the last one before each wait, and count blocked time without one apart,"
                         + " by pool. Repeatable.")
         List<String> app = new ArrayList<>();
 
@@ -348,6 +348,16 @@ final class Cli {
 
         @Mixin
         DigestHideOptions hide;
+
+        @Option(
+                names = "--process-details",
+                arity = "1",
+                paramLabel = "true|false",
+                defaultValue = "false",
+                description = "Keep the target's command line, system properties and environment variables from the"
+                        + " JFR in the report and show them in the digest. They can hold secrets, such as passwords"
+                        + " passed as -D options. Default: ${DEFAULT-VALUE}.")
+        boolean processDetails;
 
         @Option(
                 names = "--max-profile-entries",
@@ -477,7 +487,7 @@ final class Cli {
                 names = "--exclude-from",
                 paramLabel = "FILE",
                 description = "Read --exclude patterns from a file, one per line, or a bundled preset:NAME such"
-                        + " as preset:jvm-idle; repeatable.")
+                        + " as preset:jvm-waiting; repeatable.")
         List<String> excludeFrom = new ArrayList<>();
 
         StackProfileRenderer.Filter filter() throws IOException {
@@ -750,8 +760,9 @@ final class Cli {
                     || options.given("--profile-group-by")
                     || options.given("--max-profile-entries")
                     || options.given("--summary-output")
-                    || options.given("--idle")
-                    || options.given("--idle-from")
+                    || options.given("--process-details")
+                    || options.given("--waiting")
+                    || options.given("--waiting-from")
                     || options.given("--app")
                     || options.given("--app-from")
                     || options.given("--hide")
@@ -772,9 +783,10 @@ final class Cli {
         if (!format.equals("collapsed")) {
             throw options.usage("Invalid output format: " + format + " (only with --partial true)");
         }
-        boolean idleGiven = !options.idle.isEmpty() || !options.idleFrom.isEmpty();
-        if (idleGiven && !options.summaryOutput) {
-            throw options.usage("--idle and --idle-from shape the digest, which --summary-output false leaves out");
+        boolean waitingGiven = !options.waiting.isEmpty() || !options.waitingFrom.isEmpty();
+        if (waitingGiven && !options.summaryOutput) {
+            throw options.usage(
+                    "--waiting and --waiting-from shape the digest, which --summary-output false leaves out");
         }
         boolean appGiven = !options.app.isEmpty() || !options.appFrom.isEmpty();
         if ((appGiven || options.hide.given()) && !options.summaryOutput) {
@@ -794,15 +806,16 @@ final class Cli {
             // Resolved before correlating, so that a bad pattern fails at once rather than after the analysis.
             if (options.summaryOutput) {
                 Digest.Options digestDefaults = Digest.defaults(
-                        idleGiven
-                                ? sourced(options.idle, "--idle-from", options.idleFrom)
-                                : sourced(List.of(), "--idle-from", List.of("preset:jvm-idle")));
+                        waitingGiven
+                                ? sourced(options.waiting, "--waiting-from", options.waitingFrom)
+                                : sourced(List.of(), "--waiting-from", List.of("preset:jvm-waiting")));
                 digest = new Digest.Options(
                         sourced(options.app, "--app-from", options.appFrom),
-                        digestDefaults.idle(),
+                        digestDefaults.waiting(),
                         digestDefaults.machinery(),
                         options.hide.patterns(appGiven),
-                        digestDefaults.limit());
+                        digestDefaults.limit(),
+                        options.processDetails);
             }
         } catch (IllegalArgumentException invalid) {
             throw options.usage(invalid.getMessage());
@@ -822,7 +835,8 @@ final class Cli {
                 options.collapsedReasonFrame,
                 options.profileOutput,
                 profileOptions,
-                digest);
+                digest,
+                options.processDetails);
     }
 
     @Command(
@@ -1079,7 +1093,7 @@ final class Cli {
                 : frames.divide(weight, 1, java.math.RoundingMode.HALF_EVEN);
     }
 
-    /** The options {@code top} and {@code summarize} share: what is application code, idle and wait machinery. */
+    /** The options {@code top} and {@code summarize} share: what is application code, waiting and wait machinery. */
     static final class RankingOptions {
         @Option(
                 names = "--app",
@@ -1094,18 +1108,19 @@ final class Cli {
         List<String> appFrom = new ArrayList<>();
 
         @Option(
-                names = "--idle",
+                names = "--waiting",
                 paramLabel = "REGEX",
-                description = "An interval with a frame matching this is idle, a wait for work: top lists it in its"
+                description = "An interval with a frame matching this is waiting, a wait for work: top lists it in its"
                         + " own table, and the digest leaves it out of its tables. Repeatable.")
-        List<String> idle = new ArrayList<>();
+        List<String> waiting = new ArrayList<>();
 
         @Option(
-                names = "--idle-from",
+                names = "--waiting-from",
                 paramLabel = "FILE",
-                description = "Read --idle patterns from a file or preset:NAME, such as preset:jvm-idle; repeatable."
-                        + " Default for summarize, when no idle pattern is given: preset:jvm-idle.")
-        List<String> idleFrom = new ArrayList<>();
+                description =
+                        "Read --waiting patterns from a file or preset:NAME, such as preset:jvm-waiting; repeatable."
+                                + " Default for summarize, when no waiting pattern is given: preset:jvm-waiting.")
+        List<String> waitingFrom = new ArrayList<>();
 
         @Option(
                 names = "--machinery-from",
@@ -1125,11 +1140,11 @@ final class Cli {
             return sourced(app, "--app-from", appFrom);
         }
 
-        List<StackTransforms.Sourced> idle(boolean defaultPreset) throws IOException {
-            if (defaultPreset && idle.isEmpty() && idleFrom.isEmpty()) {
-                return sourced(List.of(), "--idle-from", List.of("preset:jvm-idle"));
+        List<StackTransforms.Sourced> waiting(boolean defaultPreset) throws IOException {
+            if (defaultPreset && waiting.isEmpty() && waitingFrom.isEmpty()) {
+                return sourced(List.of(), "--waiting-from", List.of("preset:jvm-waiting"));
             }
-            return sourced(idle, "--idle-from", idleFrom);
+            return sourced(waiting, "--waiting-from", waitingFrom);
         }
 
         List<StackTransforms.Sourced> machinery() throws IOException {
@@ -1146,11 +1161,11 @@ final class Cli {
             versionProvider = Version.class,
             sortOptions = false,
             description = {
-                "Ranks where off-CPU time went. Each selected interval is idle when a frame of any of its stacks"
-                        + " matches --idle, and busy otherwise; busy time is attributed by --by to a row, and idle"
+                "Ranks where off-CPU time went. Each selected interval is waiting when a frame of any of its stacks"
+                        + " matches --waiting, and blocked otherwise; blocked time is attributed by --by to a row, and waiting"
                         + " time is listed in its own table.",
                 "--by boundary (the default) keys a row by the deepest --app frame and the blocker below it, and"
-                        + " breaks busy time without an application frame down by thread pool."
+                        + " breaks blocked time without an application frame down by thread pool."
             },
             footer = {
                 "",
@@ -1254,7 +1269,7 @@ final class Cli {
             Top.Options options = new Top.Options(
                     by,
                     ranking.app(),
-                    ranking.idle(false),
+                    ranking.waiting(false),
                     ranking.machinery(),
                     ranking.limit,
                     transformOptions.transforms(),
@@ -1327,14 +1342,14 @@ final class Cli {
             sortOptions = false,
             description = {
                 "Writes the analysis digest, " + OutputFiles.SUMMARY_MD + " and " + OutputFiles.SUMMARY_JSON
-                        + ": the capture's coverage and losses, where the time went, the busy time ranked and"
-                        + " its heaviest transformed stacks with the idle waits left out, and the command that"
-                        + " reproduces each table.",
+                        + ": when and on what the capture was recorded, the blocked time ranked with the waits for"
+                        + " work left out, where the time went, the capture's coverage and losses, and the command"
+                        + " that reproduces each table.",
                 "With --app every table is rooted at the application, as its flame graph with --hide-from and"
                         + " --root-at-unmatched hide is: the application method that waited, where threads entered"
-                        + " the application, the heaviest application stacks and application methods across stacks,"
-                        + " with busy time without an application frame counted by pool.",
-                "Correlation writes it by default, with its own --idle and --app patterns; this command rewrites it"
+                        + " the application and application methods across stacks, with blocked time without an"
+                        + " application frame counted by pool.",
+                "Correlation writes it by default, with its own --waiting and --app patterns; this command rewrites it"
                         + " with other patterns."
             })
     static final class Summarize implements Callable<Integer> {
@@ -1361,6 +1376,16 @@ final class Cli {
         @Mixin
         DigestHideOptions hide;
 
+        @Option(
+                names = "--process-details",
+                arity = "1",
+                paramLabel = "true|false",
+                defaultValue = "false",
+                description = "Show the target's command line, system properties and environment variables, when"
+                        + " the report holds them (correlate --process-details true). They can hold secrets."
+                        + " Default: ${DEFAULT-VALUE}.")
+        boolean processDetails;
+
         @Spec
         CommandSpec spec;
 
@@ -1380,7 +1405,12 @@ final class Cli {
                     : ProtoJson.parse(java.nio.file.Files.readString(report), ReportProto.Report.newBuilder())
                             .build();
             Digest.Options options = new Digest.Options(
-                    ranking.app(), ranking.idle(true), ranking.machinery(), hide.patterns(appGiven), ranking.limit);
+                    ranking.app(),
+                    ranking.waiting(true),
+                    ranking.machinery(),
+                    hide.patterns(appGiven),
+                    ranking.limit,
+                    processDetails);
             AnalysisProto.Digest digest = Digest.of(read, profile.toString(), captured, options);
             Path directory = outputDirectory == null ? Path.of("") : outputDirectory;
             java.nio.file.Files.createDirectories(directory.toAbsolutePath());
