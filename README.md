@@ -1,539 +1,133 @@
 ![#jonoffcpu](docs/images/jonoffcpu-banner.jpg)
 
-`jonoffcpu` is an off-CPU profiler for JVM applications on Linux. It measures how
-long each thread was off-CPU, using the kernel scheduler as the source of truth,
-and attributes that time to the Java stack that was waiting. The result is an
-off-CPU flame graph whose widths are real durations, recorded alongside an
-ordinary async-profiler JFR.
+**jonoffcpu** shows where JVM applications wait, and for exactly how long. It
+is a profiling toolset for Java on Linux that runs
+[async-profiler](https://github.com/async-profiler/async-profiler) and extends
+it with off-CPU profiling measured by the kernel. The Linux scheduler, through
+eBPF, times every interval a thread spends off the CPU. async-profiler captures
+the Java stack that waited, and an offline correlator joins the two into flame
+graphs and ranked reports whose numbers are real durations.
 
-## Table of contents
+- **Measured, not estimated.** Each recorded wait carries its exact duration
+  from the scheduler, why the thread left the CPU, and how much of it was
+  spent asleep versus queued for a CPU. Flame-graph widths are microseconds,
+  not sample counts.
+- **async-profiler included.** One `-javaagent` starts a current
+  async-profiler. [Its fork](https://github.com/jonoffcpu/async-profiler)
+  follows upstream master, with its patches rebased periodically. CPU,
+  allocation, lock and wall-clock profiles land in the same JFR recording as
+  the off-CPU samples.
+- **A small observer effect.** The per-context-switch work stays in the
+  kernel, which decides after measuring each interval whether to record it.
+  Duration-proportional sampling bounds the recording rate by off-CPU time
+  rather than by the number of context switches, and the population estimate
+  stays exact. A recorded interval costs about 120 bytes. Correlation runs
+  offline, on any machine.
+- **Your code, not the plumbing.** Threads *waiting for work*, such as idle
+  event loops and pool workers, are kept apart from threads *blocked* while
+  they had work to do. Filters and transforms root each stack at your
+  application, hide executors and lambda bridges, and collapse lock internals
+  into the call that blocked. The flame graph and the ranked tables then show
+  where your code waited, and on what.
+- **Made for automation.** A bounded Markdown and JSON digest carries the
+  command that reproduces each of its tables. The structured outputs are
+  documented protobuf messages with a JSON view, the export is ready for
+  DuckDB, and runs compare per unit of work, so an AI agent or a CI job can
+  act on the results.
+- **Runs where your JVM runs.** One self-contained agent JAR covers Linux
+  x86-64 and arm64, glibc and musl (Alpine). It profiles a container from
+  inside it, without `--pid=host`, and it fails closed rather than recording
+  degraded data.
 
-- [What is off-CPU profiling?](#what-is-off-cpu-profiling)
-- [The problem](#the-problem)
-- [How it works](#how-it-works)
-  - [Why two files?](#why-two-files)
-  - [Files jonoffcpu writes](#files-jonoffcpu-writes)
-  - [What the Java stack means](#what-the-java-stack-means)
-  - [Why the thread left the CPU](#why-the-thread-left-the-cpu)
-- [Requirements](#requirements)
-  - [Kernel settings](#kernel-settings)
-    - [Applying them to a VM's kernel](#applying-them-to-a-vms-kernel)
-    - [Running the collector without root](#running-the-collector-without-root)
-  - [Profiling in Docker](#profiling-in-docker)
-    - [Docker Desktop on macOS and Windows](#docker-desktop-on-macos-and-windows)
-- [Quick start](#quick-start)
-  - [1. Get the JARs](#1-get-the-jars)
-  - [2. Record](#2-record)
-  - [3. Correlate](#3-correlate)
-  - [4. Render the flame graph](#4-render-the-flame-graph)
-  - [Other views of the same recording](#other-views-of-the-same-recording)
-  - [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile)
-  - [6. Find what to optimize](#6-find-what-to-optimize)
-- [Analyzing with AI agents](#analyzing-with-ai-agents)
-- [Analyzing with SQL](#analyzing-with-sql)
-- [Example: Apache Pulsar](#example-apache-pulsar)
-- [Configuration](#configuration)
-  - [Agent options](#agent-options)
-  - [Choosing what to sample](#choosing-what-to-sample)
-  - [Overhead and the observer effect](#overhead-and-the-observer-effect)
-  - [Turning jonoffcpu off without removing it](#turning-jonoffcpu-off-without-removing-it)
-  - [Correlator options](#correlator-options)
-  - [Using the artifacts as libraries](#using-the-artifacts-as-libraries)
-- [Building from source](#building-from-source)
-- [Repository layout](#repository-layout)
-- [License](#license)
+**[Quick start](#quick-start)** ·
+**[Documentation](#documentation)** ·
+**[Releases](https://github.com/jonoffcpu/jonoffcpu/releases)**
 
-## What is off-CPU profiling?
+## Why off-CPU profiling
 
-A CPU executes one thread at a time, and the Linux scheduler decides which.
-Every hand-over is a context switch, visible to the kernel as the
-`sched_switch` tracepoint: the outgoing thread is *switched out*, the incoming
-one *switched in*. A thread is **on-CPU** from a switch-in to its next
-switch-out and **off-CPU** the rest of the time. An off-CPU interval holds up
-to two scheduler states. The thread is **sleeping** while it is not runnable
-and waits for a wakeup — a futex, data on a socket, a disk read, a timer — and
-it is **runnable** from the `sched_wakeup` that ends the sleep until a CPU is
-free to switch it in. A thread that is preempted skips the sleep: it stays
-runnable and only waits in the run queue. Off-CPU profiling records, for each
-such interval, its exact duration and the code path that was executing when
-the thread was switched out. CPU profilers sample only the on-CPU state; a
-wall-clock sampler notices at each tick that a thread is off-CPU, but neither
-how long the interval lasted nor whether the thread was sleeping or merely
-queued.
+In most services, request latency is not CPU time. A request that takes
+200 ms may burn 5 ms of CPU and spend the rest sleeping on a socket for a
+query result, parked on a future, or queued behind a busy CPU. A CPU flame
+graph shows those 5 ms in detail and nothing about the other 195 ms. An
+off-CPU profile attributes the waiting time to the stack that waited, so the
+195 ms show up under the code that issued the query, took the lock, or called
+the remote service.
 
-[![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
-
-The kernel sees the *mechanism* of a wait, never its *reason*. A thread never
-blocks "on the database": with a synchronous JDBC driver it sleeps in a socket
-read; with an asynchronous client, a connection pool or any `Future.get()` it
-parks on a monitor or condition variable, a `futex`, while another thread
-does the I/O. The mechanism and the duration are what the kernel can prove;
-the reason lives in the stack of the code that called into the wait.
-
-| What the code is doing | Where the Java thread waits | What the kernel sees |
-| --- | --- | --- |
-| Synchronous JDBC query | `SocketInputStream.read` (`NioSocketImpl`) | `read`/`recv` or `poll` on the socket, sleeping until data arrives |
-| Async client, `CompletableFuture.get()`, connection pool | `LockSupport.park` | `futex` wait; another thread performs the I/O |
-| Contended `synchronized` or `ReentrantLock` | monitor enter / `park` | `futex` wait |
-| `Thread.sleep`, timed `wait` | `park` with a timeout | `futex` wait armed with a timer |
-
-That split is why an off-CPU profile of a JVM needs both stacks: the kernel
-stack and the interval come from the scheduler, the Java stack supplies the
-cause, and `jonoffcpu` exists to pair each kernel-measured interval with a
-Java stack.
-
-This matters because in most services request latency is not CPU time. A
-request that takes 200 ms may burn 5 ms of CPU and spend the rest sleeping on
-a socket for a query result, parked on a future, or queued behind a busy CPU.
-A CPU flame graph shows those 5 ms in detail and nothing about the other
-195 ms. An off-CPU profile inverts that: it attributes the off-CPU time to the
-stack that was waiting, so the 195 ms show up under the code that issued the
-query, took the lock, or called the remote service. Rendered as an
-[off-CPU flame graph](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html),
-frame widths are total off-CPU duration instead of sample counts, and the
-widest towers are the waits worth investigating. CPU and off-CPU profiles
-together account for a thread's whole lifetime, which is what Brendan Gregg's
-[Thread State Analysis](https://www.brendangregg.com/tsamethod.html) method
-asks for: explain latency by the states that dominate it, not by the one state
-a CPU profiler happens to see.
-
-Off-CPU time is measured, not sampled: the scheduler records the exact moment
-a thread left the CPU and the exact moment it returned, so every interval is a
-real duration and the flame graph's widths are microseconds of off-CPU time.
-`jonoffcpu` measures the whole interval, from switch-out to switch-in, so
-run-queue delay under CPU contention is included alongside sleeping. It also
-records *why* the thread left the CPU — it blocked, or it was still runnable —
-and by default records only the blocked intervals, and it splits each
-interval's time into the two states, sleeping and runnable on a run queue; see
-[Why the thread left the CPU](#why-the-thread-left-the-cpu).
-
-Further reading:
-
-- [Linux tracepoints](https://www.kernel.org/doc/html/latest/trace/events.html)
-  and [`sched(7)`](https://man7.org/linux/man-pages/man7/sched.7.html): the
-  `sched_switch` and `sched_wakeup` events this definition rests on, and the
-  scheduler's view of task states.
-- [Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html): the
-  method, its overheads, and how it complements CPU profiling.
-- [Off-CPU Flame Graphs](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html):
-  reading and generating flame graphs whose widths are off-CPU durations.
-- [The TSA Method](https://www.brendangregg.com/tsamethod.html): thread state
-  analysis as a systematic way to account for all of a thread's time.
-
-## The problem
-
-CPU profilers show where a program burns cycles. They say nothing about the
-time a thread spends *not* running: waiting on a lock, a socket, a disk, a
-`park()`, or simply a busy run queue. In a typical service that waiting time,
-not CPU time, is what shows up as latency.
-
-Existing tools each see half of the picture:
-
-- **Kernel tools** such as BCC's [`offcputime`](https://github.com/iovisor/bcc/blob/master/tools/offcputime.py)
-  know exactly when a thread went
-  off CPU and when it came back, and can capture the kernel stack. They cannot
-  walk JIT-compiled Java frames, so the Java side of the stack is missing or
-  guessed from symbol maps.
-- **JVM profilers** such as [async-profiler](https://github.com/async-profiler/async-profiler)
-  walk Java stacks accurately, but
-  their wall-clock mode is a timer-driven sampler. It sees that a thread was
-  off-CPU at each tick, not how long the interval actually lasted, and it
-  cannot tell sleeping from being runnable but descheduled.
-
-`jonoffcpu` combines both: the kernel measures the interval, async-profiler
-captures the Java stack, and a 64-bit key ties each measurement to its stack.
-
-## How it works
+Existing tools each see half of that picture. Kernel tools such as BCC's
+`offcputime` know exactly when a thread left the CPU and when it came back,
+but cannot walk JIT-compiled Java frames. JVM profilers walk Java stacks
+accurately, but a wall-clock sampler only notices at each tick that a thread
+was off the CPU, not how long the interval lasted or whether the thread was
+sleeping or merely waiting for a CPU. jonoffcpu joins both: the kernel
+measures the interval, async-profiler captures the Java stack, and a 64-bit
+key ties each measurement to its stack.
 
 [![jonoffcpu architecture](docs/images/architecture.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/architecture.svg)
 
-1. A [CO-RE eBPF program](jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c)
-   hooks `sched_switch` and `sched_exit_tp`. When a
-   thread of the target JVM is switched out it records the timestamp and why
-   the scheduler took it off the CPU; when the same thread is switched back in
-   it has a complete off-CPU interval with its kernel and user native stacks.
-2. Intervals of the selected switch-out reasons that pass the configured
-   duration bounds and admission policy
-   are written to a ring buffer together with a fresh 64-bit correlation key.
-   The kernel then sends the resumed thread a signal whose payload is only that
-   key.
-3. The signal handler, in the bundled
-   [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
-   fork, records a
-   `profiler.SignalSample` event with the Java stack, the thread, and the key,
-   in the same JFR recording that holds ordinary CPU, allocation, lock, and
-   JDK events.
-4. A [native collector](jonoffcpu-native/src/collector.rs) in the JVM process
-   drains the ring buffer, resolves the
-   native stacks, and appends each observation to the correlation stream.
-   The Java agent finalizes that stream with a footer that binds the JFR's size
-   and SHA-256.
-5. [`OffCpuCorrelator`](jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/correlator/OffCpuCorrelator.java)
-   runs offline. It joins each `SignalSample` to its
-   observation by key, weights the Java stack by the kernel-measured duration,
-   and writes a report, a collapsed-stack file, and a stack profile from which
-   other slices can be rendered later.
+[Off-CPU profiling](docs/off-cpu-profiling.md) explains the concepts, and
+[How jonoffcpu works](docs/how-it-works.md) the pipeline and its files.
 
-### Why two files?
+## jonoffcpu and async-profiler's lock profiling
 
-A `profiler.SignalSample` says only that a sampled interval ended. Everything
-that turns it into a measurement lives in the correlation stream:
+async-profiler can already answer some of the questions an off-CPU profile
+answers. The two approaches are complementary, not exclusive, and jonoffcpu
+runs both in one recording.
 
-| | JFR `profiler.SignalSample` | stream observation |
-| --- | --- | --- |
-| Correlation key | yes | yes |
-| Java stack, captured after the thread resumed | yes | no |
-| Interval start and end, i.e. the off-CPU duration | no | yes |
-| Kernel and user native stacks at the scheduler endpoint | no | yes |
-| Signal request result and kernel-side loss counters | no | yes |
-| Footer binding the JFR's size and digest | no | yes |
+- **Lock profiling** (`lock=`) records contended `synchronized` blocks and
+  waits on `ReentrantLock`, `ReentrantReadWriteLock` and `Semaphore`, with the
+  wait time and the class of the lock. It needs no eBPF and no privileges, and
+  it is the most direct answer to "which Java lock is contended". `nativelock=`
+  does the same for pthread mutexes and read-write locks.
+- **Wall-clock profiling** (`wall=`) samples every thread periodically,
+  whatever its state, which shows where threads spend their time but not how
+  long each wait lasted.
+- **Off-CPU profiling** in jonoffcpu covers every wait, whatever caused it,
+  with its exact duration. That includes socket and disk I/O, `epoll`,
+  `Condition.await`, queue `take`, `CompletableFuture.get`, sleeps, futexes in
+  native code, page faults, and the time a runnable thread queued for a CPU. It
+  cannot name the lock object: the kernel sees only the futex.
 
-Counting `SignalSample` events on their own would give a signal-frequency
-profile, not an off-CPU profile: ten 1 ms parks and one 10 s socket read would
-look identical. The JFR supplies *which Java code* was waiting; the stream
-supplies *for how long* and *in which kernel path*. Observations that never
-received a matching sample are kept and reported as loss, never dropped.
-
-### Files jonoffcpu writes
-
-Every file the agent or the correlator creates carries the `jonoffcpu` name,
-so a capture is recognisable in a shared directory or a support bundle. The
-capture files take their stem from `correlationOutput`; the analysis files are
-named by the correlator.
-
-Capture, written by the agent next to `correlationOutput` (the examples assume
-`correlationOutput: /tmp/jonoffcpu-capture.pb`):
-
-| File | Contents | Name comes from |
-| --- | --- | --- |
-| `jonoffcpu-capture.pb` | The correlation stream: `captureStart`, one `stack` per distinct native stack, one `observation` per recorded off-CPU interval referencing them by id, `captureEnd`, and the `captureFinalized` footer that binds the JFR's size and SHA-256. Length-delimited protobuf, defined by [`jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto`](jonoffcpu-capture-codec/src/main/proto/jonoffcpu-capture.proto); `java -jar jonoffcpu-correlator.jar dump --source <file>` prints it as JSON Lines, one record per line | `correlationOutput` |
-| `jonoffcpu-capture.manifest.json` | Audit manifest: configuration, resolved sampling policy, artifact paths, lifecycle state, completion flag, the native collector's replies, and the failure of an incomplete capture. The proto3 JSON of the `Manifest` message defined by [`jonoffcpu-agent/src/main/proto/jonoffcpu-manifest.proto`](jonoffcpu-agent/src/main/proto/jonoffcpu-manifest.proto) | the stem of `correlationOutput` + `.manifest.json` |
-| `jonoffcpu-capture.jfr` | The combined async-profiler recording, including `profiler.SignalSample` events | the `file=` option in `asyncProfilerOptions`; defaults to the stem of `correlationOutput` + `.jfr` |
-
-Analysis, written by the correlator into `--output`:
-
-| File | Contents |
+| Question | Best answered by |
 | --- | --- |
-| `jonoffcpu-report.json` | Lifecycle, loss, classification, duration, delivery-delay accounting, and the optional population estimate. Defined by `Report` in [`jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto) |
-| `jonoffcpu-offcpu-stacks.collapsed` | Java stacks weighted in microseconds of off-CPU time, for flame graphs. Every recorded interval; when the capture mixes switch-out reasons, each line starts with an `[offcpu: <reason>]` frame |
-| `jonoffcpu-offcpu-stacks-<reason>.collapsed` | The same, one file per switch-out reason, written only when the capture mixes reasons |
-| `jonoffcpu-offcpu-profile.pb` | The stack profile: every distinct Java, kernel and user stack once, with interval counts and observed and estimated durations per stack, reason and thread. Any other collapsed slice is rendered from it without re-correlating; see [5. Slice and filter with the stack profile](#5-slice-and-filter-with-the-stack-profile). Defined by [`jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-profile.proto) |
-| `jonoffcpu-summary.md`, `jonoffcpu-summary.json` | The analysis digest, for people and AI agents: when and on what machine and JVM the capture was recorded, then the blocked time ranked, with `--app` by the application method that waited, by application root and by application method, without it by leaf and by pool; where the time went, with shares; coverage and losses; the terms it uses; and each table's command as a shell block. Waits for work are left out (see `--waiting-from`). The Markdown is rendered from the JSON. `--summary-output false` skips it; a failure to write it is reported in the report and never fails the correlation |
-| `jonoffcpu-classified-records.jsonl` | Every source row and every JFR sample with its classification, for auditing. Written only with `--audit full`; **not written by default** |
-| `jonoffcpu-matches.jsonl` | Every exact-cookie match with its clipped interval and delivery delay. Written by the default `--audit matches`, and by `--audit full` |
-| `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
+| Which Java lock is contended, and by whom? | async-profiler `lock=` |
+| Where is CPU time spent? | async-profiler `event=cpu` |
+| Where do threads wait, on anything, and for exactly how long? | jonoffcpu off-CPU profile |
+| Are threads delayed by CPU saturation or throttling? | jonoffcpu's run-queue split and `runnable`/`preempted` intervals |
 
-Every JSON file the correlator writes, and everything it prints as JSON, is a
-protobuf message printed in the
-[proto3 JSON mapping](https://protobuf.dev/programming-guides/json/): the report,
-the audit rows, the markers and the partial-mode files are defined in
-[`jonoffcpu-report.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto),
-and the digest, `stacks --summary`, `top --format json` and `export --format
-jsonl` in [`jonoffcpu-analysis.proto`](jonoffcpu-correlator/src/main/proto/jonoffcpu-analysis.proto).
-Names are lowerCamelCase, 64-bit integers are decimal strings, exact decimals
-such as shares and probabilities are decimal strings, enums print their value
-names (`OFF_CPU_REASON_BLOCKED`), and a field that is unset is left out. The
-`.json` files are indented; the `.jsonl` files hold one message per line.
-
-`--audit` defaults to `matches`, so `jonoffcpu-classified-records.jsonl` is no
-longer written unless `--audit full` is passed — this is a backward-incompatible
-change from earlier releases, which always wrote both audit files. Anything that
-reads `jonoffcpu-classified-records.jsonl` needs `--audit full` added to its
-correlator invocation. The library API (`OffCpuCorrelator.correlate`) is
-unaffected and keeps writing both.
-
-When the retained-bytes budget is reached, `--on-limit degrade` (the default)
-trades away thinner outputs before it trades away coverage: it drops the
-audit outputs, then thins the source with an exact inverse-probability
-reweighting, and only as a last resort narrows the analysis window. Thinning still analyses the whole requested window — with
-ordinary output names, `jonoffcpu-complete.json`, and exit status 0 — because it
-is a stated estimator over what was asked for. Narrowing the window instead
-analyses a shorter window *completely*, and is labelled as visibly incomplete:
-`INCOMPLETE-jonoffcpu-*` names, a `jonoffcpu-narrowed.json` marker instead of
-`jonoffcpu-complete.json`, and exit status 2. See
-[jonoffcpu-correlator/OFFLINE.md's **Degradation**](jonoffcpu-correlator/OFFLINE.md#degradation)
-for the full ladder and the report's `degradation` object.
-
-`--partial true` inspects an interrupted capture and writes a visibly different
-set instead: `INCOMPLETE-jonoffcpu-report.json`,
-`INCOMPLETE-jonoffcpu-classified-records.jsonl`, `INCOMPLETE-jonoffcpu-pairs.jsonl`,
-optionally `INCOMPLETE-jonoffcpu-offcpu-stacks.collapsed`, and the marker
-`jonoffcpu-partial.json`. It never writes `jonoffcpu-complete.json`.
-
-### Why the thread left the CPU
-
-`sched_switch` tells the kernel why the outgoing thread is leaving the CPU,
-and `jonoffcpu` records it on every interval:
-
-| Reason | What the scheduler saw | Typical cause |
-| --- | --- | --- |
-| `blocked` | The thread left in a waiting state (`TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, …) | A futex (lock, `park`, `Future.get()`), a socket or `epoll` wait, a timer, disk I/O, a page fault |
-| `runnable` | The thread left at an ordinary scheduling point while still `TASK_RUNNING` | **Preemption of running Java code**: a thread preempted by the scheduler tick is switched out on its return to user mode, where the kernel sees an ordinary `schedule()` — and `sched_yield` |
-| `preempted` | The kernel preempted the thread at a preemption point inside the kernel | Preemption while the thread was in a system call or a page fault |
-
-`runnable` and `preempted` are both time spent *waiting for a CPU*: a stack
-that is wide under them is where execution stopped, not what the thread was
-waiting for, and the investigation belongs to CPU saturation, cgroup
-throttling, thread-pool sizing or IRQ load rather than to that code. Measured
-on a 16-CPU 7.1 kernel, more spinning threads than CPUs came back 2,861
-`runnable` against 2 `preempted`, so read the two together.
-
-The reason describes the *switch-out*. A `blocked` interval runs until the
-thread is switched back in, so it holds two different waits: the time the
-thread slept until it was woken, and then the time it waited on a run queue for
-a CPU. `jonoffcpu` splits the two:
-
-| Part | What it is | Where it comes from |
-| --- | --- | --- |
-| **sleeping** | A `blocked` interval up to its wakeup (sometimes called blocking time) | `duration − runqueue` |
-| **runqueue** | Time runnable but waiting for a CPU: a `blocked` interval after its wakeup, and `runnable` and `preempted` intervals throughout | The growth of the scheduler's own `sched_info.run_delay` across the interval |
-
-The kernel already accounts for every task's run-queue wait in
-`task_struct.sched_info.run_delay` (the second field of
-`/proc/<pid>/schedstat`). The switch-out hook saves it and the switch-in hook
-reads it again, so the split costs two field reads in hooks that run anyway,
-with nothing new firing system-wide. A slow wakeup shows up as run-queue time:
-a sleeper at nice 19 sharing a CPU with three busy threads waited 1.4 ms for
-the CPU after each 1 ms sleep, against 0.1 µs when it had a CPU to itself.
-
-It needs a kernel built with `CONFIG_SCHED_INFO`, which mainstream
-distribution kernels enable through `CONFIG_TASK_DELAY_ACCT` or
-`CONFIG_SCHEDSTATS`; the accounting runs whether or not delay accounting or
-schedstats are switched on at runtime. On a kernel without it, the agent fails
-to start rather than recording without the split; set `timeSplit.source: off`
-to capture there anyway (see [Agent options](#agent-options)).
-
-An interval is left **unsplit**, never guessed, when there is no reading: in a
-capture recorded before the split existed, with `timeSplit.source: off`, when
-the counter went backwards, or for a `blocked` interval whose reading exceeds
-its duration. The scheduler's clock can be a few microseconds stale when a
-running thread is switched out, so a `runnable` or `preempted` interval's
-reading may slightly exceed its duration; those intervals are run-queue time
-throughout either way. For every interval, sleeping + runqueue + unsplit is
-exactly its duration, and the report's `offCpuReasons` gives the three per
-reason, with a `timeSplit` object naming the source and why any interval was
-left unsplit.
-
-The kernel keeps the original value (`prev_task_state`) and the `preempt` flag
-next to the reason, and the agent and the correlator recompute the reason from
-them for every row. The kernel also counts every switch-out by reason before
-filtering, so even a blocked-only capture reports how often its threads were
-denied the CPU; the report's `offCpuReasons` object carries those counts next
-to the matched intervals of each selected reason.
-
-### What the Java stack means
-
-The key proves that a sample and an observation describe the same interval. It
-does not mean the two stacks were captured at the same instant. The native
-stack belongs to the moment the thread was scheduled back in; the Java stack is
-captured slightly later, when the signal is delivered. The report keeps the
-kernel duration, the Java stack, and the delivery delay as separate values, and
-`--max-handler-delay-ns` can reject samples that arrived too late to trust.
-
-## Requirements
-
-- 64-bit Linux with BTF, eBPF task storage, the `tp_btf/sched_exit_tp`
-  tracepoint, and the `bpf_send_signal_task` helper. The agent checks the
-  running kernel and fails closed if any of these is missing.
-- Privileges to load and attach the BPF programs: `CAP_BPF` and
-  `CAP_PERFMON`, or root. See [Kernel settings](#kernel-settings) for the
-  sysctls that async-profiler needs alongside them.
-- Java 17 or newer for the agent; Java 21 or newer for the correlator.
-- On Java 24 and newer, add `--sun-misc-unsafe-memory-access=allow` to the JVM
-  being profiled and to the correlator. The bundled protobuf codec that reads
-  and writes the capture stream uses `sun.misc.Unsafe`, which the JDK reports
-  once per JVM as a terminally deprecated call; the flag silences that warning
-  and changes nothing else.
-
-The agent JAR is self-contained. It embeds the JNI bridge, the native
-collector, and the patched async-profiler for Linux x86-64 and arm64, each
-linked against both glibc and musl (Alpine), verifies them against a SHA-256
-manifest, and extracts them to a private temporary directory at startup.
-Nothing needs to be installed on the host. The agent picks the glibc or musl
-bundle from the C library mapped into the running JVM; on an unusual host,
-`-Dio.github.jonoffcpu.agent.nativeLibc=glibc` or `=musl` selects it
-explicitly. If the temporary directory is mounted `noexec`, point
-`-Dio.github.jonoffcpu.agent.nativeWorkDir` at an executable location.
-
-### Kernel settings
-
-jonoffcpu's own eBPF collector needs privileges (`CAP_BPF` and `CAP_PERFMON`, or
-root), and nothing else. The settings below are about the *other* half of the
-capture: async-profiler runs inside the JVM, usually unprivileged, and the
-kernel restricts by default what an unprivileged process may observe. Without
-them the capture still completes, but parts of it are degraded — typically
-missing kernel frames, truncated native stacks, or no `cpu` event at all.
-
-| Setting | Suggested value | Why |
-| --- | --- | --- |
-| `kernel.perf_event_paranoid` | `1` | The gate on `perf_event_open`. The common default `2` lets an unprivileged process measure only its own user space, so async-profiler's `cpu` engine cannot sample kernel stacks; `>= 2` is also the usual reason `perf_event_open` fails outright and the profiler falls back or errors. `1` allows per-process profiling including kernel stacks. `CAP_PERFMON` bypasses the check. |
-| `kernel.kptr_restrict` | `0` | Kernel symbol addresses in `/proc/kallsyms` read back as zeros unless the reader has `CAP_SYSLOG` (`1`), or for everyone (`2`). Both async-profiler and jonoffcpu's collector symbolize kernel frames from that file, so with addresses hidden the kernel part of a stack stays as raw addresses. |
-| `kernel.perf_event_max_stack` | `1024` | The maximum call-chain depth `perf_events` records, `127` by default, which silently truncates deep JVM native stacks. Raising it only affects async-profiler: jonoffcpu's BPF stack map has a fixed depth of 127. Do not lower it below 127 — the collector's stack map cannot be created if the sysctl is smaller than the map's depth. |
-| `kernel.perf_event_mlock_kb` | `2048` | async-profiler mmaps an 8 KB perf buffer per thread, bounded by `ulimit -l` plus this value times the number of CPUs. On a thread-heavy application the default `516` runs out and native stacks are dropped for the remaining threads. |
-
-Apply them for the current boot:
-
-```sh
-sudo sysctl -w kernel.perf_event_paranoid=1
-sudo sysctl -w kernel.kptr_restrict=0
-sudo sysctl -w kernel.perf_event_max_stack=1024
-sudo sysctl -w kernel.perf_event_mlock_kb=2048
-```
-
-Use `sysctl` rather than `sudo echo 1 > /proc/sys/…`: the redirection is
-performed by the calling shell, which is still unprivileged, so that form fails
-with "Permission denied" before `sudo` runs. `sudo tee`
-(`echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid`) works as well. To
-make the values persist across reboots, put them in
-`/etc/sysctl.d/99-jonoffcpu.conf` as `key = value` lines.
-
-In a container, these are host-wide kernel settings: `kernel.perf_event_*` and
-`kernel.kptr_restrict` are not namespaced, so set them on the host, not inside
-the container. For the same reason `docker run --sysctl` refuses them, since it
-accepts only namespaced keys.
-
-#### Applying them to a VM's kernel
-
-With Docker Desktop on macOS or Windows, and with Colima, Lima or any other
-Linux VM, the kernel that matters is the VM's: `sysctl` on the workstation
-changes nothing that the containers can see. Write the values from a privileged
-container, which shares the VM kernel's `/proc/sys`:
-
-```sh
-docker run --rm --privileged alpine sh -c '
-  echo 1    > /proc/sys/kernel/perf_event_paranoid
-  echo 0    > /proc/sys/kernel/kptr_restrict
-  echo 1024 > /proc/sys/kernel/perf_event_max_stack
-  echo 2048 > /proc/sys/kernel/perf_event_mlock_kb
-  echo 0    > /proc/sys/kernel/unprivileged_bpf_disabled'
-```
-
-`--privileged` is what makes `/proc/sys` writable; without it the container gets
-it read-only, and adding `--cap-add SYS_ADMIN` or
-`--security-opt seccomp=unconfined` changes nothing that `--privileged` has not
-already granted. The writes affect the whole VM and last until it restarts, so
-this is a per-boot step rather than a one-time setup. The commands are listed
-one per line on purpose: the last one fails with `EPERM` on a kernel where
-`unprivileged_bpf_disabled` already reads `1`, and chaining them with `&&` would
-hide the earlier successes behind that failure. It is also the one line that is
-optional — see [Running the collector without root](#running-the-collector-without-root).
-
-#### Running the collector without root
-
-`kernel.unprivileged_bpf_disabled = 0` re-enables the `bpf()` syscall for
-callers that hold no BPF capability:
-
-```sh
-sudo sysctl -w kernel.unprivileged_bpf_disabled=0
-```
-
-It does **not** make jonoffcpu work unprivileged. Unprivileged `bpf()` only ever
-permitted socket-filter programs, while the collector loads tracepoint programs
-and uses helpers that require `CAP_BPF` plus `CAP_PERFMON`; with those
-capabilities the sysctl is not consulted at all. It is worth setting only where
-something else in the toolchain trips over the syscall gate. Note that the value
-`1` is a one-way latch: once the sysctl reads `1`, the kernel refuses to change
-it until the next boot, so a host that has disabled unprivileged BPF that way
-has to be rebooted (distributions that default to `2` can be changed at
-runtime).
-
-### Profiling in Docker
-
-The agent and the collector both run inside the container with the JVM: the
-agent extracts the collector from its JAR and starts it as a child process, and
-the eBPF program resolves thread ids inside the target's own PID namespace. So
-the container is profiled as it is: neither `--pid=host` nor `--net=host` is
-needed, and no kernel headers have to be mounted, because the collector is CO-RE
-and reads the kernel's own BTF. General-purpose BPF toolbox images ask for all
-of these because they trace the whole host from outside, and because BCC
-compiles its programs against kernel headers at runtime. The only case that
-needs `--pid=host`, or `--pid=container:<id>`, is running the standalone
-collector against a target in another container, which is what this
-repository's proof scripts do.
-
-| The container needs | How | Why |
-| --- | --- | --- |
-| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default seccomp profile permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
-| `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | Earlier releases attached `sched_switch` as a classic tracepoint, for which libbpf reads the numeric id from `events/sched/sched_switch/id`. Both hooks are now BTF raw tracepoints, and on a Linux host the packaged smoke passes without `tracefs` mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
-| Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
-| An executable temporary directory | `-Dio.github.jonoffcpu.agent.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
-
-BTF needs nothing: `/sys/kernel/btf/vmlinux` is part of the container's own
-`sysfs` and is readable already.
-
-Mount `tracefs` with a `local` volume, which passes its options straight to
-`mount`:
-
-```sh
-docker volume create --driver local \
-  --opt type=tracefs --opt device=tracefs --opt o=ro tracefs
-
-docker run --rm \
-  --cap-add BPF --cap-add PERFMON \
-  -v tracefs:/sys/kernel/tracing \
-  your-image \
-  java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
-```
-
-Read-only is enough, because nothing writes to it. The equivalent in Compose:
-
-```yaml
-volumes:
-  tracefs:
-    driver: local
-    driver_opts: { type: tracefs, device: tracefs, o: ro }
-services:
-  app:
-    cap_add: [BPF, PERFMON]
-    volumes:
-      - tracefs:/sys/kernel/tracing
-```
-
-Docker performs this mount itself, before the container starts, so it works in
-an unprivileged container and needs nothing bind-mounted from the host. Bind
-mounting the host's `/sys/kernel/tracing` is equivalent where the host is Linux.
-Mounting `tracefs` from inside the container instead requires `--privileged`:
-`/sys` is mounted read-only and locked, so `--cap-add SYS_ADMIN` alone cannot do
-it. If a hardened runtime refuses the capability-based setup, `--privileged` is
-the blunt alternative; it is what this repository's own proof scripts use.
-
-#### Docker Desktop on macOS and Windows
-
-There the containers run in a Linux VM, and the kernel is the VM's, not the
-host operating system's. Bind mounting `/sys/kernel/tracing` cannot work, since
-that path would be resolved on macOS or Windows; the `local` volume above does
-work, because Docker mounts it inside the VM. The sysctls are the VM's too, and
-are set as described in
-[Applying them to a VM's kernel](#applying-them-to-a-vms-kernel).
-
-The kernel features are the real question. jonoffcpu needs BTF, eBPF task
-storage, `bpf_send_signal_task`, and the `tp_btf/sched_exit_tp` tracepoint,
-which is recent enough that Docker Desktop's LinuxKit kernel and a stock WSL2
-kernel may not have it; the agent then fails closed rather than producing
-degraded data. Check the VM you have before going further:
-
-```sh
-docker run --rm --privileged alpine sh -c '
-  uname -r
-  ls -l /sys/kernel/btf/vmlinux
-  mount -t tracefs tracefs /sys/kernel/tracing &&
-    cat /sys/kernel/tracing/events/sched/sched_switch/id
-  grep -ac btf_trace_sched_exit_tp /sys/kernel/btf/vmlinux'
-```
-
-All four must succeed, the last one printing a non-zero count. If they do not,
-supply a newer kernel — on Windows through `kernel=` in `.wslconfig`, on macOS
-through a VM manager that lets you choose the image — or profile on a Linux
-host. Either way, only a JVM running inside that Linux VM can be profiled; a
-JVM running natively on macOS or Windows is invisible to it.
+Because the agent runs async-profiler, adding `lock=10ms` to
+`asyncProfilerOptions` records lock contention into the same JFR as the
+off-CPU samples, and the same converter renders it; see
+[Other views of the same recording](docs/analysis.md#other-views-of-the-same-recording).
 
 ## Quick start
 
+**Before you start**, you need:
+- 64-bit Linux on x86-64 or arm64, whose kernel has BTF and the eBPF features
+  the agent checks at startup. This prints a non-zero count on a suitable
+  kernel:
+
+  ```sh
+  test -r /sys/kernel/btf/vmlinux && grep -ac btf_trace_sched_exit_tp /sys/kernel/btf/vmlinux
+  ```
+
+- `CAP_BPF` and `CAP_PERFMON`, or root, for the profiled JVM.
+- Java 17 or newer for the agent, and Java 21 or newer for the correlator.
+
+async-profiler, which runs inside the JVM, needs these kernel settings to see
+kernel frames and deep native stacks:
+
+```sh
+sudo sysctl -w kernel.perf_event_paranoid=1 kernel.kptr_restrict=0 \
+  kernel.perf_event_max_stack=1024 kernel.perf_event_mlock_kb=2048
+```
+
+[Setting up a host](docs/setup.md) explains each setting, and covers
+containers (`--cap-add BPF --cap-add PERFMON`) and Docker Desktop.
+
 ### 1. Get the JARs
 
-Download the latest
-[GitHub Release](https://github.com/jonoffcpu/jonoffcpu/releases), which
-contains the three JARs:
+Download the three JARs of the latest
+[GitHub Release](https://github.com/jonoffcpu/jonoffcpu/releases):
 
 ```sh
 gh release download -p '*.jar' -R jonoffcpu/jonoffcpu
@@ -542,13 +136,13 @@ gh release download -p '*.jar' -R jonoffcpu/jonoffcpu
 Pass a tag such as `v0.7.0` after `download` to pick a specific release
 instead of the latest one.
 
-| JAR | What it is | When you use it |
-| --- | --- | --- |
-| `jonoffcpu-agent.jar` | The Java agent. Bundles the eBPF collector, the JNI bridge, and the patched async-profiler for Linux x86-64 and arm64, and drives the whole capture lifecycle. | Attached to the JVM being profiled with `-javaagent`. |
-| `jonoffcpu-correlator.jar` | The offline correlator CLI. Joins the combined JFR with the correlation stream, verifies integrity, and writes derived outputs such as collapsed stacks and the stack profile. | Run after the capture, on any machine with Java 21+. |
-| `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the pinned fork so that it understands the `profiler.Signal*` events and accepts `--units` to label the flame graph in microseconds. | Renders the correlator's collapsed stacks as an off-CPU flame graph whose widths are microseconds of off-CPU time. |
+| JAR | What it is |
+| --- | --- |
+| `jonoffcpu-agent.jar` | The Java agent. It bundles the eBPF collector, the JNI bridge and the patched async-profiler for every supported platform, and drives the capture. |
+| `jonoffcpu-correlator.jar` | The offline correlator. It joins the JFR with the correlation stream, verifies their integrity, and writes the flame-graph input, the stack profile and the digest. |
+| `jfr-converter.jar` | async-profiler's [`jfrconv`](https://github.com/async-profiler/async-profiler/blob/master/docs/ConverterUsage.md), built from the fork so that it labels flame graphs in microseconds. |
 
-The examples below assume all three JARs are in the current directory.
+The commands below assume all three JARs are in the current directory.
 
 ### 2. Record
 
@@ -564,23 +158,18 @@ sampling:
     recordAllAboveMicros: 10000
 ```
 
-`asyncProfilerOptions` is passed to async-profiler unchanged, so any of its
-[usual events](https://github.com/async-profiler/async-profiler/blob/master/docs/ProfilingModes.md)
-can be recorded alongside the off-CPU samples. `recordAllAboveMicros: 10000`
-records every wait of 10 ms or longer and samples shorter ones in proportion
-to their length, so long waits are never missed and the run-queue noise does
-not swamp the capture; `minOffCpuMicros: 100` drops the sub-100 µs context
-switches entirely. See [Choosing what to sample](#choosing-what-to-sample).
-Start the application:
+This records every wait of 10 ms or longer and samples shorter ones in
+proportion to their length. It drops context switches shorter than 100 µs
+entirely, and records CPU and allocation profiles alongside. Start the
+application with the agent:
 
 ```sh
 java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
 ```
 
-The capture finishes when the JVM exits normally, or earlier if the application
-calls `io.github.jonoffcpu.agent.SignalCaptureAgent.stop()`. Abrupt
-termination leaves visibly incomplete artifacts rather than a plausible-looking
-partial result.
+The capture finishes when the JVM exits normally. See
+[Configuring the capture](docs/capture.md) for every option, how to choose a
+sampling policy, and what a capture costs.
 
 ### 3. Correlate
 
@@ -593,36 +182,17 @@ java -jar jonoffcpu-correlator.jar \
   --app '^com\.example\.'
 ```
 
-`--app` names your application's frames, and roots the digest at them: its
-tables name the application method that waited and what it blocked on, where
-each thread entered your code, and the application methods the time passed
-through, with executors and lambda bridges hidden first (`--hide-from`, by
-default `preset:jvm-dispatch`) and the blocked time that has no application frame
-counted apart, by thread pool. Without it the digest ranks the leaves of the
-stacks, which name the wait mechanism rather than the code that waited.
+`--app` names your application's frames, so that the analysis ranks your code
+rather than the lock and park internals under it. `--estimate-population
+true` keeps the estimates valid for comparing runs.
 
-The digest calls the off-CPU time it ranks *blocked*: a thread off the CPU
-while it had work to do, on a lock, a monitor, I/O or a safepoint. A thread off
-the CPU until work arrives, such as an event loop or a pool worker waiting for a
-task, is *waiting*; `--waiting-from` (default `preset:jvm-waiting`) recognizes
-it, and the digest counts it in *Where the time went* and leaves it out of its
-tables. The digest opens with when the capture was recorded, the window
-analysed, and the JVM, OS and CPU from the JFR's own events. The target's
-command line, system properties and environment variables can hold secrets, so
-the report and the digest carry them only with `--process-details true`.
+### 4. Read the digest and the flame graph
 
-`--estimate-population true` keeps the inverse-probability estimates valid,
-which comparisons between runs need when sampling is proportional or uniform:
-on an Apache Pulsar broker the blocked waits add up to 49.0 s observed but
-101.4 s estimated, because proportional admission keeps short waits with a
-lower probability.
-
-The output directory then holds `jonoffcpu-report.json`,
-`jonoffcpu-offcpu-stacks.collapsed`, `jonoffcpu-offcpu-profile.pb`, the digest
-`jonoffcpu-summary.md`, the row-level audit files, and `jonoffcpu-complete.json` as the last file written;
-[Files jonoffcpu writes](#files-jonoffcpu-writes) describes each one.
-
-### 4. Render the flame graph
+Start with `/tmp/jonoffcpu-analysis/jonoffcpu-summary.md`, the digest. It
+states when and on what machine and JVM the capture was recorded. It ranks the
+blocked time by the application method that waited and what it blocked on,
+shows where the time went, and gives the command that reproduces each table.
+Then render the flame graph:
 
 ```sh
 java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
@@ -630,596 +200,65 @@ java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
   /tmp/jonoffcpu-analysis/offcpu.html
 ```
 
-Open `offcpu.html` in a browser. Frame widths are proportional to the total
-off-CPU time observed under that Java stack. The collapsed weights are
-microseconds of off-CPU time, and `--units µs` makes the flame graph say so
-instead of counting "samples"; that option is a fork addition, so use the
-provided `jfr-converter.jar` rather than a stock `jfrconv`. Add `--reverse` to see which
-blocking calls dominate regardless of caller. To keep or drop stacks by frame,
-render the slice from the stack profile with `--include`/`--exclude` (step 5),
-which also matches frames the graph does not show. Any tool that reads the collapsed-stack
-format, such as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph)
-with `--countname=µs`, works on the same file.
+Frame widths in `offcpu.html` are microseconds of off-CPU time.
 
-### Other views of the same recording
+**Next steps:**
+- [Find what to optimize](docs/analysis.md#find-what-to-optimize) with `top`
+  and the application-rooted flame graph.
+- [Slice and filter](docs/analysis.md#slice-and-filter-with-the-stack-profile)
+  the stack profile without correlating again.
+- [Compare runs](docs/analysis.md#compare-runs) per unit of work.
+- Hand the results to an [AI agent or to SQL](docs/automation.md).
 
-The agent's JFR also holds whatever `asyncProfilerOptions` recorded, and the
-same converter renders it. Render a view only for events that were
-configured: `jfrsync` alone does not make an allocation or lock view
-meaningful.
+## Documentation
 
-| `asyncProfilerOptions` contains | View | Converter |
-| --- | --- | --- |
-| `event=cpu` (or `itimer`, `ctimer`) | CPU | `--cpu` |
-| `event=wall` or `wall=` | wall clock | `--wall` |
-| `alloc=` | allocation | `--alloc --total` |
-| `lock=` | Java lock contention | `--lock --total` |
-
-```sh
-java -jar jfr-converter.jar --cpu -o collapsed /tmp/jonoffcpu-capture.jfr cpu.collapsed
-java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
-  --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
-java -jar jfr-converter.jar cpu-trimmed.collapsed cpu.html
-```
-
-Add `--threads` for a per-thread split and `-o collapsed` for
-machine-readable output. The converter writes class names as
-`org/example/Class` with `_[j]`-style markers; `stacks --collapsed-input` and
-`top --collapsed-input` normalize them, so the transforms of step 5 and the
-tables of step 6 apply to these views too.
-
-### 5. Slice and filter with the stack profile
-
-`jonoffcpu-offcpu-profile.pb` holds every distinct stack once with its
-counters, so any other collapsed file is a sub-second projection of it rather
-than a new correlation (913 KB and 0.3 s for a capture that takes a minute to
-correlate):
-
-```sh
-# Time spent waiting for a CPU, whatever the Java code was doing
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --reason runnable,preempted --output cpu-wait.collapsed
-
-# Java stacks continued by the kernel stack, so the wait mechanism is visible
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --stack java+kernel --summary blocked.json --output blocked.collapsed
-
-# ... without waits for work on a socket or an epoll loop
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --stack java+kernel --exclude '(ep_poll|sock_recvmsg|tcp_recvmsg)_\[k\]' \
-  --summary blocked.json --output blocked.collapsed
-
-# Java stacks only, without the Netty event loops' epoll waits for work
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --exclude 'io\.netty\.channel\.epoll\.Native\.epollWait0' --output app.collapsed
-
-# A kept list of waits for work, one pattern per line
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --exclude-from waiting.txt --output blocked-java.collapsed
-
-# Only the time threads spent waiting for a CPU after they were woken
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --time runqueue --output runqueue.collapsed
-
-# Every interval, each stack ending in a [sleeping] or [runqueue] frame
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --time split --output split.collapsed
-
-# Shorter frames: io.netty.channel.epoll.Native.epollWait0 becomes i.n.c.e.Native.epollWait0
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --package-names abbreviate --output short.collapsed
-
-# Blocked waits only, each stack from your first frame to the lock or monitor it waited on
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --exclude-from preset:jvm-waiting --root-at '^com\.example\.' \
-  --collapse-leaf-from preset:jvm-wait-machinery --output blocked-app.collapsed
-
-# The application-rooted flame graph: executors and lambda bridges hidden, so each stack
-# starts at the work it ran, and blocked time without an application frame left out and reported
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --exclude-from preset:jvm-waiting --canonical-names --hide-from preset:jvm-dispatch \
-  --root-at '^com\.example\.' --root-at-unmatched hide \
-  --collapse-leaf-from preset:jvm-wait-machinery --output blocked-app-root.collapsed
-
-# The same transforms on any collapsed file, such as the recording's CPU view
-java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
-  --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
-```
-
-`--reason` takes `all` (the default) or a comma-separated list of `blocked`,
-`runnable` and `preempted`;
-a slice with more than one reason starts each line with its
-`[offcpu: <reason>]` frame unless `--reason-frame never` is given. `--stack` is
-`java` (the default), `kernel`, `user`, `java+kernel` or `java+user+kernel`;
-native frames are shown without their `+0x` offsets, kernel frames carry the
-`_[k]` suffix, and the profiler's own tracing frames at the leaf of a kernel
-stack are left out. `--weights estimated` renders the inverse-probability
-estimate instead of the observed durations, when the capture's population
-estimate is available. `--time` picks which part of each interval's time is
-weighed: `total` (the default), `sleeping`, `runqueue`, or `split`, which keeps
-the whole time and ends each line in a `[sleeping]`, `[runqueue]` or
-`[unsplit]` frame so one flame graph shows both waits; every mode but `total`
-needs a profile whose capture recorded the split. `--package-names abbreviate`
-shortens each Java frame's package to its initials (`i.n.c.e.Native.epollWait0`)
-and `--package-names drop` removes it (`Native.epollWait0`); `full` is the
-default. Only Java frames change: the native frames async-profiler records in
-the Java stack (HotSpot, JNI libraries, libc, runtime stubs) keep their library
-and symbol as written.
-
-| Frame | `abbreviate` | `drop` |
-| --- | --- | --- |
-| `io.netty.channel.epoll.Native.epollWait0` | `i.n.c.e.Native.epollWait0` | `Native.epollWait0` |
-| `org.example.Cursor$$Lambda.0x0000000081a16ff8.run` | `o.e.Cursor$$Lambda.0x0000000081a16ff8.run` | `Cursor$$Lambda.0x0000000081a16ff8.run` |
-| `libjvm.so.Unsafe_Park` | unchanged | unchanged |
-
-Stacks that become identical merge into one line, and
-`--include`/`--exclude` still match the full names. Rendered with its defaults, a
-profile reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
-
-`--exclude REGEX` drops every interval with a frame matching the pattern, and
-`--include REGEX` keeps only intervals with one; both can be repeated (any
-pattern matches), and an exclusion wins. Filtering happens on the profile's
-entries, before they are merged into collapsed lines, so it removes whole
-intervals and matches every stack the profile holds, whichever `--stack`
-renders: `--stack java --exclude 'ep_poll_\[k\]'` drops the epoll waits from a
-Java-only graph. Patterns are searched for in each frame as it would be
-rendered (Java names, offset-free native symbols, kernel symbols with `_[k]`,
-and `[kernel stack unavailable]`/`[user stack unavailable]` for a missing
-stack); anchor them with `^…$` for an exact frame. The `--summary` file
-records the slice's interval count and total nanoseconds, the patterns, the
-stacks they were matched against (`filterScope`), and under `filtered` what
-the filters removed, so the kept and removed time add up to the unfiltered
-slice. The converter's own `-I`/`-X` still work on a rendered file, but see
-only the frames in its lines and cannot account for what they drop.
-
-`--include-from FILE` and `--exclude-from FILE` read patterns from a file, one
-per line, and add them to any given with `--include`/`--exclude`; both repeat.
-Blank lines and lines starting with `#` are skipped (write `\#` for a pattern
-that starts with `#`), and every other line is taken verbatim, spaces included.
-A file with no patterns, or with an invalid one, is refused, naming the line.
-
-Filters keep or drop whole intervals; transforms change the frames of the
-intervals kept, and never a total, except `--root-at-unmatched hide`, which
-moves the unmatched intervals to a total of their own. `--trim-root` strips
-the longest root-side run of matching frames (thread, executor and event-loop
-entry points), `--root-at` starts each stack at its root-most matching frame
-and puts stacks without one under `[no application frame]` (or keeps them with
-`--root-at-unmatched keep`, or leaves them out, reported in the summary's
-`rootAtUnmatchedHidden`, with `hide`), `--leaf-at` cuts below the
-leaf-most match, `--collapse-leaf` replaces the lock, park and monitor
-internals under a wait with the frame that entered them (or a category such as
-`[lock]` with `--collapse-leaf-label category`), `--hide` removes matching
-frames anywhere, `--canonical-names` removes generated-class addresses so two
-runs compare, and `--thread-frame name|pool` starts each line with the thread
-or its pool. Each has a `-from FILE` form, and every `-from` option, the
-filters' included, also takes a bundled `preset:jvm-infra`,
-`preset:jvm-wait-machinery`, `preset:jvm-waiting` or `preset:jvm-dispatch`, the
-lambda bridges and executor adapters that only forward to a task, for `--hide`
-(`stacks --list-presets` prints them). `preset:*` stands for every bundled
-preset meant for the option it is given to, as the preset's `# options:` line
-says: `--hide-from 'preset:*' --hide-from my-hide.txt` keeps jonoffcpu's
-patterns and adds yours, and picks up a preset a later release adds. An option
-without presets (`--include-from`, `--root-at-from`, `--leaf-at-from`,
-`--app-from`) refuses it. Quote it, so the shell does not glob it.
-Filters always see the untransformed stack. On an Apache Pulsar broker's blocked
-waits, `--root-at` with `--collapse-leaf` turns 164 lines at a mean depth of 23
-frames into 78 lines of about 4. `--collapsed-input FILE` applies the same
-filters and transforms to any collapsed file, such as the converter's CPU or
-allocation view, whose `_[j]`-style markers and `/`-separated class names it
-normalizes; the order and every rule are in
-[OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#transforms).
-
-Profiles merge and export as well:
-
-```sh
-java -jar jonoffcpu-correlator.jar merge --profiles run1.pb,run2.pb --output runs.pb
-java -jar jonoffcpu-correlator.jar export --profile runs.pb --format csv --output entries.csv
-duckdb -c "SELECT reason, java_stack, sum(observed_nanos) / 1e9 AS seconds
-           FROM read_csv('entries.csv') GROUP BY ALL ORDER BY seconds DESC LIMIT 20"
-```
-
-`top` ranks the same profile instead of drawing it: each interval is waiting when
-a frame matches `--waiting`/`--waiting-from` (for example `preset:jvm-waiting`) and blocked
-otherwise, and blocked time is attributed to the deepest frame of your code
-(`--app`) and the lock, monitor or park below it, with waiting time in a table of
-its own. `summarize` writes the same tables into the digest that correlation
-writes by default:
-
-```sh
-java -jar jonoffcpu-correlator.jar top --profile runs.pb \
-  --app '^com\.example\.' --waiting-from preset:jvm-waiting --format md
-java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
-  --units 5 --baseline-units 5 --app '^com\.example\.' --waiting-from preset:jvm-waiting
-```
-
-A merged profile sums durations across its inputs: it shows what dominates
-across the runs, not what fraction of any one run's time it took. Thinned
-profiles cannot be merged, because each is rescaled by its own probability.
-
-### 6. Find what to optimize
-
-A flame graph of every off-CPU interval is dominated by threads waiting for
-work: event loops in `epoll_wait`, pool workers waiting for a task, the JVM's
-own service threads. In an Apache Pulsar broker that is over 99 % of the time.
-Rank what remains by the application code that waited:
-
-```sh
-java -jar jonoffcpu-correlator.jar top \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --app '^com\.example\.' --waiting-from preset:jvm-waiting --format md
-```
-
-Each row is the deepest frame of your code in the stack (its *boundary*) with
-the *blocker* below it — a monitor, a `ReentrantLock`, a park — and the time
-and intervals spent there. Waits for work are listed in their own table, so you can
-check that nothing important was classified as waiting; the over-exclusion line
-counts waiting intervals that still waited on a lock. Add `--waiting` or
-`--waiting-from` lines for your own queues' waits for work: on a Pulsar broker,
-with `--app '^org\.apache\.'` and one more waiting line for BookKeeper's executor
-queue (`--waiting '^org\.apache\.bookkeeper\.common\.collections\.[\w$]*BlockingQueue\.take(All)?$'`),
-the top of the table reads:
-
-| Boundary | Blocker | s | Intervals |
-| --- | --- | ---: | ---: |
-| `…PersistentDispatcherMultipleConsumers.internalConsumerFlow` | `C2 Runtime complete_monitor_locking` | 11.982 | 4,245 |
-| `…GrowableBatchedArrayBlockingQueue.offer` | `java.util.concurrent.locks.ReentrantLock.lock` | 4.946 | 1,565 |
-| `…MessageDeduplication.isDuplicateNormal` | `C2 Runtime complete_monitor_locking` | 0.801 | 187 |
-
-Then look at one row in context with a trimmed flame graph:
-
-```sh
-java -jar jonoffcpu-correlator.jar stacks \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --exclude-from preset:jvm-waiting \
-  --root-at '^com\.example\.' --collapse-leaf-from preset:jvm-wait-machinery \
-  --package-names drop --output blocked.collapsed
-java -jar jfr-converter.jar --units µs blocked.collapsed blocked.html
-```
-
-`--root-at` starts each stack at your first frame, so the same call reached
-through different threads or executors merges; `--collapse-leaf` replaces the
-lock and park internals under the blocker with the blocker itself. Finally,
-`--time split` shows whether a row's time was spent asleep or waiting for a
-CPU after the wakeup.
-
-The flame graph's other end is ranked too. With `--hide-from
-preset:jvm-dispatch --root-at '^com\.example\.' --root-at-unmatched hide`,
-`top --by root` lists where threads entered your code, and `top --by app-method --app '^com\.example\.'`
-ranks every application method across the stacks it is in, methods that are
-always called together grouped into one call chain, with the time of the
-stacks that end in them as their self time. With hiding, their shares and
-those of `--by boundary` are of the blocked time that has an application frame.
-
-To compare two runs, give `top` the earlier profile as `--baseline` and each
-run's work as units, for example millions of messages; it lists each boundary's
-time per unit in both runs and warns when the runs are not comparable:
-
-```sh
-java -jar jonoffcpu-correlator.jar top --profile new.pb --baseline old.pb \
-  --units 5 --baseline-units 5 --weights estimated \
-  --app '^com\.example\.' --waiting-from preset:jvm-waiting
-```
-
-## Analyzing with AI agents
-
-Give an agent the digest first: `jonoffcpu-summary.md` in the analysis
-directory (or `summarize --profile … --app …`, which takes the capture section
-from the report the profile carries), written with `--app` so that its tables
-name your code. It is bounded in size, says when and on what the capture was
-recorded, states its coverage and losses, defines its terms, and holds the
-ranked tables with the exact command that reproduces each one, so the agent can drill down with
-`top --format json` or `stacks` instead of reading raw stacks. For custom
-questions, `export --format jsonl` gives one row per profile entry, frames as
-arrays (see [Analyzing with SQL](#analyzing-with-sql)). Do not hand an agent
-the capture stream or the JFR: they are large, binary, and
-the correlator has already extracted what they contain. When comparing runs,
-give it `top --baseline` output, which normalizes per unit of work and warns
-when the runs are not comparable.
-
-## Analyzing with SQL
-
-`export --format jsonl` writes one row per profile entry that
-[DuckDB](https://duckdb.org/) reads directly: the stacks as arrays
-(`javaFrames`, `kernelFrames`, `userFrames`), the counters, the thread's pool,
-a canonical stack that joins across runs, and on every row the `run` and
-whether its estimated columns are valid. The 64-bit counters are decimal
-strings, as the proto3 JSON mapping writes them, so cast them to `UBIGINT` (or
-declare the column types in `read_json`). Rank the blocked waits by application
-boundary:
-
-```sh
-java -jar jonoffcpu-correlator.jar export \
-  --profile /tmp/jonoffcpu-analysis/jonoffcpu-offcpu-profile.pb \
-  --format jsonl --output broker-offcpu.jsonl
-```
-
-```sql
-CREATE TEMP TABLE entries AS
-SELECT javaFrames AS frames, observedNanos::UBIGINT AS nanos, intervals::UBIGINT AS intervals
-FROM read_json('broker-offcpu.jsonl', format = 'newline_delimited');
-
-SELECT coalesce(list_filter(frames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1],
-                '[no application frame]') AS boundary,
-       round(sum(nanos) / 1e9, 3) AS seconds, sum(intervals) AS intervals
-FROM entries
-WHERE NOT list_bool_or(list_transform(frames, lambda f: regexp_matches(f,
-      '^(io\.netty\.channel\.epoll\.Native\.epollWait0?|java\.util\.concurrent\.ThreadPoolExecutor\.getTask|sun\.nio\.ch\.SelectorImpl\.select|java\.util\.concurrent\.ForkJoinPool\.awaitWork)$|BlockingQueue\.take(All)?$|^java\.lang\.ref\.|^libasyncProfiler\.so\.')))
-GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
-```
-
-On a Pulsar broker this returns `internalConsumerFlow` with 11.982 s in 4,245
-intervals and `GrowableBatchedArrayBlockingQueue.offer` with 4.946 s in 1,565
-as the top application rows, as `top` does. To compare runs, export each with
-its own `--run-label` and load them into one table; `--run-metadata FILE`
-writes each profile's provenance and totals as one JSON object (a
-`RunMetadata` message) to join on
-`run`. Seconds per million measured messages and share of blocked application
-time, for two runs of 5 million messages each:
-
-```sql
-CREATE TEMP TABLE e AS
-SELECT 5.0 AS mmsgs, * FROM read_json(['alpine.jsonl', 'wolfi.jsonl'], format = 'newline_delimited');
-
-WITH b AS (
-  SELECT run, mmsgs, observedNanos::UBIGINT AS nanos,
-         list_filter(javaFrames, lambda f: regexp_matches(f, '^org\.apache\.'))[-1] AS boundary
-  FROM e
-  WHERE NOT list_bool_or(list_transform(javaFrames, lambda f: regexp_matches(f, '<waiting patterns>'))))
-SELECT boundary,
-       round(sum(nanos) FILTER (WHERE run = 'alpine') / 1e9 / any_value(mmsgs), 3) AS alpine_s_per_m,
-       round(sum(nanos) FILTER (WHERE run = 'wolfi') / 1e9 / any_value(mmsgs), 3) AS wolfi_s_per_m
-FROM b WHERE boundary IS NOT NULL
-GROUP BY 1 ORDER BY greatest(coalesce(alpine_s_per_m, 0), coalesce(wolfi_s_per_m, 0)) DESC LIMIT 20;
-```
-
-Replace `<waiting patterns>` with the lines of `preset:jvm-waiting`
-(`stacks --list-presets` prints them) joined with `|`. Use `estimatedNanos`
-instead of `observedNanos` only when `estimateAvailable` is true for both runs:
-under proportional admission observed time under-weights short waits (the
-broker's blocked slice is 49.0 s observed and 101.4 s estimated).
-
-## Example: Apache Pulsar
-
-jonoffcpu grew out of optimizing [Apache Pulsar](https://pulsar.apache.org/).
-The Pulsar performance launcher profiles a broker and its clients with the
-agent under a load scenario, then correlates and renders the results. In an
-IoT scenario (5 million messages from 500 producers to one topic) the broker
-spent 8,519 s off-CPU across its threads, and after `preset:jvm-waiting` and one
-BookKeeper queue line only 49.0 s of that was blocked. `top --app
-'^org\.apache\.'` put two rows ahead of everything else:
-`PersistentDispatcherMultipleConsumers.internalConsumerFlow` waiting on a
-monitor, 12.0 s, and the BookKeeper executor queue's `offer` waiting on a
-`ReentrantLock`, 4.9 s. The same tables on an Alpine (musl) image counted
-2,019 s as blocked instead of 49 s: on musl every native frame is
-`/lib/ld-musl-x86_64.so.1`, so the JVM's own GC and compiler threads waiting for work cannot
-be recognized, and a glibc image is needed for the blocked total without an
-application frame to mean anything. The application rows still compare, which
-is what `top --baseline` restricts itself to.
-
-`export --format jsonl` also carries each stack as an array (`javaFrames`,
-`kernelFrames`, `userFrames`), the stack without generated-class addresses
-(`canonicalJavaStack`), the thread's pool (`threadPool`), a `run` column
-(`--run-label`), and on every row whether the estimated columns are valid
-(`estimateAvailable`); its 64-bit counters are decimal strings. `--run-metadata FILE`
-writes the profile's provenance and totals as one JSON object. The columns
-are listed in [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md#stack-profile).
-
-## Configuration
-
-### Agent options
-
-| Option | Meaning |
+| Guide | What it covers |
 | --- | --- |
-| `correlationOutput` | Required. Path of the correlation stream. Must not exist yet. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](#files-jonoffcpu-writes). |
-| `asyncProfilerOptions` | Required. async-profiler options, including one absolute `file=` path for the JFR. |
-| `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
-| `sampling.reasons` | Optional list of switch-out reasons to record: `blocked`, `runnable`, `preempted`. Default `[blocked]`; see [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
-| `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |
-| `sampling.maxOffCpuMicros` | Optional strict upper bound on the off-CPU duration, in microseconds. |
-| `sampling.admission.policy` | Required. `proportional`, `uniform`, or `none`. |
-| `sampling.admission.recordAllAboveMicros` | `proportional` only. Intervals at least this long are always recorded; shorter ones with probability `length / recordAllAboveMicros`. |
-| `sampling.admission.probability` | `uniform` only. `"0.000"` through `"1.000"`; every eligible interval is recorded with this probability. `"0"` is the same as policy `none`. Quote the value to keep its exact spelling in the capture metadata. |
-| `timeSplit.source` | `schedInfo` (default) records each interval's run-queue part from the scheduler's `sched_info.run_delay`, splitting its time into sleeping and run-queue time; `"off"` (quoted, since YAML reads a bare `off` as a boolean) reads nothing, for a kernel without `CONFIG_SCHED_INFO`. See [Why the thread left the CPU](#why-the-thread-left-the-cpu). |
-| `signalDelivery` | `queued` (default) uses a dedicated real-time signal and never merges notifications. `coalescing` uses a standard signal and may merge them, trading lost samples for a bounded pending-signal queue. |
-| `nativeStopTimeoutMillis` | Budget for detaching the eBPF source and draining the ring buffer at stop. Default 30000. |
-| `deliveryGraceMillis` | Time allowed after detach for already-requested signals to arrive. Default 100. |
-| `shutdownTimeoutMillis` | How long the JVM shutdown hook waits for the capture to finalize. Default 10000. |
+| [Off-CPU profiling](docs/off-cpu-profiling.md) | What off-CPU time is, why a JVM needs both a kernel and a Java view, why threads leave the CPU, sleeping and run-queue time |
+| [How jonoffcpu works](docs/how-it-works.md) | The capture pipeline, the two capture files, what the Java stack means, every file jonoffcpu writes |
+| [Setting up a host](docs/setup.md) | Kernel requirements and settings, the bundled native libraries, Docker and Docker Desktop |
+| [Configuring the capture](docs/capture.md) | Agent options, choosing what to sample, overhead and the observer effect |
+| [Analyzing a capture](docs/analysis.md) | Correlating, flame graphs, other views, slicing, filtering and transforms, finding what to optimize, comparing runs, correlator options |
+| [AI agents and SQL](docs/automation.md) | The digest as an agent's input, and DuckDB queries over the export |
+| [Building and testing](docs/building.md) | Building from source, test categories, continuous integration |
+| [Offline correlation](jonoffcpu-correlator/OFFLINE.md) | The correlator's contracts: integrity, clipping, weighting, the stack profile, degradation |
+| [The Java agent](jonoffcpu-agent/README.md) | Agent lifecycle, native bundle, programmatic start, the raw `-agentpath` form |
+| [The native collector](jonoffcpu-native/README.md) | The libbpf-rs collector, its eBPF programs and kernel proof tools |
 
-### Choosing what to sample
+## Where jonoffcpu is going
 
-Every off-CPU interval costs the same to *measure* (the kernel does that
-anyway), but *recording* one costs a signal to the thread and a Java stack
-walk, and that cost lands on the thread being measured. Sampling exists to
-keep that disturbance small enough that the profile still describes the
-application rather than the profiler; see
-[Overhead and the observer effect](#overhead-and-the-observer-effect). The
-`sampling` block decides which measured intervals are worth recording. All
-decisions are made in the kernel after the interval's duration is known, in
-this order:
+jonoffcpu started as an experiment in automating performance optimization and
+tuning of [Apache Pulsar](https://pulsar.apache.org/), with its end-to-end
+[performance scenarios](https://github.com/apache/pulsar/tree/master/tests/performance).
+Its features are currently shaped by that work. The application-rooted digest,
+the separation of waiting from blocked time, and comparisons per unit of work
+answer what an optimization loop needs to know after each run.
 
-1. **`reasons`** — which switch-out reasons are recorded, `[blocked]` unless
-   given. Intervals of other reasons are counted by reason and dropped. Adding
-   `runnable` and `preempted` records every preemption of a busy thread, which
-   can multiply the recording rate: pair it with `minOffCpuMicros` or a low
-   `uniform` probability. Before this option existed every interval was
-   recorded whatever its reason, which `reasons: [blocked, runnable, preempted]`
-   reproduces.
-2. **`minOffCpuMicros` / `maxOffCpuMicros`** — strict bounds. Intervals outside
-   them are never recorded and never counted.
-3. **`admission.policy`** — which of the remaining intervals to record:
-   - `proportional`: an interval of at least `recordAllAboveMicros` is always
-     recorded; a shorter one is recorded with probability
-     `length / recordAllAboveMicros`. With `10000`, a 1 ms wait has a 10 %
-     chance and a 10 µs wait 0.1 %.
-   - `uniform`: every interval is recorded with the same `probability`.
-   - `none`: nothing is recorded and no eBPF program is loaded (see below).
+The direction is to support automated performance optimization and tuning more
+broadly: measurements that an AI agent can analyze, act on, and verify against
+a baseline. jonoffcpu does not try to compete with the tooling emerging for AI
+agents in this space. It aims to integrate with that tooling and build on it.
+Two examples of that tooling:
 
-Each policy has exactly one parameter; giving `probability` to `proportional`
-or `recordAllAboveMicros` to `uniform` is a configuration error, as are bounds
-with `none`. There is no default: the block is required so that a capture
-without off-CPU data is always a deliberate choice.
+- [Jafar](https://github.com/btraceio/jafar) is a fast JFR parser with an MCP
+  server that lets AI agents analyze JFR recordings.
+- [jafar-perf-box](https://github.com/btraceio/jafar-perf-box) packages a
+  performance-analysis methodology for AI agents on top of Jafar.
 
-**Which one to use?**
+The recording jonoffcpu writes is an ordinary async-profiler JFR, and its
+derived outputs are documented protobuf messages with a JSON view, so they can
+serve as inputs to such tools.
 
-- *"Show me the slow waits."* `proportional` with `recordAllAboveMicros` set
-  to the duration you never want to miss, say `10000` (10 ms). Every wait of
-  10 ms or more is recorded; shorter waits still appear with the right total
-  width but do not flood the capture. Below the reference the chance of
-  recording an interval grows with its length, so a millisecond of off-CPU
-  time yields the same expected number of samples whether it was one 1 ms
-  wait or ten 100 µs waits: samples follow off-CPU *time*, which is what a
-  duration-weighted flame graph wants, and the recording rate is bounded by
-  the total off-CPU time divided by `recordAllAboveMicros` no matter how many
-  short waits the application makes. The cost does scale with concurrency:
-  when many threads wake from long waits at once, each of them signals.
-- *"I only want the tail and nothing else."* Use `minOffCpuMicros` as the
-  cutoff. Everything below it is invisible rather than under-sampled, and the
-  report's totals describe only the intervals above the bound. A
-  `minOffCpuMicros` at or above `recordAllAboveMicros` degenerates to
-  "record every eligible interval".
-- *"I want everything and can afford it."* `uniform` with `probability: "1"`.
-  Expect the signal rate to track the context-switch rate.
-- *"Uniform, cheap, statistical."* `uniform` with `probability: "0.01"` is a
-  plain 1-in-100 sample of intervals. Long waits are missed 99 times out of
-  100, so pair it with `minOffCpuMicros` to stop short intervals from
-  dominating.
+## Project status
 
-**Reading the results.** The collapsed stacks and flame graph always show the
-durations that were actually observed, so a wait recorded under
-`proportional` appears at its true length. Every observation row records the
-exact admission threshold the kernel drew against, and the correlator's
-`--estimate-population true` reweights the observed intervals by those
-thresholds to estimate the total off-CPU time of all eligible intervals,
-including the ones the sampler skipped: under `proportional`, each recorded
-interval shorter than `recordAllAboveMicros` stands in for
-`recordAllAboveMicros` worth of waiting and each longer one for itself. That
-estimate is exact arithmetic on the recorded thresholds, not a heuristic, but
-a single rare short wait that happened to be caught carries a large weight, so
-treat per-stack estimates for rare stacks as noisy.
+jonoffcpu is under active development and has not reached 1.0. Until the
+1.0.0 release, formats and options change without backward compatibility; the
+[release notes](https://github.com/jonoffcpu/jonoffcpu/releases) list what
+changed. From 1.0.0 on, the configuration, the capture stream, the report, the
+analysis outputs and the command line stay backward compatible unless a
+migration is documented.
 
-### Overhead and the observer effect
-
-Scheduler events are frequent — a busy service switches threads tens of
-thousands of times per second, in extreme cases millions — so, as Brendan
-Gregg's
-[Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html) warns, a
-tracer that costs even a little per event, or that ships every event to user
-space, quickly becomes the largest thing on the machine. `jonoffcpu` is built
-so that the unavoidable per-switch cost stays in the kernel and everything
-else is paid only for intervals that are actually recorded:
-
-| Stage | Applies to | Cost | Where it lands |
-| --- | --- | --- | --- |
-| eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the reason, a read of the scheduler's run delay, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
-| Ring-buffer record + signal | each recorded interval | a 136-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
-| Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
-| Drain and write | each recorded interval | a protobuf record of roughly 120 bytes | the collector's own thread; records are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
-| Symbolize | each **distinct** native stack | one stack-map lookup and per-frame symbol resolution, written once as a `stack` record | the collector's own thread, on first sight of that stack |
-
-The second and third stages are the observer effect: the signal and the stack
-walk are on-CPU time and latency the application would not otherwise have,
-and they can themselves cause context switches. Recording every interval of a
-busy service would therefore change the very thing being measured. The
-admission policy bounds the recording rate, and with `proportional` it bounds
-it in proportion to off-CPU *time* rather than event *count*, so the intervals
-that dominate the profile are always recorded while the short, numerous ones —
-whose recording cost would exceed their information — are sampled. The
-capture's `captureEnd` counters show what the kernel saw against what it
-recorded: `switchOuts` is every switch of the process's threads,
-`eligibleIntervals` the ones inside the bounds, and `selectedIntervals` the
-ones recorded. If `selectedIntervals` is a large fraction of `switchOuts`,
-raise `recordAllAboveMicros` or `minOffCpuMicros`.
-
-Data volume follows the same rule. Stacks are interned: each distinct kernel
-and user stack is symbolized and written once as a `stack` record, and every
-observation references it by id, so a record costs about 120 bytes no matter
-how deep the stack is. A thousand recorded intervals per second write about
-0.12 MB/s of correlation stream, and the same knobs bound disk usage and
-correlation time. Interning and the binary encoding together took a measured
-smoke capture from 3.3 KB to 116 bytes per observation.
-
-Feedback loops — the profiler observing its own waits — are closed in the
-kernel: the collector's drain thread and the agent's controller thread report
-their thread IDs at setup and the eBPF program never records their intervals.
-async-profiler's own threads are ordinary threads of the process and do appear
-when they wait; a `wall=` sampler, for example, shows up under
-`libasyncProfiler.so` frames sleeping for its interval. Leave `wall=` out of
-`asyncProfilerOptions` unless wall-clock samples are wanted alongside the
-measured intervals.
-
-### Turning jonoffcpu off without removing it
-
-Set `sampling.admission.policy: none` to run plain async-profiler through the
-same `-javaagent` line. The agent then loads no eBPF program, negotiates no signal,
-and needs no BPF privileges; async-profiler is started with
-`asyncProfilerOptions` exactly as given, so the JFR contains only its ordinary
-events. The correlation path still receives a one-record stream whose
-`captureFinalized` record has state `FINALIZED_STATE_PROFILER_ONLY`, so the correlator reports
-that there is nothing to correlate instead of failing on a missing file. This
-lets a deployment keep one configuration and flip off-CPU capture on or off.
-
-The agent can also be started programmatically with
-`SignalCaptureAgent.start(path)` or attached at runtime through its
-`Agent-Class` entry point. See [jonoffcpu-agent/README.md](jonoffcpu-agent/README.md).
-
-### Correlator options
-
-The generated help is the reference: `java -jar jonoffcpu-correlator.jar help
-<command>` lists every option of `correlate`, `stacks`, `top`, `summarize`,
-`merge`, `export` and `dump`. The most used correlation options:
-
-| Option | Meaning |
-| --- | --- |
-| `--from`, `--to` | Select samples by JFR event time. Accepts ISO-8601 timestamps, epoch milliseconds, durations, or offsets from the recording start such as `30s` and `2m`. |
-| `--max-handler-delay-ns` | Reject matches whose Java stack was captured more than this long after the interval ended. |
-| `--from-ns`, `--to-ns` | Clip matched intervals to a window in the source monotonic clock. |
-| `--estimate-population true` | Add a `populationEstimate` to the report: the total off-CPU time of every eligible interval, reweighted by each row's admission threshold. See [OFFLINE.md](jonoffcpu-correlator/OFFLINE.md). |
-| `--max-accounted-loss <f>` | Largest fraction of selected intervals that counted sequence contention may drop before the population estimate is refused (`accounted-loss-above-limit`). Below it the estimate is scaled for the loss and reports it in `accountedLoss`. Default `0.01`. |
-| `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
-| `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json`. |
-| `--audit full\|matches\|none` | How much per-row audit output to write. Default `matches`: `jonoffcpu-matches.jsonl` but not `jonoffcpu-classified-records.jsonl`. |
-| `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses immediately, like earlier releases. `truncate` skips thinning and narrows the window directly. |
-| `--thinning <q>` | Keep each recorded interval with probability `q` and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
-| `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
-| `--collapsed-reason-frame auto\|always\|never` | Whether each line of `jonoffcpu-offcpu-stacks.collapsed` starts with its `[offcpu: <reason>]` frame. Default `auto`: only when the capture mixes reasons. |
-| `--profile-output true\|false` | Whether to write `jonoffcpu-offcpu-profile.pb`. Default `true`. |
-| `--summary-output true\|false` | Whether to write the digest, `jonoffcpu-summary.md` and `.json`. Default `true`. |
-| `--waiting <regex>`, `--waiting-from <file>` | The waits for work that the digest leaves out of its tables and stacks: an interval with a frame matching one is waiting. Default `preset:jvm-waiting`; add an application's own waits for work with a file of your own. The other outputs keep every interval. |
-| `--app <regex>`, `--app-from <file>` | Your application's frames, for the digest: its tables are then rooted at the application, as the application-rooted flame graph is (see [Find what to optimize](#6-find-what-to-optimize)), and blocked time without an application frame is counted by pool instead. Recommended; without it the digest ranks stack leaves. |
-| `--process-details true\|false` | Whether the report keeps, and the digest shows, the target's command line, system properties and environment variables from the JFR (`jdk.JVMInformation`, `jdk.InitialSystemProperty`, `jdk.InitialEnvironmentVariable`). They can hold secrets. Default `false`. |
-| `--hide <regex>`, `--hide-from <file>` | With `--app`, the frames the digest removes before rooting each stack at the application, such as executors that only run a task. Default `preset:jvm-dispatch`; give your own executors in a file of your own, next to the preset. |
-| `--profile-group-by <list>` | Which optional dimensions the profile keeps besides the Java stack and the reason: any of `kernel`, `user`, `thread`, or `none`. Default all three. |
-| `--max-profile-entries <n>` | Entry limit for the profile. Past it the thread, then the user stack, then the kernel stack are dropped from the grouping, which merges entries and changes no total; the report names what was dropped. Default 2,000,000. |
-
-`--max-rows` and `--max-retained-bytes` bound admission; the default
-`--max-retained-bytes` is sixty percent of the JVM's `-Xmx`, never below 256 MiB.
-Plan a capture's memory against roughly 95 bytes of correlator retention per
-recorded interval, plus one retained copy of each distinct Java and native stack
-and the stack profile's entries — retention
-tracks distinct stacks, not capture length, so a long capture with few distinct
-call paths costs little more than a short one.
-
-`java -jar jonoffcpu-correlator.jar help <command>` (or `<command> --help`)
-prints every option of a command with its default, and `--version` the build
-and the async-profiler fork commit. The correlator exits with status 0 for a
-complete result, 2 for narrowed or partial output, and 64 for an invalid
-command line, which it reports with the command's usage.
-
-By default the correlator refuses a JFR whose size or SHA-256 differs from the
-one recorded in the stream's footer. The full output, integrity, and weighting
-contracts are in [jonoffcpu-correlator/OFFLINE.md](jonoffcpu-correlator/OFFLINE.md).
-
-### Using the artifacts as libraries
+## Using the artifacts as libraries
 
 ```kotlin
 dependencies {
@@ -1239,74 +278,17 @@ licensed under Apache-2.0 like async-profiler itself.
 
 ## Building from source
 
-Clone with the async-profiler submodule and build for the current host
-architecture:
-
 ```sh
 git clone --recurse-submodules https://github.com/jonoffcpu/jonoffcpu.git
 cd jonoffcpu
-./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check
+./gradlew jvmCheck                                              # any OS: formatting and the JVM tests
+./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check    # Linux: also the native bundle and its tests
 ```
 
-Development is expected to happen on Linux, on x86-64 or arm64 (`aarch64`).
-The correlator and the converter are ordinary Java and build anywhere, but
-`:jonoffcpu-agent:check` does not: the agent refuses to load its native bundle
-on anything except 64-bit Linux, the native and integration tests need a Linux
-kernel with BTF and the eBPF features listed under
-[Requirements](#requirements), and several of them need privileged Docker. On
-macOS the containers run in a Linux VM whose kernel is not the one the build
-detects, and the build's own C-library detection reads `/proc/self/maps`. On
-Windows, work inside WSL2, which is a Linux VM and behaves like one. Build only
-the host architecture locally: the other one runs under QEMU emulation and is
-far slower than it is worth, and CI covers it on native runners.
-
-The build needs [Amazon Corretto 25](https://aws.amazon.com/corretto/) and
-Docker with [BuildKit](https://docs.docker.com/build/buildkit/); the native
-libraries are compiled in a pinned container against the running kernel's BTF.
-Pass `-PnativeArchitectures=all` to embed both Linux x86-64 and arm64 bundles,
-or `x86_64` / `aarch64` to pick one. Each architecture has a glibc and a musl
-flavour; `-PnativeLibcs` selects `musl` (the default), `glibc`, or `all`.
-Releases embed all four bundles. The agent JAR lands in
-`jonoffcpu-agent/build/libs/` and the runnable correlator JAR in
-`jonoffcpu-correlator/build/libs/`.
-
-The build runs with Gradle's configuration cache, build cache,
-configure-on-demand and parallel execution; the modules share their build
-logic through the convention plugins in `build-logic/`, and every library and
-plugin version is in `gradle/libs.versions.toml`. The native bundle's Dockerfiles
-compile the collector's Cargo dependencies in a layer of their own, so a
-collector change rebuilds only the collector. The tests are JUnit Jupiter
-tests with AssertJ: `src/test` holds unit tests that run on any platform with
-Java, and `src/integrationTest` holds the tests that need the native bundle,
-a packaged JAR, Docker or an external tool, including the agent's end-to-end
-tests against the host kernel in privileged Testcontainers. What both
-suites share is in `src/testFixtures`, Gradle's test fixtures. `check` runs
-both; [`CODING.md`](CODING.md) describes the conventions and the time budget
-they keep. CI publishes a
-[Build Scan](https://scans.gradle.com) for every Gradle build, and restores
-the native bundle's Docker layers from the GitHub Actions cache with
-`-PdockerCache=gha` (`-PdockerCacheWrite=true` also exports them, which CI
-does only on `main`).
-
-The converter is built from the same fork's `src/converter` sources by the
-`jonoffcpu-jfr-converter` module:
-
-```sh
-./gradlew :jonoffcpu-jfr-converter:check
-```
-
-Every [CI run](https://github.com/jonoffcpu/jonoffcpu/actions) also publishes
-the three JARs as a `jonoffcpu-runnable-jars` workflow artifact:
-
-```sh
-gh run download <run-id> --repo jonoffcpu/jonoffcpu \
-  --name jonoffcpu-runnable-jars --dir jonoffcpu-runnable-jars
-```
-
-Formatting is enforced with [Spotless](https://github.com/diffplug/spotless)
-(`./gradlew spotlessApply`). Release and
-publishing steps are in [RELEASING.md](RELEASING.md); contributor conventions
-are in [AGENTS.md](AGENTS.md).
+The build needs Amazon Corretto 25, and the native part needs Docker.
+[Building and testing](docs/building.md) covers the options, the test
+categories and CI. [CODING.md](CODING.md) has the code conventions, and
+[AGENTS.md](AGENTS.md) the rules for contributors and coding agents.
 
 ## Repository layout
 
@@ -1319,6 +301,7 @@ are in [AGENTS.md](AGENTS.md).
 | [`jonoffcpu-jfr-converter/`](jonoffcpu-jfr-converter/) | async-profiler's jfr-converter, built from the submodule's sources |
 | [`build-logic/`](build-logic/) | Gradle convention plugins and task types the modules share |
 | [`async-profiler/`](async-profiler/) | Submodule tracking the [`jonoffcpu-dev`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev) branch of [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler) |
+| [`docs/`](docs/) | The guides linked above, and the diagrams' d2 sources and rendered images |
 
 ## License
 

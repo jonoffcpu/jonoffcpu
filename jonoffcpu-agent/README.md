@@ -100,9 +100,9 @@ and does not allow aliases. The configuration keeps its own spellings
 (`reasons: [blocked, runnable]`, `policy: uniform`, `source: schedInfo`,
 `signalDelivery: queued`); the agent maps them to the capture schema's messages
 and enums, and rejects the schema's enum names (`OFF_CPU_REASON_BLOCKED`) there.
-Integers must be YAML integers, not quoted or decimal. The `sampling` block is required; the top-level
-README's [Choosing what to sample](../README.md#choosing-what-to-sample)
-explains its policies. Quote a `uniform` policy's `probability` when its exact
+Integers must be YAML integers, not quoted or decimal. The `sampling` block is required;
+[Choosing what to sample](../docs/capture.md#choosing-what-to-sample) explains its policies, and
+[Agent options](../docs/capture.md#agent-options) lists every key. Quote a `uniform` policy's `probability` when its exact
 decimal spelling should be retained in capture metadata.
 
 Then start the application with the Java agent:
@@ -122,9 +122,9 @@ Applications that already include the artifact as a runtime dependency may call
 `io.github.jonoffcpu.agent.SignalCaptureAgent.start(yamlOrConfigPath)` and later
 `SignalCaptureAgent.stop()`. The same JAR supports `premain` and `agentmain`.
 
-The older raw `-agentpath` entry point remains available for development. In
-that mode, everything before `asprofpath` belongs to jonoffcpu and everything
-after it is forwarded to async-profiler:
+For development, the JNI library can also be loaded directly with a raw
+`-agentpath`. In that form, everything before `asprofpath` belongs to jonoffcpu
+and everything after it is forwarded to async-profiler:
 
 ```sh
 java -agentpath:/path/to/libjonoffcpu.so=jonoffcpuoutput=/data/jonoffcpu-capture.pb,asprofpath=/path/to/libasyncProfiler.so,event=cpu,jfrsync=profile,file=/data/jonoffcpu-capture.jfr ...

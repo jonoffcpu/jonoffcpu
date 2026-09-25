@@ -1,7 +1,7 @@
 # Code and test conventions
 
 How code and tests are written in jonoffcpu. The architecture contracts they serve are in
-[`AGENTS.md`](AGENTS.md); the build and the workflow are in [`README.md`](README.md).
+[`AGENTS.md`](AGENTS.md); the build, the test categories and CI are in [`docs/building.md`](docs/building.md).
 
 ## Code
 
@@ -54,14 +54,21 @@ plugin:
   fixtures are in `jonoffcpu-capture-codec`, beside the codec they use: `CaptureRecordFixture` writes and reads streams
   of typed records, and `CaptureFixtures` builds valid records to start from.
 
-Integration tests say what they need with a tag, and the build routes each tag:
+Tests that need more than a JDK, or a JVM of their own, say so with a tag, and the build routes each tag. The lifecycle tasks group them by
+what they need: `jvmCheck` (root project) runs everything that needs only a JDK, and `:jonoffcpu-agent:nativeTest`
+the tests that need the selected native bundles; CI runs the first once and the second once per architecture and C
+library:
 
-| Tag | Needs | Runs in |
-|---|---|---|
-| `host-native` | The host architecture's native bundle loaded into the test JVM | `integrationTest` on a Linux host whose C library is selected; otherwise `containerIntegrationTest<Platform>`, which runs them with the JUnit Console Launcher in the pinned Corretto image of each selected C library (the default on macOS, `-PintegrationTestsInContainer=true` elsewhere) |
-| `privileged-container` | A Linux host with Docker, BTF and tracefs | `integrationTest`, through Testcontainers, once per selected C library of the host's architecture; skipped without Linux or Docker |
-| `packaged-jar` | Only the shaded JAR and the test libraries on the classpath | `packagedJarTest` |
-| `scale` | A heap cap equal to the bound it proves | `scaleTest`, in a JVM of its own |
+| Tag | Needs | Runs in | In CI |
+|---|---|---|---|
+| `host-native` | The host architecture's native bundle loaded into the test JVM | `integrationTest` on a Linux host whose C library is selected; otherwise `containerIntegrationTest<Platform>`, which runs them with the JUnit Console Launcher in the pinned Corretto image of each selected C library (the default on macOS, `-PintegrationTestsInContainer=true` elsewhere) | `nativeTest`, per platform |
+| `privileged-container` | A Linux host with Docker, BTF and tracefs | `integrationTest`, through Testcontainers, once per selected C library of the host's architecture; skipped without Linux or Docker | `nativeTest`, per platform |
+| `packaged-jar` | Only the shaded JAR and the test libraries on the classpath | `packagedJarTest` | The correlator's in `jvmCheck`; the agent's in the package job, whose JAR embeds all four bundles |
+| `scale` | A heap cap equal to the bound it proves | `scaleTest`, in a JVM of its own | `jvmCheck` |
+| `readme` | The repository's Markdown files | `readmeTest` (`DocumentationTest`), whose inputs they are | `jvmCheck`, and the documentation check of every change |
+
+Untagged integration tests run in `integrationTest`: the correlator's are platform independent and run in `jvmCheck`;
+the agent's `integrationTest` holds only native tests.
 
 Containers always run at the host's own architecture; never test the other architecture under emulation. The
 container runner copies every JAR flat into one directory named by a classpath wildcard (`java -cp 'lib/*'`), puts

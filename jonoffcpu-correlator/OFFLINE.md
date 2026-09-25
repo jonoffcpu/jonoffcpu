@@ -172,16 +172,14 @@ events in it remain available to other tools.
 
 `--audit full|matches|none` controls how much per-row audit output is written.
 The CLI defaults to `matches`: `jonoffcpu-matches.jsonl` is written but
-`jonoffcpu-classified-records.jsonl` is **not**, which is a backward-incompatible
-change from earlier releases that always wrote both. Anything that reads
+`jonoffcpu-classified-records.jsonl` is **not**. Anything that reads
 `jonoffcpu-classified-records.jsonl` — including
 the agent's `AsyncProfilerFirstStopTest`
 and
 [`jonoffcpu-native/tools/run-agent-signal-pressure.py`](../jonoffcpu-native/tools/run-agent-signal-pressure.py)
-— must now pass `--audit full` explicitly. `--audit none` writes neither audit
+— passes `--audit full` explicitly. `--audit none` writes neither audit
 file. The *library* API (`OffCpuCorrelator.correlate`, and `OfflineCorrelator`'s
-`OutputOptions.defaults()`) keeps the old `full` default, so embedding the
-correlator as a dependency is unaffected.
+`OutputOptions.defaults()`) defaults to `full` and writes both.
 
 The audit outputs are produced by a second read of the same two files, so they
 describe the rows the correlation actually kept, not every row in the inputs. Under
@@ -715,8 +713,8 @@ every step in the report's `degradation` object (a `DegradationReport`):
 4. **Fail**, naming the limit, the steps already tried and the flag that would allow the
    next one.
 
-`--on-limit fail` restores the old behaviour. `--on-limit truncate` skips thinning and
-goes straight to narrowing.
+`--on-limit fail` refuses at the limit instead, naming it. `--on-limit truncate` skips
+thinning and goes straight to narrowing.
 
 The two degradations are labelled differently because they differ:
 
@@ -785,9 +783,8 @@ relative seconds or epoch timestamps. Either bound can be omitted. A matching
 handler event outside the interval still identifies an overlapping source interval.
 `--from-ns`, `--to-ns` and `--max-handler-delay-ns` are held as signed `long`
 nanoseconds in the engine's columns, so each is rejected with `Time boundary
-outside signed 64-bit nanoseconds` when it is negative or at or above `2^63`;
-values in `[2^63, 2^64)` that an earlier release accepted now fail fast instead of
-wrapping.
+outside signed 64-bit nanoseconds` when it is negative or at or above `2^63`,
+rather than wrapping.
 
 Default admission limits are a hundred million total source/JFR records, 1 MiB per
 source record, 4,096 frames per stack record and per JFR sample, and a retained-bytes

@@ -274,10 +274,17 @@ val containerIntegrationTests =
                 shouldRunAfter(tasks.named("test"))
             }
         }
-if (integrationTestsInContainer) {
-    tasks.check {
-        dependsOn(containerIntegrationTests)
+// Every test that needs the selected platforms' native bundles, which CI runs once per architecture and C library;
+// the root project's jvmCheck runs everything that needs only a JDK.
+val nativeTest =
+    tasks.register("nativeTest") {
+        group = LifecycleBasePlugin.VERIFICATION_GROUP
+        description = "Runs the integration tests that need the selected native bundles."
+        dependsOn(tasks.named("integrationTest"))
+        if (integrationTestsInContainer) dependsOn(containerIntegrationTests)
     }
+tasks.check {
+    dependsOn(nativeTest)
 }
 
 // JUnit loads every class it scans before reading its tags, and the other integration tests need classes this

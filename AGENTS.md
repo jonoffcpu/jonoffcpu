@@ -7,8 +7,13 @@ smallest relevant layer before running privileged end-to-end tests.
 
 ## Read the relevant documentation first
 
-- [`README.md`](README.md): architecture, requirements, build, capture, and
-  analysis workflow.
+- [`README.md`](README.md): what jonoffcpu is for, how it relates to
+  async-profiler, and the quick start. The details are in the `docs/` pages
+  it indexes: [off-CPU concepts](docs/off-cpu-profiling.md),
+  [architecture and files](docs/how-it-works.md), [host setup](docs/setup.md),
+  [capture configuration](docs/capture.md), [analysis](docs/analysis.md),
+  [AI agents and SQL](docs/automation.md), and
+  [building and CI](docs/building.md).
 - [`jonoffcpu-agent/README.md`](jonoffcpu-agent/README.md): Java agent lifecycle,
   native bundle, configuration, and integration tests.
 - [`jonoffcpu-correlator/OFFLINE.md`](jonoffcpu-correlator/OFFLINE.md): offline
@@ -144,11 +149,23 @@ Builds use Amazon Corretto 25. The capture agent targets Java 17, and the
 correlator targets Java 21. The native collector uses Rust Edition 2024 and is
 built in the pinned native-bundle container.
 
-Ordinary local Java work builds only the current host architecture:
+Two lifecycle tasks split the tests by what they need. `jvmCheck` runs
+formatting and every test that needs only a JDK, on any operating system:
+every module's unit tests and the correlator's and converter's integration
+tests. `:jonoffcpu-agent:nativeTest` runs the agent's integration tests, which
+need the selected native bundles, Linux and Docker. `check` runs both, and
+ordinary local work builds only the current host architecture:
 
 ```sh
+./gradlew jvmCheck --no-daemon
 ./gradlew :jonoffcpu-agent:check :jonoffcpu-correlator:check --no-daemon
 ```
+
+A new test goes where its needs put it: pure Java in `src/test`, anything that
+needs a native bundle, a packaged JAR, Docker or an external tool in
+`src/integrationTest`, tagged as [`CODING.md`](CODING.md#layout) describes. A
+test of the agent's `integrationTest` runs once per architecture and C library
+in CI, so keep platform-independent checks out of it.
 
 Never build or test the other architecture's native bundle on a development
 machine: an arm64 bundle on an x86-64 host (or the reverse) runs under QEMU
@@ -186,9 +203,16 @@ replace kernel-level evidence with mocked unit tests. The end-to-end entry point
 ./gradlew :jonoffcpu-agent:integrationTest --no-daemon
 ```
 
-CI builds and executes x86-64 and arm64 bundles on native runners, running the
-integration tests once per C-library flavour (the glibc and Alpine musl Corretto
-images). Do not add QEMU-based arm64 verification to CI. The arm64 collector must retain the
+CI runs `jvmCheck` once, then builds the x86-64 and arm64 bundles on native
+runners and runs `:jonoffcpu-agent:nativeTest` once per C-library flavour (the
+glibc and Alpine musl Corretto images), and finally packages and verifies the
+agent JAR with all four bundles; [docs/building.md](docs/building.md#continuous-integration)
+lists the jobs. A change that touches only documentation, as
+[`.github/changes-filter.yaml`](.github/changes-filter.yaml) defines it, skips
+the build and runs only the documentation check
+(`:jonoffcpu-correlator:readmeTest`); keep that filter's documentation set free
+of anything a build or test reads. Do not add QEMU-based arm64 verification to
+CI. The arm64 collector must retain the
 `libgcc` link needed by outlined atomics, and the native-bundle build must keep
 rejecting unresolved `__aarch64_*` helpers.
 
@@ -256,8 +280,16 @@ initialization or packaging.
 
 - Keep changes focused and update the relevant documentation when a contract,
   option, artifact, or workflow changes.
-- Diagram sources are d2 files in `docs/diagrams/`; the README embeds the
-  rendered SVGs from `docs/images/`. After editing a source, run
+- The README stays an overview: the value proposition, the comparison with
+  async-profiler's own modes, and a quick start. Details belong in the `docs/`
+  pages, and a new page is added to the README's Documentation table.
+  `:jonoffcpu-correlator:readmeTest` checks the correlator options the README
+  and the pages name against the parser, and every relative link and anchor in
+  the repository's Markdown; run it after editing documentation. `release.yml`
+  rewrites the release tag and the Maven coordinates in the README, so keep
+  them there.
+- Diagram sources are d2 files in `docs/diagrams/`; the README and the `docs/`
+  pages embed the rendered SVGs from `docs/images/`. After editing a source, run
   `docs/diagrams/render.sh` (renders changed sources; `--watch NAME` for live
   editing) and commit the source and the SVG together.
 - New source must have provenance compatible with the repository license. Do
