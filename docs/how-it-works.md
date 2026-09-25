@@ -29,7 +29,7 @@ agent and the correlator write. The correlation contracts themselves are in
    [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
    fork, records a `profiler.SignalSample` event with the Java stack, the
    thread, and the key, in the same JFR recording that holds ordinary CPU,
-   allocation, lock, and JDK events.
+   allocation, lock, and JDK events; see [The recording](recording.md).
 4. A [native collector](../jonoffcpu-native/src/collector.rs) in the JVM
    process drains the ring buffer, resolves the native stacks, and appends each
    observation to the correlation stream. The Java agent finalizes that stream

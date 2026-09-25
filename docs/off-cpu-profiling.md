@@ -31,32 +31,37 @@ queued.
 
 [![Thread states seen by the scheduler](images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
-The kernel sees the *mechanism* of a wait, never its *reason*. A thread never
-blocks "on the database": with a synchronous JDBC driver it sleeps in a socket
-read; with an asynchronous client, a connection pool or any `Future.get()` it
-parks on a monitor or condition variable, a `futex`, while another thread
-does the I/O. The mechanism and the duration are what the kernel can prove;
-the reason lives in the stack of the code that called into the wait.
+From the Java side, the same three states split further by where the thread
+is: running Java code or native code, waiting for a CPU in either, waiting in
+native code, or blocked at the Java level on a monitor or a park. The kernel
+sees only running, runnable and blocked, and for a blocked thread the
+*mechanism* of the wait, never its *reason*. A thread never blocks "on the
+storage layer": with a synchronous client it sleeps in a socket read; with an
+asynchronous client, a pool or any `Future.get()` it parks on a condition, a
+`futex`, while another thread does the I/O. The mechanism and the duration are
+what the kernel can prove; the reason lives in the stack of the code that
+called into the wait.
 
 | What the code is doing | Where the Java thread waits | What the kernel sees |
 | --- | --- | --- |
-| Synchronous JDBC query | `SocketInputStream.read` (`NioSocketImpl`) | `read`/`recv` or `poll` on the socket, sleeping until data arrives |
-| Async client, `CompletableFuture.get()`, connection pool | `LockSupport.park` | `futex` wait; another thread performs the I/O |
-| Contended `synchronized` or `ReentrantLock` | monitor enter / `park` | `futex` wait |
-| `Thread.sleep`, timed `wait` | `park` with a timeout | `futex` wait armed with a timer |
+| A blocking call to another service | `SocketInputStream.read` (`NioSocketImpl`) | `read`/`recv` or `poll` on the socket, sleeping until data arrives |
+| Waiting for an asynchronous result: `CompletableFuture.get()`, a pool, a queue's `take` | `LockSupport.park` | `futex` wait; another thread performs the work |
+| A contended `synchronized` block or `ReentrantLock` | monitor enter / `park` | `futex` wait |
+| An event loop waiting for I/O, such as Netty's | `epollWait` (native) | `epoll_wait`, sleeping until a socket is ready |
+| `Thread.sleep`, a timed `wait` | `park` with a timeout | `futex` wait armed with a timer |
 
 That split is why an off-CPU profile of a JVM needs both stacks: the kernel
 stack and the interval come from the scheduler, the Java stack supplies the
 cause, and `jonoffcpu` exists to pair each kernel-measured interval with a
 Java stack.
 
-This matters because in most services request latency is not CPU time. A
-request that takes 200 ms may burn 5 ms of CPU and spend the rest sleeping on
-a socket for a query result, parked on a future, or queued behind a busy CPU.
+This matters because in most services latency is not CPU time. A request
+that takes 200 ms may burn 5 ms of CPU and spend the rest waiting: for a reply
+from another service, for a lock, for a write to be acknowledged, or for a CPU.
 A CPU flame graph shows those 5 ms in detail and nothing about the other
 195 ms. An off-CPU profile inverts that: it attributes the off-CPU time to the
-stack that was waiting, so the 195 ms show up under the code that issued the
-query, took the lock, or called the remote service. Rendered as an
+stack that was waiting, so the 195 ms show up under the code that made the
+call, took the lock, or waited for the write. Rendered as an
 [off-CPU flame graph](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html),
 frame widths are total off-CPU duration instead of sample counts, and the
 widest towers are the waits worth investigating. CPU and off-CPU profiles
@@ -94,8 +99,8 @@ Existing tools each see half of the picture:
   sampler. It sees that a thread was off-CPU at each tick, not how long the
   interval actually lasted, and it cannot tell sleeping from being runnable but
   descheduled. Its lock profiling measures contended Java locks precisely, but
-  only those; the README compares the two in
-  [jonoffcpu and async-profiler's lock profiling](../README.md#jonoffcpu-and-async-profilers-lock-profiling).
+  only those; the README compares the approaches in
+  [Complementing async-profiler and JFR](../README.md#complementing-async-profiler-and-jfr).
 
 `jonoffcpu` combines both: the kernel measures the interval, async-profiler
 captures the Java stack, and a 64-bit key ties each measurement to its stack.

@@ -12,11 +12,12 @@ graphs and ranked reports whose numbers are real durations.
   from the scheduler, why the thread left the CPU, and how much of it was
   spent asleep versus queued for a CPU. Flame-graph widths are microseconds,
   not sample counts.
-- **async-profiler included.** One `-javaagent` starts a current
-  async-profiler. [Its fork](https://github.com/jonoffcpu/async-profiler)
-  follows upstream master, with its patches rebased periodically. CPU,
-  allocation, lock and wall-clock profiles land in the same JFR recording as
-  the off-CPU samples.
+- **One recording, every source.** One `-javaagent` starts a current
+  async-profiler. [Its fork](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
+  follows upstream master, with its patches rebased periodically. A single run
+  records the JDK's own Flight Recorder events, async-profiler's CPU,
+  allocation and lock profiles, and the off-CPU samples into one JFR file. That
+  file opens in JDK Mission Control and async-profiler's converter as usual.
 - **A small observer effect.** The per-context-switch work stays in the
   kernel, which decides after measuring each interval whether to record it.
   Duration-proportional sampling bounds the recording rate by off-CPU time
@@ -43,61 +44,143 @@ graphs and ranked reports whose numbers are real durations.
 **[Documentation](#documentation)** ·
 **[Releases](https://github.com/jonoffcpu/jonoffcpu/releases)**
 
-## Why off-CPU profiling
+## What is off-CPU profiling
 
-In most services, request latency is not CPU time. A request that takes
-200 ms may burn 5 ms of CPU and spend the rest sleeping on a socket for a
-query result, parked on a future, or queued behind a busy CPU. A CPU flame
-graph shows those 5 ms in detail and nothing about the other 195 ms. An
-off-CPU profile attributes the waiting time to the stack that waited, so the
-195 ms show up under the code that issued the query, took the lock, or called
-the remote service.
+At any moment, a Java thread is doing one of three things:
 
-Existing tools each see half of that picture. Kernel tools such as BCC's
-`offcputime` know exactly when a thread left the CPU and when it came back,
-but cannot walk JIT-compiled Java frames. JVM profilers walk Java stacks
-accurately, but a wall-clock sampler only notices at each tick that a thread
-was off the CPU, not how long the interval lasted or whether the thread was
-sleeping or merely waiting for a CPU. jonoffcpu joins both: the kernel
-measures the interval, async-profiler captures the Java stack, and a 64-bit
-key ties each measurement to its stack.
+- **Running on a CPU**, in Java code or in native code: the JVM itself, a JNI
+  library, or the kernel working on the thread's behalf.
+- **Ready to run but waiting for a CPU**, in the scheduler's run queue,
+  because other threads hold every CPU it may use.
+- **Blocked until something happens**: a lock is released, data arrives on a
+  socket, a disk write completes, a timer fires, or a task is queued for it. In
+  Java this shows as a monitor, a `park`, or blocking I/O. Underneath, the
+  thread sleeps in the kernel on a futex, a socket or a timer.
+
+[![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
+
+A CPU profiler samples only the first state. Everything else is *off-CPU
+time*, and in most services it is where the latency goes. The Linux scheduler
+sees every transition: a thread is switched out when it blocks or is
+preempted, and switched back in when it gets a CPU again. Off-CPU profiling
+measures each of those intervals and attributes it to the code that was
+waiting. jonoffcpu takes the interval's duration, and why it began, from the
+scheduler through eBPF. It takes the Java stack from async-profiler. Kernel
+tools cannot walk JIT-compiled Java frames, and a JVM's wall-clock sampler
+cannot tell how long a wait lasted; jonoffcpu joins the two.
+[Off-CPU profiling](docs/off-cpu-profiling.md) explains the concepts in
+depth.
+
+## Why jonoffcpu
+
+In a small service, a CPU profile and a few thread dumps often find the
+problem. In a system like [Apache Pulsar](https://pulsar.apache.org/) they
+don't. There, millions of events per second flow through hundreds of threads:
+event loops, executor pools, storage clients and the JVM's own threads. Nearly
+all of their off-CPU time is spent waiting for work. The waits that limit
+throughput or add latency are a small fraction of that time, invisible in an
+unfiltered flame graph.
+
+In one Pulsar broker capture, the threads were off the CPU for 8,519 s in
+total, and only 49 s of that was blocked. Two waits led everything else: a
+contended monitor in the dispatcher (12 s) and a lock in a storage client's
+queue (5 s).
+
+Finding such a bottleneck takes several steps. Waiting for work has to be
+separated from blocking. The waits have to be attributed to the application
+code, not to the lock internals under it. After every change, the new run has
+to be compared with the previous one under the same load, per unit of work.
+Doing that by hand for every experiment does not scale. jonoffcpu is built so
+that a script or an AI agent can do it: the correlator reduces each capture to
+a digest and ranked tables that can be read, drilled into and compared
+automatically.
+
+## Where jonoffcpu is going
+
+jonoffcpu started as an experiment in automating performance optimization and
+tuning of Apache Pulsar, with its end-to-end
+[performance scenarios](https://github.com/apache/pulsar/tree/master/tests/performance),
+and its features are currently shaped by that work. The direction is to
+support automated performance optimization and tuning more broadly:
+
+- **Extract what matters from one run.** A recording holds the JDK's Flight
+  Recorder events, async-profiler's profiles and jonoffcpu's eBPF
+  measurements. jonoffcpu will extract the information relevant to "what
+  limits this system, and did the change help?" from all three.
+- **Normalize stacks automatically.** Stack traces will be normalized, and the
+  boundaries between the application, its libraries and the JDK detected from
+  the data itself, rather than from patterns given by hand. That keeps a vast
+  amount of stack data readable, and comparable across runs and versions.
+- **Integrate, don't compete.** jonoffcpu does not try to compete with the
+  tooling emerging for AI agents in this space. It aims to integrate with that
+  tooling and build on it. [Jafar](https://github.com/btraceio/jafar) is a fast
+  JFR parser with an MCP server that lets AI agents analyze JFR recordings.
+  [jafar-perf-box](https://github.com/btraceio/jafar-perf-box) packages a
+  performance-analysis methodology for AI agents on top of it. jonoffcpu's
+  recording is an ordinary JFR file, and its derived outputs are documented
+  protobuf messages with a JSON view, so they can serve as inputs to such
+  tools.
+
+## How a recording works
+
+One run records everything, into two files:
+
+- **The JFR recording.** The agent starts async-profiler with the options you
+  give it. With `jfrsync=profile`, async-profiler also starts the JDK's own
+  Flight Recorder and writes one JFR file holding three kinds of events:
+  - the JDK's events: garbage collections, safepoints, JIT compilation, the
+    JVM, OS, CPU and container details, and JFR's own events for waits above
+    a threshold;
+  - async-profiler's samples, as configured: CPU, allocation, lock contention
+    and wall clock, each in place of the JDK's own events of that kind;
+  - a `profiler.SignalSample` event with the Java stack of every off-CPU
+    interval jonoffcpu recorded.
+- **The correlation stream.** The eBPF program measures each off-CPU interval,
+  and the collector writes its duration, reason, native stacks and
+  correlation key to this file.
 
 [![jonoffcpu architecture](docs/images/architecture.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/architecture.svg)
 
-[Off-CPU profiling](docs/off-cpu-profiling.md) explains the concepts, and
-[How jonoffcpu works](docs/how-it-works.md) the pipeline and its files.
+The JFR file is an ordinary recording. Open it in
+[JDK Mission Control](https://adoptium.net/jmc) for its GC, CPU, allocation
+and lock analysis, or convert it to flame graphs with async-profiler's
+converter. The correlator joins the correlation stream with the recording's
+`SignalSample` events offline, into the off-CPU profile.
+[The recording](docs/recording.md) describes what it contains and how to read
+it, and [How jonoffcpu works](docs/how-it-works.md) the pipeline and its files.
 
-## jonoffcpu and async-profiler's lock profiling
+## Complementing async-profiler and JFR
 
-async-profiler can already answer some of the questions an off-CPU profile
-answers. The two approaches are complementary, not exclusive, and jonoffcpu
-runs both in one recording.
+async-profiler and JFR can already answer some of the questions an off-CPU
+profile answers. The approaches are complementary, not exclusive, and one
+jonoffcpu recording holds them all.
 
-- **Lock profiling** (`lock=`) records contended `synchronized` blocks and
-  waits on `ReentrantLock`, `ReentrantReadWriteLock` and `Semaphore`, with the
-  wait time and the class of the lock. It needs no eBPF and no privileges, and
-  it is the most direct answer to "which Java lock is contended". `nativelock=`
-  does the same for pthread mutexes and read-write locks.
+- **async-profiler's lock profiling** (`lock=`) records contended
+  `synchronized` blocks and waits on `ReentrantLock`, `ReentrantReadWriteLock`
+  and `Semaphore`, with the wait time and the class of the lock. It needs no
+  eBPF and no privileges, and it is the most direct answer to "which Java lock
+  is contended". `nativelock=` does the same for pthread mutexes and
+  read-write locks.
+- **JFR's own events** record sleep, socket and file waits that last longer
+  than a threshold, and monitor and park waits too when `lock=` does not
+  replace them. In JDK 25's `profile` configuration, the threshold is 10 ms for
+  locks and 1 ms for I/O.
 - **Wall-clock profiling** (`wall=`) samples every thread periodically,
-  whatever its state, which shows where threads spend their time but not how
+  whatever its state. That shows where threads spend their time, but not how
   long each wait lasted.
-- **Off-CPU profiling** in jonoffcpu covers every wait, whatever caused it,
-  with its exact duration. That includes socket and disk I/O, `epoll`,
+- **jonoffcpu's off-CPU profiling** covers every wait, whatever caused it, with
+  its exact duration. That includes socket and disk I/O, `epoll`,
   `Condition.await`, queue `take`, `CompletableFuture.get`, sleeps, futexes in
   native code, page faults, and the time a runnable thread queued for a CPU. It
-  cannot name the lock object: the kernel sees only the futex.
+  cannot name the lock object, because the kernel sees only the futex.
 
 | Question | Best answered by |
 | --- | --- |
 | Which Java lock is contended, and by whom? | async-profiler `lock=` |
 | Where is CPU time spent? | async-profiler `event=cpu` |
-| Where do threads wait, on anything, and for exactly how long? | jonoffcpu off-CPU profile |
+| How do GC pauses and safepoints affect the application? | JFR's events, in JDK Mission Control |
+| Where do threads wait, on anything, and for exactly how long? | jonoffcpu's off-CPU profile |
 | Are threads delayed by CPU saturation or throttling? | jonoffcpu's run-queue split and `runnable`/`preempted` intervals |
-
-Because the agent runs async-profiler, adding `lock=10ms` to
-`asyncProfilerOptions` records lock contention into the same JFR as the
-off-CPU samples, and the same converter renders it; see
-[Other views of the same recording](docs/analysis.md#other-views-of-the-same-recording).
 
 ## Quick start
 
@@ -150,7 +233,7 @@ Create `jonoffcpu.yaml`:
 
 ```yaml
 correlationOutput: /tmp/jonoffcpu-capture.pb
-asyncProfilerOptions: event=cpu,alloc=2m,jfrsync=profile,file=/tmp/jonoffcpu-capture.jfr
+asyncProfilerOptions: event=cpu,alloc=2m,lock=10ms,jfrsync=profile,file=/tmp/jonoffcpu-capture.jfr
 sampling:
   minOffCpuMicros: 100
   admission:
@@ -160,8 +243,9 @@ sampling:
 
 This records every wait of 10 ms or longer and samples shorter ones in
 proportion to their length. It drops context switches shorter than 100 µs
-entirely, and records CPU and allocation profiles alongside. Start the
-application with the agent:
+entirely. Into the same JFR file it records async-profiler's CPU, allocation
+and lock profiles, and, through `jfrsync=profile`, the JDK's own Flight
+Recorder events. Start the application with the agent:
 
 ```sh
 java -javaagent:jonoffcpu-agent.jar=jonoffcpu.yaml -jar application.jar
@@ -186,7 +270,7 @@ java -jar jonoffcpu-correlator.jar \
 rather than the lock and park internals under it. `--estimate-population
 true` keeps the estimates valid for comparing runs.
 
-### 4. Read the digest and the flame graph
+### 4. Read the results
 
 Start with `/tmp/jonoffcpu-analysis/jonoffcpu-summary.md`, the digest. It
 states when and on what machine and JVM the capture was recorded. It ranks the
@@ -200,7 +284,10 @@ java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
   /tmp/jonoffcpu-analysis/offcpu.html
 ```
 
-Frame widths in `offcpu.html` are microseconds of off-CPU time.
+Frame widths in `offcpu.html` are microseconds of off-CPU time. The recording
+itself, `/tmp/jonoffcpu-capture.jfr`, opens in
+[JDK Mission Control](https://adoptium.net/jmc) for GC, CPU, allocation and
+lock analysis.
 
 **Next steps:**
 - [Find what to optimize](docs/analysis.md#find-what-to-optimize) with `top`
@@ -208,6 +295,8 @@ Frame widths in `offcpu.html` are microseconds of off-CPU time.
 - [Slice and filter](docs/analysis.md#slice-and-filter-with-the-stack-profile)
   the stack profile without correlating again.
 - [Compare runs](docs/analysis.md#compare-runs) per unit of work.
+- Render the recording's [CPU, allocation and lock views](docs/recording.md#flame-graphs-of-the-other-events)
+  as flame graphs.
 - Hand the results to an [AI agent or to SQL](docs/automation.md).
 
 ## Documentation
@@ -216,6 +305,7 @@ Frame widths in `offcpu.html` are microseconds of off-CPU time.
 | --- | --- |
 | [Off-CPU profiling](docs/off-cpu-profiling.md) | What off-CPU time is, why a JVM needs both a kernel and a Java view, why threads leave the CPU, sleeping and run-queue time |
 | [How jonoffcpu works](docs/how-it-works.md) | The capture pipeline, the two capture files, what the Java stack means, every file jonoffcpu writes |
+| [The recording](docs/recording.md) | What one JFR recording holds from the JDK, async-profiler and jonoffcpu, and how to read it with JDK Mission Control, the converter and the `jfr` tool |
 | [Setting up a host](docs/setup.md) | Kernel requirements and settings, the bundled native libraries, Docker and Docker Desktop |
 | [Configuring the capture](docs/capture.md) | Agent options, choosing what to sample, overhead and the observer effect |
 | [Analyzing a capture](docs/analysis.md) | Correlating, flame graphs, other views, slicing, filtering and transforms, finding what to optimize, comparing runs, correlator options |
@@ -300,7 +390,7 @@ categories and CI. [CODING.md](CODING.md) has the code conventions, and
 | [`jonoffcpu-correlator/`](jonoffcpu-correlator/) | Offline correlator: JFR reader and derived-output writers ([OFFLINE.md](jonoffcpu-correlator/OFFLINE.md)) |
 | [`jonoffcpu-jfr-converter/`](jonoffcpu-jfr-converter/) | async-profiler's jfr-converter, built from the submodule's sources |
 | [`build-logic/`](build-logic/) | Gradle convention plugins and task types the modules share |
-| [`async-profiler/`](async-profiler/) | Submodule tracking the [`jonoffcpu-dev`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev) branch of [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler) |
+| [`async-profiler/`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev) | Submodule tracking the `jonoffcpu-dev` branch of the [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler) fork, which follows upstream master with jonoffcpu's patches rebased onto it |
 | [`docs/`](docs/) | The guides linked above, and the diagrams' d2 sources and rendered images |
 
 ## License

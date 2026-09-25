@@ -18,7 +18,7 @@ raw `-agentpath` form are in [the agent's README](../jonoffcpu-agent/README.md).
 | Option | Meaning |
 | --- | --- |
 | `correlationOutput` | Required. Path of the correlation stream. Must not exist yet, and its directory must. Its stem names the sibling `.manifest.json` and, when `file=` is absent, the `.jfr`; see [Files jonoffcpu writes](how-it-works.md#files-jonoffcpu-writes). |
-| `asyncProfilerOptions` | Required. async-profiler's options, passed on unchanged, such as `event=cpu,alloc=2m,lock=10ms,jfrsync=profile`. `file=` names the JFR, which must not exist yet; without it the JFR is written next to the correlation stream. The agent owns the profiler's actions and its signal options, so `start`, `stop`, `signalcookie` and the like are refused, as are `file=` patterns with `%`. |
+| `asyncProfilerOptions` | Required. async-profiler's options, passed on unchanged, such as `event=cpu,alloc=2m,lock=10ms,jfrsync=profile`; see [Choosing what to record](recording.md#choosing-what-to-record). `file=` names the JFR, which must not exist yet; without it the JFR is written next to the correlation stream. The agent owns the profiler's actions and its signal options, so `start`, `stop`, `signalcookie` and the like are refused, as are `file=` patterns with `%`. |
 | `sampling` | Required. Which off-CPU intervals are recorded; see [Choosing what to sample](#choosing-what-to-sample). |
 | `sampling.reasons` | Optional list of switch-out reasons to record: `blocked`, `runnable`, `preempted`. Default `[blocked]`; see [Why the thread left the CPU](off-cpu-profiling.md#why-the-thread-left-the-cpu). |
 | `sampling.minOffCpuMicros` | Optional strict lower bound on the off-CPU duration, in microseconds. |

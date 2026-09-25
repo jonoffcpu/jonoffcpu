@@ -11,7 +11,6 @@ holds the contracts behind them.
 
 - [Correlate](#correlate)
 - [Render the flame graph](#render-the-flame-graph)
-- [Other views of the same recording](#other-views-of-the-same-recording)
 - [Slice and filter with the stack profile](#slice-and-filter-with-the-stack-profile)
 - [Transform stacks](#transform-stacks)
 - [Merge and export profiles](#merge-and-export-profiles)
@@ -84,32 +83,9 @@ the graph does not show. Any tool that reads the collapsed-stack format, such
 as [`flamegraph.pl`](https://github.com/brendangregg/FlameGraph) with
 `--countname=µs`, works on the same file.
 
-## Other views of the same recording
-
-The agent's JFR also holds whatever `asyncProfilerOptions` recorded, and the
-same converter renders it. Render a view only for events that were
-configured: `jfrsync` alone does not make an allocation or lock view
-meaningful.
-
-| `asyncProfilerOptions` contains | View | Converter |
-| --- | --- | --- |
-| `event=cpu` (or `itimer`, `ctimer`) | CPU | `--cpu` |
-| `event=wall` or `wall=` | wall clock | `--wall` |
-| `alloc=` | allocation | `--alloc --total` |
-| `lock=` | Java lock contention | `--lock --total` |
-
-```sh
-java -jar jfr-converter.jar --cpu -o collapsed /tmp/jonoffcpu-capture.jfr cpu.collapsed
-java -jar jonoffcpu-correlator.jar stacks --collapsed-input cpu.collapsed \
-  --trim-root-from preset:jvm-infra --output cpu-trimmed.collapsed
-java -jar jfr-converter.jar cpu-trimmed.collapsed cpu.html
-```
-
-Add `--threads` for a per-thread split and `-o collapsed` for
-machine-readable output. The converter writes class names as
-`org/example/Class` with `_[j]`-style markers; `stacks --collapsed-input` and
-`top --collapsed-input` normalize them, so the transforms and the ranked tables
-below apply to these views too.
+The recording's other events, such as CPU, allocation and lock samples, render
+with the same converter, and the filters and transforms below apply to them
+too; see [Flame graphs of the other events](recording.md#flame-graphs-of-the-other-events).
 
 ## Slice and filter with the stack profile
 

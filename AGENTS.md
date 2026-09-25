@@ -10,7 +10,8 @@ smallest relevant layer before running privileged end-to-end tests.
 - [`README.md`](README.md): what jonoffcpu is for, how it relates to
   async-profiler, and the quick start. The details are in the `docs/` pages
   it indexes: [off-CPU concepts](docs/off-cpu-profiling.md),
-  [architecture and files](docs/how-it-works.md), [host setup](docs/setup.md),
+  [architecture and files](docs/how-it-works.md),
+  [the JFR recording](docs/recording.md), [host setup](docs/setup.md),
   [capture configuration](docs/capture.md), [analysis](docs/analysis.md),
   [AI agents and SQL](docs/automation.md), and
   [building and CI](docs/building.md).
