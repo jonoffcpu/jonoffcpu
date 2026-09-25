@@ -139,18 +139,34 @@ system like it. The steps toward that:
   the data itself, rather than from patterns given by hand. That keeps a vast
   amount of stack data readable, and comparable across runs, scenarios and
   versions.
-- **Compare across runs and scenarios.** Results are compared per unit of
-  work today, one baseline at a time. The aim is to track a system's
-  bottlenecks and their trade-offs across a whole set of scenarios.
-- **Integrate, don't compete.** jonoffcpu does not try to compete with the
-  tooling emerging for AI agents in this space. It aims to integrate with that
-  tooling and build on it. [Jafar](https://github.com/btraceio/jafar) is a fast
-  JFR parser with an MCP server that lets AI agents analyze JFR recordings.
-  [jafar-perf-box](https://github.com/btraceio/jafar-perf-box) packages a
-  performance-analysis methodology for AI agents on top of it. jonoffcpu's
-  recording is an ordinary JFR file, and its derived outputs are documented
-  protobuf messages with a JSON view, so they can serve as inputs to such
-  tools.
+- **Compare across runs and scenarios.** jonoffcpu is built to support this.
+  `top --baseline` compares two runs per unit of work and warns when they are
+  not comparable. `export --run-label` and `--run-metadata` put any number of
+  runs side by side in SQL. What drives the runs lives outside jonoffcpu today,
+  in Apache Pulsar's performance scenarios. Its generic parts, and
+  contributions from the jonoffcpu community, can become subprojects of the
+  [jonoffcpu organization](https://github.com/jonoffcpu). Likely candidates are
+  integrations with load generators, and test-report generators that show a
+  change's effect across scenarios.
+- **Complement existing tooling, and plug into it.** jonoffcpu does not try to
+  compete with JFR tooling or with the tooling emerging for AI agents. It
+  complements them, and may integrate with them through their plugin
+  mechanisms.
+  - Its recording is an ordinary JFR file, which JDK Mission Control and JFR
+    libraries read. For example, [Jafar](https://github.com/btraceio/jafar) is
+    a fast JFR parser with an MCP server that lets AI agents analyze JFR
+    recordings.
+  - Its derived outputs are documented protobuf messages with a JSON view, so
+    other tools can consume them without a parser of their own.
+  - For coding agents, the next step is skills and plugins that know the
+    workflow: capture, correlate, read the digest, drill down with `top` and
+    `stacks`, and compare with a baseline.
+    [jafar-perf-box](https://github.com/btraceio/jafar-perf-box) shows the
+    pattern: it packages a performance-analysis methodology for AI agents as a
+    plugin on top of Jafar.
+
+Ideas and contributions toward any of these are welcome; open an
+[issue](https://github.com/jonoffcpu/jonoffcpu/issues) to discuss them.
 
 ## How a recording works
 
