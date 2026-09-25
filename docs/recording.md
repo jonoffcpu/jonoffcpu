@@ -54,8 +54,8 @@ it. They cover the Java-level waits the JDK instruments, and only those longer
 than the threshold: in JDK 25's `profile` configuration, 10 ms for monitors and
 parks, and 1 ms for socket and file I/O, throttled. async-profiler's `lock=`
 samples contended locks by accumulated wait time instead, and names the lock's
-class. The off-CPU profile covers every wait the scheduler sees, whatever
-caused it, with its exact duration.
+class. The off-CPU profile covers every kind of wait the scheduler sees,
+whatever caused it, and records each sampled wait with its exact duration.
 
 ## Choosing what to record
 

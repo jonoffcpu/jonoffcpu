@@ -1,6 +1,6 @@
 ![#jonoffcpu](docs/images/jonoffcpu-banner.jpg)
 
-**jonoffcpu** shows where JVM applications wait, and for exactly how long. It
+**jonoffcpu** shows where JVM applications wait, and for how long. It
 is a profiling toolset for Java on Linux that runs
 [async-profiler](https://github.com/async-profiler/async-profiler) and extends
 it with off-CPU profiling measured by the kernel. The Linux scheduler, through
@@ -9,11 +9,19 @@ spends off the CPU. async-profiler captures
 the Java stack that waited, and an offline correlator joins the two into flame
 graphs and ranked reports whose numbers are real durations.
 
-- **Measured, not estimated.** Each recorded wait carries its exact duration
-  from the scheduler, why the thread left the CPU, and how much of it was
-  spent asleep versus queued for a CPU.
-  [Flame-graph](https://www.brendangregg.com/flamegraphs.html) widths are
-  microseconds, not sample counts.
+- **Measured in the kernel, sampled by duration.** jonoffcpu's eBPF program
+  times each off-CPU interval at the scheduler's own switch points. Recording
+  an interval costs the thread a signal and a stack walk, so a capture usually
+  records a sample: every wait longer than a threshold you choose, and shorter
+  ones with a probability proportional to their duration
+  ([probability proportional to size](https://en.wikipedia.org/wiki/Probability-proportional-to-size_sampling)).
+  Each recorded wait carries its exact duration, why the thread left the CPU,
+  how much of it was spent asleep versus queued for a CPU, and the threshold
+  it was drawn against.
+  [Flame graphs](https://www.brendangregg.com/flamegraphs.html) weigh stacks
+  by measured microseconds, not by sample counts, and the thresholds turn the
+  sample into unbiased estimates of the total off-CPU time
+  ([Horvitz–Thompson](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator)).
 - **One recording, every source.** One `-javaagent` starts a current
   async-profiler. [Its fork](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
   follows upstream master, with its patches rebased periodically. A single run
@@ -23,14 +31,11 @@ graphs and ranked reports whose numbers are real durations.
   file opens in JDK Mission Control and async-profiler's converter as usual.
 - **A small [observer effect](https://en.wikipedia.org/wiki/Observer_effect_(information_technology)).**
   The per-[context-switch](https://en.wikipedia.org/wiki/Context_switch) work
-  stays in the kernel, which decides after measuring each interval whether to
-  record it. Duration-proportional sampling
-  ([probability proportional to size](https://en.wikipedia.org/wiki/Probability-proportional-to-size_sampling))
-  bounds the recording rate by off-CPU time rather than by the number of
-  context switches, and the population estimate
-  ([Horvitz–Thompson](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator))
-  stays exact. A recorded interval costs about 120 bytes. Correlation runs
-  offline, on any machine.
+  stays in the kernel, which measures each interval before deciding whether to
+  record it. Sampling by duration keeps the recording rate in proportion to
+  off-CPU time rather than to the number of context switches, and nothing
+  leaves the kernel for an interval that is not recorded. A recorded interval
+  costs about 120 bytes. Correlation runs offline, on any machine.
 - **Your code, not the plumbing.** Threads *waiting for work*, such as idle
   event loops and pool workers, are kept apart from threads *blocked* while
   they had work to do. Filters and transforms root each stack at your
@@ -215,8 +220,8 @@ jonoffcpu recording holds them all.
 - **Wall-clock profiling** (`wall=`) samples every thread periodically,
   whatever its state. That shows where threads spend their time, but not how
   long each wait lasted.
-- **jonoffcpu's off-CPU profiling** covers every wait, whatever caused it, with
-  its exact duration. That includes socket and disk I/O, `epoll`,
+- **jonoffcpu's off-CPU profiling** covers every kind of wait, whatever caused
+  it, and records each sampled wait with its exact duration. That includes socket and disk I/O, `epoll`,
   `Condition.await`, queue `take`, `CompletableFuture.get`, sleeps, futexes in
   native code, page faults, and the time a runnable thread queued for a CPU. It
   cannot name the lock object, because the kernel sees only the futex.

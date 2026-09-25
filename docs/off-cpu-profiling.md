@@ -85,9 +85,14 @@ together account for a thread's whole lifetime, which is what Brendan Gregg's
 asks for: explain latency by the states that dominate it, not by the one state
 a CPU profiler happens to see.
 
-Off-CPU time is measured, not sampled: the scheduler records the exact moment
-a thread left the CPU and the exact moment it returned, so every interval is a
-real duration and the flame graph's widths are microseconds of off-CPU time.
+Each off-CPU interval is measured, not inferred from periodic samples: the
+scheduler records the exact moment a thread left the CPU and the exact moment
+it returned, so every recorded interval is a real duration and the flame
+graph's widths are microseconds of off-CPU time. Which intervals are recorded
+is a separate choice. Recording one costs the thread a signal and a stack
+walk, so a capture usually records a sample weighted by duration, and the
+thresholds recorded with it turn it into unbiased estimates of the totals; see
+[Choosing what to sample](capture.md#choosing-what-to-sample).
 `jonoffcpu` measures the whole interval, from switch-out to switch-in, so
 run-queue delay under CPU contention is included alongside sleeping. It also
 records *why* the thread left the CPU — it blocked, or it was still runnable —
