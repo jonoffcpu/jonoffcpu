@@ -1192,7 +1192,7 @@ final class Cli {
                 defaultValue = "boundary",
                 converter = ByConverter.class,
                 description = "What a row is: boundary (deepest --app frame and its blocker), root (the first frame"
-                        + " after the transforms, with the heaviest line under it), app-method (every distinct --app"
+                        + " after the transforms), app-method (every distinct --app"
                         + " frame after the transforms, inclusive, call chains grouped, with self time), self (the"
                         + " leaf, after --collapse-leaf), method, class or package (every distinct one in the stack,"
                         + " inclusive), or pool (the thread name with digit runs as #). Default: ${DEFAULT-VALUE}.")

@@ -22,10 +22,10 @@ Each row is the last application method before the blocking call and what it blo
 
 Each row is the first application frame of a stack, where a thread entered the application.
 
-| # | Root | s | Share | Intervals | Reason | Heaviest stack |
-|---:|---|---:|---:|---:|---|---|
-| 1 | `x.Svc.lambda$go$0` | 2.000 | 66.7 % | 2 | blocked | `x.Svc.lambda$go$0;x.Svc.work;j.u.c.l.ReentrantLock.lock` |
-| 2 | `x.Svc.handle` | 1.000 | 33.3 % | 1 | blocked | `x.Svc.handle;x.Map.get;j.u.c.l.StampedLock.readLock` |
+| # | Root | s | Share | Intervals | Reason |
+|---:|---|---:|---:|---:|---|
+| 1 | `x.Svc.lambda$go$0` | 2.000 | 66.7 % | 2 | blocked |
+| 2 | `x.Svc.handle` | 1.000 | 33.3 % | 1 | blocked |
 
 ## Blocked, by application method
 

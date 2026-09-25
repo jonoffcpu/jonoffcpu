@@ -211,8 +211,6 @@ message TopRow {
   optional io.github.jonoffcpu.capture.v1.OffCpuReason reason = 10;
   // --by boundary: the heaviest root-most application frame.
   optional string caller = 11;
-  // --by root: the heaviest transformed line under the root, abbreviated package names.
-  optional string heaviest_stack = 12;
   // --by app-method: the chain's methods, root-most first; time whose deepest application frame is one of
   // them; and the distinct transformed stacks it occurs in.
   repeated string methods = 13;

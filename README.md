@@ -889,8 +889,7 @@ CPU after the wakeup.
 
 The flame graph's other end is ranked too. With `--hide-from
 preset:jvm-dispatch --root-at '^com\.example\.' --root-at-unmatched hide`,
-`top --by root` lists where threads entered your code, each root with the
-heaviest line under it, and `top --by app-method --app '^com\.example\.'`
+`top --by root` lists where threads entered your code, and `top --by app-method --app '^com\.example\.'`
 ranks every application method across the stacks it is in, methods that are
 always called together grouped into one call chain, with the time of the
 stacks that end in them as their self time. With hiding, their shares and

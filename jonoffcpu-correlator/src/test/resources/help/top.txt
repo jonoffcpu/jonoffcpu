@@ -37,12 +37,11 @@ breaks blocked time without an application frame down by thread pool.
       --collapsed-input=FILE Rank any collapsed file instead of --profile; values keep the file's
                                unit.
       --by=KEY               What a row is: boundary (deepest --app frame and its blocker), root
-                               (the first frame after the transforms, with the heaviest line under
-                               it), app-method (every distinct --app frame after the transforms,
-                               inclusive, call chains grouped, with self time), self (the leaf,
-                               after --collapse-leaf), method, class or package (every distinct one
-                               in the stack, inclusive), or pool (the thread name with digit runs
-                               as #). Default: boundary.
+                               (the first frame after the transforms), app-method (every distinct
+                               --app frame after the transforms, inclusive, call chains grouped,
+                               with self time), self (the leaf, after --collapse-leaf), method,
+                               class or package (every distinct one in the stack, inclusive), or
+                               pool (the thread name with digit runs as #). Default: boundary.
       --app=REGEX            A frame of your application; the deepest one is a stack's boundary.
                                Repeatable.
       --app-from=FILE        Read --app patterns from a file or preset:NAME; repeatable.

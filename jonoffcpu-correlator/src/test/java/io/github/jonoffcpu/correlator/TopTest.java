@@ -325,7 +325,7 @@ class TopTest {
     }
 
     /**
-     * {@code --by root}: the first frame after the transforms, with the heaviest line under it; with hiding, the
+     * {@code --by root}: the first frame after the transforms; with hiding, the
      * unmatched time is a total and a pool table of its own, and shares are of the rest.
      */
     @Test
@@ -358,9 +358,6 @@ class TopTest {
         assertThat(first.getShare())
                 .as("Shares are of the blocked time that was not hidden")
                 .isEqualTo("0.941176");
-        assertThat(first.getHeaviestStack())
-                .as("The heaviest transformed line under the root, abbreviated")
-                .isEqualTo("x.A.m;y.Lib.n;x.B.o;j.u.c.l.ReentrantLock.lock");
         assertThat(keys(rooted.getRowsList())).containsExactly("x.A.m", "x.R.r");
         assertThat(rooted.getTotals().getBlockedRootAtUnmatchedHidden().getValue())
                 .as("The hidden time is a total of its own")
@@ -382,7 +379,7 @@ class TopTest {
         assertThat(markdown)
                 .contains(
                         "| Blocked without an application frame, hidden by --root-at | 1 | 2 | 0.500 |",
-                        "| Root | s | Share | Intervals | Reason | Heaviest stack |",
+                        "| Root | s | Share | Intervals | Reason |",
                         "## Blocked without an application frame, by pool");
         CommandLineFixture.usageError(
                 "--root-at-unmatched hide needs --root-at",

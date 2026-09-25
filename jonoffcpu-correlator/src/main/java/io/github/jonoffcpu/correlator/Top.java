@@ -254,8 +254,6 @@ final class Top {
         BigDecimal runqueue = BigDecimal.ZERO;
         final Map<OffCpuReason, BigDecimal> reasons = new EnumMap<>(OffCpuReason.class);
         final Map<String, BigDecimal> callers = new HashMap<>();
-        /** {@link By#ROOT}: the transformed lines under the root, abbreviated, by weight. */
-        final Map<String, BigDecimal> lines = new HashMap<>();
         /** {@link By#APP_METHOD}: the chain's methods, root-most first, its self time and distinct stacks. */
         List<String> methods;
 
@@ -267,10 +265,6 @@ final class Top {
         }
 
         void add(Item item, String caller) {
-            add(item, caller, null);
-        }
-
-        void add(Item item, String caller, String line) {
             weight = weight.add(item.weight());
             intervals += item.intervals();
             if (item.estimated() != null) estimated = estimated.add(item.estimated());
@@ -278,7 +272,6 @@ final class Top {
             if (item.runqueue() != null) runqueue = runqueue.add(item.runqueue());
             if (item.reason() != null) reasons.merge(item.reason(), item.weight(), BigDecimal::add);
             if (caller != null) callers.merge(caller, item.weight(), BigDecimal::add);
-            if (line != null) lines.merge(line, item.weight(), BigDecimal::add);
         }
 
         /** Adds another row's sums, reasons included; its callers and lines are not merged. */
@@ -330,7 +323,6 @@ final class Top {
         private final StackTransforms.Compiled callerPath;
         private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> named = new IdentityHashMap<>();
         private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> transformed = new IdentityHashMap<>();
-        private final Map<StackProfile.Frame, String> abbreviated = new HashMap<>();
 
         Attribution(Options options) {
             this.options = options;
@@ -388,13 +380,6 @@ final class Top {
                 return false;
             }
             return boundary(stack(item)) >= 0;
-        }
-
-        /** A transformed stack as one line with abbreviated package names, as a flame graph would label it. */
-        String line(List<StackProfile.Frame> stack) {
-            StringBuilder line = new StringBuilder();
-            StackProfileRenderer.appendJava(line, stack, StackProfileRenderer.PackageNames.ABBREVIATE, abbreviated);
-            return line.toString();
         }
 
         boolean isApplication(StackProfile.Frame frame) {
@@ -501,11 +486,8 @@ final class Top {
         Map<List<String>, Row> rows = new HashMap<>();
         for (Item item : items) {
             String caller = withCallers ? attribution.caller(item) : null;
-            String line = by == By.ROOT && !attribution.transformed(item).isEmpty()
-                    ? attribution.line(attribution.transformed(item))
-                    : null;
             for (List<String> key : attribution.keys(item, by)) {
-                rows.computeIfAbsent(key, Row::new).add(item, caller, line);
+                rows.computeIfAbsent(key, Row::new).add(item, caller);
             }
         }
         List<Row> sorted = new ArrayList<>(rows.values());
@@ -766,7 +748,6 @@ final class Top {
             if (input.seconds() && row.reason() != null && row.methods == null)
                 item.setReason(row.reason().proto());
             if (!row.callers.isEmpty()) item.setCaller(options.packages().apply(Row.heaviest(row.callers)));
-            if (!row.lines.isEmpty()) item.setHeaviestStack(Row.heaviest(row.lines));
             result.add(item.build());
         }
         return result;
@@ -1069,8 +1050,6 @@ final class Top {
         if (reasons) columns.add("Reason");
         boolean callers = rows.stream().anyMatch(TopRow::hasCaller);
         if (callers) columns.add("Caller");
-        boolean heaviest = rows.stream().anyMatch(TopRow::hasHeaviestStack);
-        if (heaviest) columns.add("Heaviest stack");
         text.append("| ").append(String.join(" | ", columns)).append(" |\n|");
         for (String column : columns) {
             text.append(
@@ -1106,7 +1085,6 @@ final class Top {
             }
             if (reasons) cells.add(row.hasReason() ? label(row.getReason()) : "");
             if (callers) cells.add(row.hasCaller() ? code(row.getCaller()) : "");
-            if (heaviest) cells.add(row.hasHeaviestStack() ? code(row.getHeaviestStack()) : "");
             text.append("| ").append(String.join(" | ", cells)).append(" |\n");
         }
     }
@@ -1144,7 +1122,7 @@ final class Top {
         boolean seconds = result.getUnit().equals("seconds");
         text.append("table,rank,key,blocker,value,share,")
                 .append(seconds ? "intervals" : "lines")
-                .append(",estimated,sleeping,runqueue,reason,caller,heaviest_stack,self,stacks,methods\n");
+                .append(",estimated,sleeping,runqueue,reason,caller,self,stacks,methods\n");
         boolean boundary = result.getBy().equals("boundary")
                 || result.getBy().equals("app-method")
                 || result.getTotals().hasBlockedRootAtUnmatchedHidden();
@@ -1168,7 +1146,6 @@ final class Top {
                                 row.getRunqueue(),
                                 row.hasReason() ? label(row.getReason()) : "",
                                 csvCell(row.getCaller()),
-                                csvCell(row.getHeaviestStack()),
                                 row.getSelf(),
                                 row.hasStacks() ? Long.toString(row.getStacks()) : "",
                                 csvCell(String.join(";", row.getMethodsList()))))

@@ -542,8 +542,7 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
   seconds when the profile's estimate is available, sleeping and run-queue
   seconds when it has the split, the dominant reason, and for boundary rows the
   heaviest root-most application frame (the caller, after `--trim-root` and
-  `--root-at`). Root rows add `heaviestStack`, the heaviest transformed line
-  under the root with abbreviated package names. Application-method rows add
+  `--root-at`). Application-method rows add
   `self` (the time of the stacks whose deepest application frame is in the
   chain, the same boundary as `--by boundary`, so self times add up to the
   rows' total) and `stacks` (the distinct transformed stacks), and name no
@@ -577,8 +576,8 @@ java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REG
   (or `comparisonTotals` and `comparison`), and `warnings`. A row's `key` is
   the boundary, the pool or the `--by` key; seconds and shares are decimal
   strings, and `reason` an `OFF_CPU_REASON_…` value. `md` and `csv` (one row
-  per table row, with a `table` column, and `heaviest_stack`, `self`, `stacks`
-  and `methods` appended after `caller`) are rendered from it; the Markdown
+  per table row, with a `table` column, and `self`, `stacks` and `methods`
+  appended after `caller`) are rendered from it; the Markdown
   starts with the reproduce command as a `bash` block and lists each chain of
   three or more methods in a `<details>` block below its table.
 - **Commands** are printed one per `bash` block: on one line when they fit in
