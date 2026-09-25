@@ -54,7 +54,9 @@ architecture has a glibc and a musl flavour; `-PnativeLibcs` selects `musl`
 The agent JAR lands in `jonoffcpu-agent/build/libs/` and the runnable
 correlator JAR in `jonoffcpu-correlator/build/libs/`.
 
-The build runs with Gradle's configuration cache, build cache,
+The build runs with Gradle's
+[configuration cache](https://docs.gradle.org/current/userguide/configuration_cache.html),
+build cache,
 configure-on-demand and parallel execution; the modules share their build
 logic through the convention plugins in `build-logic/`, and every library and
 plugin version is in `gradle/libs.versions.toml`. The native bundle's
@@ -70,8 +72,10 @@ run `./gradlew spotlessApply` after editing.
 The tests are JUnit Jupiter tests with AssertJ. `src/test` holds unit tests
 that run on any platform with Java, `src/integrationTest` holds the tests that
 need the native bundle, a packaged JAR, Docker or an external tool, and what
-both share is in `src/testFixtures`, Gradle's test fixtures. Integration tests
-declare what they need with a JUnit tag; [CODING.md](../CODING.md#layout) lists
+both share is in `src/testFixtures`, Gradle's
+[test fixtures](https://docs.gradle.org/current/userguide/java_testing.html#sec:java_test_fixtures).
+Integration tests declare what they need with a
+[JUnit tag](https://docs.junit.org/current/writing-tests/tagging-and-filtering.html); [CODING.md](../CODING.md#layout) lists
 the tags and how the build routes them. Two lifecycle tasks group the tests by
 what they need, so CI and a developer run the same thing:
 

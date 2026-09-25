@@ -4,24 +4,31 @@
 is a profiling toolset for Java on Linux that runs
 [async-profiler](https://github.com/async-profiler/async-profiler) and extends
 it with off-CPU profiling measured by the kernel. The Linux scheduler, through
-eBPF, times every interval a thread spends off the CPU. async-profiler captures
+[eBPF](https://en.wikipedia.org/wiki/EBPF), times every interval a thread
+spends off the CPU. async-profiler captures
 the Java stack that waited, and an offline correlator joins the two into flame
 graphs and ranked reports whose numbers are real durations.
 
 - **Measured, not estimated.** Each recorded wait carries its exact duration
   from the scheduler, why the thread left the CPU, and how much of it was
-  spent asleep versus queued for a CPU. Flame-graph widths are microseconds,
-  not sample counts.
+  spent asleep versus queued for a CPU.
+  [Flame-graph](https://www.brendangregg.com/flamegraphs.html) widths are
+  microseconds, not sample counts.
 - **One recording, every source.** One `-javaagent` starts a current
   async-profiler. [Its fork](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
   follows upstream master, with its patches rebased periodically. A single run
-  records the JDK's own Flight Recorder events, async-profiler's CPU,
+  records the JDK's own [Flight Recorder](https://openjdk.org/jeps/328)
+  events, async-profiler's CPU,
   allocation and lock profiles, and the off-CPU samples into one JFR file. That
   file opens in JDK Mission Control and async-profiler's converter as usual.
-- **A small observer effect.** The per-context-switch work stays in the
-  kernel, which decides after measuring each interval whether to record it.
-  Duration-proportional sampling bounds the recording rate by off-CPU time
-  rather than by the number of context switches, and the population estimate
+- **A small [observer effect](https://en.wikipedia.org/wiki/Observer_effect_(information_technology)).**
+  The per-[context-switch](https://en.wikipedia.org/wiki/Context_switch) work
+  stays in the kernel, which decides after measuring each interval whether to
+  record it. Duration-proportional sampling
+  ([probability proportional to size](https://en.wikipedia.org/wiki/Probability-proportional-to-size_sampling))
+  bounds the recording rate by off-CPU time rather than by the number of
+  context switches, and the population estimate
+  ([Horvitz–Thompson](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator))
   stays exact. A recorded interval costs about 120 bytes. Correlation runs
   offline, on any machine.
 - **Your code, not the plumbing.** Threads *waiting for work*, such as idle
@@ -36,7 +43,8 @@ graphs and ranked reports whose numbers are real durations.
   DuckDB, and runs compare per unit of work, so an AI agent or a CI job can
   act on the results.
 - **Runs where your JVM runs.** One self-contained agent JAR covers Linux
-  x86-64 and arm64, glibc and musl (Alpine). It profiles a container from
+  x86-64 and arm64, [glibc](https://en.wikipedia.org/wiki/Glibc) and
+  [musl](https://en.wikipedia.org/wiki/Musl) (Alpine). It profiles a container from
   inside it, without `--pid=host`, and it fails closed rather than recording
   degraded data.
 
@@ -46,15 +54,19 @@ graphs and ranked reports whose numbers are real durations.
 
 ## What is off-CPU profiling
 
-At any moment, a Java thread is running on a CPU, waiting for one, or blocked:
+At any moment, a Java thread is in one of the
+[process states](https://en.wikipedia.org/wiki/Process_state) the scheduler
+keeps: [running](https://en.wikipedia.org/wiki/Process_state#Running) on a
+CPU, [ready](https://en.wikipedia.org/wiki/Process_state#Ready) and waiting
+for one, or [blocked](https://en.wikipedia.org/wiki/Process_state#Blocked):
 
 | The thread is | For example | jonoffcpu records it as |
 | --- | --- | --- |
-| **Running on a CPU** | Java code, the JVM itself, a JNI library, or the kernel working on the thread's behalf | Not off-CPU time; async-profiler's `event=cpu` samples it |
-| **Waiting for a CPU** | Preempted while running, or woken up while every CPU it may use is busy | Run-queue time: an interval of reason `runnable` or `preempted`, or a `blocked` interval after its wakeup |
-| **Blocked, waiting for work** | An idle event loop in `epoll_wait`, or a pool worker waiting for its next task | Reason `blocked`, set apart as *waiting* by the analysis |
-| **Blocked while it has work to do** | A contended lock or monitor, a reply from another service, a disk write, a future | Reason `blocked`, ranked as *blocked* by the analysis |
-| **Blocked by the OS or the JVM** | A [page fault](https://en.wikipedia.org/wiki/Page_fault) that reads from disk, or a JVM [safepoint](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint) such as a GC pause | Reason `blocked`, ranked as *blocked* by the analysis |
+| **Running on a CPU** | Java code, the JVM itself, a [JNI](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#JNI) library, or the kernel working on the thread's behalf | Not off-CPU time; async-profiler's `event=cpu` samples it |
+| **Waiting for a CPU** | [Preempted](https://en.wikipedia.org/wiki/Preemption_(computing)) by the kernel while running, or woken up while every CPU it may use is busy | [Run-queue](https://en.wikipedia.org/wiki/Run_queue) time: an interval of reason `runnable` or `preempted`, or a `blocked` interval after its wakeup |
+| **Blocked, waiting for work** | An idle [event loop](https://en.wikipedia.org/wiki/Event_loop) in `epoll_wait`, or a [thread pool](https://en.wikipedia.org/wiki/Thread_pool) worker waiting for its next task | Reason `blocked`, set apart as *waiting* by the analysis |
+| **Blocked while it has work to do** | A contended [lock](https://en.wikipedia.org/wiki/Lock_(computer_science)) or [monitor](https://en.wikipedia.org/wiki/Monitor_(synchronization)), a reply from another service, a disk write, a future | Reason `blocked`, ranked as *blocked* by the analysis |
+| **Blocked by the OS or the JVM** | A [page fault](https://en.wikipedia.org/wiki/Page_fault) that reads from disk, or a JVM [safepoint](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint) such as a [stop-the-world](https://en.wikipedia.org/wiki/Tracing_garbage_collection#Stop-the-world_vs._incremental_vs._concurrent) GC pause | Reason `blocked`, ranked as *blocked* by the analysis |
 
 [![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
@@ -67,7 +79,8 @@ sleep on a [futex](https://en.wikipedia.org/wiki/Futex). That is in the Java
 stack.
 jonoffcpu takes each interval's duration and reason from the scheduler
 through eBPF, and the Java stack from async-profiler. Kernel tools cannot walk
-JIT-compiled Java frames, and a JVM's wall-clock sampler cannot tell how long
+[JIT-compiled](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#JITCompilers)
+Java frames, and a JVM's wall-clock sampler cannot tell how long
 a wait lasted; jonoffcpu joins the two.
 [Off-CPU profiling](docs/off-cpu-profiling.md) explains the states and the
 reasons in depth.
@@ -82,27 +95,37 @@ all of their off-CPU time is spent waiting for work. The waits that limit
 throughput or add latency are a small fraction of that time, invisible in an
 unfiltered flame graph.
 
-In one Pulsar broker capture, the threads were off the CPU for 8,519 s in
-total, and only 49 s of that was blocked. Two waits led everything else: a
-contended monitor in the dispatcher (12 s) and a lock in a storage client's
-queue (5 s).
+As an example from Apache Pulsar profiling: in a broker under a many-producer
+load, almost all of the threads' off-CPU time was waiting for work. Once that
+was set apart, two waits led everything else: a contended monitor in the
+message dispatcher, and a lock in the queue of the storage client's executor.
 
-Finding such a bottleneck takes several steps. Waiting for work has to be
-separated from blocking. The waits have to be attributed to the application
-code, not to the lock internals under it. After every change, the new run has
-to be compared with the previous one under the same load, per unit of work.
-Doing that by hand for every experiment does not scale. jonoffcpu is built so
-that a script or an AI agent can do it: the correlator reduces each capture to
-a digest and ranked tables that can be read, drilled into and compared
-automatically.
+Such bottlenecks are also different in every usage scenario. Many producers
+to one topic, many topics, large messages, slow consumers and geo-replication
+each stress a different part of the system. A change that removes one
+bottleneck can move the load onto another, or trade latency in one scenario
+for throughput in another.
+
+Finding a bottleneck takes several steps. Waiting for work has to be separated
+from blocking. The waits have to be attributed to the application code, not to
+the lock internals under it. After every change, the new run has to be
+compared with the previous one under the same load, per unit of work, and
+that has to be repeated for every scenario the change affects. Without
+automated performance analysis, profiling, optimizing and weighing trade-offs
+across many scenarios does not scale. jonoffcpu is built so that a script or
+an AI agent can do it: the correlator reduces each capture to a digest and
+ranked tables that can be read, drilled into and compared automatically.
 
 ## Where jonoffcpu is going
 
 jonoffcpu started as an experiment in automating performance optimization and
 tuning of Apache Pulsar, with its end-to-end
 [performance scenarios](https://github.com/apache/pulsar/tree/master/tests/performance),
-and its features are currently shaped by that work. The direction is to
-support automated performance optimization and tuning more broadly:
+and its features are currently shaped by that work. Solving the problem
+described above is the core of the vision: automated performance analysis that
+finds the bottleneck of each scenario, checks whether a change helped, and
+shows the trade-offs across scenarios, for Apache Pulsar and for any JVM
+system like it. The steps toward that:
 
 - **Extract what matters from one run.** A recording holds the JDK's Flight
   Recorder events, async-profiler's profiles and jonoffcpu's eBPF
@@ -111,7 +134,11 @@ support automated performance optimization and tuning more broadly:
 - **Normalize stacks automatically.** Stack traces will be normalized, and the
   boundaries between the application, its libraries and the JDK detected from
   the data itself, rather than from patterns given by hand. That keeps a vast
-  amount of stack data readable, and comparable across runs and versions.
+  amount of stack data readable, and comparable across runs, scenarios and
+  versions.
+- **Compare across runs and scenarios.** Results are compared per unit of
+  work today, one baseline at a time. The aim is to track a system's
+  bottlenecks and their trade-offs across a whole set of scenarios.
 - **Integrate, don't compete.** jonoffcpu does not try to compete with the
   tooling emerging for AI agents in this space. It aims to integrate with that
   tooling and build on it. [Jafar](https://github.com/btraceio/jafar) is a fast
@@ -315,30 +342,6 @@ lock analysis.
 | [Offline correlation](jonoffcpu-correlator/OFFLINE.md) | The correlator's contracts: integrity, clipping, weighting, the stack profile, degradation |
 | [The Java agent](jonoffcpu-agent/README.md) | Agent lifecycle, native bundle, programmatic start, the raw `-agentpath` form |
 | [The native collector](jonoffcpu-native/README.md) | The libbpf-rs collector, its eBPF programs and kernel proof tools |
-
-## Where jonoffcpu is going
-
-jonoffcpu started as an experiment in automating performance optimization and
-tuning of [Apache Pulsar](https://pulsar.apache.org/), with its end-to-end
-[performance scenarios](https://github.com/apache/pulsar/tree/master/tests/performance).
-Its features are currently shaped by that work. The application-rooted digest,
-the separation of waiting from blocked time, and comparisons per unit of work
-answer what an optimization loop needs to know after each run.
-
-The direction is to support automated performance optimization and tuning more
-broadly: measurements that an AI agent can analyze, act on, and verify against
-a baseline. jonoffcpu does not try to compete with the tooling emerging for AI
-agents in this space. It aims to integrate with that tooling and build on it.
-Two examples of that tooling:
-
-- [Jafar](https://github.com/btraceio/jafar) is a fast JFR parser with an MCP
-  server that lets AI agents analyze JFR recordings.
-- [jafar-perf-box](https://github.com/btraceio/jafar-perf-box) packages a
-  performance-analysis methodology for AI agents on top of Jafar.
-
-The recording jonoffcpu writes is an ordinary async-profiler JFR, and its
-derived outputs are documented protobuf messages with a JSON view, so they can
-serve as inputs to such tools.
 
 ## Project status
 

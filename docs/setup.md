@@ -15,8 +15,9 @@ that lacks a feature gets an error, never a capture with degraded data.
 
 ## Requirements
 
-- 64-bit Linux on x86-64 or arm64, with BTF, eBPF task storage, the
-  `tp_btf/sched_exit_tp` tracepoint, and the `bpf_send_signal_task` helper. The
+- 64-bit Linux on x86-64 or arm64, with [BTF](https://docs.kernel.org/bpf/btf.html),
+  eBPF task storage, the `tp_btf/sched_exit_tp` tracepoint, and the
+  `bpf_send_signal_task` helper. The
   agent checks the running kernel and fails closed if any of these is missing.
   This checks the two you can see from a shell; it prints a non-zero count on a
   suitable kernel:
@@ -25,8 +26,9 @@ that lacks a feature gets an error, never a capture with degraded data.
   test -r /sys/kernel/btf/vmlinux && grep -ac btf_trace_sched_exit_tp /sys/kernel/btf/vmlinux
   ```
 
-- Privileges to load and attach the BPF programs: `CAP_BPF` and
-  `CAP_PERFMON`, or root. See [Kernel settings](#kernel-settings) for the
+- Privileges to load and attach the BPF programs: the
+  [capabilities](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+  `CAP_BPF` and `CAP_PERFMON`, or root. See [Kernel settings](#kernel-settings) for the
   sysctls that async-profiler needs alongside them.
 - Java 17 or newer for the agent; Java 21 or newer for the correlator.
 - On Java 24 and newer, add `--sun-misc-unsafe-memory-access=allow` to the JVM
@@ -42,7 +44,8 @@ that lacks a feature gets an error, never a capture with degraded data.
 
 The agent JAR is self-contained. It embeds the JNI bridge, the native
 collector, and the patched async-profiler for Linux x86-64 and arm64, each
-linked against both glibc and musl (Alpine), verifies them against a SHA-256
+linked against both [glibc](https://en.wikipedia.org/wiki/Glibc) and
+[musl](https://en.wikipedia.org/wiki/Musl) (Alpine), verifies them against a SHA-256
 manifest, and extracts them to a private temporary directory at startup.
 Nothing needs to be installed on the host. The agent picks the glibc or musl
 bundle from the C library mapped into the running JVM and never falls back to
@@ -62,10 +65,10 @@ missing kernel frames, truncated native stacks, or no `cpu` event at all.
 
 | Setting | Suggested value | Why |
 | --- | --- | --- |
-| `kernel.perf_event_paranoid` | `1` | The gate on `perf_event_open`. The common default `2` lets an unprivileged process measure only its own user space, so async-profiler's `cpu` engine cannot sample kernel stacks; `>= 2` is also the usual reason `perf_event_open` fails outright and the profiler falls back or errors. `1` allows per-process profiling including kernel stacks. `CAP_PERFMON` bypasses the check. |
-| `kernel.kptr_restrict` | `0` | Kernel symbol addresses in `/proc/kallsyms` read back as zeros unless the reader has `CAP_SYSLOG` (`1`), or for everyone (`2`). Both async-profiler and jonoffcpu's collector symbolize kernel frames from that file, so with addresses hidden the kernel part of a stack stays as raw addresses. |
-| `kernel.perf_event_max_stack` | `1024` | The maximum call-chain depth `perf_events` records, `127` by default, which silently truncates deep JVM native stacks. Raising it only affects async-profiler: jonoffcpu's BPF stack map has a fixed depth of 127. Do not lower it below 127 — the collector's stack map cannot be created if the sysctl is smaller than the map's depth. |
-| `kernel.perf_event_mlock_kb` | `2048` | async-profiler mmaps an 8 KB perf buffer per thread, bounded by `ulimit -l` plus this value times the number of CPUs. On a thread-heavy application the default `516` runs out and native stacks are dropped for the remaining threads. |
+| [`kernel.perf_event_paranoid`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#perf-event-paranoid) | `1` | The gate on `perf_event_open`. The common default `2` lets an unprivileged process measure only its own user space, so async-profiler's `cpu` engine cannot sample kernel stacks; `>= 2` is also the usual reason `perf_event_open` fails outright and the profiler falls back or errors. `1` allows per-process profiling including kernel stacks. `CAP_PERFMON` bypasses the check. |
+| [`kernel.kptr_restrict`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#kptr-restrict) | `0` | Kernel symbol addresses in [`/proc/kallsyms`](https://man7.org/linux/man-pages/man5/proc_kallsyms.5.html) read back as zeros unless the reader has `CAP_SYSLOG` (`1`), or for everyone (`2`). Both async-profiler and jonoffcpu's collector symbolize kernel frames from that file, so with addresses hidden the kernel part of a stack stays as raw addresses. |
+| [`kernel.perf_event_max_stack`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#perf-event-max-stack) | `1024` | The maximum call-chain depth `perf_events` records, `127` by default, which silently truncates deep JVM native stacks. Raising it only affects async-profiler: jonoffcpu's BPF stack map has a fixed depth of 127. Do not lower it below 127 — the collector's stack map cannot be created if the sysctl is smaller than the map's depth. |
+| [`kernel.perf_event_mlock_kb`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#perf-event-mlock-kb) | `2048` | async-profiler mmaps an 8 KB perf buffer per thread, bounded by `ulimit -l` plus this value times the number of CPUs. On a thread-heavy application the default `516` runs out and native stacks are dropped for the remaining threads. |
 
 Apply them for the current boot:
 
@@ -116,7 +119,8 @@ optional — see [Running the collector without root](#running-the-collector-wit
 
 ### Running the collector without root
 
-`kernel.unprivileged_bpf_disabled = 0` re-enables the `bpf()` syscall for
+[`kernel.unprivileged_bpf_disabled`](https://docs.kernel.org/admin-guide/sysctl/kernel.html#unprivileged-bpf-disabled)
+`= 0` re-enables the `bpf()` syscall for
 callers that hold no BPF capability:
 
 ```sh
@@ -149,8 +153,8 @@ repository's proof scripts do.
 
 | The container needs | How | Why |
 | --- | --- | --- |
-| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default seccomp profile permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
-| `tracefs` on `/sys/kernel/tracing` | a `local` volume, below | Both hooks are BTF raw tracepoints, which do not read `tracefs`: on a Linux host the packaged smoke passes without it mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
+| BPF and perf capabilities | `--cap-add BPF --cap-add PERFMON` | Loading and attaching the programs is `bpf()`; both scheduler hooks are BTF raw tracepoints attached through BPF links. Docker's default [seccomp profile](https://docs.docker.com/engine/security/seccomp/) permits it once the matching capabilities are present, so `--security-opt seccomp=unconfined` is not required. |
+| [`tracefs`](https://docs.kernel.org/trace/ftrace.html#the-file-system) on `/sys/kernel/tracing` | a `local` volume, below | Both hooks are BTF raw tracepoints, which do not read `tracefs`: on a Linux host the packaged smoke passes without it mounted, both `--privileged` and with only `--cap-add BPF --cap-add PERFMON --cap-add SYSLOG`. Keep the mount on Docker Desktop, where that has not been verified. |
 | Kernel symbols | `kernel.kptr_restrict=0` on the host, or `--cap-add SYSLOG` | Otherwise `/proc/kallsyms` reads back as zeros and kernel frames stay raw addresses. |
 | An executable temporary directory | `-Dio.github.jonoffcpu.agent.nativeWorkDir=…` if `/tmp` is `noexec` | The agent extracts the native bundle and executes it. |
 

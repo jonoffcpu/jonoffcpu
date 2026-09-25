@@ -16,18 +16,24 @@ agent and the correlator write. The correlation contracts themselves are in
 
 [![jonoffcpu architecture](images/architecture.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/architecture.svg)
 
-1. A [CO-RE eBPF program](../jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c)
-   hooks `sched_switch` and `sched_exit_tp`. When a thread of the target JVM is
+1. A [CO-RE](https://docs.kernel.org/bpf/libbpf/libbpf_overview.html#bpf-co-re-compile-once-run-everywhere)
+   [eBPF](https://en.wikipedia.org/wiki/EBPF) program,
+   [`jonoffcpu_cookie.bpf.c`](../jonoffcpu-native/src/bpf/jonoffcpu_cookie.bpf.c),
+   hooks the `sched_switch` and `sched_exit_tp`
+   [tracepoints](https://docs.kernel.org/trace/tracepoints.html). When a thread of the target JVM is
    switched out it records the timestamp and why the scheduler took it off the
    CPU; when the same thread is switched back in it has a complete off-CPU
    interval with its kernel and user native stacks.
 2. Intervals of the selected switch-out reasons that pass the configured
-   duration bounds and admission policy are written to a ring buffer together
-   with a fresh 64-bit correlation key. The kernel then sends the resumed
-   thread a signal whose payload is only that key.
+   duration bounds and admission policy are written to a
+   [BPF ring buffer](https://docs.kernel.org/bpf/ringbuf.html) together with a
+   fresh 64-bit correlation key. The kernel then sends the resumed thread a
+   [signal](https://man7.org/linux/man-pages/man7/signal.7.html) whose payload
+   is only that key.
 3. The signal handler, in the bundled
    [`jonoffcpu/async-profiler`](https://github.com/jonoffcpu/async-profiler/tree/jonoffcpu-dev)
-   fork, records a `profiler.SignalSample` event with the Java stack, the
+   fork, records a `profiler.SignalSample` event with the Java
+   [stack trace](https://en.wikipedia.org/wiki/Stack_trace), the
    thread, and the key, in the same JFR recording that holds ordinary CPU,
    allocation, lock, and JDK events; see [The recording](recording.md).
 4. A [native collector](../jonoffcpu-native/src/collector.rs) in the JVM
@@ -37,7 +43,9 @@ agent and the correlator write. The correlation contracts themselves are in
 5. [`OffCpuCorrelator`](../jonoffcpu-correlator/src/main/java/io/github/jonoffcpu/correlator/OffCpuCorrelator.java)
    runs offline. It joins each `SignalSample` to its observation by key,
    weights the Java stack by the kernel-measured duration, and writes a report,
-   a collapsed-stack file, and a stack profile from which other slices can be
+   a collapsed-stack file (the
+   [folded format](https://github.com/brendangregg/FlameGraph#2-fold-stacks)
+   flame-graph tools read), and a stack profile from which other slices can be
    rendered later.
 
 Only the first two steps run for every context switch, and they run in the
@@ -103,7 +111,7 @@ Analysis, written by the correlator into `--output`:
 | `jonoffcpu-complete.json` | Written last, only after all inputs and outputs validate. Never written when the run narrowed its window (see `--on-limit` below) |
 
 Every JSON file the correlator writes, and everything it prints as JSON, is a
-protobuf message printed in the
+[protobuf](https://protobuf.dev/) message printed in the
 [proto3 JSON mapping](https://protobuf.dev/programming-guides/json/): the report,
 the audit rows, the markers and the partial-mode files are defined in
 [`jonoffcpu-report.proto`](../jonoffcpu-correlator/src/main/proto/jonoffcpu-report.proto),

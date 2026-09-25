@@ -24,9 +24,11 @@ import org.commonmark.ext.heading.anchor.HeadingAnchorExtension;
 import org.commonmark.node.AbstractVisitor;
 import org.commonmark.node.Code;
 import org.commonmark.node.FencedCodeBlock;
+import org.commonmark.node.Heading;
 import org.commonmark.node.Image;
 import org.commonmark.node.Link;
 import org.commonmark.node.Node;
+import org.commonmark.node.Text;
 import org.commonmark.parser.Parser;
 import org.commonmark.renderer.html.HtmlRenderer;
 import org.junit.jupiter.api.BeforeAll;
@@ -215,6 +217,34 @@ class DocumentationTest {
             }
         }
         assertThat(broken).as("Broken links").isEmpty();
+    }
+
+    /** A heading appears once per document, so a moved section cannot leave its old copy behind. */
+    @Test
+    void headingsAreUnique() {
+        List<String> repeated = new ArrayList<>();
+        for (String document : documents) {
+            Set<String> seen = new LinkedHashSet<>();
+            parse(document).accept(new AbstractVisitor() {
+                @Override
+                public void visit(Heading heading) {
+                    StringBuilder text = new StringBuilder();
+                    heading.accept(new AbstractVisitor() {
+                        @Override
+                        public void visit(Text literal) {
+                            text.append(literal.getLiteral());
+                        }
+
+                        @Override
+                        public void visit(Code code) {
+                            text.append(code.getLiteral());
+                        }
+                    });
+                    if (!seen.add(text.toString())) repeated.add(document + ": " + text);
+                }
+            });
+        }
+        assertThat(repeated).as("Headings repeated within a document").isEmpty();
     }
 
     private static Node parse(String document) {

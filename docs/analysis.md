@@ -71,8 +71,10 @@ java -jar jfr-converter.jar --title "Off-CPU time" --units µs \
   /tmp/jonoffcpu-analysis/offcpu.html
 ```
 
-Open `offcpu.html` in a browser. Frame widths are proportional to the total
-off-CPU time observed under that Java stack. The collapsed weights are
+Open `offcpu.html` in a browser. It is an
+[off-CPU flame graph](https://www.brendangregg.com/FlameGraphs/offcpuflamegraphs.html):
+frame widths are proportional to the total off-CPU time observed under that
+Java stack. The collapsed weights are
 microseconds of off-CPU time, and `--units µs` makes the flame graph say so
 instead of counting "samples"; that option is a fork addition, so use the
 provided `jfr-converter.jar` rather than a stock `jfrconv`. Add `--reverse` to
@@ -166,6 +168,8 @@ Stacks that become identical merge into one line, and
 `--include`/`--exclude` still match the full names. Rendered with its defaults, a
 profile reproduces `jonoffcpu-offcpu-stacks.collapsed` byte for byte.
 
+Patterns are Java
+[regular expressions](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Pattern.html).
 `--exclude REGEX` drops every interval with a frame matching the pattern, and
 `--include REGEX` keeps only intervals with one; both can be repeated (any
 pattern matches), and an exclusion wins. Filtering happens on the profile's
@@ -222,7 +226,9 @@ java -jar jonoffcpu-correlator.jar stacks \
   with the frame that entered them, or with a category such as `[lock]` with
   `--collapse-leaf-label category`.
 - `--hide` removes matching frames anywhere.
-- `--canonical-names` removes generated-class addresses, so two runs compare.
+- `--canonical-names` removes the addresses in the names of generated classes,
+  such as lambdas' [hidden classes](https://openjdk.org/jeps/371), so two runs
+  compare.
 - `--thread-frame name|pool` starts each line with the thread or its pool.
 
 Each has a `-from FILE` form, and every `-from` option, the filters' included,
@@ -281,7 +287,7 @@ and intervals spent there. Waits for work are listed in their own table, so you
 can check that nothing important was classified as waiting; the over-exclusion
 line counts waiting intervals that still waited on a lock. Add `--waiting` or
 `--waiting-from` lines for your own queues' waits for work; the
-[Pulsar example](#example-apache-pulsar) shows what the table looks like.
+[Apache Pulsar example](#example-apache-pulsar) shows what the table looks like.
 `summarize` writes the same tables into a digest, as correlation does by
 default.
 
@@ -362,13 +368,13 @@ The generated help is the reference. The most used correlation options:
 | `--from`, `--to` | Select samples by JFR event time. Accepts ISO-8601 timestamps, epoch milliseconds, durations, or offsets from the recording start such as `30s` and `2m`. |
 | `--max-handler-delay-ns` | Reject matches whose Java stack was captured more than this long after the interval ended. |
 | `--from-ns`, `--to-ns` | Clip matched intervals to a window in the source monotonic clock. |
-| `--estimate-population true` | Add a `populationEstimate` to the report: the total off-CPU time of every eligible interval, reweighted by each row's admission threshold. See [OFFLINE.md](../jonoffcpu-correlator/OFFLINE.md). |
+| `--estimate-population true` | Add a `populationEstimate` to the report: the total off-CPU time of every eligible interval, reweighted by each row's admission threshold (a [Horvitz–Thompson estimate](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator)). See [Reading the results](capture.md#choosing-what-to-sample) and [OFFLINE.md](../jonoffcpu-correlator/OFFLINE.md). |
 | `--max-accounted-loss <f>` | Largest fraction of selected intervals that counted sequence contention may drop before the population estimate is refused (`accounted-loss-above-limit`). Below it the estimate is scaled for the loss and reports it in `accountedLoss`. Default `0.01`. |
 | `--partial-jfr true` | Accept a JFR that another tool has cut. Source rows without a sample in the cut JFR are reported as expected omissions instead of loss. |
 | `--partial true` | Inspect an interrupted capture. Writes `INCOMPLETE-jonoffcpu-*` files and a `jonoffcpu-partial.json` marker, exits with status 2, and never writes `jonoffcpu-complete.json`. |
 | `--audit full\|matches\|none` | How much per-row audit output to write. Default `matches`: `jonoffcpu-matches.jsonl` but not `jonoffcpu-classified-records.jsonl`. |
 | `--on-limit degrade\|fail\|truncate` | What to do when the retained-bytes budget is reached. Default `degrade`: drop audit outputs, thin and reweight, narrow the window — reporting each step. `fail` refuses at the limit. `truncate` skips thinning and narrows the window directly. |
-| `--thinning <q>` | Keep each recorded interval with probability `q` and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
+| `--thinning <q>` | Keep each recorded interval with probability `q` ([Bernoulli sampling](https://en.wikipedia.org/wiki/Bernoulli_sampling)) and reweight by `1/q`. Deterministic in the cookie, so the result does not depend on order. Default: chosen automatically, and `1` whenever the input fits. |
 | `--thinning-seed <n>` | Changes the deterministic draw `--thinning` uses. |
 | `--collapsed-reason-frame auto\|always\|never` | Whether each line of `jonoffcpu-offcpu-stacks.collapsed` starts with its `[offcpu: <reason>]` frame. Default `auto`: only when the capture mixes reasons. |
 | `--profile-output true\|false` | Whether to write `jonoffcpu-offcpu-profile.pb`. Default `true`. |
@@ -385,7 +391,7 @@ The generated help is the reference. The most used correlation options:
 256 MiB. Retention tracks distinct stacks, not capture length, so a long
 capture with few distinct call paths costs little more than a short one. Plan
 against at least 103 bytes per recorded interval for the columns alone, plus
-one copy of each distinct stack and the profile's entries: a real Pulsar broker
+one copy of each distinct stack and the profile's entries: a real Apache Pulsar broker
 capture held about 253 bytes per interval. OFFLINE.md's
 [Interpretation](../jonoffcpu-correlator/OFFLINE.md#interpretation) has the
 measurements.

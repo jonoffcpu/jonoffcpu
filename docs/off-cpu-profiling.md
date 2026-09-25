@@ -13,16 +13,24 @@ describes the pieces that do the measuring.
 
 ## What is off-CPU profiling?
 
-A CPU executes one thread at a time, and the Linux scheduler decides which.
-Every hand-over is a context switch, visible to the kernel as the
-`sched_switch` tracepoint: the outgoing thread is *switched out*, the incoming
-one *switched in*. A thread is **on-CPU** from a switch-in to its next
-switch-out and **off-CPU** the rest of the time. An off-CPU interval holds up
-to two scheduler states. The thread is **sleeping** while it is not runnable
-and waits for a wakeup — a futex, data on a socket, a disk read, a timer — and
-it is **runnable** from the `sched_wakeup` that ends the sleep until a CPU is
-free to switch it in. A thread that is preempted skips the sleep: it stays
-runnable and only waits in the run queue. Off-CPU profiling records, for each
+A CPU executes one thread at a time, and the Linux
+[scheduler](https://en.wikipedia.org/wiki/Scheduling_(computing)) decides
+which. Every hand-over is a
+[context switch](https://en.wikipedia.org/wiki/Context_switch), visible to the
+kernel as the `sched_switch` tracepoint: the outgoing thread is *switched
+out*, the incoming one *switched in*. A thread is **on-CPU** from a switch-in
+to its next switch-out and **off-CPU** the rest of the time. An off-CPU
+interval holds up to two of the scheduler's
+[process states](https://en.wikipedia.org/wiki/Process_state). The thread is
+**sleeping**, [blocked](https://en.wikipedia.org/wiki/Process_state#Blocked),
+while it is not runnable and waits for a wakeup — a
+[futex](https://man7.org/linux/man-pages/man2/futex.2.html), data on a
+socket, a disk read, a timer — and it is **runnable**,
+[ready](https://en.wikipedia.org/wiki/Process_state#Ready), from the
+`sched_wakeup` that ends the sleep until a CPU is free to switch it in. A
+thread that is [preempted](https://en.wikipedia.org/wiki/Preemption_(computing))
+skips the sleep: it stays runnable and only waits in the
+[run queue](https://en.wikipedia.org/wiki/Run_queue). Off-CPU profiling records, for each
 such interval, its exact duration and the code path that was executing when
 the thread was switched out. CPU profilers sample only the on-CPU state; a
 wall-clock sampler notices at each tick that a thread is off-CPU, but neither
@@ -33,8 +41,15 @@ queued.
 
 From the Java side, these states split further: a thread runs Java code or
 native code, waits for a CPU in either, or is blocked in native code or at the
-Java level, on a monitor or a park. The kernel sees only running, runnable and
-blocked, and for a blocked thread the
+Java level, on a [monitor](https://en.wikipedia.org/wiki/Monitor_(synchronization))
+or a [`park`](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/concurrent/locks/LockSupport.html).
+Java's own
+[`Thread.State`](https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/lang/Thread.State.html)
+does not line up with the kernel's view: a thread in a blocking socket read is
+`RUNNABLE` to Java but blocked to the kernel, and `BLOCKED`, `WAITING` and
+`TIMED_WAITING` (a monitor, a `park`, a timed wait) are all a futex wait
+underneath. The kernel sees only running, runnable and blocked, and for a
+blocked thread the
 *mechanism* of the wait, never its *reason*. A thread never blocks "on the
 storage layer": with a synchronous client it sleeps in a socket read; with an
 asynchronous client, a pool or any `Future.get()` it parks on a condition, a
@@ -92,7 +107,9 @@ Existing tools each see half of the picture:
 
 - **Kernel tools** such as BCC's [`offcputime`](https://github.com/iovisor/bcc/blob/master/tools/offcputime.py)
   know exactly when a thread went off CPU and when it came back, and can
-  capture the kernel stack. They cannot walk JIT-compiled Java frames, so the
+  capture the kernel stack. They cannot walk
+  [JIT-compiled](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#JITCompilers)
+  Java frames, so the
   Java side of the stack is missing or guessed from symbol maps.
 - **JVM profilers** such as [async-profiler](https://github.com/async-profiler/async-profiler)
   walk Java stacks accurately, but their wall-clock mode is a timer-driven
@@ -118,13 +135,18 @@ and `jonoffcpu` records it on every interval:
 
 `blocked` covers three situations that the kernel cannot tell apart:
 
-- **Waiting for work:** an idle event loop in `epoll_wait`, or a pool worker
-  waiting for its next task.
-- **Blocked while it had work to do:** a contended lock or monitor, a reply
-  from another service, a disk write, a future.
+- **Waiting for work:** an idle [event loop](https://en.wikipedia.org/wiki/Event_loop)
+  in [`epoll_wait`](https://man7.org/linux/man-pages/man7/epoll.7.html), or a
+  [thread pool](https://en.wikipedia.org/wiki/Thread_pool) worker waiting for
+  its next task.
+- **Blocked while it had work to do:** a contended
+  [lock](https://en.wikipedia.org/wiki/Lock_(computer_science)) or monitor, a
+  reply from another service, a disk write, a future.
 - **Blocked by the OS or the JVM:** a page fault that reads from disk, or a JVM
   [safepoint](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint)
-  such as a GC pause.
+  such as a
+  [stop-the-world](https://en.wikipedia.org/wiki/Tracing_garbage_collection#Stop-the-world_vs._incremental_vs._concurrent)
+  GC pause.
 
 The Java stack tells them apart. The analysis recognizes waits for work by
 their frames (`--waiting-from`, by default the bundled `preset:jvm-waiting`),
@@ -133,8 +155,9 @@ sets them apart as *waiting*, and ranks the rest as *blocked*; see
 
 `runnable` and `preempted` are both time spent *waiting for a CPU*: a stack
 that is wide under them is where execution stopped, not what the thread was
-waiting for, and the investigation belongs to CPU saturation, cgroup
-throttling, thread-pool sizing or IRQ load rather than to that code. Measured
+waiting for, and the investigation belongs to CPU saturation,
+[cgroup CPU throttling](https://docs.kernel.org/scheduler/sched-bwc.html),
+thread-pool sizing or IRQ load rather than to that code. Measured
 on a 16-CPU 7.1 kernel, more spinning threads than CPUs came back 2,861
 `runnable` against 2 `preempted`, so read the two together.
 
@@ -161,15 +184,18 @@ a CPU. `jonoffcpu` splits the two:
 
 The kernel already accounts for every task's run-queue wait in
 `task_struct.sched_info.run_delay` (the second field of
-`/proc/<pid>/schedstat`). The switch-out hook saves it and the switch-in hook
+`/proc/<pid>/schedstat`, as the kernel's
+[scheduler statistics](https://docs.kernel.org/scheduler/sched-stats.html)
+document). The switch-out hook saves it and the switch-in hook
 reads it again, so the split costs two field reads in hooks that run anyway,
 with nothing new firing system-wide. A slow wakeup shows up as run-queue time:
 a sleeper at nice 19 sharing a CPU with three busy threads waited 1.4 ms for
 the CPU after each 1 ms sleep, against 0.1 µs when it had a CPU to itself.
 
 It needs a kernel built with `CONFIG_SCHED_INFO`, which mainstream
-distribution kernels enable through `CONFIG_TASK_DELAY_ACCT` or
-`CONFIG_SCHEDSTATS`; the accounting runs whether or not delay accounting or
+distribution kernels enable through `CONFIG_TASK_DELAY_ACCT`
+([delay accounting](https://docs.kernel.org/accounting/delay-accounting.html))
+or `CONFIG_SCHEDSTATS`; the accounting runs whether or not delay accounting or
 schedstats are switched on at runtime. On a kernel without it, the agent fails
 to start rather than recording without the split; set `timeSplit.source: off`
 to capture there anyway (see [Agent options](capture.md#agent-options)).

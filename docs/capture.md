@@ -27,7 +27,7 @@ raw `-agentpath` form are in [the agent's README](../jonoffcpu-agent/README.md).
 | `sampling.admission.recordAllAboveMicros` | `proportional` only. Intervals at least this long are always recorded; shorter ones with probability `length / recordAllAboveMicros`. |
 | `sampling.admission.probability` | `uniform` only. `"0.000"` through `"1.000"`; every eligible interval is recorded with this probability. `"0"` is the same as policy `none`. Quote the value to keep its exact spelling in the capture metadata. |
 | `timeSplit.source` | `schedInfo` (default) records each interval's run-queue part from the scheduler's `sched_info.run_delay`, splitting its time into sleeping and run-queue time; `"off"` (quoted, since YAML reads a bare `off` as a boolean) reads nothing, for a kernel without `CONFIG_SCHED_INFO`. See [Sleeping and run-queue time](off-cpu-profiling.md#sleeping-and-run-queue-time). |
-| `signalDelivery` | `queued` (default) uses a dedicated real-time signal and never merges notifications. `coalescing` uses a standard signal and may merge them, trading lost samples for a bounded pending-signal queue. |
+| `signalDelivery` | `queued` (default) uses a dedicated [real-time signal](https://man7.org/linux/man-pages/man7/signal.7.html), which the kernel queues, and never merges notifications. `coalescing` uses a standard signal, which the kernel merges while one is pending, trading lost samples for a bounded pending-signal queue. |
 | `nativeStopTimeoutMillis` | Budget for detaching the eBPF source and draining the ring buffer at stop. Default 30000. |
 | `deliveryGraceMillis` | Time allowed after detach for already-requested signals to arrive. Default 100. |
 | `shutdownTimeoutMillis` | How long the JVM shutdown hook waits for the capture to finalize. Default 10000. |
@@ -63,8 +63,12 @@ this order:
    - `proportional`: an interval of at least `recordAllAboveMicros` is always
      recorded; a shorter one is recorded with probability
      `length / recordAllAboveMicros`. With `10000`, a 1 ms wait has a 10 %
-     chance and a 10 µs wait 0.1 %.
-   - `uniform`: every interval is recorded with the same `probability`.
+     chance and a 10 µs wait 0.1 %. In survey-sampling terms this is
+     [Poisson sampling](https://en.wikipedia.org/wiki/Poisson_sampling) with
+     [probability proportional to size](https://en.wikipedia.org/wiki/Probability-proportional-to-size_sampling),
+     the size being the interval's duration.
+   - `uniform`: every interval is recorded with the same `probability`,
+     [Bernoulli sampling](https://en.wikipedia.org/wiki/Bernoulli_sampling).
    - `none`: nothing is recorded and no eBPF program is loaded (see
      [Turning jonoffcpu off](#turning-jonoffcpu-off-without-removing-it)).
 
@@ -104,7 +108,11 @@ durations that were actually observed, so a wait recorded under
 exact admission threshold the kernel drew against, and the correlator's
 `--estimate-population true` reweights the observed intervals by those
 thresholds to estimate the total off-CPU time of all eligible intervals,
-including the ones the sampler skipped: under `proportional`, each recorded
+including the ones the sampler skipped. This is the
+[Horvitz–Thompson estimator](https://en.wikipedia.org/wiki/Horvitz%E2%80%93Thompson_estimator),
+an [inverse probability weighting](https://en.wikipedia.org/wiki/Inverse_probability_weighting):
+each recorded interval counts as its duration divided by the probability it
+had of being recorded. Under `proportional`, each recorded
 interval shorter than `recordAllAboveMicros` stands in for
 `recordAllAboveMicros` worth of waiting and each longer one for itself. That
 estimate is exact arithmetic on the recorded thresholds, not a heuristic, but
@@ -113,7 +121,9 @@ treat per-stack estimates for rare stacks as noisy.
 
 ## Overhead and the observer effect
 
-Scheduler events are frequent — a busy service switches threads tens of
+The [observer effect](https://en.wikipedia.org/wiki/Observer_effect_(information_technology))
+is the change a measurement makes to what it measures. Scheduler events are
+frequent — a busy service switches threads tens of
 thousands of times per second, in extreme cases millions — so, as Brendan
 Gregg's
 [Off-CPU Analysis](https://www.brendangregg.com/offcpuanalysis.html) warns, a
@@ -125,7 +135,7 @@ else is paid only for intervals that are actually recorded:
 | Stage | Applies to | Cost | Where it lands |
 | --- | --- | --- | --- |
 | eBPF switch-out / switch-in hooks | every context switch of the target process's threads | a task-storage lookup, a timestamp, the reason, a read of the scheduler's run delay, the bounds check and the admission draw | the switching thread, in the kernel; nothing leaves the kernel for intervals the bounds or the admission policy reject |
-| Ring-buffer record + signal | each recorded interval | a 136-byte kernel record and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
+| Ring-buffer record + signal | each recorded interval | a 136-byte record in the [BPF ring buffer](https://docs.kernel.org/bpf/ringbuf.html) and a signal queued to the thread that just resumed | the resumed thread, when the signal is delivered |
 | Java stack walk | each recorded interval | async-profiler's signal handler walks the Java stack and writes the `SignalSample` event | the resumed thread, before it continues its own work |
 | Drain and write | each recorded interval | a protobuf record of roughly 120 bytes | the collector's own thread; records are buffered (256 KiB) and flushed after each drain batch, at most every 5 ms, and fsynced only at stop |
 | Symbolize | each **distinct** native stack | one stack-map lookup and per-frame symbol resolution, written once as a `stack` record | the collector's own thread, on first sight of that stack |

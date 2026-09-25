@@ -1,7 +1,8 @@
 # The recording
 
-A jonoffcpu capture records everything in one run. The JDK's own Flight
-Recorder, async-profiler and jonoffcpu's eBPF program all observe the same
+A jonoffcpu capture records everything in one run. The JDK's own
+[Flight Recorder](https://openjdk.org/jeps/328) (JFR), async-profiler and
+jonoffcpu's eBPF program all observe the same
 execution of the application, and their events land in one JFR file. The
 off-CPU measurements go to a correlation stream beside it. This page describes
 what the JFR file holds, how to choose what goes into it, and how to read it
@@ -39,8 +40,8 @@ safepoints, the container configuration and the JDK's other events.
 
 | Source | Events | Recorded when |
 | --- | --- | --- |
-| The JDK's Flight Recorder | Garbage collections and their phases (`jdk.GarbageCollection`, `jdk.GCPhasePause`), safepoints, JIT compilations, heap and CPU load, the JVM, OS, CPU and container details (`jdk.JVMInformation`, `jdk.OSInformation`, `jdk.CPUInformation`, `jdk.ContainerConfiguration`), initial system properties and environment variables, and waits above a threshold: sleep, socket and file I/O, and monitor enter and park unless `lock=` replaces them | `jfrsync`, with the events and thresholds its configuration enables |
-| async-profiler | CPU samples (`jdk.ExecutionSample`), allocations (`jdk.ObjectAllocationInNewTLAB`, `jdk.ObjectAllocationOutsideTLAB`), lock contention (`jdk.JavaMonitorEnter`, `jdk.ThreadPark`), wall-clock samples (`profiler.WallClockSample`), native locks (`profiler.NativeLock`) | The matching `event=`, `alloc=`, `lock=`, `wall=` or `nativelock=` option |
+| The JDK's Flight Recorder | [Garbage collections](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#garbageCollection) and their phases (`jdk.GarbageCollection`, `jdk.GCPhasePause`), [safepoints](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint), [JIT compilations](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#JITCompilers), heap and CPU load, the JVM, OS, CPU and container details (`jdk.JVMInformation`, `jdk.OSInformation`, `jdk.CPUInformation`, `jdk.ContainerConfiguration`), initial system properties and environment variables, and waits above a threshold: sleep, socket and file I/O, and monitor enter and park unless `lock=` replaces them | `jfrsync`, with the events and thresholds its configuration enables |
+| async-profiler | CPU samples (`jdk.ExecutionSample`), allocations in and outside a [TLAB](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#TLAB) (`jdk.ObjectAllocationInNewTLAB`, `jdk.ObjectAllocationOutsideTLAB`), lock contention (`jdk.JavaMonitorEnter`, `jdk.ThreadPark`), wall-clock samples (`profiler.WallClockSample`), native locks (`profiler.NativeLock`) | The matching `event=`, `alloc=`, `lock=`, `wall=` or `nativelock=` option |
 | jonoffcpu | `profiler.SignalSample`: the Java stack of each recorded off-CPU interval, with its correlation key. `profiler.SignalCapture` and `profiler.SignalCaptureStats`: the capture's identity and signal counters | Always, unless the admission policy is `none` |
 
 async-profiler also writes the JVM, OS and CPU information events itself, so

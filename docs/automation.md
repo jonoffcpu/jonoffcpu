@@ -27,7 +27,8 @@ the runs are not comparable.
 
 ## Analyzing with SQL
 
-`export --format jsonl` writes one row per profile entry that DuckDB reads
+`export --format jsonl` writes one row per profile entry, in
+[JSON Lines](https://jsonlines.org/), that DuckDB reads
 directly: the stacks as arrays (`javaFrames`, `kernelFrames`, `userFrames`),
 the stack without generated-class addresses (`canonicalJavaStack`, which joins
 across runs), the counters, the thread's pool (`threadPool`), a `run` column
@@ -58,7 +59,7 @@ WHERE NOT list_bool_or(list_transform(frames, lambda f: regexp_matches(f,
 GROUP BY 1 ORDER BY 2 DESC LIMIT 20;
 ```
 
-On a Pulsar broker this returns `internalConsumerFlow` with 11.982 s in 4,245
+On an Apache Pulsar broker this returns `internalConsumerFlow` with 11.982 s in 4,245
 intervals and `GrowableBatchedArrayBlockingQueue.offer` with 4.946 s in 1,565
 as the top application rows, as `top` does. To compare runs, export each with
 its own `--run-label` and load them into one table; `--run-metadata FILE`
