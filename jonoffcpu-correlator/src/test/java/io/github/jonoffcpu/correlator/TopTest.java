@@ -44,36 +44,54 @@ class TopTest {
     private static Path profile(
             Path dir, String name, CaptureProto.Sampling sampling, boolean estimate, ReportProto.Report report)
             throws IOException {
-        List<StackProfile.Entry> entries = List.of(
-                // The boundary is the deepest application frame, past interleaved library frames.
-                entry(
-                        java(
-                                "x.A.m",
-                                "y.Lib.n",
-                                "x.B.o",
-                                "java.util.concurrent.locks.ReentrantLock.lock",
-                                "jdk.internal.misc.Unsafe.park"),
-                        "pool-1-thread-1",
-                        3,
-                        3_000_000_000L),
-                entry(
-                        java("x.A.m", "y.Lib.n", "x.B.o", "C2 Runtime complete_monitor_locking"),
-                        "pool-1-thread-2",
-                        1,
-                        1_000_000_000L),
-                // No application frame: listed by pool.
-                entry(java("java.lang.Thread.run", "libjvm.so.ZDriver::run"), "ZDriverMinor", 2, 500_000_000L),
-                // Idle: listed apart, not under busy; it also waited on a lock, which the over-exclusion check counts.
-                entry(
-                        java(
-                                "x.A.loop",
-                                "java.util.concurrent.locks.ReentrantLock.lock",
-                                "java.util.concurrent.ThreadPoolExecutor.getTask"),
-                        "pool-1-thread-3",
-                        5,
-                        7_000_000_000L),
-                // Recursion: x.R.r appears twice and is counted once by --by method.
-                entry(java("x.R.r", "x.R.r", "jdk.internal.misc.Unsafe.park"), "worker-7", 4, 250_000_000L));
+        return write(
+                dir,
+                name,
+                sampling,
+                estimate,
+                report,
+                List.of(
+                        // The boundary is the deepest application frame, past interleaved library frames.
+                        entry(
+                                java(
+                                        "x.A.m",
+                                        "y.Lib.n",
+                                        "x.B.o",
+                                        "java.util.concurrent.locks.ReentrantLock.lock",
+                                        "jdk.internal.misc.Unsafe.park"),
+                                "pool-1-thread-1",
+                                3,
+                                3_000_000_000L),
+                        entry(
+                                java("x.A.m", "y.Lib.n", "x.B.o", "C2 Runtime complete_monitor_locking"),
+                                "pool-1-thread-2",
+                                1,
+                                1_000_000_000L),
+                        // No application frame: listed by pool.
+                        entry(java("java.lang.Thread.run", "libjvm.so.ZDriver::run"), "ZDriverMinor", 2, 500_000_000L),
+                        // Waiting: listed apart, not under blocked; it also waited on a lock, which the over-exclusion
+                        // check
+                        // counts.
+                        entry(
+                                java(
+                                        "x.A.loop",
+                                        "java.util.concurrent.locks.ReentrantLock.lock",
+                                        "java.util.concurrent.ThreadPoolExecutor.getTask"),
+                                "pool-1-thread-3",
+                                5,
+                                7_000_000_000L),
+                        // Recursion: x.R.r appears twice and is counted once by --by method.
+                        entry(java("x.R.r", "x.R.r", "jdk.internal.misc.Unsafe.park"), "worker-7", 4, 250_000_000L)));
+    }
+
+    private static Path write(
+            Path dir,
+            String name,
+            CaptureProto.Sampling sampling,
+            boolean estimate,
+            ReportProto.Report report,
+            List<StackProfile.Entry> entries)
+            throws IOException {
         Path path = dir.resolve(name + ".pb");
         new StackProfile(
                         new StackProfile.Header(
@@ -114,7 +132,7 @@ class TopTest {
     }
 
     private static List<String> common(Path profile) {
-        return List.of("--profile", profile.toString(), "--app", "^x\\.", "--idle", "getTask$");
+        return List.of("--profile", profile.toString(), "--app", "^x\\.", "--waiting", "getTask$");
     }
 
     @Test
@@ -135,22 +153,22 @@ class TopTest {
         assertThat(boundary.getNoApplicationFrame(0).getKey())
                 .as("No application frame goes to the pool table: %s", boundary)
                 .isEqualTo("ZDriverMinor");
-        assertThat(keys(boundary.getIdleList()))
-                .as("The idle entry is listed as idle")
+        assertThat(keys(boundary.getWaitingList()))
+                .as("The waiting entry is listed as waiting")
                 .containsExactly("x.A.loop");
         AnalysisProto.TopTotals totals = boundary.getTotals();
         String totalsMessage =
-                "Totals add up: busy and idle make the selection, rows and pools make the busy: " + totals;
+                "Totals add up: blocked and waiting make the selection, rows and pools make the blocked: " + totals;
         assertThat(totals.getSelected().getValue()).as(totalsMessage).isEqualTo("11.750");
-        assertThat(totals.getIdle().getValue()).as(totalsMessage).isEqualTo("7.000");
-        assertThat(totals.getBusy().getValue()).as(totalsMessage).isEqualTo("4.750");
-        assertThat(totals.getBusyApplication().getValue()).as(totalsMessage).isEqualTo("4.250");
-        assertThat(totals.getBusyNoApplicationFrame().getValue())
+        assertThat(totals.getWaiting().getValue()).as(totalsMessage).isEqualTo("7.000");
+        assertThat(totals.getBlocked().getValue()).as(totalsMessage).isEqualTo("4.750");
+        assertThat(totals.getBlockedApplication().getValue()).as(totalsMessage).isEqualTo("4.250");
+        assertThat(totals.getBlockedNoApplicationFrame().getValue())
                 .as(totalsMessage)
                 .isEqualTo("0.500");
         assertThat(totals.getOverExclusion().getEntries()).as(totalsMessage).isEqualTo(1);
         assertThat(keys(boundary.getRowsList()))
-                .as("An idle entry is never busy")
+                .as("A waiting entry is never blocked")
                 .doesNotContain("x.A.loop");
         assertThat(boundary.getRows(0).hasEstimated())
                 .as("No estimate column without an estimate")
@@ -162,7 +180,7 @@ class TopTest {
     @Test
     void otherGroupings(@TempDir Path dir) throws Exception {
         Path profile = profile(dir, "run", NONE, false);
-        TopResult method = json("--profile", profile.toString(), "--by", "method", "--idle", "getTask$");
+        TopResult method = json("--profile", profile.toString(), "--by", "method", "--waiting", "getTask$");
         for (TopRow row : method.getRowsList()) {
             if (row.getKey().equals("x.R.r")) {
                 assertThat(row.getIntervals())
@@ -183,7 +201,7 @@ class TopTest {
                         keys -> assertThat(keys.get(0)).isEqualTo("x.A.loop"),
                         keys -> assertThat(List.<String>copyOf(keys))
                                 .contains("java.util.concurrent.locks.ReentrantLock.lock"));
-        TopResult pools = json("--profile", profile.toString(), "--by", "pool", "--idle", "getTask$");
+        TopResult pools = json("--profile", profile.toString(), "--by", "pool", "--waiting", "getTask$");
         assertThat(pools.getRows(0).getKey()).as("Pools: %s", pools).isEqualTo("pool-#-thread-#");
     }
 
@@ -200,7 +218,8 @@ class TopTest {
         assertThat(markdown)
                 .contains("| 1 | `x.B.o` | `java.util.concurrent.locks.ReentrantLock.lock` | 3.000 |")
                 .contains("| blocked |")
-                .contains("Reproduce: `java -jar jonoffcpu-correlator.jar top --format md --profile ");
+                .contains(
+                        "**Reproduce:**\n\n```bash\njava -jar jonoffcpu-correlator.jar top \\\n  --format md \\\n  --profile ");
         List<String> csvArgs = new ArrayList<>(List.of("top", "--format", "csv"));
         csvArgs.addAll(common);
         List<String> csv = CommandLineFixture.invoke(csvArgs.toArray(String[]::new))
@@ -209,7 +228,10 @@ class TopTest {
                 .toList();
         assertThat(csv)
                 .as("CSV")
-                .hasSize(1 + boundary.getRowsCount() + boundary.getNoApplicationFrameCount() + boundary.getIdleCount());
+                .hasSize(1
+                        + boundary.getRowsCount()
+                        + boundary.getNoApplicationFrameCount()
+                        + boundary.getWaitingCount());
         assertThat(csv.get(1))
                 .startsWith("rows,1,x.B.o,java.util.concurrent.locks.ReentrantLock.lock,3.000,")
                 .contains(",blocked,");
@@ -237,7 +259,7 @@ class TopTest {
                 "4",
                 "--app",
                 "^x\\.",
-                "--idle",
+                "--waiting",
                 "getTask$");
         AnalysisProto.ComparedRow top = compared.getComparison(0);
         assertThat(top.getBoundary()).as("Seconds per unit: %s", top).isEqualTo("x.B.o");
@@ -287,18 +309,260 @@ class TopTest {
         assertThat(digest.hasCapture())
                 .as("A profile without a report has no capture section")
                 .isFalse();
-        assertThat(digest.getWhereTheTimeWent().getIdle().getValue())
-                .as("The default idle preset recognises getTask")
+        assertThat(digest.getWhereTheTimeWent().getWaiting().getValue())
+                .as("The default waiting preset recognises getTask")
                 .isEqualTo("7.000");
-        assertThat(digest.getBusy().getRowsList())
-                .as("The busy table leaves the idle interval out")
+        assertThat(digest.getBlocked().getRowsList())
+                .as("The blocked table leaves the waiting interval out")
                 .noneMatch(row ->
                         row.toString().contains("getTask") || row.toString().contains("x.A.loop"));
         assertThat(markdown)
-                .as("The digest leads with busy time and has no idle table")
-                .contains("| Busy |", "| Idle, left out below |", "cover busy time only")
-                .doesNotContain("## Idle");
+                .as("With --app the digest leads with the application's blocked time and has no waiting table")
+                .startsWith("# jonoffcpu analysis digest")
+                .contains("Blocked with an application frame: 4.250 s", "| Waiting, left out |")
+                .doesNotContain("## Waiting");
         assertThat(markdown).as("The digest says how to reproduce each table").contains("## How to reproduce");
+    }
+
+    /**
+     * {@code --by root}: the first frame after the transforms; with hiding, the
+     * unmatched time is a total and a pool table of its own, and shares are of the rest.
+     */
+    @Test
+    void byRoot(@TempDir Path dir) throws Exception {
+        Path profile = profile(dir, "run", NONE, false);
+        TopResult plain = json("--profile", profile.toString(), "--by", "root", "--waiting", "getTask$");
+        assertThat(keys(plain.getRowsList()))
+                .as("Without --root-at a root is a thread's entry point")
+                .containsExactly("x.A.m", "java.lang.Thread.run", "x.R.r");
+        assertThat(plain.getWarningsList()).anyMatch(warning -> warning.contains("thread's entry point"));
+        assertThat(plain.getTotals().hasBlockedRootAtUnmatchedHidden()).isFalse();
+
+        TopResult rooted = json(
+                "--profile",
+                profile.toString(),
+                "--by",
+                "root",
+                "--waiting",
+                "getTask$",
+                "--root-at",
+                "^x\\.",
+                "--root-at-unmatched",
+                "hide",
+                "--collapse-leaf-from",
+                "preset:jvm-wait-machinery");
+        assertThat(rooted.getWarningsList()).noneMatch(warning -> warning.contains("thread's entry point"));
+        TopRow first = rooted.getRows(0);
+        assertThat(first.getKey()).isEqualTo("x.A.m");
+        assertThat(first.getValue()).isEqualTo("4.000");
+        assertThat(first.getShare())
+                .as("Shares are of the blocked time that was not hidden")
+                .isEqualTo("0.941176");
+        assertThat(keys(rooted.getRowsList())).containsExactly("x.A.m", "x.R.r");
+        assertThat(rooted.getTotals().getBlockedRootAtUnmatchedHidden().getValue())
+                .as("The hidden time is a total of its own")
+                .isEqualTo("0.500");
+        assertThat(keys(rooted.getNoApplicationFrameList()))
+                .as("The hidden time stays visible by pool")
+                .containsExactly("ZDriverMinor");
+        String markdown = CommandLineFixture.invoke(
+                        "top",
+                        "--profile",
+                        profile.toString(),
+                        "--by",
+                        "root",
+                        "--root-at",
+                        "^x\\.",
+                        "--root-at-unmatched",
+                        "hide")
+                .out();
+        assertThat(markdown)
+                .contains(
+                        "| Blocked without an application frame, hidden by --root-at | 1 | 2 | 0.500 |",
+                        "| Root | s | Share | Intervals | Reason |",
+                        "## Blocked without an application frame, by pool");
+        CommandLineFixture.usageError(
+                "--root-at-unmatched hide needs --root-at",
+                "top",
+                "--profile",
+                profile.toString(),
+                "--by",
+                "root",
+                "--root-at-unmatched",
+                "hide");
+    }
+
+    /**
+     * {@code --by app-method}: each distinct application method counts a stack once, recursion included; methods of
+     * the same stacks are one chain; self time is by the deepest application frame and adds up to the rows' total.
+     */
+    @Test
+    void byApplicationMethod(@TempDir Path dir) throws Exception {
+        Path profile = write(
+                dir,
+                "methods",
+                NONE,
+                false,
+                null,
+                List.of(
+                        entry(
+                                java("x.A.a", "x.B.b", "x.C.c", "jdk.internal.misc.Unsafe.park"),
+                                "t-1",
+                                2,
+                                2_000_000_000L),
+                        entry(java("x.A.a", "x.B.b", "x.C.c", "jdk.internal.misc.Unsafe.park"), "t-2", 1, 500_000_000L),
+                        entry(
+                                java(
+                                        "x.A.a",
+                                        "x.B.b",
+                                        "y.Lib.l",
+                                        "x.E.e",
+                                        "x.D.d",
+                                        "x.D.d",
+                                        "C2 Runtime complete_monitor_locking"),
+                                "t-3",
+                                3,
+                                1_000_000_000L),
+                        entry(
+                                java("java.lang.Thread.run", "libjvm.so.ZDriver::run"),
+                                "ZDriverMinor",
+                                1,
+                                4_000_000_000L)));
+        TopResult methods =
+                json("--profile", profile.toString(), "--by", "app-method", "--app", "^x\\.", "--limit", "10");
+        assertThat(keys(methods.getRowsList()))
+                .as("x.A.a and x.B.b are in the same stacks, so they are one chain: %s", methods)
+                .containsExactly("x.A.a → x.B.b", "x.C.c", "x.E.e → x.D.d");
+        TopRow chain = methods.getRows(0);
+        assertThat(chain.getMethodsList()).containsExactly("x.A.a", "x.B.b");
+        assertThat(chain.getValue()).isEqualTo("3.500");
+        assertThat(chain.getSelf()).as("No stack ends in the chain").isEqualTo("0.000");
+        assertThat(chain.getStacks())
+                .as("Two entries of one stack are one stack")
+                .isEqualTo(2);
+        assertThat(chain.getShare())
+                .as("Shares are of the blocked time with an application frame")
+                .isEqualTo("1.000000");
+        TopRow recursive = methods.getRows(2);
+        assertThat(recursive.getValue()).as("Recursion counts once").isEqualTo("1.000");
+        assertThat(recursive.getIntervals()).as("Recursion counts once").isEqualTo(3);
+        assertThat(recursive.getSelf()).isEqualTo("1.000");
+        assertThat(recursive.hasReason()).as("A method's row names no reason").isFalse();
+        assertThat(methods.getRowsList().stream()
+                        .map(row -> new java.math.BigDecimal(row.getSelf()))
+                        .reduce(java.math.BigDecimal.ZERO, java.math.BigDecimal::add))
+                .as("Self times add up to the blocked time with an application frame")
+                .isEqualByComparingTo(
+                        methods.getTotals().getBlockedApplication().getValue());
+        assertThat(keys(methods.getNoApplicationFrameList())).containsExactly("ZDriverMinor");
+
+        TopResult longChain = json("--profile", profile.toString(), "--by", "app-method", "--app", "^[xy]\\.");
+        assertThat(keys(longChain.getRowsList()))
+                .as("A chain of three or more shows its ends and its length")
+                .containsExactly("x.A.a → x.B.b", "x.C.c", "y.Lib.l → … (3) → x.D.d");
+        String markdown = CommandLineFixture.invoke(
+                        "top",
+                        "--profile",
+                        profile.toString(),
+                        "--by",
+                        "app-method",
+                        "--app",
+                        "^[xy]\\.",
+                        "--hide",
+                        "^x\\.B\\.")
+                .out();
+        assertThat(markdown)
+                .contains("| # | Application methods | s | Share | Self s | Stacks | Intervals |")
+                .contains(
+                        "| 3 | `y.Lib.l → … (3) → x.D.d` |",
+                        "<details><summary>3: `y.Lib.l → … (3) → x.D.d`</summary>",
+                        "1. `x.E.e`")
+                .as("A hidden frame is never an application method")
+                .doesNotContain("x.B.b");
+        CommandLineFixture.usageError(
+                "--by app-method needs --app", "top", "--profile", profile.toString(), "--by", "app-method");
+    }
+
+    /** A boundary is found after hidden frames; with hiding, its shares are of the time with an application frame. */
+    @Test
+    void boundaryAfterHiddenFrames(@TempDir Path dir) throws Exception {
+        Path profile = profile(dir, "run", NONE, false);
+        TopResult hidden = json(
+                "--profile",
+                profile.toString(),
+                "--app",
+                "^x\\.",
+                "--waiting",
+                "getTask$",
+                "--hide",
+                "^x\\.B\\.",
+                "--root-at",
+                "^x\\.",
+                "--root-at-unmatched",
+                "hide");
+        TopRow first = hidden.getRows(0);
+        assertThat(first.getKey()).as("x.B.o is hidden, so x.A.m waited").isEqualTo("x.A.m");
+        assertThat(first.getBlocker()).isEqualTo("java.util.concurrent.locks.ReentrantLock.lock");
+        assertThat(first.getShare())
+                .as("3 of the 4.25 s with an application frame")
+                .isEqualTo("0.705882");
+        assertThat(hidden.getTotals().getBlockedRootAtUnmatchedHidden().getValue())
+                .isEqualTo("0.500");
+        TopResult plain = json(common(profile).toArray(String[]::new));
+        assertThat(plain.getRows(0).getShare())
+                .as("Without hiding, shares stay of all blocked time")
+                .isEqualTo("0.631579");
+    }
+
+    /** Commands wrap one option per line past the width, with values kept on their option's line. */
+    @Test
+    void shellBlock() {
+        assertThat(Top.shellBlock(Top.shell(List.of(Cli.NAME, "top", "--profile", "p.pb"))))
+                .as("A short command stays on one line")
+                .isEqualTo("java -jar jonoffcpu-correlator.jar top --profile p.pb");
+        String longPath = "/" + "d".repeat(120) + "/run.pb";
+        String command = Top.shell(List.of(
+                Cli.NAME,
+                "top",
+                "--profile",
+                longPath,
+                "--app",
+                "^x\\.",
+                "--waiting",
+                "it's waiting",
+                "--canonical-names",
+                "--by=self",
+                "--limit",
+                "20"));
+        String block = Top.shellBlock(command);
+        assertThat(block)
+                .isEqualTo("java -jar jonoffcpu-correlator.jar top \\\n"
+                        + "  --profile " + longPath + " \\\n"
+                        + "  --app '^x\\.' \\\n"
+                        + "  --waiting 'it'\\''s waiting' \\\n"
+                        + "  --canonical-names \\\n"
+                        + "  --by=self \\\n"
+                        + "  --limit 20");
+        String joined = block.replace(" \\\n  ", " ");
+        assertThat(Top.words(joined))
+                .as("The block joins to the command's words")
+                .isEqualTo(Top.words(command));
+        assertThat(Top.words(command))
+                .containsExactly(
+                        Cli.NAME,
+                        "top",
+                        "--profile",
+                        longPath,
+                        "--app",
+                        "^x\\.",
+                        "--waiting",
+                        "it's waiting",
+                        "--canonical-names",
+                        "--by=self",
+                        "--limit",
+                        "20");
+        assertThat(Top.percent(new java.math.BigDecimal("0.0001"))).isEqualTo("< 0.1 %");
+        assertThat(Top.percent(java.math.BigDecimal.ZERO)).isEqualTo("0.0 %");
     }
 
     private static ReportProto.Report report(String session, long sourceRows) {

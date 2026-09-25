@@ -21,8 +21,8 @@ With --collapsed-input, filters and transforms any collapsed file instead, such 
 converter wrote.
       --profile=FILE         The stack profile, such as jonoffcpu-offcpu-profile.pb. Required
                                unless --collapsed-input is given.
-      --reason=REASONS       all, or a comma-separated list of blocked, runnable, preempted and
-                               unspecified. Default: all.
+      --reason=REASONS       all, or a comma-separated list of blocked, runnable and preempted.
+                               Default: all.
       --stack=KINDS          Which stacks a line is made of: java, kernel, user, java+kernel or
                                java+user+kernel. Default: java.
       --weights=WEIGHTS      observed durations, or the estimated inverse-probability population
@@ -48,7 +48,7 @@ converter wrote.
       --include-from=FILE    Read --include patterns from a file, one per line, or a bundled preset:
                                NAME; repeatable.
       --exclude-from=FILE    Read --exclude patterns from a file, one per line, or a bundled preset:
-                               NAME such as preset:jvm-idle; repeatable.
+                               NAME such as preset:jvm-waiting; repeatable.
       --canonical-names      Remove generated-class addresses ($Lambda.0x..., LambdaForm$MH/0x...),
                                so two runs' stacks compare.
       --hide=REGEX           Remove every frame that matches, anywhere in the stack; a stack of
@@ -64,7 +64,9 @@ converter wrote.
       --root-at-from=FILE    Read --root-at patterns from a file or preset:NAME; repeatable.
       --root-at-unmatched=MODE
                              A stack without a --root-at match: bucket (becomes the single frame
-                               [no application frame]) or keep (unchanged). Default: bucket.
+                               [no application frame]), keep (unchanged) or hide (left out of the
+                               lines and the rows, and reported as a total of its own). Default:
+                               bucket.
       --leaf-at=REGEX        Cut the callees of the leaf-most matching frame, keeping the match.
                                Repeatable.
       --leaf-at-from=FILE    Read --leaf-at patterns from a file or preset:NAME; repeatable.
@@ -86,5 +88,7 @@ converter wrote.
 
 Per kept entry, in this order: --canonical-names, --hide, --trim-root, --root-at, --leaf-at,
 --collapse-leaf, then --package-names and --thread-frame as display. Filters see the untransformed
-stacks, and lines that transform alike merge, so totals never change. Every -from option also takes
-preset:NAME; --list-presets prints them.
+stacks, and lines that transform alike merge, so totals never change, except that
+--root-at-unmatched hide moves unmatched entries to a total of their own. Every -from option also
+takes preset:NAME, or preset:* for every bundled preset meant for it (quote it for the shell);
+--list-presets prints them with their options.

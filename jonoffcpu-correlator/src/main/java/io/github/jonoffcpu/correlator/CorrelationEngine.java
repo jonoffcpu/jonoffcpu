@@ -307,6 +307,7 @@ final class CorrelationEngine implements CaptureInput.SourceVisitor {
                     observedStats[0] = stats.getCounters();
                     if (capture.partial) capture.diagnostics.setObservedApStats(stats);
                 }
+                case RECORDING -> capture.recording = row.getRecording();
                 case END ->
                     require(
                             row.getEnd().getParseComplete() && row.getEnd().getSamples() == samplesSeen,

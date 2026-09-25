@@ -27,11 +27,14 @@ import java.util.regex.Pattern;
 
 /**
  * Ranked tables of where off-CPU time went, for people and agents who should not have to read a flame graph: each
- * selected interval is either idle, when any frame of any of its stacks matches an idle pattern, or busy, and busy
+ * selected interval is either waiting, when any frame of any of its stacks matches a waiting pattern, or blocked, and blocked
  * time is attributed by {@link By} to a row. With {@link By#BOUNDARY} a row is the deepest application frame of the
- * stack and the blocker below it, and busy time without an application frame is broken down by thread pool instead.
- * Idle time is listed in its own table, never silently dropped, and every total adds up: busy and idle make the
- * selection, and application rows and the pool table make the busy time.
+ * stack and the blocker below it, with {@link By#ROOT} the root of the transformed stack, and with {@link
+ * By#APP_METHOD} a call chain of application methods; blocked time without an application frame is broken down by
+ * thread pool instead. {@link StackTransforms.UnmatchedRoot#HIDE} leaves blocked time without a {@code --root-at} match
+ * out of every mode's rows, into a total and the pool table of its own. Waiting time is listed in its own table, never
+ * silently dropped, and every total adds up: blocked and waiting make the selection, and the rows and the pool table make
+ * the blocked time.
  *
  * <p>The result is a {@link TopResult}, printed as JSON; Markdown and CSV are rendered from it, so no format can
  * disagree with another.
@@ -40,6 +43,8 @@ final class Top {
     /** What a row is keyed by. */
     enum By {
         BOUNDARY,
+        ROOT,
+        APP_METHOD,
         SELF,
         METHOD,
         CLASS,
@@ -47,18 +52,32 @@ final class Top {
         POOL;
 
         String label() {
-            return name().toLowerCase(java.util.Locale.ROOT);
+            return name().toLowerCase(java.util.Locale.ROOT).replace('_', '-');
+        }
+
+        /** Whether the rows cover only blocked time with an application frame, the rest going to the pool table. */
+        boolean application() {
+            return this == BOUNDARY || this == APP_METHOD;
         }
     }
 
     static final String NO_APPLICATION_FRAME = StackTransforms.NO_APPLICATION_FRAME;
 
     /**
-     * An idle entry that still waited on a lock or a monitor: the waits an idle list may hide by mistake, reported as
+     * A waiting entry that still waited on a lock or a monitor: the waits a waiting list may hide by mistake, reported as
      * the over-exclusion check.
      */
     static final Pattern LOCK_ACQUIRE =
             Pattern.compile("^java\\.util\\.concurrent\\.locks\\..*\\.(lock|acquire)\\w*$|complete_monitor_locking");
+
+    /** Warned when time without an application frame is reported; the digest says it once, in its notes. */
+    static final String SYMBOLIZATION_WARNING = "Blocked time without an application frame depends on native"
+            + " symbolization: on a musl image every native frame is /lib/ld-musl-<arch>.so.1, the HotSpot waiting"
+            + " patterns cannot match, and GC and compiler threads waiting for work count as blocked.";
+
+    /** Warned when observed time is biased; the digest says it once, under its terms. */
+    static final String SAMPLING_WARNING = "Sampling kept only some intervals (proportional or uniform admission), so"
+            + " observed time under-weights short waits; use --weights estimated when the estimate is available.";
 
     private static final BigDecimal NANOS_PER_SECOND = BigDecimal.valueOf(1_000_000_000L);
 
@@ -66,7 +85,7 @@ final class Top {
     record Options(
             By by,
             List<StackTransforms.Sourced> app,
-            List<StackTransforms.Sourced> idle,
+            List<StackTransforms.Sourced> waiting,
             List<StackTransforms.Sourced> machinery,
             int limit,
             StackTransforms transforms,
@@ -85,7 +104,7 @@ final class Top {
             BigDecimal estimated,
             BigDecimal sleeping,
             BigDecimal runqueue,
-            boolean idle) {}
+            boolean waiting) {}
 
     /**
      * The selected items and what the input can say about them: the unit of their weights, whether estimates, the
@@ -100,7 +119,8 @@ final class Top {
             boolean pools,
             boolean exhaustiveSampling,
             boolean estimateAvailable,
-            AnalysisProto.TopSelection source) {}
+            AnalysisProto.TopSelection source,
+            boolean runQueue) {}
 
     private Top() {}
 
@@ -120,14 +140,14 @@ final class Top {
                     "This profile is not grouped by its thread stacks; --by pool needs the thread dimension");
         }
         Predicate<StackProfile.Entry> keeps = options.filter().predicate(profile);
-        Predicate<StackProfile.Entry> busy = StackProfileRenderer.Filter.of(
+        Predicate<StackProfile.Entry> blocked = StackProfileRenderer.Filter.of(
                         List.of(),
-                        options.idle().stream()
+                        options.waiting().stream()
                                 .map(StackTransforms.Sourced::pattern)
                                 .toList())
                 .predicate(profile);
         Set<OffCpuReason> reasons =
-                options.reasons() == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(options.reasons());
+                options.reasons() == null ? EnumSet.copyOf(OffCpuReason.CLASSIFIED) : EnumSet.copyOf(options.reasons());
         Thinning thinning = estimated ? Thinning.NONE : header.thinning();
         List<Item> items = new ArrayList<>();
         for (StackProfile.Entry entry : profile.entries()) {
@@ -148,7 +168,7 @@ final class Top {
                     header.timeSplitAvailable()
                             ? unsigned(entry.split().nanos(TimeSplit.Part.RUNQUEUE, estimated))
                             : null,
-                    !busy.test(entry)));
+                    !blocked.test(entry)));
         }
         AnalysisProto.TopSelection source = AnalysisProto.TopSelection.newBuilder()
                 .setProfile(path.toString())
@@ -162,24 +182,47 @@ final class Top {
                 header.dimensions().contains(ProfileAccumulator.THREAD),
                 exhaustive(header),
                 header.estimateAvailable(),
-                source);
+                source,
+                runQueue(header, reasons));
+    }
+
+    /**
+     * Whether runnable or preempted intervals can be in the selection: selected, and recorded by some source's
+     * sampling. Then the blocked slice is "blocked or in the run queue".
+     */
+    static boolean runQueue(StackProfile.Header header, Set<OffCpuReason> selected) {
+        for (var source : header.sources()) {
+            for (CaptureProto.OffCpuReason recorded : source.getSampling().getReasonsList()) {
+                OffCpuReason reason = OffCpuReason.fromWire(recorded.getNumber());
+                if ((reason == OffCpuReason.RUNNABLE || reason == OffCpuReason.PREEMPTED)
+                        && selected.contains(reason)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** The blocked slice's name, capitalised: "Blocked", or "Blocked or in the run queue". */
+    static String blockedLabel(boolean runQueue) {
+        return runQueue ? "Blocked or in the run queue" : "Blocked";
     }
 
     static Input fromCollapsed(Path path, Options options) throws IOException {
-        StackProfileRenderer.Filter idle = StackProfileRenderer.Filter.of(
+        StackProfileRenderer.Filter waiting = StackProfileRenderer.Filter.of(
                 List.of(),
-                options.idle().stream().map(StackTransforms.Sourced::pattern).toList());
+                options.waiting().stream().map(StackTransforms.Sourced::pattern).toList());
         List<Item> items = new ArrayList<>();
         for (CollapsedStacks.Line line : CollapsedStacks.read(path)) {
             List<String> names =
                     line.frames().stream().map(StackProfile.Frame::name).toList();
             if (!options.filter().keeps(names)) continue;
-            items.add(new Item(line.frames(), null, null, 1, line.weight(), null, null, null, !idle.keeps(names)));
+            items.add(new Item(line.frames(), null, null, 1, line.weight(), null, null, null, !waiting.keeps(names)));
         }
         AnalysisProto.TopSelection source = AnalysisProto.TopSelection.newBuilder()
                 .setCollapsedInput(path.toString())
                 .build();
-        return new Input(items, false, false, false, false, true, false, source);
+        return new Input(items, false, false, false, false, true, false, source, false);
     }
 
     /** Whether every eligible interval was kept, so that observed time is an unbiased weight. */
@@ -211,6 +254,11 @@ final class Top {
         BigDecimal runqueue = BigDecimal.ZERO;
         final Map<OffCpuReason, BigDecimal> reasons = new EnumMap<>(OffCpuReason.class);
         final Map<String, BigDecimal> callers = new HashMap<>();
+        /** {@link By#APP_METHOD}: the chain's methods, root-most first, its self time and distinct stacks. */
+        List<String> methods;
+
+        BigDecimal self = BigDecimal.ZERO;
+        long stacks;
 
         Row(List<String> key) {
             this.key = key;
@@ -224,6 +272,16 @@ final class Top {
             if (item.runqueue() != null) runqueue = runqueue.add(item.runqueue());
             if (item.reason() != null) reasons.merge(item.reason(), item.weight(), BigDecimal::add);
             if (caller != null) callers.merge(caller, item.weight(), BigDecimal::add);
+        }
+
+        /** Adds another row's sums, reasons included; its callers and lines are not merged. */
+        void merge(Row other) {
+            weight = weight.add(other.weight);
+            intervals += other.intervals;
+            estimated = estimated.add(other.estimated);
+            sleeping = sleeping.add(other.sleeping);
+            runqueue = runqueue.add(other.runqueue);
+            other.reasons.forEach((reason, value) -> reasons.merge(reason, value, BigDecimal::add));
         }
 
         static String heaviest(Map<String, BigDecimal> weights) {
@@ -264,6 +322,7 @@ final class Top {
         private final StackTransforms.Compiled full;
         private final StackTransforms.Compiled callerPath;
         private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> named = new IdentityHashMap<>();
+        private final Map<List<StackProfile.Frame>, List<StackProfile.Frame>> transformed = new IdentityHashMap<>();
 
         Attribution(Options options) {
             this.options = options;
@@ -277,7 +336,7 @@ final class Top {
                             transforms.hide(),
                             List.of(),
                             List.of(),
-                            false,
+                            StackTransforms.UnmatchedRoot.BUCKET,
                             List.of(),
                             List.of(),
                             false,
@@ -289,7 +348,7 @@ final class Top {
                             transforms.hide(),
                             transforms.trimRoot(),
                             transforms.rootAt(),
-                            true,
+                            StackTransforms.UnmatchedRoot.KEEP,
                             List.of(),
                             List.of(),
                             false,
@@ -300,6 +359,27 @@ final class Top {
         /** The Java stack attribution sees: after canonical names and hidden frames. */
         List<StackProfile.Frame> stack(Item item) {
             return named.computeIfAbsent(item.java(), names::apply);
+        }
+
+        /** The Java stack after every transform, as a flame graph with the same options draws it. */
+        List<StackProfile.Frame> transformed(Item item) {
+            return transformed.computeIfAbsent(item.java(), full::apply);
+        }
+
+        /** Whether {@link StackTransforms.UnmatchedRoot#HIDE} leaves this item out. */
+        boolean hidden(Item item) {
+            return StackTransforms.hidden(item.java(), transformed(item));
+        }
+
+        /** Whether the item has an application frame, as {@code by} decides: a boundary, or one after the transforms. */
+        boolean hasApplication(Item item, By by) {
+            if (by == By.APP_METHOD) {
+                for (StackProfile.Frame frame : transformed(item)) {
+                    if (isApplication(frame)) return true;
+                }
+                return false;
+            }
+            return boundary(stack(item)) >= 0;
         }
 
         boolean isApplication(StackProfile.Frame frame) {
@@ -346,8 +426,16 @@ final class Top {
                                     ? List.of(NO_APPLICATION_FRAME)
                                     : List.of(stack.get(boundary).name(), blocker(stack, boundary)));
                 }
+                case ROOT -> {
+                    List<StackProfile.Frame> transformed = transformed(item);
+                    yield List.of(List.of(
+                            transformed.isEmpty()
+                                    ? hidden(item) ? NO_APPLICATION_FRAME : "[empty stack]"
+                                    : transformed.get(0).name()));
+                }
+                case APP_METHOD -> throw new IllegalArgumentException("Application methods are grouped by chain");
                 case SELF -> {
-                    List<StackProfile.Frame> transformed = full.apply(item.java());
+                    List<StackProfile.Frame> transformed = transformed(item);
                     yield List.of(List.of(
                             transformed.isEmpty()
                                     ? "[empty stack]"
@@ -394,6 +482,7 @@ final class Top {
     }
 
     static List<Row> aggregate(List<Item> items, Attribution attribution, By by, boolean withCallers) {
+        if (by == By.APP_METHOD) return applicationMethods(items, attribution);
         Map<List<String>, Row> rows = new HashMap<>();
         for (Item item : items) {
             String caller = withCallers ? attribution.caller(item) : null;
@@ -408,58 +497,143 @@ final class Top {
         return sorted;
     }
 
+    /**
+     * {@link By#APP_METHOD}: every distinct application frame of each transformed stack adds the stack's time once
+     * (inclusive), and methods that occur in exactly the same distinct stacks are one call chain, one row. A row's
+     * self time is that of the stacks whose deepest application frame is in the chain, so self times add up to the
+     * items' total. Rows sort by inclusive time, then self time, then the root-most method.
+     */
+    static List<Row> applicationMethods(List<Item> items, Attribution attribution) {
+        Map<List<StackProfile.Frame>, Integer> ids = new HashMap<>();
+        List<Row> stacks = new ArrayList<>();
+        List<String> deepest = new ArrayList<>();
+        Map<String, java.util.BitSet> members = new java.util.LinkedHashMap<>();
+        Map<String, Integer> depth = new HashMap<>();
+        for (Item item : items) {
+            List<StackProfile.Frame> stack = attribution.transformed(item);
+            Integer id = ids.get(stack);
+            if (id == null) {
+                id = stacks.size();
+                ids.put(stack, id);
+                stacks.add(new Row(List.of()));
+                List<String> application = new ArrayList<>();
+                for (StackProfile.Frame frame : stack) {
+                    if (attribution.isApplication(frame)) application.add(frame.name());
+                }
+                deepest.add(application.isEmpty() ? null : application.get(application.size() - 1));
+                int index = 0;
+                for (String method : new LinkedHashSet<>(application)) {
+                    members.computeIfAbsent(method, key -> new java.util.BitSet())
+                            .set(id);
+                    depth.merge(method, index++, Math::min);
+                }
+            }
+            stacks.get(id).add(item, null);
+        }
+        Map<java.util.BitSet, List<String>> chains = new java.util.LinkedHashMap<>();
+        members.forEach((method, in) ->
+                chains.computeIfAbsent(in, key -> new ArrayList<>()).add(method));
+        List<Row> rows = new ArrayList<>();
+        chains.forEach((in, methods) -> {
+            List<String> ordered = new ArrayList<>(methods);
+            ordered.sort(Comparator.comparing(depth::get));
+            Row row = new Row(List.of(ordered.get(0)));
+            row.methods = List.copyOf(ordered);
+            Set<String> chain = Set.copyOf(ordered);
+            in.stream().forEach(id -> {
+                row.merge(stacks.get(id));
+                if (chain.contains(deepest.get(id))) row.self = row.self.add(stacks.get(id).weight);
+            });
+            row.stacks = in.cardinality();
+            rows.add(row);
+        });
+        rows.sort(Comparator.comparing((Row row) -> row.weight)
+                .reversed()
+                .thenComparing(Comparator.comparing((Row row) -> row.self).reversed())
+                .thenComparing(row -> row.key.get(0)));
+        return rows;
+    }
+
+    /** A chain as its row key reads: the method, both ends, or both ends and how many methods it has. */
+    static String chain(List<String> methods) {
+        return switch (methods.size()) {
+            case 1 -> methods.get(0);
+            case 2 -> methods.get(0) + " → " + methods.get(1);
+            default -> methods.get(0) + " → … (" + methods.size() + ") → " + methods.get(methods.size() - 1);
+        };
+    }
+
+    /** An identity set of items, for splitting a list by membership. */
+    private static Set<Item> identities(List<Item> items) {
+        Set<Item> set = java.util.Collections.newSetFromMap(new IdentityHashMap<>());
+        set.addAll(items);
+        return set;
+    }
+
     // ---- the result ---------------------------------------------------------------------------------------------
 
     /** The ranked tables. */
     static TopResult tables(Input input, Options options, String command) {
         Attribution attribution = new Attribution(options);
-        List<Item> busy = input.items().stream().filter(item -> !item.idle()).toList();
-        List<Item> idle = input.items().stream().filter(Item::idle).toList();
-        boolean boundary = options.by() == By.BOUNDARY;
-        List<Item> application = busy;
-        List<Item> noApplication = List.of();
-        if (boundary) {
-            application = busy.stream()
-                    .filter(item -> attribution.boundary(attribution.stack(item)) >= 0)
-                    .toList();
-            noApplication = busy.stream()
-                    .filter(item -> attribution.boundary(attribution.stack(item)) < 0)
-                    .toList();
-        }
+        List<Item> blocked =
+                input.items().stream().filter(item -> !item.waiting()).toList();
+        List<Item> waiting = input.items().stream().filter(Item::waiting).toList();
+        By by = options.by();
+        boolean applicationRanking = by.application();
+        boolean hides = options.transforms().unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
+        List<Item> hidden = hides ? blocked.stream().filter(attribution::hidden).toList() : List.of();
+        // The rows' items: blocked ones not hidden and, for an application ranking, with an application frame. The rest
+        // of the blocked time is in the pool table.
+        List<Item> application = blocked.stream()
+                .filter(item -> !hides || !attribution.hidden(item))
+                .filter(item -> !applicationRanking || attribution.hasApplication(item, by))
+                .toList();
+        Set<Item> inRows = identities(application);
+        List<Item> noApplication =
+                blocked.stream().filter(item -> !inRows.contains(item)).toList();
         TopResult.Builder result = TopResult.newBuilder()
                 .setCommand(command)
-                .setBy(options.by().label())
+                .setBy(by.label())
                 .setUnit(input.seconds() ? "seconds" : "weight")
                 .setSelection(selection(input, options));
 
-        Sum busySum = Sum.of(busy);
+        Sum blockedSum = Sum.of(blocked);
+        Sum applicationSum = Sum.of(application);
+        BigDecimal all = Sum.of(input.items()).weight();
+        BigDecimal of = blockedSum.weight();
         TopTotals.Builder totals = TopTotals.newBuilder()
-                .setSelected(sum(Sum.of(input.items()), input))
-                .setIdle(sum(Sum.of(idle), input))
-                .setBusy(sum(busySum, input));
-        if (boundary) {
-            totals.setBusyApplication(sum(Sum.of(application), input));
-            totals.setBusyNoApplicationFrame(sum(Sum.of(noApplication), input));
+                .setSelected(sum(Sum.of(input.items()), input, null, all))
+                .setWaiting(sum(Sum.of(waiting), input, null, all))
+                .setBlocked(sum(blockedSum, input, of, all));
+        if (applicationRanking) {
+            totals.setBlockedApplication(sum(applicationSum, input, of, all));
+            totals.setBlockedNoApplicationFrame(sum(Sum.of(noApplication), input, of, all));
         }
+        if (hides) totals.setBlockedRootAtUnmatchedHidden(sum(Sum.of(hidden), input, of, all));
         totals.setOverExclusion(sum(
-                Sum.of(idle.stream()
+                Sum.of(waiting.stream()
                         .filter(item -> item.java().stream()
                                 .anyMatch(frame ->
                                         LOCK_ACQUIRE.matcher(frame.name()).find()))
                         .toList()),
-                input));
-        result.setTotals(totals);
+                input,
+                null,
+                all));
+        result.setTotals(totals).setRunQueue(input.runQueue());
 
-        List<Row> rows = aggregate(boundary ? application : busy, attribution, options.by(), boundary);
-        result.addAllRows(rows(rows, busySum.weight(), input, options));
-        if (boundary) {
+        // Shares are of the time the rows cover whenever some blocked time is left out of them; a boundary ranking
+        // without hiding keeps its shares of all blocked time.
+        BigDecimal whole = by == By.BOUNDARY && !hides ? blockedSum.weight() : applicationSum.weight();
+        List<Row> rows = aggregate(application, attribution, by, by == By.BOUNDARY);
+        result.addAllRows(rows(rows, whole, input, options));
+        if (applicationRanking || hides) {
             List<Row> pools = input.pools()
                     ? aggregate(noApplication, attribution, By.POOL, false)
                     : aggregate(noApplication, attribution, By.BOUNDARY, false);
-            result.addAllNoApplicationFrame(rows(pools, busySum.weight(), input, options));
+            result.addAllNoApplicationFrame(rows(pools, blockedSum.weight(), input, options));
         }
-        List<Row> idleRows = boundary
-                ? aggregate(idle, attribution, By.BOUNDARY, false).stream()
+        List<Row> waitingRows = applicationRanking
+                ? aggregate(waiting, attribution, By.BOUNDARY, false).stream()
                         .collect(java.util.stream.Collectors.groupingBy(
                                 row -> row.key.get(0),
                                 java.util.LinkedHashMap::new,
@@ -483,16 +657,20 @@ final class Top {
                                 .reversed()
                                 .thenComparing(row -> row.key.get(0)))
                         .toList()
-                : aggregate(idle, attribution, options.by(), false);
-        result.addAllIdle(rows(idleRows, Sum.of(idle).weight(), input, options));
-        if (boundary && !noApplication.isEmpty() && input.seconds()) {
-            result.addWarnings("Busy time without an application frame depends on native symbolization: on a musl"
-                    + " image every native frame is /lib/ld-musl-<arch>.so.1, the HotSpot idle patterns cannot match,"
-                    + " and idle GC and compiler threads count as busy.");
+                : aggregate(waiting, attribution, by, false);
+        result.addAllWaiting(rows(waitingRows, Sum.of(waiting).weight(), input, options));
+        if (by == By.ROOT
+                && options.transforms().rootAt().isEmpty()
+                && options.transforms().trimRoot().isEmpty()) {
+            result.addWarnings("No --root-at or --trim-root is given, so each root is a thread's entry point, such as"
+                    + " Thread.run; give --root-at with your application's patterns to rank where threads entered"
+                    + " your code.");
+        }
+        if ((applicationRanking || hides) && !noApplication.isEmpty() && input.seconds()) {
+            result.addWarnings(SYMBOLIZATION_WARNING);
         }
         if (!input.exhaustiveSampling() && options.weights() == StackProfileRenderer.Weights.OBSERVED) {
-            result.addWarnings("Sampling kept only some intervals (proportional or uniform admission), so observed"
-                    + " time under-weights short waits; use --weights estimated when the estimate is available.");
+            result.addWarnings(SAMPLING_WARNING);
         }
         return result.build();
     }
@@ -505,7 +683,7 @@ final class Top {
         return selection
                 .setWeights(options.weights().name().toLowerCase(java.util.Locale.ROOT))
                 .addAllApp(StackTransforms.patterns(options.app()))
-                .addAllIdle(StackTransforms.patterns(options.idle()))
+                .addAllWaiting(StackTransforms.patterns(options.waiting()))
                 .addAllMachinery(StackTransforms.patterns(options.machinery()))
                 .addAllInclude(StackProfileRenderer.patterns(options.filter().include()))
                 .addAllExclude(StackProfileRenderer.patterns(options.filter().exclude()))
@@ -515,17 +693,25 @@ final class Top {
                 .build();
     }
 
-    private static TableSum sum(Sum sum, Input input) {
-        return TableSum.newBuilder()
+    /** A total with its shares of the blocked time ({@code blocked}, null for a slice outside it) and the selection. */
+    private static TableSum sum(Sum sum, Input input, BigDecimal blocked, BigDecimal selected) {
+        TableSum.Builder total = TableSum.newBuilder()
                 .setEntries(sum.entries())
                 .setIntervals(sum.intervals())
                 .setValue(value(sum.weight(), input).toPlainString())
-                .build();
+                .setShareOfSelected(totalShare(sum.weight(), selected));
+        if (blocked != null) total.setShareOfBlocked(totalShare(sum.weight(), blocked));
+        return total.build();
     }
 
     /** A weight in the table's unit: seconds to three decimals, or the collapsed file's own unit. */
     static BigDecimal value(BigDecimal weight, Input input) {
         return (input.seconds() ? weight.divide(NANOS_PER_SECOND) : weight).setScale(3, RoundingMode.HALF_EVEN);
+    }
+
+    /** A total's share, to nine decimals so that a slice present but tiny next to the waiting time is not zero. */
+    private static String totalShare(BigDecimal part, BigDecimal whole) {
+        return (whole.signum() == 0 ? BigDecimal.ZERO : part.divide(whole, 9, RoundingMode.HALF_EVEN)).toPlainString();
     }
 
     static BigDecimal share(BigDecimal part, BigDecimal whole) {
@@ -537,9 +723,17 @@ final class Top {
         int rank = 0;
         for (Row row : rows) {
             if (rank == options.limit()) break;
-            TopRow.Builder item = TopRow.newBuilder()
-                    .setRank(++rank)
-                    .setKey(options.packages().apply(row.key.get(0)));
+            TopRow.Builder item = TopRow.newBuilder().setRank(++rank);
+            if (row.methods != null) {
+                List<String> methods =
+                        row.methods.stream().map(options.packages()::apply).toList();
+                item.setKey(chain(methods))
+                        .addAllMethods(methods)
+                        .setSelf(value(row.self, input).toPlainString())
+                        .setStacks(row.stacks);
+            } else {
+                item.setKey(options.packages().apply(row.key.get(0)));
+            }
             if (row.key.size() > 1) item.setBlocker(options.packages().apply(row.key.get(1)));
             item.setValue(value(row.weight, input).toPlainString())
                     .setShare(share(row.weight, whole).toPlainString())
@@ -550,7 +744,8 @@ final class Top {
                 item.setSleeping(value(row.sleeping, input).toPlainString());
                 item.setRunqueue(value(row.runqueue, input).toPlainString());
             }
-            if (input.seconds() && row.reason() != null)
+            // An application method's row spans stacks of any reason, so it names none.
+            if (input.seconds() && row.reason() != null && row.methods == null)
                 item.setReason(row.reason().proto());
             if (!row.callers.isEmpty()) item.setCaller(options.packages().apply(Row.heaviest(row.callers)));
             result.add(item.build());
@@ -566,13 +761,13 @@ final class Top {
         Attribution attribution = new Attribution(options);
         Map<String, BigDecimal[]> rows = new HashMap<>();
         BigDecimal[] application = {BigDecimal.ZERO, BigDecimal.ZERO};
-        BigDecimal[] busy = {BigDecimal.ZERO, BigDecimal.ZERO};
+        BigDecimal[] blocked = {BigDecimal.ZERO, BigDecimal.ZERO};
         BigDecimal[] unresolved = {BigDecimal.ZERO, BigDecimal.ZERO};
         List<Input> runs = List.of(baseline, input);
         for (int run = 0; run < 2; run++) {
             for (Item item : runs.get(run).items()) {
-                if (item.idle()) continue;
-                busy[run] = busy[run].add(item.weight());
+                if (item.waiting()) continue;
+                blocked[run] = blocked[run].add(item.weight());
                 List<StackProfile.Frame> stack = attribution.stack(item);
                 if (stack.stream().anyMatch(frame -> frame.name().startsWith("/"))) {
                     unresolved[run] = unresolved[run].add(item.weight());
@@ -615,10 +810,11 @@ final class Top {
                 .setUnit(perUnit ? "seconds per unit" : "seconds")
                 .setSelection(selection)
                 .setComparisonTotals(AnalysisProto.ComparisonTotals.newBuilder()
-                        .setBaselineBusy(value(busy[0], input).toPlainString())
-                        .setBusy(value(busy[1], input).toPlainString())
-                        .setBaselineBusyApplication(value(application[0], input).toPlainString())
-                        .setBusyApplication(value(application[1], input).toPlainString()));
+                        .setBaselineBlocked(value(blocked[0], input).toPlainString())
+                        .setBlocked(value(blocked[1], input).toPlainString())
+                        .setBaselineBlockedApplication(
+                                value(application[0], input).toPlainString())
+                        .setBlockedApplication(value(application[1], input).toPlainString()));
         int rank = 0;
         for (Compared row : compared) {
             if (rank == options.limit()) break;
@@ -637,11 +833,12 @@ final class Top {
             }
             result.addComparison(item);
         }
-        BigDecimal unresolvedBaseline = share(unresolved[0], busy[0]);
-        BigDecimal unresolvedCurrent = share(unresolved[1], busy[1]);
+        BigDecimal unresolvedBaseline = share(unresolved[0], blocked[0]);
+        BigDecimal unresolvedCurrent = share(unresolved[1], blocked[1]);
         if (unresolvedBaseline.subtract(unresolvedCurrent).abs().compareTo(new BigDecimal("0.10")) > 0) {
-            result.addWarnings("The runs' unresolved native frames differ by more than 10 points of busy time ("
-                    + percent(unresolvedBaseline) + " vs " + percent(unresolvedCurrent) + "): their busy time without"
+            result.addWarnings("The runs' unresolved native frames differ by more than 10 points of blocked time ("
+                    + percent(unresolvedBaseline) + " vs " + percent(unresolvedCurrent)
+                    + "): their blocked time without"
                     + " an application frame is not comparable; compare the application rows only.");
         }
         if ((!input.exhaustiveSampling() || !baseline.exhaustiveSampling())
@@ -661,7 +858,9 @@ final class Top {
 
     // ---- rendering -----------------------------------------------------------------------------------------------
 
+    /** A share as a percentage to one decimal; a share present but below 0.05 % reads "< 0.1 %", not as nothing. */
     static String percent(BigDecimal share) {
+        if (share.signum() > 0 && share.compareTo(new BigDecimal("0.0005")) < 0) return "< 0.1 %";
         return share.multiply(BigDecimal.valueOf(100)).setScale(1, RoundingMode.HALF_EVEN) + " %";
     }
 
@@ -681,20 +880,23 @@ final class Top {
         boolean seconds = result.getUnit().startsWith("seconds");
         String unit = seconds ? "s" : "weight";
         String count = seconds ? "Intervals" : "Lines";
-        text.append("Reproduce: `").append(result.getCommand()).append("`\n\n");
+        text.append("**Reproduce:**\n\n")
+                .append(commandBlock(result.getCommand()))
+                .append('\n');
+        String blocked = blockedLabel(result.getRunQueue());
         if (result.hasComparisonTotals()) {
             AnalysisProto.ComparisonTotals totals = result.getComparisonTotals();
             boolean perUnit = result.getUnit().equals("seconds per unit");
             String column = perUnit ? "s/unit" : "s";
-            text.append("## Busy application time, compared with the baseline\n\n");
-            text.append("Busy application time: ")
-                    .append(totals.getBaselineBusyApplication())
+            text.append("## Blocked application time, compared with the baseline\n\n");
+            text.append("Blocked application time: ")
+                    .append(totals.getBaselineBlockedApplication())
                     .append(" s (baseline) vs ")
-                    .append(totals.getBusyApplication())
-                    .append(" s. Busy total including time without an application frame: ")
-                    .append(totals.getBaselineBusy())
+                    .append(totals.getBlockedApplication())
+                    .append(" s. Blocked total including time without an application frame: ")
+                    .append(totals.getBaselineBlocked())
                     .append(" s vs ")
-                    .append(totals.getBusy())
+                    .append(totals.getBlocked())
                     .append(" s.\n\n");
             text.append("| # | Boundary | Baseline ")
                     .append(column)
@@ -727,50 +929,85 @@ final class Top {
                 .append(" | ")
                 .append(unit)
                 .append(" |\n|---|---:|---:|---:|\n");
-        totalsRows(totals, false, text);
+        totalsRows(totals, blocked, text);
         text.append('\n');
-        boolean boundary = result.getBy().equals("boundary");
-        text.append(boundary ? "## Busy, by application boundary\n\n" : "## Busy, by " + result.getBy() + "\n\n");
-        table(result.getRowsList(), boundary ? "boundary" : "key", unit, count, seconds, text);
-        if (boundary) {
-            text.append("\n## Busy without an application frame, by pool\n\n");
+        String by = result.getBy();
+        boolean boundary = by.equals("boundary") || by.equals("app-method");
+        text.append("## ").append(blocked).append(", by ").append(heading(by)).append("\n\n");
+        rowsTable(result.getRowsList(), by, unit, count, seconds, text);
+        if (boundary || totals.hasBlockedRootAtUnmatchedHidden()) {
+            text.append("\n## ").append(blocked).append(" without an application frame, by pool\n\n");
             table(result.getNoApplicationFrameList(), "pool", unit, count, seconds, text);
         }
-        text.append("\n## Idle, by ")
-                .append(boundary ? "boundary" : result.getBy())
-                .append("\n\n");
-        table(result.getIdleList(), boundary ? "boundary" : "key", unit, count, seconds, text);
+        text.append("\n## Waiting, by ").append(boundary ? "boundary" : by).append("\n\n");
+        table(result.getWaitingList(), boundary ? "boundary" : keyName(by), unit, count, seconds, text);
         warnings(result.getWarningsList(), text);
         return text.toString();
     }
 
-    /**
-     * The totals as table rows: the selection, idle and busy, and with a boundary the busy time with and without an
-     * application frame, then the over-exclusion check. {@code digest} uses the digest's longer labels.
-     */
-    static void totalsRows(TopTotals totals, boolean digest, StringBuilder text) {
-        if (digest) {
-            // The digest is about busy time, so it leads with it; its tables and stacks leave idle intervals out.
-            busyRows(totals, text);
-            totalsRow(totals.getIdle(), "Idle, left out below", text);
-            totalsRow(totals.getSelected(), "All selected", text);
-            totalsRow(totals.getOverExclusion(), "Over-exclusion check: idle entries with a lock-acquire frame", text);
-            return;
-        }
-        totalsRow(totals.getSelected(), "Selected", text);
-        totalsRow(totals.getIdle(), "Idle", text);
-        busyRows(totals, text);
-        totalsRow(totals.getOverExclusion(), "Over-exclusion: idle entries with a lock-acquire frame", text);
+    /** A ranking's name in a section heading. */
+    static String heading(String by) {
+        return switch (by) {
+            case "boundary" -> "application boundary";
+            case "root" -> "root";
+            case "app-method" -> "application method";
+            default -> by;
+        };
     }
 
-    private static void busyRows(TopTotals totals, StringBuilder text) {
-        totalsRow(totals.getBusy(), "Busy", text);
-        if (totals.hasBusyApplication()) {
-            totalsRow(totals.getBusyApplication(), "Busy, with an application frame", text);
+    /** The key column's heading of a ranking's rows. */
+    static String keyName(String by) {
+        return switch (by) {
+            case "boundary" -> "boundary";
+            case "root" -> "root";
+            case "app-method" -> "application methods";
+            default -> "key";
+        };
+    }
+
+    /**
+     * A ranking's rows as one table, and for application methods each chain's methods in a {@code <details>} block
+     * below it. The digest renders its tables with this too, so a reproduced table reads byte for byte the same.
+     */
+    static void rowsTable(
+            List<TopRow> rows, String by, String unit, String count, boolean seconds, StringBuilder text) {
+        boolean methods = by.equals("app-method");
+        table(rows, keyName(by), unit, count, seconds && !methods, text);
+        if (!methods) return;
+        for (TopRow row : rows) {
+            if (row.getMethodsCount() < 3) continue;
+            text.append("\n<details><summary>")
+                    .append(row.getRank())
+                    .append(": ")
+                    .append(code(row.getKey()))
+                    .append("</summary>\n\n");
+            for (String method : row.getMethodsList())
+                text.append("1. ").append(code(method)).append('\n');
+            text.append("\n</details>\n");
         }
-        if (totals.hasBusyNoApplicationFrame()) {
-            totalsRow(totals.getBusyNoApplicationFrame(), "Busy, no application frame", text);
+    }
+
+    /**
+     * The totals as table rows: the selection, waiting and blocked, and with a boundary the blocked time with and
+     * without an application frame, then the over-exclusion check. {@code blocked} names the blocked slice.
+     */
+    static void totalsRows(TopTotals totals, String blocked, StringBuilder text) {
+        totalsRow(totals.getSelected(), "Selected", text);
+        totalsRow(totals.getWaiting(), "Waiting", text);
+        totalsRow(totals.getBlocked(), blocked, text);
+        if (totals.hasBlockedApplication()) {
+            totalsRow(totals.getBlockedApplication(), blocked + ", with an application frame", text);
         }
+        if (totals.hasBlockedNoApplicationFrame()) {
+            totalsRow(totals.getBlockedNoApplicationFrame(), blocked + ", no application frame", text);
+        }
+        if (totals.hasBlockedRootAtUnmatchedHidden()) {
+            totalsRow(
+                    totals.getBlockedRootAtUnmatchedHidden(),
+                    blocked + " without an application frame, hidden by --root-at",
+                    text);
+        }
+        totalsRow(totals.getOverExclusion(), "Over-exclusion: waiting entries with a lock-acquire frame", text);
     }
 
     private static void totalsRow(TableSum sum, String label, StringBuilder text) {
@@ -805,7 +1042,9 @@ final class Top {
         TopRow first = rows.get(0);
         List<String> columns = new ArrayList<>(List.of("#", capital(keyName)));
         if (first.hasBlocker()) columns.add("Blocker");
-        columns.addAll(List.of(unit, "Share", count));
+        columns.addAll(List.of(unit, "Share"));
+        if (first.hasSelf()) columns.addAll(List.of("Self " + unit, "Stacks"));
+        columns.add(count);
         if (first.hasEstimated()) columns.add("Estimated " + unit);
         if (first.hasSleeping()) columns.addAll(List.of("Sleeping " + unit, "Run queue " + unit));
         if (reasons) columns.add("Reason");
@@ -818,6 +1057,8 @@ final class Top {
                                     || column.startsWith(unit)
                                     || column.equals("Share")
                                     || column.equals(count)
+                                    || column.startsWith("Self")
+                                    || column.equals("Stacks")
                                     || column.startsWith("Estimated")
                                     || column.startsWith("Sleeping")
                                     || column.startsWith("Run queue")
@@ -832,6 +1073,10 @@ final class Top {
             if (first.hasBlocker()) cells.add(row.hasBlocker() ? code(row.getBlocker()) : "");
             cells.add(row.getValue());
             cells.add(percent(row.getShare()));
+            if (first.hasSelf()) {
+                cells.add(row.getSelf());
+                cells.add(Long.toString(row.getStacks()));
+            }
             cells.add(Long.toString(row.getIntervals()));
             if (first.hasEstimated()) cells.add(row.getEstimated());
             if (first.hasSleeping()) {
@@ -877,12 +1122,14 @@ final class Top {
         boolean seconds = result.getUnit().equals("seconds");
         text.append("table,rank,key,blocker,value,share,")
                 .append(seconds ? "intervals" : "lines")
-                .append(",estimated,sleeping,runqueue,reason,caller\n");
-        boolean boundary = result.getBy().equals("boundary");
+                .append(",estimated,sleeping,runqueue,reason,caller,self,stacks,methods\n");
+        boolean boundary = result.getBy().equals("boundary")
+                || result.getBy().equals("app-method")
+                || result.getTotals().hasBlockedRootAtUnmatchedHidden();
         List<Map.Entry<String, List<TopRow>>> tables = new ArrayList<>();
         tables.add(Map.entry("rows", result.getRowsList()));
         if (boundary) tables.add(Map.entry("noApplicationFrame", result.getNoApplicationFrameList()));
-        tables.add(Map.entry("idle", result.getIdleList()));
+        tables.add(Map.entry("waiting", result.getWaitingList()));
         for (Map.Entry<String, List<TopRow>> table : tables) {
             for (TopRow row : table.getValue()) {
                 text.append(String.join(
@@ -898,7 +1145,10 @@ final class Top {
                                 row.getSleeping(),
                                 row.getRunqueue(),
                                 row.hasReason() ? label(row.getReason()) : "",
-                                csvCell(row.getCaller())))
+                                csvCell(row.getCaller()),
+                                row.getSelf(),
+                                row.hasStacks() ? Long.toString(row.getStacks()) : "",
+                                csvCell(String.join(";", row.getMethodsList()))))
                         .append('\n');
             }
         }
@@ -913,10 +1163,91 @@ final class Top {
     /** A command line as a shell would need it, single-quoting what is not plainly safe. */
     static String shell(List<String> words) {
         List<String> quoted = new ArrayList<>();
-        for (String word : words) {
-            boolean plain = word.equals(Cli.NAME) || word.matches("[A-Za-z0-9_./:=,+@%-]+");
-            quoted.add(plain ? word : "'" + word.replace("'", "'\\''") + "'");
-        }
+        for (String word : words) quoted.add(word.equals(Cli.NAME) ? word : quote(word));
         return String.join(" ", quoted);
+    }
+
+    /** One word as a shell needs it: plain when it is plainly safe, else single-quoted. */
+    static String quote(String word) {
+        return word.matches("[A-Za-z0-9_./:=,+@%-]+") ? word : "'" + word.replace("'", "'\\''") + "'";
+    }
+
+    /** The words of a command {@link #shell} wrote, {@link Cli#NAME} first: the inverse of its quoting. */
+    static List<String> words(String command) {
+        List<String> words = new ArrayList<>();
+        String rest = command;
+        if (command.startsWith(Cli.NAME + " ")) {
+            words.add(Cli.NAME);
+            rest = command.substring(Cli.NAME.length() + 1);
+        }
+        StringBuilder word = new StringBuilder();
+        boolean quoted = false;
+        boolean any = false;
+        char[] chars = rest.toCharArray();
+        for (int index = 0; index < chars.length; index++) {
+            char c = chars[index];
+            if (c == '\'') {
+                quoted = !quoted;
+                any = true;
+            } else if (c == '\\' && !quoted && index + 1 < chars.length) {
+                // Outside quotes a backslash escapes the next character, as in the '\'' that closes, escapes and
+                // reopens a quote around a single quote.
+                word.append(chars[++index]);
+                any = true;
+            } else if (c == ' ' && !quoted) {
+                if (any) words.add(word.toString());
+                word.setLength(0);
+                any = false;
+            } else {
+                word.append(c);
+                any = true;
+            }
+        }
+        if (any) words.add(word.toString());
+        return words;
+    }
+
+    /** The longest command line a {@link #shellBlock} keeps on one line. */
+    static final int COMMAND_WIDTH = 100;
+
+    /**
+     * A command as the lines of a shell code block: on one line when it fits in {@link #COMMAND_WIDTH} characters,
+     * else the program and its subcommand first, then one option per line with its value, indented two spaces,
+     * every line but the last continued with {@code \}. The quoting is {@link #shell}'s, so the block pastes as one
+     * command.
+     */
+    static String shellBlock(String command) {
+        if (command.length() <= COMMAND_WIDTH) return command;
+        List<String> words = words(command);
+        List<String> lines = new ArrayList<>();
+        int index = 0;
+        StringBuilder first = new StringBuilder();
+        if (!words.isEmpty() && words.get(0).equals(Cli.NAME)) {
+            first.append(Cli.NAME);
+            index = 1;
+            if (words.size() > 1 && !words.get(1).startsWith("-")) {
+                first.append(' ').append(quote(words.get(1)));
+                index = 2;
+            }
+        } else if (!words.isEmpty()) {
+            first.append(quote(words.get(0)));
+            index = 1;
+        }
+        lines.add(first.toString());
+        while (index < words.size()) {
+            String word = words.get(index++);
+            StringBuilder line = new StringBuilder("  ").append(quote(word));
+            boolean option = word.startsWith("-") && !word.contains("=");
+            if (option && index < words.size() && !words.get(index).startsWith("-")) {
+                line.append(' ').append(quote(words.get(index++)));
+            }
+            lines.add(line.toString());
+        }
+        return String.join(" \\\n", lines);
+    }
+
+    /** A command as a fenced {@code bash} block, wrapped by {@link #shellBlock}. */
+    static String commandBlock(String command) {
+        return "```bash\n" + shellBlock(command) + "\n```\n";
     }
 }

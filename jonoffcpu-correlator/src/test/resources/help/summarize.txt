@@ -1,28 +1,43 @@
 Usage: java -jar jonoffcpu-correlator.jar summarize [-hV] [--limit=N] [--output-dir=DIR]
-       [--profile=FILE] [--report=FILE] [--app=REGEX]... [--app-from=FILE]... [--idle=REGEX]...
-       [--idle-from=FILE]... [--machinery-from=FILE]...
-Writes the analysis digest, jonoffcpu-summary.md and jonoffcpu-summary.json: the capture's coverage
-and losses, where the time went, the busy time ranked and its heaviest transformed stacks with the
-idle waits left out, and the command that reproduces each table.
-Correlation writes it by default, with its own --idle patterns; this command rewrites it with an
-application pattern or other idle patterns.
-      --profile=FILE     The stack profile. Required.
-      --report=FILE      A correlation report (jonoffcpu-report.json) for the capture section.
-                           Default: the report the profile carries; a merged profile has none.
-      --output-dir=DIR   Where to write the digest; its files must not exist. Default: the current
-                           directory.
-      --app=REGEX        A frame of your application; the deepest one is a stack's boundary.
-                           Repeatable.
-      --app-from=FILE    Read --app patterns from a file or preset:NAME; repeatable.
-      --idle=REGEX       An interval with a frame matching this is idle, a wait for work: top lists
-                           it in its own table, and the digest leaves it out of its tables.
-                           Repeatable.
-      --idle-from=FILE   Read --idle patterns from a file or preset:NAME, such as preset:jvm-idle;
-                           repeatable. Default for summarize, when no idle pattern is given: preset:
-                           jvm-idle.
-      --machinery-from=FILE
-                         The wait machinery below a boundary whose entry frame is the blocker, from
-                           a file or preset:NAME; repeatable. Default: preset:jvm-wait-machinery.
-      --limit=N          Rows per table. Default: 20.
-  -h, --help             Show this help message and exit.
-  -V, --version          Print version information and exit.
+       [--process-details=true|false] [--profile=FILE] [--report=FILE] [--app=REGEX]...
+       [--app-from=FILE]... [--hide=REGEX]... [--hide-from=FILE]... [--machinery-from=FILE]...
+       [--waiting=REGEX]... [--waiting-from=FILE]...
+Writes the analysis digest, jonoffcpu-summary.md and jonoffcpu-summary.json: when and on what the
+capture was recorded, the blocked time ranked with the waits for work left out, where the time
+went, the capture's coverage and losses, and the command that reproduces each table.
+With --app every table is rooted at the application, as its flame graph with --hide-from and
+--root-at-unmatched hide is: the application method that waited, where threads entered the
+application and application methods across stacks, with blocked time without an application frame
+counted by pool.
+Correlation writes it by default, with its own --waiting and --app patterns; this command rewrites
+it with other patterns.
+      --profile=FILE        The stack profile. Required.
+      --report=FILE         A correlation report (jonoffcpu-report.json) for the capture section.
+                              Default: the report the profile carries; a merged profile has none.
+      --output-dir=DIR      Where to write the digest; its files must not exist. Default: the
+                              current directory.
+      --app=REGEX           A frame of your application; the deepest one is a stack's boundary.
+                              Repeatable.
+      --app-from=FILE       Read --app patterns from a file or preset:NAME; repeatable.
+      --waiting=REGEX       An interval with a frame matching this is waiting, a wait for work: top
+                              lists it in its own table, and the digest leaves it out of its
+                              tables. Repeatable.
+      --waiting-from=FILE   Read --waiting patterns from a file or preset:NAME, such as preset:
+                              jvm-waiting; repeatable. Default for summarize, when no waiting
+                              pattern is given: preset:*, the bundled waiting presets.
+      --machinery-from=FILE The wait machinery below a boundary whose entry frame is the blocker,
+                              from a file or preset:NAME; repeatable. Default: preset:*, the
+                              bundled wait machinery presets (preset:jvm-wait-machinery).
+      --limit=N             Rows per table. Default: 20.
+      --hide=REGEX          For the digest with --app: remove matching frames, such as executors
+                              that only run a task, before each stack is rooted at the application.
+                              Repeatable.
+      --hide-from=FILE      Read --hide patterns from a file or preset:NAME; repeatable. Default,
+                              with --app and no hide pattern: preset:*, the bundled dispatch
+                              presets (preset:jvm-dispatch).
+      --process-details=true|false
+                            Show the target's command line, system properties and environment
+                              variables, when the report holds them (correlate --process-details
+                              true). They can hold secrets. Default: false.
+  -h, --help                Show this help message and exit.
+  -V, --version             Print version information and exit.

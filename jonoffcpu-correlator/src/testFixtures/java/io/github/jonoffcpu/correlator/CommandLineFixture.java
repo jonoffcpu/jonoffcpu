@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.PrintWriter;
 import java.io.StringWriter;
+import java.util.List;
 
 /** Runs the command line in-process, as the tests of every command do. */
 final class CommandLineFixture {
@@ -18,6 +19,16 @@ final class CommandLineFixture {
         StringWriter err = new StringWriter();
         int code = Cli.run(args, new PrintWriter(out), new PrintWriter(err));
         return new Invocation(code, out.toString(), err.toString());
+    }
+
+    /**
+     * A reproduce command's words after {@code java -jar jonoffcpu-correlator.jar}, as a shell splits what {@link
+     * Top#shell} quoted, to run it in-process.
+     */
+    static String[] words(String command) {
+        assertThat(command).startsWith(Cli.NAME + " ");
+        List<String> words = Top.words(command);
+        return words.subList(1, words.size()).toArray(String[]::new);
     }
 
     /** Checks that a command line is refused as a usage error, with its usage and without a stack trace. */

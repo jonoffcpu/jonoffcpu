@@ -126,10 +126,14 @@ class ExportTest {
         Path metadata = dir.resolve("run.json");
         List<String> csv = Files.readAllLines(export(
                 dir, "rows.csv", profile(dir), "--run-label", "baseline", "--run-metadata", metadata.toString()));
-        assertThat(csv.get(0)).endsWith(",canonical_java_stack,thread_pool,run,estimate_available");
+        assertThat(csv.get(0))
+                .startsWith("run,estimate_available,reason,task_state,thread,thread_pool,intervals,")
+                .endsWith(",java_stack,java_stack_kinds,canonical_java_stack,kernel_stack,user_stack");
         assertThat(csv.get(1))
                 .as("CSV row")
-                .endsWith(",a.B$$Lambda.run;libjvm.so.Unsafe_Park,pulsar-io-#-#,baseline,false");
+                .startsWith("baseline,false,blocked,")
+                .contains(",pulsar-io-#-#,")
+                .contains(",java;native,a.B$$Lambda.run;libjvm.so.Unsafe_Park,");
         AnalysisProto.RunMetadata run = CorrelationFixture.parse(metadata, AnalysisProto.RunMetadata.newBuilder())
                 .build();
         ProfileProto.Provenance source = run.getSources(0);

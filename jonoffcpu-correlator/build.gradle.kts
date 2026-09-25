@@ -102,6 +102,14 @@ tasks.withType<Test>().configureEach {
     )
 }
 
+testing.suites.named<JvmTestSuite>("test") {
+    dependencies {
+        implementation(libs.commonmark)
+        implementation(libs.commonmark.ext.gfm.tables)
+        implementation(libs.commonmark.ext.heading.anchor)
+    }
+}
+
 tasks.test {
     maxHeapSize = "1g"
     (options as JUnitPlatformOptions).excludeTags("readme")

@@ -17,8 +17,7 @@ records as messages: the `sampling`, `timeSplit` and `verifiedIdentity` copies i
 `captureStart` and the footer's `analysisInputs` must be equal, and a missing or
 unspecified value (an unset sampling policy or time split, an unknown enum
 value) is refused rather than defaulted. Read a capture with
-`java -jar jonoffcpu-correlator.jar dump --source <file>` (formerly `--dump --source`,
-still accepted), which prints one record per line in the schema's proto3 JSON
+`java -jar jonoffcpu-correlator.jar dump --source <file>`, which prints one record per line in the schema's proto3 JSON
 mapping (`{"captureStart":{...}}`, `{"stack":{...}}`, `{"observation":{...}}`, …),
 and a final `{"truncatedTailBytes":"N"}` line when the stream ends in a record
 cut short.
@@ -306,7 +305,7 @@ and refuses a truncated or foreign file. Three subcommands use it:
 
 ```sh
 java -jar jonoffcpu-correlator.jar stacks --profile P --output F
-    [--reason all|blocked,runnable,preempted,unspecified]
+    [--reason all|blocked,runnable,preempted]
     [--stack java|kernel|user|java+kernel|java+user+kernel]
     [--weights observed|estimated] [--reason-frame auto|always|never]
     [--time total|sleeping|runqueue|split] [--package-names full|abbreviate|drop]
@@ -314,7 +313,7 @@ java -jar jonoffcpu-correlator.jar stacks --profile P --output F
     [--include REGEX]... [--exclude REGEX]...
     [--include-from FILE]... [--exclude-from FILE]...
     [--canonical-names] [--hide REGEX]... [--trim-root REGEX]...
-    [--root-at REGEX]... [--root-at-unmatched bucket|keep] [--leaf-at REGEX]...
+    [--root-at REGEX]... [--root-at-unmatched bucket|keep|hide] [--leaf-at REGEX]...
     [--collapse-leaf REGEX]... [--collapse-leaf-label frame|category]
     [--thread-frame none|name|pool]    (each REGEX option also has a -from FILE form)
 java -jar jonoffcpu-correlator.jar stacks --collapsed-input C --output F [filters and transforms]
@@ -354,8 +353,10 @@ therefore always match the full, untransformed stacks, in this order:
    run stops at the first frame that does not match, so deeper matches stay,
    and a stack that matches throughout keeps its leaf.
 4. `--root-at` starts the stack at its root-most matching frame. A stack
-   without one becomes the single frame `[no application frame]`, or stays as
-   it is with `--root-at-unmatched keep`.
+   without one becomes the single frame `[no application frame]`, stays as
+   it is with `--root-at-unmatched keep`, or with `--root-at-unmatched hide` is
+   left out of the lines, as described below. `hide` without `--root-at` is
+   refused, since nothing can be unmatched.
 5. `--leaf-at` cuts the callees of the leaf-most matching frame and keeps the
    match; a stack without one is unchanged.
 6. `--collapse-leaf` replaces the longest leaf-side run of matching frames by
@@ -368,14 +369,35 @@ every digit run replaced by `#`, as a frame after any reason frame) are then
 applied as display. With `--stack java+kernel` or `java+user+kernel` the native
 stacks are appended unchanged after the transformed Java stack. Lines that read
 the same after transforming merge, adding their intervals and nanoseconds, so
-no transform changes a total. Each `REGEX` option repeats, and has a
+no transform changes a total, with one exception: `--root-at-unmatched hide`
+leaves an entry without a `--root-at` match out of the lines and out of the
+slice's totals, and the `--summary` file reports it as
+`rootAtUnmatchedHidden` (`intervals` and `totalNanos`, or `inputLines` and
+`totalWeight` for a collapsed input), so the kept and hidden totals add up to
+the slice rendered without hiding; its `noApplicationFrame` is then the hidden
+weight, and its share of that sum. Hiding is decided per entry after the
+filters and before `--reason-frame auto`. Each `REGEX` option repeats, and has a
 `-from FILE` form that reads patterns as `--exclude-from` does. Every `-from`
 option, the filters' included, also accepts `preset:NAME`, a list bundled with
 the correlator: `jvm-infra` (thread, executor and Netty entry points, for
 `--trim-root` or `--hide`), `jvm-wait-machinery` (lock, park and monitor
-internals down to libc and the kernel, for `--collapse-leaf`) and `jvm-idle`
-(waits for work, for `--exclude-from`); `stacks --list-presets` prints them with
-their caveats. When any transform is in effect the `--summary` file gains a
+internals down to libc and the kernel, for `--collapse-leaf`), `jvm-waiting`
+(waits for work, for `--exclude-from`) and `jvm-dispatch` (generated lambda
+classes' methods, `Executors$RunnableAdapter.call`, `FutureTask.run` and
+`runAndReset`, `CompletableFuture`'s async tasks and Guava's listenable future
+tasks: frames that only forward to the code a task runs, for `--hide`, so that
+`--root-at` lands on the work; hidden anywhere in the stack, since they carry
+no information mid-stack either); `stacks --list-presets` prints them with
+their caveats and the options each is meant for. `preset:*` stands for every
+bundled preset whose header's `# options:` line names the option it is given
+to: `jvm-dispatch` for `--hide-from`, `jvm-waiting` for `--waiting-from` and
+`--exclude-from`, `jvm-infra` for `--trim-root-from`, and `jvm-wait-machinery`
+for `--collapse-leaf-from` and `--machinery-from`. An option's default preset
+is exactly its `preset:*`. `--include-from`, `--root-at-from`, `--leaf-at-from`
+and `--app-from` have no presets and refuse `preset:*` (exit status 64), as
+every option refuses an unknown preset. Summaries and the digest's notes record
+the presets `preset:*` expanded to, and the digest's reproduce commands repeat
+`'preset:*'` as given. When any transform is in effect the `--summary` file gains a
 `transforms` object: each option with its patterns and their source (`inline`, a
 file, or `preset:NAME`), `linesBefore`/`linesAfter`, the weight-averaged depth
 `framesBefore`/`framesAfter`, and for `--root-at` the `noApplicationFrame`
@@ -398,8 +420,8 @@ first letter (`io.netty.channel.epoll.Native.epollWait0` becomes
 `i.n.c.e.Native.epollWait0`), and `drop` shows `Class.method`; a hidden class's
 `.0x…` suffix (`Cursor$$Lambda.0x0000000081a16ff8`) stays part of the class. Only
 `JAVA` frames change: a `JFR_NATIVE` frame keeps its library and symbol
-(`libjvm.so.Unsafe_Park`). As a fallback for schema 1 profiles, and as a second
-line of defence, a name that reads as native is also left alone: one with a C++
+(`libjvm.so.Unsafe_Park`). As a second line of defence, and for a collapsed
+input, whose frames have no kinds, a name that reads as native is also left alone: one with a C++
 `::`, a shared-library segment (`.so.`, `.so.6.`), a leading `/` or `[`, or a
 space. That rule can only prevent a rewrite, and a frame that is not a
 package-qualified `Class.method` is left unchanged too. It only changes the
@@ -432,21 +454,21 @@ with different grouping, and thinned profiles, whose weights have no common scal
 It sums the split parts too, so an input without the split contributes its time
 as unsplit and the merged profile has the split when any input has it. Java
 stacks with the same frame names merge whatever kinds their inputs gave them, and
-a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`, so a schema 1 input
-cannot make a native frame rewritable.
-`export` writes one row per entry with expanded stacks, the six split columns and
-`java_stack_kinds` (`javaStackKinds` in JSON Lines): each Java-stack frame's
-kind, `java` or `native`, joined with `;` like `java_stack`. It is for tools such
-as DuckDB. A JSON Lines row is an `ExportRow` message. These columns are followed,
-in this order, by:
+a frame any input calls `JFR_NATIVE` stays `JFR_NATIVE`.
+`export` writes one row per entry with its stacks expanded, for tools such as
+DuckDB; a JSON Lines row is an `ExportRow` message. The columns, in order:
 
 | JSON Lines | CSV | Contents |
 | --- | --- | --- |
-| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first, as the joined columns render them; empty for an absent stack, whose joined column is left out. CSV stays flat. |
-| `canonicalJavaStack` | `canonical_java_stack` | `javaStack` without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
-| `threadPool` | `thread_pool` | The thread name with every digit run replaced by `#` |
 | `run` | `run` | `--run-label`, by default the profile's label, else its first source's session id |
 | `estimateAvailable` | `estimate_available` | Whether the estimated columns may be used, from the profile header |
+| `reason`, `taskState` | `reason`, `task_state` | The switch-out reason and the task state it was derived from |
+| `thread`, `threadPool` | `thread`, `thread_pool` | The thread's name, and its pool: the name with every digit run replaced by `#`; empty when the profile is not grouped by thread |
+| `intervals`, `observedNanos`, `estimatedNanos` | `intervals`, `observed_nanos`, `estimated_nanos` | The entry's counters |
+| `sleepingNanos`, `runqueueNanos`, `unsplitNanos` and their `estimated…` forms | `sleeping_nanos`, `runqueue_nanos`, `unsplit_nanos` and their `estimated_…` forms | The six split columns |
+| `javaStack`, `javaStackKinds`, `canonicalJavaStack` | `java_stack`, `java_stack_kinds`, `canonical_java_stack` | The Java stack joined with `;`, root first; each frame's kind, `java` or `native`, joined the same way; and the stack without generated-class addresses, the rule of `stacks --canonical-names`, so stacks of two runs join |
+| `kernelStack`, `userStack` | `kernel_stack`, `user_stack` | The native stacks, joined; left out when absent |
+| `javaFrames`, `javaFrameKinds`, `kernelFrames`, `userFrames` | — | The stacks and the Java frames' kinds as arrays, root first; empty for an absent stack. CSV stays flat. |
 
 In JSON Lines `reason` is the enum value name (`OFF_CPU_REASON_BLOCKED`, where
 the CSV has `blocked`), `taskState` is a number, and the 64-bit counters
@@ -485,88 +507,191 @@ file's) time went, with the selection, filter and transform options of
 
 ```sh
 java -jar jonoffcpu-correlator.jar top (--profile P | --collapsed-input F)
-    [--by boundary|self|method|class|package|pool] [--app REGEX]... [--app-from FILE]...
-    [--idle REGEX]... [--idle-from FILE]... [--machinery-from FILE]...
+    [--by boundary|root|app-method|self|method|class|package|pool] [--app REGEX]... [--app-from FILE]...
+    [--waiting REGEX]... [--waiting-from FILE]... [--machinery-from FILE]...
     [--weights observed|estimated] [--limit N] [--format md|json|csv] [--output FILE]
     [--baseline P2 [--units X --baseline-units Y]]
 java -jar jonoffcpu-correlator.jar summarize --profile P [--report R] [--app REGEX]...
-    [--idle-from FILE]... [--limit N] [--output-dir D]
+    [--hide-from FILE]... [--waiting-from FILE]... [--limit N] [--process-details true|false]
+    [--output-dir D]
 ```
 
-- **Idle or busy.** An entry is idle when any frame of any of its stacks
-  matches an idle pattern, matched as `--exclude` matches. Idle entries are not
-  dropped: they get their own table. `--exclude` still removes entries.
+- **Waiting or blocked.** An entry is waiting, a thread off the CPU until work
+  arrives, when any frame of any of its stacks matches a waiting pattern,
+  matched as `--exclude` matches; every other entry is blocked, off the CPU
+  while it had work to do. Waiting entries are not dropped: they get their own
+  table. `--exclude` still removes entries. When runnable or preempted
+  intervals are selected and recorded (`runQueue` in the JSON), the Markdown
+  names the blocked slice "Blocked or in the run queue".
 - **Attribution** is computed on the Java stack after `--canonical-names` and
   `--hide`. `boundary` (the default, which needs `--app`) keys a row by the
   deepest application frame and its **blocker**: the entry frame of the longest
   leaf-side run below the boundary that matches the wait machinery
   (`--machinery-from`, default `preset:jvm-wait-machinery`), or the leaf when
-  there is none. Busy entries without an application frame go to a table by
-  thread pool (the name with digit runs as `#`). `self` is the leaf after the
+  there is none. Blocked entries without an application frame go to a table by
+  thread pool (the name with digit runs as `#`). `root` is the first frame of
+  the stack after every transform, the root box of the flame graph rendered
+  with the same options; without `--root-at` or `--trim-root` it is a thread's
+  entry point, and the output warns. `app-method` (which needs `--app`) takes
+  the distinct application frames of each transformed stack, hidden frames
+  being gone by then, and adds the stack's time to each once (inclusive, so a
+  recursive method counts once); methods that occur in exactly the same
+  distinct transformed stacks are one call chain and one row, keyed
+  `A → … (n) → Z` for `n` methods, root-most first, with every method in
+  `methods`. Its blocked entries without an application frame go to the pool
+  table, as for `boundary`. `self` is the leaf after the
   transforms, `method`, `class` and `package` count every distinct one in the
   stack once per entry (inclusive), and `pool` is the thread's pool.
+- **Hidden entries.** With `--root-at-unmatched hide` a blocked entry without a
+  `--root-at` match is left out of every mode's rows; `totals` reports it as
+  `blockedRootAtUnmatchedHidden` (Markdown: "Blocked without an application frame,
+  hidden by --root-at") and the pool table lists it by pool.
 - **Columns**: rank, key (and blocker), seconds to three decimals, share of the
-  busy total (of the idle total in the idle table), intervals, estimated
+  blocked total (of the waiting total in the waiting table), intervals, estimated
   seconds when the profile's estimate is available, sleeping and run-queue
   seconds when it has the split, the dominant reason, and for boundary rows the
   heaviest root-most application frame (the caller, after `--trim-root` and
-  `--root-at`). Rows sort by weight, then key.
-- **Totals** add up: busy and idle make the selection, and application rows and
-  the pool table make the busy total. The over-exclusion check counts idle
+  `--root-at`). Application-method rows add
+  `self` (the time of the stacks whose deepest application frame is in the
+  chain, the same boundary as `--by boundary`, so self times add up to the
+  rows' total) and `stacks` (the distinct transformed stacks), and name no
+  reason; they sort by inclusive time, then self time, then the root-most
+  method. Other rows sort by weight, then key. A share is of the blocked total,
+  except that `app-method` shares are of the blocked time with an application
+  frame (and add up to more than 100 %), and with `--root-at-unmatched hide`
+  every share is of the blocked time the rows cover.
+- **Totals** add up: blocked and waiting make the selection, and the rows (their
+  `blockedApplication` total for `boundary` and `app-method`) and the pool table
+  make the blocked total. Each total carries `shareOfSelected`, and each part of
+  the blocked time `shareOfBlocked`; a share below 0.05 % that is not zero
+  reads `< 0.1 %` in the Markdown. The over-exclusion check counts waiting
   entries with a `java.util.concurrent.locks.*.lock*`/`acquire*` or
-  `complete_monitor_locking` frame, the waits an idle list may hide by mistake.
+  `complete_monitor_locking` frame, the waits a waiting list may hide by mistake.
 - **Weights.** `observed` by default; `estimated` needs the profile's
   estimate. Under proportional or uniform admission observed time
   under-weights short waits, and the output warns.
 - **`--baseline`** keys both runs by application boundary and gives each row's
   seconds, or seconds per unit of work with `--units`/`--baseline-units`, and
-  its share of that run's busy application time. Rows present in one run only
+  its share of that run's blocked application time. Rows present in one run only
   have the other side empty; rows sort by the larger value, then by the
   absolute delta. It refuses observed weights when both runs have estimates and
   either was sampled, warns when neither has estimates, and warns when the runs'
   unresolved native frames (`/lib/…` paths) differ by more than 10 points of
-  busy time, since their time without an application frame is then not
+  blocked time, since their time without an application frame is then not
   comparable.
 - **Formats.** `json` is the source, a `TopResult` message: `command` (the
   reproduce command), `by`, `unit`, `selection` (every option, with the
-  patterns and their sources), `totals`, `rows`, `noApplicationFrame`, `idle`
+  patterns and their sources), `totals`, `rows`, `noApplicationFrame`, `waiting`
   (or `comparisonTotals` and `comparison`), and `warnings`. A row's `key` is
   the boundary, the pool or the `--by` key; seconds and shares are decimal
   strings, and `reason` an `OFF_CPU_REASON_…` value. `md` and `csv` (one row
-  per table row, with a `table` column) are rendered from it.
+  per table row, with a `table` column, and `self`, `stacks` and `methods`
+  appended after `caller`) are rendered from it; the Markdown
+  starts with the reproduce command as a `bash` block and lists each chain of
+  three or more methods in a `<details>` block below its table.
+- **Commands** are printed one per `bash` block: on one line when they fit in
+  100 characters, else the program and subcommand first and then one option
+  per line with its value, each line but the last continued with ` \`. The
+  quoting is the JSON's single-line command's, so a block pastes as that
+  command.
 
 Correlation writes the **digest**, `jonoffcpu-summary.json` and
 `jonoffcpu-summary.md`, next to the report unless `--summary-output false` is
-given, with the idle patterns of `--idle` and `--idle-from` (default
-`preset:jvm-idle`), `preset:jvm-wait-machinery`, canonical names and no
-application pattern; `summarize` rewrites it with `--app` or other idle
-patterns, taking the capture section from the report the profile carries, or
-from `--report FILE`, which is parsed strictly as a `Report`.
+given, with the waiting patterns of `--waiting` and `--waiting-from` (default
+`preset:jvm-waiting`), the application patterns of `--app` and `--app-from`, the
+hidden frames of `--hide` and `--hide-from` (default, with `--app`,
+`preset:jvm-dispatch`; refused without `--app`), `preset:jvm-wait-machinery`
+and canonical names. Like the waiting options they are refused with
+`--summary-output false` and in partial mode. `summarize` rewrites it with
+other patterns, taking the capture section and the recording from the report
+the profile carries, or from `--report FILE`, which is parsed strictly as a
+`Report`.
 
-The digest is about busy time. An interval with a frame matching an idle
-pattern is a wait for work, such as an event loop in `epoll` or a pool worker
-waiting for a task, and would otherwise dominate every table: the digest counts
-idle intervals in `whereTheTimeWent` and leaves them out of every table and
-stack. The idle patterns only shape the digest; the collapsed stacks, the
-profile and the report keep every interval. An application's own idle waits,
-such as a task queue of its own, belong in an `--idle-from` file of its own,
-next to `preset:jvm-idle`. The report's `digest` object names the files, or
-holds the `error` when the digest could not be written, which never fails the
+**The recording.** While correlating, the JFR pass keeps a snapshot of what
+the recording says about the process and the machine: the first and last chunk
+boundaries, async-profiler's version from its `jdk.ActiveRecording`, the first
+`jdk.JVMInformation`, `jdk.OSInformation`, `jdk.CPUInformation` and
+`jdk.ContainerConfiguration` events with every field (a timestamp or duration
+as ISO-8601 text), and the `jdk.InitialSystemProperty` and
+`jdk.InitialEnvironmentVariable` values. The report carries it as `recording`,
+a `JfrRecording` message, and the digest shows it. The command line
+(`jvmArguments` and `javaArguments`), the system properties and the
+environment variables can hold secrets: the report keeps them, and the digest
+shows them, only with `--process-details true` (on `correlate`; `summarize
+--process-details true` shows what the report kept). A recording without one
+of these events simply leaves its part out.
+
+**The Markdown** reads tables first:
+
+1. The title and a metadata block: *Recorded* (the chunk bounds in UTC and the
+   duration), *Analysed* (`--from`/`--to` as selected, "the selected window",
+   or "the whole recording"), *Process* (the target's PID and host TGID, the
+   JVM's name and version, async-profiler's version) and *System* (the OS,
+   kernel and C library, the CPU model with its cores and hardware threads, a
+   container's limits).
+2. One headline line: the blocked time with an application frame and its share
+   of the blocked time (without `--app`: the blocked time and its share of the
+   selection), the waiting time left out, and a link to the terms. With
+   `--app`, when more than half of the blocked time has no application frame,
+   a second line points to the pool table.
+3. The tables, each under one sentence saying what a row is. With `--app`
+   every table is computed from one set of transforms, those of the
+   application-rooted flame graph: `--exclude-from <waiting>` as the filter,
+   then `--canonical-names --hide-from <hide> --root-at-from <app>
+   --root-at-unmatched hide --collapse-leaf-from preset:jvm-wait-machinery`,
+   and the tables are the blocked time by the application method that waited
+   (`top --by boundary`), by application root (`top --by root`) and by
+   application method (`top --by app-method`); the boundary and root tables
+   each sum to the blocked time with an application frame. Without `--app`
+   they are the blocked time by leaf, after collapsing the wait machinery, and
+   by pool.
+4. *Where the time went*: the blocked time (and with `--app` its parts with and
+   without an application frame), the waiting time left out, all selected
+   time and the over-exclusion check, with entries, intervals, seconds, the
+   share of the blocked time and the share of the selection.
+5. With `--app`, the blocked time without an application frame by pool, then
+   the capture's coverage and losses and the warnings.
+6. *About this digest*: the terms the tables use (blocked, waiting, in the run
+   queue when it applies, and with `--app` application frame, application
+   root, application method that waited, self time, and observed seconds),
+   then notes: the waiting patterns as given, the over-exclusion check, that
+   the application method table is inclusive, native symbolization on musl,
+   the session and the JFR with its SHA-256, and the correlator that wrote the
+   digest. With `--process-details true`, the command line as a `text` block
+   and the system properties and environment variables in `<details>` blocks.
+7. *How to reproduce*: one labelled `bash` block per table, then the flame
+   graph's `stacks` command (application-rooted with `--app`), the command
+   whose waiting table lists the waiting time by pool, and an `export`
+   command.
+
+Input paths are named as they were given, so a digest written with relative
+paths keeps working when its directory moves. The waiting patterns only shape
+the digest; the collapsed stacks, the profile and the report keep every
+interval. An application's own waits for work, such as a task queue of its
+own, belong in a `--waiting-from` file of its own, next to
+`preset:jvm-waiting`. The report's `digest` object names the files, or holds
+the `error` when the digest could not be written, which never fails the
 correlation. The JSON is a `Digest` message:
 
 | Field | Contents |
 | --- | --- |
-| `profile`, `run`, `estimateAvailable`, `timeSplitAvailable` | What was summarised |
-| `capture` | From the report: session, sampling, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
+| `profile`, `run`, `estimateAvailable`, `timeSplitAvailable`, `sampled` | What was summarised, and whether sampling kept only some intervals |
+| `capture` | From the report: session, sampling, the target's PID and host TGID, the JFR's path and SHA-256, source rows, matched, rows outside the selected JFR window, orphan and invalid counts, collector loss counters, handler delay p50/p99/max, reasons and kernel switch-outs, the population estimate's status and accounted loss when present, and degradation steps |
+| `recording` | The report's `JfrRecording`, without the command line, system properties and environment variables unless `--process-details true` |
+| `analysed` | The window the tables cover: `from`, `to`, `seconds`, and `wholeRecording` |
 | `selection` | As in `top --format json` |
-| `whereTheTimeWent` | `top`'s totals: selected, idle, busy, busy with and without an application frame, over-exclusion |
-| `busy` | `by` (`boundary` with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, which also lists the idle waits, and the busy `rows` of `top` |
-| `busyNoApplicationFrameByPool` | The pool table (with `--app`), or busy time by pool (without) |
-| `heaviestStacks` | The busy slice with `--root-at` (or `--trim-root-from preset:jvm-infra`) and `--collapse-leaf`, dropped package names: its `lines`, `meanDepth`, the ten heaviest lines (`top`), and the `command` |
-| `warnings` | As in `top` |
+| `runQueue` | Whether runnable or preempted intervals are selected, so the blocked slice is "blocked or in the run queue" |
+| `whereTheTimeWent` | `top`'s totals with their shares: selected, waiting, blocked, blocked with and without an application frame, over-exclusion |
+| `blocked` | `by` (`boundary`, the application method that waited, with `--app`, else `self` after collapsing the wait machinery), the reproducing `command`, and the blocked `rows` of `top` |
+| `blockedByRoot`, `blockedByApplicationMethod` | With `--app`: the rows of `top --by root` and `top --by app-method`, each with its `command`; a method row carries its chain's `methods` |
+| `blockedNoApplicationFrameByPool` | The pool table (with `--app`), or blocked time by pool (without) |
+| `blockedWithoutApplicationFrame` | With `--app`: the blocked time the tables leave out, also in `whereTheTimeWent` |
+| `flameGraphCommand` | The `stacks` command of the flame graph: application-rooted with `--app`, else trimmed with `preset:jvm-infra` |
+| `waitingCommand` | The `top` command whose waiting table lists the waiting time the tables leave out |
+| `warnings` | As in `top`, less the symbolization and sampling notes, which *About this digest* states |
+| `writtenBy` | The correlator that wrote the digest |
 
-Every table is limited to `--limit` rows (default 20), which keeps the Markdown
-of an Apache Pulsar broker's digest under 16 KB. The Markdown is rendered from
+Every table is limited to `--limit` rows (default 20). The Markdown is rendered from
 the JSON, so the two cannot disagree, and the same inputs give the same bytes.
 
 ## Degradation

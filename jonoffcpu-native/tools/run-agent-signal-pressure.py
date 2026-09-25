@@ -20,7 +20,7 @@ def capture_rows(jdk, classpath, source):
     protobuf. 64-bit integers are decimal strings and enums are their value names."""
     dumped = subprocess.run(
         [str(jdk / "bin/java"), "-cp", classpath,
-         "io.github.jonoffcpu.correlator.OffCpuCorrelator", "--dump", "--source", str(source)],
+         "io.github.jonoffcpu.correlator.OffCpuCorrelator", "dump", "--source", str(source)],
         check=True, capture_output=True, text=True).stdout
     return [json.loads(line) for line in dumped.splitlines()]
 

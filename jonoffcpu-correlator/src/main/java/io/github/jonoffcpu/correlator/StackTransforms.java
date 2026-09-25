@@ -8,7 +8,9 @@ import java.util.regex.Pattern;
 /**
  * Frame-level transforms of a Java stack, applied after the {@link StackProfileRenderer.Filter filters} have kept an
  * entry, so filters always see the untransformed stack. They change what a line looks like, never which intervals it
- * holds: lines that transform to the same text merge and their weights add, so totals are unchanged.
+ * holds: lines that transform to the same text merge and their weights add, so totals are unchanged. The one exception
+ * is {@link UnmatchedRoot#HIDE}, which leaves an entry without a {@code --root-at} match out of the lines and moves it
+ * to a total of its own that every consumer reports, so the time it removes stays accountable.
  *
  * <p>The order is fixed: {@code canonical names → hide → trim root → root at → leaf at → collapse leaf}. Package
  * names and the thread frame are applied afterwards by the renderer, as display. Patterns are searched for with
@@ -19,16 +21,38 @@ record StackTransforms(
         List<Sourced> hide,
         List<Sourced> trimRoot,
         List<Sourced> rootAt,
-        boolean keepUnmatchedRoot,
+        UnmatchedRoot unmatchedRoot,
         List<Sourced> leafAt,
         List<Sourced> collapseLeaf,
         boolean categoryLabel,
         ThreadFrame threadFrame) {
 
-    /** A pattern and where it came from: {@code inline}, a file path, or {@code preset:NAME}. */
-    record Sourced(String pattern, String source) {
+    /**
+     * A pattern and where it came from: {@code inline}, a file path, or {@code preset:NAME}. {@code given} is the
+     * {@code -from} argument as written, which differs from {@code source} for {@code preset:*}: reproduce commands
+     * repeat what was given, and summaries record the preset it expanded to.
+     */
+    record Sourced(String pattern, String source, String given) {
+        Sourced(String pattern, String source) {
+            this(pattern, source, source);
+        }
+
         Pattern compiled() {
             return Pattern.compile(pattern);
+        }
+    }
+
+    /**
+     * What becomes of a stack without a {@code --root-at} match: the single frame {@link #NO_APPLICATION_FRAME}, the
+     * stack unchanged, or nothing at all, the entry being left out and reported apart.
+     */
+    enum UnmatchedRoot {
+        BUCKET,
+        KEEP,
+        HIDE;
+
+        String label() {
+            return name().toLowerCase(java.util.Locale.ROOT);
         }
     }
 
@@ -44,7 +68,15 @@ record StackTransforms(
     }
 
     static final StackTransforms NONE = new StackTransforms(
-            false, List.of(), List.of(), List.of(), false, List.of(), List.of(), false, ThreadFrame.NONE);
+            false,
+            List.of(),
+            List.of(),
+            List.of(),
+            UnmatchedRoot.BUCKET,
+            List.of(),
+            List.of(),
+            false,
+            ThreadFrame.NONE);
 
     /** The single frame an entry without any {@code --root-at} match is rendered as. */
     static final String NO_APPLICATION_FRAME = "[no application frame]";
@@ -96,6 +128,11 @@ record StackTransforms(
         return new Compiled(this);
     }
 
+    /** Whether {@link Compiled#apply} left this entry's stack out, as only {@link UnmatchedRoot#HIDE} does. */
+    static boolean hidden(List<StackProfile.Frame> stack, List<StackProfile.Frame> transformed) {
+        return stack != null && !stack.isEmpty() && transformed.isEmpty();
+    }
+
     static final class Compiled {
         private final StackTransforms transforms;
         private final List<Pattern> hide;
@@ -117,7 +154,10 @@ record StackTransforms(
             return patterns.stream().map(Sourced::compiled).toList();
         }
 
-        /** The transformed stack, root first; never empty for a non-empty input. */
+        /**
+         * The transformed stack, root first. It is empty for a non-empty input only when {@link UnmatchedRoot#HIDE}
+         * leaves the entry out, and the caller then counts the entry as hidden.
+         */
         List<StackProfile.Frame> apply(List<StackProfile.Frame> stack) {
             if (stack == null || stack.isEmpty() || !transforms.active()) return stack;
             List<StackProfile.Frame> frames = new ArrayList<>(stack.size());
@@ -147,7 +187,9 @@ record StackTransforms(
                 }
                 if (start >= 0) {
                     frames = frames.subList(start, frames.size());
-                } else if (!transforms.keepUnmatchedRoot) {
+                } else if (transforms.unmatchedRoot == UnmatchedRoot.HIDE) {
+                    return List.of();
+                } else if (transforms.unmatchedRoot == UnmatchedRoot.BUCKET) {
                     return List.of(synthetic(NO_APPLICATION_FRAME));
                 }
             }
@@ -234,7 +276,7 @@ record StackTransforms(
                 .addAllHide(patterns(hide))
                 .addAllTrimRoot(patterns(trimRoot))
                 .addAllRootAt(patterns(rootAt))
-                .setRootAtUnmatched(keepUnmatchedRoot ? "keep" : "bucket")
+                .setRootAtUnmatched(unmatchedRoot.label())
                 .addAllLeafAt(patterns(leafAt))
                 .addAllCollapseLeaf(patterns(collapseLeaf))
                 .setCollapseLeafLabel(categoryLabel ? "category" : "frame")

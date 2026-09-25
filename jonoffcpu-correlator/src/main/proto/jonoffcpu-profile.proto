@@ -56,8 +56,6 @@ message ProfileStart {
   // recorded run-queue parts (time_split.source TIME_SPLIT_SOURCE_SCHED_INFO). When false, fields 20-25 are
   // 0 and every entry's time reads as unsplit.
   bool time_split_available = 8;
-  reserved 9;
-  reserved "report_json";
   // Frames every rendered collapsed line starts with, joined by ';' and ending in ';', stating what was
   // done to produce the numbers (a thinned subsample, a narrowed window). Empty when nothing was.
   string label = 10;
@@ -70,8 +68,6 @@ message Provenance {
   uint64 capture_epoch = 2;
   string source_sha256 = 3;
   string original_jfr_sha256 = 4;
-  reserved 5, 10;
-  reserved "sampling_json", "time_split_json";
   // The correlation-time thinning applied to this capture: "1" when none.
   string thinning_probability = 6;
   uint64 thinning_seed = 7;

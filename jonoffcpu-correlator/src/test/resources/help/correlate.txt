@@ -2,9 +2,11 @@ Usage: java -jar jonoffcpu-correlator.jar correlate [-hV] [--audit=LEVEL]
        [--collapsed-reason-frame=MODE] [--estimate-population=true|false] [--format=FORMAT]
        [--from=TIME] [--from-ns=N] [--jfr=FILE] [--max-accounted-loss=F] [--max-handler-delay-ns=N]
        [--max-profile-entries=N] [--max-retained-bytes=N] [--max-rows=N] [--on-limit=POLICY]
-       [--output=DIR] [--partial=true|false] [--partial-jfr=true|false] [--profile-group-by=LIST]
-       [--profile-output=true|false] [--source=FILE] [--summary-output=true|false] [--thinning=Q]
-       [--thinning-seed=N] [--to=TIME] [--to-ns=N] [--idle=REGEX]... [--idle-from=FILE]...
+       [--output=DIR] [--partial=true|false] [--partial-jfr=true|false]
+       [--process-details=true|false] [--profile-group-by=LIST] [--profile-output=true|false]
+       [--source=FILE] [--summary-output=true|false] [--thinning=Q] [--thinning-seed=N] [--to=TIME]
+       [--to-ns=N] [--app=REGEX]... [--app-from=FILE]... [--hide=REGEX]... [--hide-from=FILE]...
+       [--waiting=REGEX]... [--waiting-from=FILE]...
 Correlates a capture with its JFR into a new output directory (the default command).
       --source=FILE          The finalized capture stream the agent wrote (jonoffcpu-capture.pb).
                                Required.
@@ -63,11 +65,27 @@ Correlates a capture with its JFR into a new output directory (the default comma
                                jonoffcpu-summary.json, from the profile and the report. A failure
                                to write it is reported in the report and never fails the
                                correlation. Default: true.
-      --idle=REGEX           For the digest: an interval with a frame matching this is idle, a wait
-                               for work, and the digest's tables and stacks leave it out. The other
-                               outputs keep every interval. Repeatable.
-      --idle-from=FILE       Read --idle patterns from a file or preset:NAME; repeatable. Default,
-                               when no idle pattern is given: preset:jvm-idle.
+      --waiting=REGEX        For the digest: an interval with a frame matching this is waiting, a
+                               wait for work, and the digest's tables and stacks leave it out. The
+                               other outputs keep every interval. Repeatable.
+      --waiting-from=FILE    Read --waiting patterns from a file or preset:NAME; repeatable.
+                               Default, when no waiting pattern is given: preset:*, the bundled
+                               waiting presets (preset:jvm-waiting).
+      --app=REGEX            For the digest: a frame of your application. Its tables then start
+                               each stack at the first one and name the last one before each wait,
+                               and count blocked time without one apart, by pool. Repeatable.
+      --app-from=FILE        Read --app patterns from a file or preset:NAME; repeatable.
+      --hide=REGEX           For the digest with --app: remove matching frames, such as executors
+                               that only run a task, before each stack is rooted at the
+                               application. Repeatable.
+      --hide-from=FILE       Read --hide patterns from a file or preset:NAME; repeatable. Default,
+                               with --app and no hide pattern: preset:*, the bundled dispatch
+                               presets (preset:jvm-dispatch).
+      --process-details=true|false
+                             Keep the target's command line, system properties and environment
+                               variables from the JFR in the report and show them in the digest.
+                               They can hold secrets, such as passwords passed as -D options.
+                               Default: false.
       --max-profile-entries=N
                              Entry limit for the profile; past it the thread, then the user and the
                                kernel stack are dropped from the grouping. Default: 2000000.

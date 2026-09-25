@@ -4,6 +4,8 @@
 #
 # Only the root-side run is removed by --trim-root, so an application call into one of these
 # classes keeps its frames. Other transports (io_uring, KQueue) are not covered yet.
+#
+# options: trim-root
 ^java\.lang\.Thread\.(run|runWith)$
 ^java\.util\.concurrent\.(ThreadPoolExecutor\$Worker\.run|ThreadPoolExecutor\.runWorker|FutureTask\.run|ScheduledThreadPoolExecutor\$ScheduledFutureTask\.run|Executors\$RunnableAdapter\.call|ForkJoinWorkerThread\.run|ForkJoinPool\.(runWorker|scan)|ForkJoinPool\$WorkQueue\.topLevelExec|ForkJoinTask\.doExec|CompletableFuture\$(AsyncRun|AsyncSupply)\.(run|exec))$
 ^io\.netty\.util\.concurrent\.(FastThreadLocalRunnable\.run|SingleThreadEventExecutor(\$\d+)?\.(run|runAllTasks\w*)|AbstractEventExecutor\.(safeExecute|runTask)|DefaultThreadFactory\$DefaultRunnableDecorator\.run)$

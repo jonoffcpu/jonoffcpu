@@ -130,6 +130,7 @@ public final class SignalJfrExporter {
             if (!partial) throw error;
             return new PrefixOutcome(false, false, false, 0, 0, boundedMessage(error));
         }
+        JfrSnapshot snapshot = new JfrSnapshot();
         try (RecordingFile recording = opened) {
             while (true) {
                 RecordedEvent event;
@@ -142,6 +143,7 @@ public final class SignalJfrExporter {
                     break;
                 }
                 String type = event.getEventType().getName();
+                if (type.startsWith("jdk.")) snapshot.accept(event);
                 try {
                     if (type.equals("profiler.SignalCapture")) {
                         Context found = Context.read(event);
@@ -243,6 +245,10 @@ public final class SignalJfrExporter {
         if (!allowMissingMetadata && stats != 1) {
             throw new IOException("Missing terminal signal capture stats event");
         }
+        JfrTimeRange.RecordingBounds bounds = JfrTimeRange.recordingBounds(input);
+        output.accept(SignalProto.SignalRecord.newBuilder()
+                .setRecording(snapshot.build(bounds.start(), bounds.end()))
+                .build());
         output.accept(SignalProto.SignalRecord.newBuilder()
                 .setEnd(SignalProto.SignalEnd.newBuilder()
                         .setParseComplete(true)

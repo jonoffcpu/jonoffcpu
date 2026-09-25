@@ -98,7 +98,7 @@ final class StackProfileRenderer {
      * ({@code i.n.c.e.Native.epollWait0}), or dropped ({@code Native.epollWait0}). Only the display changes: filters
      * still match the full names, and frames that become equal merge into one line. Native frames of the Java stack
      * ({@code libjvm.so.Unsafe_Park}) are left as they are: by their {@link StackProfile.Kind#JFR_NATIVE} kind, and,
-     * for a profile that predates the kind, by a name that is recognisably native.
+     * as a second line of defence, by a name that is recognisably native.
      */
     enum PackageNames {
         FULL,
@@ -133,8 +133,7 @@ final class StackProfileRenderer {
         /**
          * A Java frame's name as shown. A name that is not a package-qualified {@code Class.method}, or that reads
          * as native — a C++ {@code ::}, a shared library, a path, a bracketed placeholder, or a space — is left
-         * unchanged. The name rule is what protects a profile written before frames had kinds; with kinds it can only
-         * ever prevent a rewrite.
+         * unchanged. With kinds the name rule can only ever prevent a rewrite.
          */
         String apply(String frame) {
             if (this == FULL || looksNative(frame)) return frame;
@@ -270,7 +269,8 @@ final class StackProfileRenderer {
      * The collapsed lines of one slice and the totals behind them, for a summary a reader can reconcile. The
      * filtered totals are what the slice's filter removed: an unfiltered slice's totals less the kept ones. The
      * unsplit total is the part of the kept entries' time that has no sleeping/run-queue split, which a
-     * {@code sleeping} or {@code runqueue} slice leaves out.
+     * {@code sleeping} or {@code runqueue} slice leaves out. The hidden totals are the kept entries that
+     * {@link StackTransforms.UnmatchedRoot#HIDE} left out of the lines, and out of every other total.
      */
     record Slice(
             Map<String, BigInteger> nanos,
@@ -278,7 +278,9 @@ final class StackProfileRenderer {
             BigInteger totalNanos,
             long filteredIntervals,
             BigInteger filteredNanos,
-            BigInteger unsplitNanos) {}
+            BigInteger unsplitNanos,
+            long hiddenIntervals,
+            BigInteger hiddenNanos) {}
 
     private static final Pattern OFFSET = Pattern.compile("\\+0x[0-9a-fA-F]+$");
     /**
@@ -343,7 +345,9 @@ final class StackProfileRenderer {
                 kept.totalNanos(),
                 Math.subtractExact(all.intervals(), kept.intervals()),
                 all.totalNanos().subtract(kept.totalNanos()),
-                kept.unsplitNanos());
+                kept.unsplitNanos(),
+                kept.hiddenIntervals(),
+                kept.hiddenNanos());
     }
 
     private static Slice project(
@@ -378,11 +382,26 @@ final class StackProfileRenderer {
         if (transforms.threadFrame() != StackTransforms.ThreadFrame.NONE) {
             requireDimension(profile, ProfileAccumulator.THREAD);
         }
-        Set<OffCpuReason> selected = reasons == null ? EnumSet.allOf(OffCpuReason.class) : EnumSet.copyOf(reasons);
+        Set<OffCpuReason> selected =
+                reasons == null ? EnumSet.copyOf(OffCpuReason.CLASSIFIED) : EnumSet.copyOf(reasons);
         List<StackProfile.Entry> entries = new ArrayList<>();
         Set<OffCpuReason> present = EnumSet.noneOf(OffCpuReason.class);
+        long hiddenIntervals = 0;
+        BigInteger hidden = BigInteger.ZERO;
+        boolean hides = transforms.unmatchedRoot() == StackTransforms.UnmatchedRoot.HIDE;
         for (StackProfile.Entry entry : profile.entries()) {
             if (!selected.contains(entry.reason()) || !keeps.test(entry)) continue;
+            // A hidden entry is left out before anything else, so the slice reads as if it had none.
+            if (hides
+                    && StackTransforms.hidden(
+                            entry.javaStack(), transformed.computeIfAbsent(entry.javaStack(), transform::apply))) {
+                hiddenIntervals = Math.addExact(hiddenIntervals, entry.intervals());
+                hidden = hidden.add(U64.big(
+                        time.part != null
+                                ? entry.split().nanos(time.part, estimated)
+                                : estimated ? entry.estimatedNanos() : entry.observedNanos()));
+                continue;
+            }
             entries.add(entry);
             // Only reasons that contribute a line count, as in the correlator's own collapsed file.
             long contributes =
@@ -440,7 +459,8 @@ final class StackProfileRenderer {
             total = total.add(value);
         }
         BigInteger unsplitTotal = thinning.active() ? thinning.scale(unsplit) : BigInteger.valueOf(unsplit);
-        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO, unsplitTotal);
+        BigInteger hiddenTotal = thinning.active() ? thinning.scale(hidden.longValueExact()) : hidden;
+        return new Slice(scaled, intervals, total, 0, BigInteger.ZERO, unsplitTotal, hiddenIntervals, hiddenTotal);
     }
 
     /** The leaf frame naming one part of an interval's time in a {@link Time#SPLIT} slice. */
@@ -535,7 +555,7 @@ final class StackProfileRenderer {
             Filter filter,
             PackageNames packages) {
         AnalysisProto.SliceSummary.Builder summary = AnalysisProto.SliceSummary.newBuilder();
-        for (OffCpuReason reason : reasons == null ? EnumSet.allOf(OffCpuReason.class) : reasons) {
+        for (OffCpuReason reason : reasons == null ? OffCpuReason.CLASSIFIED : reasons) {
             summary.addReasons(reason.proto());
         }
         summary.setStack(kinds.text)
@@ -563,6 +583,14 @@ final class StackProfileRenderer {
         return summary;
     }
 
+    /** What {@link StackTransforms.UnmatchedRoot#HIDE} left out of a slice, for its summary. */
+    static AnalysisProto.FilteredSlice hidden(Slice slice) {
+        return AnalysisProto.FilteredSlice.newBuilder()
+                .setIntervals(slice.hiddenIntervals())
+                .setTotalNanos(slice.hiddenNanos().toString())
+                .build();
+    }
+
     static List<String> patterns(List<Pattern> patterns) {
         return patterns.stream().map(Pattern::pattern).toList();
     }
@@ -580,28 +608,28 @@ final class StackProfileRenderer {
     }
 
     /**
-     * One row per entry with its stacks expanded, for tools such as DuckDB. The columns before 0.5.0 keep their
-     * names, order and meaning; the ones after them are appended, so a reader by name or by position keeps working.
+     * One row per entry with its stacks expanded, for tools such as DuckDB: the run and the entry's identity, its
+     * counters, then its stacks, in the order of {@link AnalysisProto.ExportRow}.
      */
     static void export(StackProfile profile, Export options, BufferedWriter writer) throws IOException {
         boolean estimateAvailable = profile.header().estimateAvailable();
         switch (options.format()) {
             case "csv" -> {
-                writer.write("reason,task_state,thread,java_stack,kernel_stack,user_stack,"
+                writer.write("run,estimate_available,reason,task_state,thread,thread_pool,"
                         + "intervals,observed_nanos,estimated_nanos,sleeping_nanos,runqueue_nanos,unsplit_nanos,"
-                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,java_stack_kinds,"
-                        + "canonical_java_stack,thread_pool,run,estimate_available");
+                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,"
+                        + "java_stack,java_stack_kinds,canonical_java_stack,kernel_stack,user_stack");
                 writer.newLine();
                 for (StackProfile.Entry entry : profile.entries()) {
                     String javaStack = joined(entry.javaStack(), false);
                     writer.write(String.join(
                             ",",
+                            csv(options.run()),
+                            Boolean.toString(estimateAvailable),
                             entry.reason().label(),
                             Integer.toUnsignedString(entry.taskState()),
                             csv(entry.thread()),
-                            csv(javaStack),
-                            csv(joined(entry.kernelStack(), true)),
-                            csv(joined(entry.userStack(), true)),
+                            csv(entry.thread() == null ? null : StackTransforms.poolName(entry.thread())),
                             Long.toString(entry.intervals()),
                             Long.toUnsignedString(entry.observedNanos()),
                             Long.toUnsignedString(entry.estimatedNanos()),
@@ -611,11 +639,11 @@ final class StackProfileRenderer {
                             Long.toUnsignedString(entry.split().estimatedSleeping()),
                             Long.toUnsignedString(entry.split().estimatedRunqueue()),
                             Long.toUnsignedString(entry.split().estimatedUnsplit()),
+                            csv(javaStack),
                             csv(javaKinds(entry.javaStack())),
                             csv(javaStack == null ? null : StackTransforms.canonicalName(javaStack)),
-                            csv(entry.thread() == null ? null : StackTransforms.poolName(entry.thread())),
-                            csv(options.run()),
-                            Boolean.toString(estimateAvailable)));
+                            csv(joined(entry.kernelStack(), true)),
+                            csv(joined(entry.userStack(), true))));
                     writer.newLine();
                 }
             }

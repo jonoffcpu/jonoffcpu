@@ -39,6 +39,8 @@ final class CaptureInput {
     final boolean partial;
     /** What partial mode reports about the prefix; the engine adds what it observes in the JFR. */
     final ReportProto.PartialReport.Builder diagnostics;
+    /** The process and machine the JFR describes, set by the JFR pass; null until then, and in partial mode. */
+    SignalProto.JfrRecording recording;
 
     private CaptureInput(
             CaptureProto.CaptureStart start,

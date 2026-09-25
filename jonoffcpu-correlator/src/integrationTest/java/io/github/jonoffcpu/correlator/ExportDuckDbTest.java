@@ -72,7 +72,7 @@ class ExportDuckDbTest {
                         0),
                 new StackProfile.Entry(
                         List.of(
-                                frame(StackProfile.Kind.JAVA, "y.Idle.run"),
+                                frame(StackProfile.Kind.JAVA, "y.Waiting.run"),
                                 frame(StackProfile.Kind.JAVA, "x.App.wait")),
                         null,
                         null,

@@ -27,8 +27,12 @@ public final class OffCpuCorrelator {
             Degradation ladder,
             boolean stackProfile,
             StackProfileRenderer.ReasonFrame reasonFrame,
-            Digest.Options digest) {
-        /** {@code digest} is how the analysis digest is computed, or null to leave it out. */
+            Digest.Options digest,
+            boolean processDetails) {
+        /**
+         * {@code digest} is how the analysis digest is computed, or null to leave it out. {@code processDetails}
+         * keeps the target's command line, system properties and environment variables in the report's recording.
+         */
         public OutputOptions {
             if (reasonFrame == null) throw new IllegalArgumentException("Missing reason frame mode");
             if (audit == null) throw new IllegalArgumentException("Missing audit level");
@@ -44,7 +48,8 @@ public final class OffCpuCorrelator {
                     Degradation.none(),
                     true,
                     StackProfileRenderer.ReasonFrame.AUTO,
-                    Digest.defaults());
+                    Digest.defaults(),
+                    false);
         }
     }
 
@@ -151,7 +156,8 @@ public final class OffCpuCorrelator {
             StackProfileRenderer.ReasonFrame reasonFrame,
             boolean stackProfile,
             ProfileAccumulator.Options profileOptions,
-            Digest.Options digest)
+            Digest.Options digest,
+            boolean processDetails)
             throws IOException {
         boolean hasJfrRange = from != null || to != null;
         OfflineCorrelator.JfrSelection selection = null;
@@ -181,7 +187,14 @@ public final class OffCpuCorrelator {
                 AnalysisOutput.of(result, sourcePath, jfr, selection, settings.narrowedToNanos()),
                 output,
                 new OutputOptions(
-                        estimatePopulation, ladder.audit(), prefix, ladder, stackProfile, reasonFrame, digest),
+                        estimatePopulation,
+                        ladder.audit(),
+                        prefix,
+                        ladder,
+                        stackProfile,
+                        reasonFrame,
+                        digest,
+                        processDetails),
                 () -> publishedResult.capture().verifyUnchanged(sourcePath, jfr));
         System.out.println((narrowed ? "Wrote INCOMPLETE narrowed analysis to " : "Wrote validated analysis to ")
                 + output
@@ -285,6 +298,12 @@ public final class OffCpuCorrelator {
                 .setSelectedObservedDurationNanos(output.selectedObservedDurationNanos());
         if (output.submittedButNotParsed() != null) report.setSubmittedButNotParsed(output.submittedButNotParsed());
         if (output.jfrSelection() != null) report.setJfrSelection(output.jfrSelection());
+        if (output.recording() != null) {
+            report.setRecording(
+                    options.processDetails()
+                            ? output.recording()
+                            : JfrSnapshot.withoutProcessDetails(output.recording()));
+        }
         if (options.populationEstimate() && output.populationEstimate() != null) {
             report.setPopulationEstimate(output.populationEstimate());
         }
@@ -470,6 +489,10 @@ public final class OffCpuCorrelator {
      */
     static List<String> patternFile(String option, String file) throws IOException {
         List<String> patterns = new java.util.ArrayList<>();
+        if (file.equals(Presets.ALL)) {
+            for (String preset : Presets.all(option)) patterns.addAll(patternFile(option, preset));
+            return patterns;
+        }
         List<String> lines = file.startsWith(Presets.PREFIX)
                 ? Presets.lines(file.substring(Presets.PREFIX.length()))
                 : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);

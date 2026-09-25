@@ -25,10 +25,11 @@ import org.junit.jupiter.params.provider.FieldSource;
  * The reference numbers the 0.5.0 specs were written against, measured on recordings of an Apache Pulsar broker. The
  * recordings are not part of the repository; run with {@code -Djonoffcpu.fixtures=DIR} (Gradle:
  * {@code -PjonoffcpuFixtures=DIR}) pointing at a directory holding {@code pulsar-broker-2026-09-23-wolfi/} and
- * {@code pulsar-broker-2026-09-23-wolfi-cpu/}, and it is skipped otherwise.
+ * {@code pulsar-broker-2026-09-23-wolfi-cpu/}, and it is skipped otherwise. The digest-application-roots spec's
+ * numbers are measured on {@code pulsar-broker-2026-09-25-key-shared/}.
  */
 class FixtureAcceptanceTest {
-    static final String IDLE_BOOKKEEPER =
+    static final String WAITING_BOOKKEEPER =
             "^org\\.apache\\.bookkeeper\\.common\\.collections\\.[\\w$]*BlockingQueue\\.take(All)?$";
     static final String APP = "^org\\.apache\\.";
 
@@ -115,9 +116,9 @@ class FixtureAcceptanceTest {
                 "--profile",
                 profile.toString(),
                 "--exclude-from",
-                "preset:jvm-idle",
+                "preset:jvm-waiting",
                 "--exclude",
-                IDLE_BOOKKEEPER));
+                WAITING_BOOKKEEPER));
         offArgs.addAll(row.options());
         String offShape = shape(run(dir.resolve("off-" + index + ".collapsed"), offArgs));
         assertThat(cpuShape).as("%s: CPU", row.name()).isEqualTo(row.cpuLines() + " lines at " + row.cpuDepth());
@@ -245,16 +246,16 @@ class FixtureAcceptanceTest {
         Path fixtures = fixtures();
         Path wolfi = fixtures.resolve("pulsar-broker-2026-09-23-wolfi/jonoffcpu-offcpu-profile.pb");
         Path alpine = fixtures.resolve("pulsar-broker-2026-09-23-alpine/jonoffcpu-offcpu-profile.pb");
-        List<String> options =
-                List.of("--app", APP, "--idle-from", "preset:jvm-idle", "--idle", IDLE_BOOKKEEPER, "--limit", "10");
+        List<String> options = List.of(
+                "--app", APP, "--waiting-from", "preset:jvm-waiting", "--waiting", WAITING_BOOKKEEPER, "--limit", "10");
         List<String> args = new ArrayList<>(List.of("--profile", wolfi.toString()));
         args.addAll(options);
         AnalysisProto.TopResult result = topJson(args);
         AnalysisProto.TopTotals totals = result.getTotals();
         assertThat(totals(totals.getSelected())).as("All: %s", totals).isEqualTo("2791/308777/8519.334");
-        assertThat(totals(totals.getIdle())).as("Idle: %s", totals).isEqualTo("660/301389/8470.366");
-        assertThat(totals(totals.getBusy())).as("Busy: %s", totals).isEqualTo("2131/7388/48.968");
-        assertThat(totals(totals.getBusyNoApplicationFrame()))
+        assertThat(totals(totals.getWaiting())).as("Waiting: %s", totals).isEqualTo("660/301389/8470.366");
+        assertThat(totals(totals.getBlocked())).as("Blocked: %s", totals).isEqualTo("2131/7388/48.968");
+        assertThat(totals(totals.getBlockedNoApplicationFrame()))
                 .as("No application frame: %s", totals)
                 .isEqualTo("132/237/28.374");
         assertThat(totals(totals.getOverExclusion()))
@@ -264,7 +265,7 @@ class FixtureAcceptanceTest {
         for (AnalysisProto.TopRow row : result.getRowsList()) {
             rows.add(row.getKey() + "|" + row.getBlocker() + "|" + row.getValue() + "|" + row.getIntervals());
         }
-        assertThat(rows).as("Busy by boundary").isEqualTo(BOUNDARY_ROWS);
+        assertThat(rows).as("Blocked by boundary").isEqualTo(BOUNDARY_ROWS);
         List<AnalysisProto.TopRow> pools = result.getNoApplicationFrameList();
         List<String> firstPools = new ArrayList<>();
         for (AnalysisProto.TopRow pool : pools.subList(0, 2)) {
@@ -273,12 +274,12 @@ class FixtureAcceptanceTest {
         assertThat(firstPools)
                 .as("Pools: %s", pools)
                 .containsExactly("ZDriverMinor|22.517|88", "ZDriverMajor|5.527|27");
-        List<String> idle = new ArrayList<>();
-        for (AnalysisProto.TopRow row : result.getIdleList()) {
-            idle.add(row.getKey() + " " + new BigDecimal(row.getValue()).setScale(1, RoundingMode.HALF_EVEN));
+        List<String> waiting = new ArrayList<>();
+        for (AnalysisProto.TopRow row : result.getWaitingList()) {
+            waiting.add(row.getKey() + " " + new BigDecimal(row.getValue()).setScale(1, RoundingMode.HALF_EVEN));
         }
-        assertThat(idle.subList(0, 5))
-                .as("Idle by boundary: %s", idle)
+        assertThat(waiting.subList(0, 5))
+                .as("Waiting by boundary: %s", waiting)
                 .containsExactly(
                         "[no application frame] 7687.8",
                         "org.apache.bookkeeper.common.collections.GrowableBatchedArrayBlockingQueue.internalTakeAll 231.2",
@@ -306,10 +307,10 @@ class FixtureAcceptanceTest {
         assertThat(compared).as("Comparison").isEqualTo(COMPARISON_ROWS);
         AnalysisProto.ComparisonTotals compareTotals = comparison.getComparisonTotals();
         assertThat(List.of(
-                        compareTotals.getBaselineBusyApplication(),
-                        compareTotals.getBusyApplication(),
-                        compareTotals.getBaselineBusy(),
-                        compareTotals.getBusy()))
+                        compareTotals.getBaselineBlockedApplication(),
+                        compareTotals.getBlockedApplication(),
+                        compareTotals.getBaselineBlocked(),
+                        compareTotals.getBlocked()))
                 .as("Comparison totals: %s", compareTotals)
                 .containsExactly("16.574", "20.593", "2019.121", "48.968");
         assertThat(comparison.getWarningsList()).as("Both warnings").hasSize(2);
@@ -322,9 +323,9 @@ class FixtureAcceptanceTest {
                         "--profile",
                         wolfi.toString(),
                         "--exclude-from",
-                        "preset:jvm-idle",
+                        "preset:jvm-waiting",
                         "--exclude",
-                        IDLE_BOOKKEEPER,
+                        WAITING_BOOKKEEPER,
                         "--leaf-at",
                         APP));
         Map<String, BigDecimal> leaves = new HashMap<>();
@@ -359,24 +360,262 @@ class FixtureAcceptanceTest {
                 wolfi.toString(),
                 "--app",
                 APP,
-                "--idle-from",
-                "preset:jvm-idle",
-                "--idle",
-                IDLE_BOOKKEEPER,
+                "--waiting-from",
+                "preset:jvm-waiting",
+                "--waiting",
+                WAITING_BOOKKEEPER,
                 "--output-dir",
                 digest.toString());
         assertThat(summarize.code()).as("summarize failed: %s", summarize).isZero();
-        assertThat(Files.size(digest.resolve(OutputFiles.SUMMARY_MD)))
-                .as("The digest's Markdown must stay under 16 KB")
-                .isLessThan(16 * 1024);
-        AnalysisProto.HeaviestStacks heaviest = ProtoJson.parse(
+        AnalysisProto.Digest written = ProtoJson.parse(
                         Files.readString(digest.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
-                .getHeaviestStacks();
-        assertThat(heaviest.getLines())
-                .as("Heaviest transformed stacks: %s", heaviest)
-                .isEqualTo(78);
-        assertThat(heaviest.getMeanDepth())
-                .as("Heaviest transformed stacks: %s", heaviest)
-                .isEqualTo("4.1");
+                .build();
+        assertThat(written.getBlocked().getBy()).isEqualTo("boundary");
+        assertThat(written.getFlameGraphCommand()).contains(" stacks ", "--root-at-unmatched hide");
+    }
+
+    static final String KEY_SHARED = "pulsar-broker-2026-09-25-key-shared";
+
+    /** The key-shared fixture's application-rooted options, in --package-names drop for short keys. */
+    static List<String> applicationRooted(Path fixture, String... more) {
+        List<String> args = new ArrayList<>(List.of(
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--waiting-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--canonical-names",
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--root-at",
+                APP,
+                "--root-at-unmatched",
+                "hide",
+                "--package-names",
+                "drop",
+                "--limit",
+                "100"));
+        args.addAll(List.of(more));
+        return args;
+    }
+
+    private static List<String> rows(AnalysisProto.TopResult result, boolean blocker) {
+        List<String> rows = new ArrayList<>();
+        for (AnalysisProto.TopRow row : result.getRowsList()) {
+            rows.add(row.getKey() + (blocker ? " [" + row.getBlocker() + "]" : "") + " " + row.getValue() + " "
+                    + Top.percent(row.getShare()));
+        }
+        return rows;
+    }
+
+    static final List<String> HIDDEN_FRAMES = List.of(
+            "$$Lambda",
+            "SingleThreadExecutor.run",
+            "SingleThreadExecutor.safeRunTask",
+            "FutureTask.",
+            "Runnables$CatchingAndLoggingRunnable",
+            "PulsarFlowControlHandler",
+            "PulsarDecoder.channelRead");
+
+    /** Spec digest-application-roots, change 1: hiding moves the unattributed blocked time to a total of its own. */
+    @Test
+    void rootAtUnmatchedHide(@TempDir Path dir) throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        List<String> common = List.of(
+                "stacks",
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--exclude-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--canonical-names",
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--root-at",
+                APP);
+        List<String> bucket = new ArrayList<>(common);
+        bucket.addAll(List.of("--summary", dir.resolve("bucket.json").toString()));
+        run(dir.resolve("bucket.collapsed"), bucket);
+        List<String> hide = new ArrayList<>(common);
+        hide.addAll(List.of(
+                "--root-at-unmatched",
+                "hide",
+                "--summary",
+                dir.resolve("hide.json").toString()));
+        run(dir.resolve("hide.collapsed"), hide);
+        AnalysisProto.SliceSummary all = ProtoJson.parse(
+                        Files.readString(dir.resolve("bucket.json")), AnalysisProto.SliceSummary.newBuilder())
+                .build();
+        AnalysisProto.SliceSummary kept = ProtoJson.parse(
+                        Files.readString(dir.resolve("hide.json")), AnalysisProto.SliceSummary.newBuilder())
+                .build();
+        assertThat(all.getIntervals()).as("Blocked intervals").isEqualTo(291);
+        assertThat(seconds(all.getTotalNanos())).as("Blocked seconds").isEqualTo("40.566");
+        assertThat(seconds(kept.getTotalNanos()))
+                .as("With an application frame")
+                .isEqualTo("0.297");
+        assertThat(seconds(kept.getRootAtUnmatchedHidden().getTotalNanos()))
+                .as("Without an application frame, hidden")
+                .isEqualTo("40.269");
+        assertThat(new BigDecimal(kept.getTotalNanos())
+                        .add(new BigDecimal(kept.getRootAtUnmatchedHidden().getTotalNanos())))
+                .as("Kept and hidden add up to the unhidden total exactly")
+                .isEqualTo(new BigDecimal(all.getTotalNanos()));
+        assertThat(Files.readString(dir.resolve("hide.collapsed")))
+                .doesNotContain(StackTransforms.NO_APPLICATION_FRAME);
+    }
+
+    private static String seconds(String nanos) {
+        return new BigDecimal(nanos)
+                .movePointLeft(9)
+                .setScale(3, RoundingMode.HALF_EVEN)
+                .toPlainString();
+    }
+
+    /** Spec digest-application-roots, changes 3 to 5: the root, application method and boundary tables. */
+    @Test
+    void applicationTables() throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        AnalysisProto.TopResult roots = topJson(applicationRooted(fixture, "--by", "root"));
+        assertThat(rows(roots, false).subList(0, 8))
+                .containsExactly(
+                        "PersistentDispatcherMultipleConsumers.lambda$readMoreEntriesAsync$0 0.094 31.5 %",
+                        "ServerCnx.handleSend 0.087 29.1 %",
+                        "ServerCnx.handleAck 0.027 9.1 %",
+                        "PulsarCommandSenderImpl.lambda$sendMessagesToConsumer$0 0.024 8.0 %",
+                        "ZKSessionWatcher.checkConnectionStatus 0.023 7.8 %",
+                        "PerChannelBookieClient.lambda$writeAndFlush$5 0.018 6.0 %",
+                        "ModularLoadManagerImpl.updateAll 0.012 3.9 %",
+                        "BookieProtoEncoding$ResponseDecoder.channelRead 0.008 2.7 %");
+        assertThat(roots.getRows(roots.getRowsCount() - 1).getKey()).isEqualTo("ManagedLedgerImpl.runAddBatch");
+        assertThat(roots.getTotals().getBlockedRootAtUnmatchedHidden().getValue())
+                .isEqualTo("40.269");
+        for (AnalysisProto.TopRow row : roots.getRowsList()) {
+            assertThat(row.getKey()).as("A root is never a dispatch frame").doesNotContain(HIDDEN_FRAMES);
+        }
+
+        AnalysisProto.TopResult methods = topJson(applicationRooted(fixture, "--by", "app-method", "--app", APP));
+        assertThat(methods.getRowsCount()).as("Chains").isEqualTo(27);
+        assertThat(methods.getRowsList().stream()
+                        .mapToInt(AnalysisProto.TopRow::getMethodsCount)
+                        .sum())
+                .as("Distinct application methods")
+                .isEqualTo(96);
+        List<String> first = new ArrayList<>();
+        for (AnalysisProto.TopRow row : methods.getRowsList().subList(0, 4)) {
+            first.add(row.getKey() + " " + row.getValue() + " " + Top.percent(row.getShare()) + " " + row.getSelf()
+                    + " " + row.getStacks());
+        }
+        assertThat(first)
+                .containsExactly(
+                        "PersistentDispatcherMultipleConsumers.lambda$readMoreEntriesAsync$0 → … (3) →"
+                                + " PersistentDispatcherMultipleConsumers.internalReadMoreEntries 0.094 31.5 % 0.012 6",
+                        "ServerCnx.handleSend → … (6) → MessageDeduplication.isDuplicateNormal 0.087 29.1 % 0.087 1",
+                        "ManagedCursorImpl.asyncReadEntriesWithSkipOrWait → … (4) →"
+                                + " ManagedLedgerImpl.internalReadFromLedger 0.082 27.7 % 0.000 5",
+                        "ManagedLedgerImpl.asyncReadEntry → … (4) → RangeEntryCacheImpl.asyncReadEntriesByPosition"
+                                + " 0.043 14.5 % 0.000 4");
+        BigDecimal self = BigDecimal.ZERO;
+        for (AnalysisProto.TopRow row : methods.getRowsList()) {
+            self = self.add(new BigDecimal(row.getSelf()));
+            assertThat(row.getMethodsList())
+                    .as("No hidden frame is an application method")
+                    .allSatisfy(method -> assertThat(method).doesNotContain(HIDDEN_FRAMES));
+        }
+        assertThat(self)
+                .as("Self times add up, within the rows' rounding to milliseconds")
+                .isCloseTo(new BigDecimal("0.297"), within(new BigDecimal("0.0135")));
+
+        AnalysisProto.TopResult boundaries = topJson(applicationRooted(fixture, "--app", APP));
+        assertThat(rows(boundaries, true).subList(0, 8))
+                .containsExactly(
+                        "MessageDeduplication.isDuplicateNormal [C2 Runtime complete_monitor_locking] 0.087 29.1 %",
+                        "ManagedCursorImpl.isMessageDeleted [ReentrantReadWriteLock$ReadLock.lock] 0.039 13.2 %",
+                        "ManagedCursorImpl.filterReadEntries [ReentrantReadWriteLock$ReadLock.lock] 0.029 9.6 %",
+                        "ZKSessionWatcher.checkConnectionStatus [ForkJoinPool.managedBlock] 0.023 7.8 %",
+                        "InMemoryRedeliveryTracker.getRedeliveryCount [StampedLock.readLock] 0.023 7.8 %",
+                        "ManagedCursorImpl.asyncDelete [ReentrantReadWriteLock$WriteLock.lock] 0.022 7.4 %",
+                        "ConcurrentOpenHashMap$Section.get [StampedLock.readLock] 0.018 6.0 %",
+                        "PendingAcksMap.addPendingAckIfAllowed [ReentrantReadWriteLock$WriteLock.lock] 0.012 4.1 %");
+        assertThat(rows(boundaries, true))
+                .as("Collections stay boundaries")
+                .contains(
+                        "ConcurrentOpenHashMap$Section.remove [StampedLock.writeLock] 0.004 1.4 %",
+                        "GrowableBatchedArrayBlockingQueue.offer [ReentrantLock.lock] 0.004 1.3 %");
+        for (AnalysisProto.TopResult result : List.of(roots, boundaries)) {
+            assertThat(result.getRowsList())
+                    .as("No boundary or root is an executor submit frame")
+                    .noneMatch(row -> row.getKey().contains("SingleThreadExecutor.execute")
+                            || row.getKey().contains("executeOrdered"));
+        }
+    }
+
+    /** Spec digest-application-roots, change 6: the digest leads with the application methods that waited. */
+    @Test
+    void applicationDigest(@TempDir Path dir) throws Exception {
+        Path fixture = fixtures().resolve(KEY_SHARED);
+        Path output = dir.resolve("digest");
+        CommandLineFixture.Invocation summarize = CommandLineFixture.invoke(
+                "summarize",
+                "--profile",
+                fixture.resolve("jonoffcpu-offcpu-profile.pb").toString(),
+                "--app",
+                APP,
+                "--hide-from",
+                fixture.resolve("pulsar-dispatch-hide.txt").toString(),
+                "--waiting-from",
+                fixture.resolve("offcpu-idle-waits.txt").toString(),
+                "--output-dir",
+                output.toString());
+        assertThat(summarize.code()).as("summarize failed: %s", summarize).isZero();
+        AnalysisProto.Digest digest = ProtoJson.parse(
+                        Files.readString(output.resolve(OutputFiles.SUMMARY_JSON)), AnalysisProto.Digest.newBuilder())
+                .build();
+        String markdown = Files.readString(output.resolve(OutputFiles.SUMMARY_MD));
+        AnalysisProto.TopRow first = digest.getBlocked().getRows(0);
+        assertThat(first.getKey())
+                .isEqualTo("org.apache.pulsar.broker.service.persistent.MessageDeduplication.isDuplicateNormal");
+        assertThat(first.getValue() + " " + Top.percent(first.getShare())).isEqualTo("0.087 29.1 %");
+        assertThat(markdown.indexOf("## Blocked, by the application method that waited"))
+                .as("The first table")
+                .isLessThan(markdown.indexOf("| # |"));
+        String application =
+                digest.getWhereTheTimeWent().getBlockedApplication().getValue();
+        assertThat(application).isEqualTo("0.297");
+        for (AnalysisProto.DigestTable table : List.of(digest.getBlocked(), digest.getBlockedByRoot())) {
+            assertThat(table.getRowsList().stream()
+                            .map(row -> new BigDecimal(row.getValue()))
+                            .reduce(BigDecimal.ZERO, BigDecimal::add))
+                    .as("The %s rows sum to the blocked time with an application frame", table.getBy())
+                    .isCloseTo(new BigDecimal(application), within(new BigDecimal("0.005")));
+        }
+        assertThat(digest.getBlockedByRoot().toString())
+                .as("The root table holds no unattributed time")
+                .doesNotContain("pulsar-web", "ZDriver");
+        assertThat(digest.getBlockedNoApplicationFrameByPool().getRowsList())
+                .extracting(AnalysisProto.TopRow::getKey)
+                .startsWith("pulsar-web-#-#", "ZDriverMinor");
+        assertThat(markdown)
+                .contains("> Most of the blocked time has no application frame")
+                .as("digest-readability, change 5: the share columns")
+                .contains(
+                        "| Blocked | 179 | 291 | 40.566 | 100.0 % | 1.1 % |",
+                        " | 0.297 | 0.7 % | < 0.1 % |",
+                        " | 40.269 | 99.3 % | 1.1 % |",
+                        "| Waiting, left out | 489 | 103641 | 3727.187 |  | 98.9 % |",
+                        "| Over-exclusion check: waiting entries with a lock-acquire frame | 1 | 1 | 0.001 |  | < 0.1 % |")
+                .as("The analysed window from the report's selection")
+                .contains(
+                        "- **Analysed:** 2026-09-24 23:45:09.903 UTC to 23:45:47.924 UTC (38.0 s), the selected window");
+
+        // Every reproduce command, run as written, prints its table as the digest has it.
+        for (AnalysisProto.DigestTable table :
+                List.of(digest.getBlocked(), digest.getBlockedByRoot(), digest.getBlockedByApplicationMethod())) {
+            CommandLineFixture.Invocation top = CommandLineFixture.invoke(CommandLineFixture.words(table.getCommand()));
+            StringBuilder rendered = new StringBuilder();
+            Top.rowsTable(table.getRowsList(), table.getBy(), "s", "Intervals", true, rendered);
+            assertThat(markdown).contains(rendered);
+            assertThat(top.out())
+                    .as("%s reproduces its table", table.getCommand())
+                    .contains(rendered);
+        }
     }
 }

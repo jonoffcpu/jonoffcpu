@@ -234,8 +234,12 @@ and exact-cookie matches rather than only checking process exit status.
   reads inputs through providers or value sources. Check a build change with
   `--configuration-cache-problems=warn` and by running it twice: the second run
   must say `Reusing configuration cache`.
-- Keep public configuration, manifest, capture stream, report, and CLI changes backward
-  compatible unless a format/version migration is designed and documented.
+- From the 1.0.0 release on, keep public configuration, manifest, capture stream,
+  report, analysis output (stack profile, digest, `top`, `export`) and CLI changes
+  backward compatible unless a format/version migration is designed and
+  documented. Until then there is no compatibility to keep: change a format or
+  option outright, and remove old schemas, aliases and fallbacks rather than
+  carrying them.
 - Use supported public JDK JFR APIs in the correlator. Do not depend on
   `jdk.jfr.internal.*` implementation classes.
 - CI and releases share [`.github/workflows/build-and-verify.yml`](.github/workflows/build-and-verify.yml).

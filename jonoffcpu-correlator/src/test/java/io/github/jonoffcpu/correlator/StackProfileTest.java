@@ -299,13 +299,13 @@ class StackProfileTest {
 
         // The export is one row per entry, for tools such as DuckDB.
         List<String> rows = exportCsv(profile, dir.resolve("entries.csv"));
-        assertThat(rows.get(0)).as("CSV header changed").startsWith("reason,task_state,thread,java_stack");
+        assertThat(rows.get(0)).as("CSV header changed").startsWith("run,estimate_available,reason,task_state,thread,");
         assertThat(rows).as("One CSV row per entry").hasSize(read.entries().size() + 1);
-        assertThat(rows.get(1)).as("Unexpected CSV row").startsWith("blocked,1," + thread + ",");
-        // A column names each Java-stack frame's kind, parallel to java_stack; the 0.5.0 columns follow it.
+        assertThat(rows.get(1)).as("Unexpected CSV row").contains(",blocked,1," + thread + ",");
+        // A column names each Java-stack frame's kind, parallel to java_stack.
         assertThat(rows.get(0))
                 .as("CSV header lacks the kinds")
-                .endsWith(",java_stack_kinds,canonical_java_stack,thread_pool,run,estimate_available");
+                .contains(",java_stack,java_stack_kinds,canonical_java_stack,");
         String firstStack = String.join(
                 ";",
                 read.entries().get(0).javaStack().stream().map(frame -> "java").toList());
@@ -638,9 +638,8 @@ class StackProfileTest {
         List<String> csv = exportCsv(profile, dir.resolve("entries.csv"));
         assertThat(csv.get(0))
                 .as("CSV header")
-                .endsWith(",sleeping_nanos,runqueue_nanos,unsplit_nanos,"
-                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,"
-                        + "java_stack_kinds,canonical_java_stack,thread_pool,run,estimate_available");
+                .contains(",sleeping_nanos,runqueue_nanos,unsplit_nanos,"
+                        + "estimated_sleeping_nanos,estimated_runqueue_nanos,estimated_unsplit_nanos,");
 
         // A profile without the split refuses the parts, and merging it with one that has them keeps it unsplit.
         Path v3 = reasonCapture(dir.resolve("v3"), jfr, ALL_REASONS, row -> ALL_REASONS.get(row % 3));
@@ -1146,7 +1145,7 @@ class StackProfileTest {
 
         // Pattern files hold one pattern per line, skipping blank and '#' lines, and add to the inline patterns.
         Path includes = dir.resolve("includes.txt");
-        Files.writeString(includes, "# idle-free waits\nfutex_wait\n\n   \nsched_yield\r\n");
+        Files.writeString(includes, "# waiting-free waits\nfutex_wait\n\n   \nsched_yield\r\n");
         assertThat(stacks(profile, dir.resolve("include-from.collapsed"), "--include-from", includes.toString()))
                 .as("A pattern file must read like repeated --include options")
                 .isEqualTo(union);

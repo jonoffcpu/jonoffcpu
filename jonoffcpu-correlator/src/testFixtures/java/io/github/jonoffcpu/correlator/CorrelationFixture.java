@@ -69,9 +69,22 @@ final class CorrelationFixture {
         public long submittedSamples = 1;
     }
 
+    /** The JDK events a recording of the fixture carries besides the signal events, as a real capture does. */
+    static final List<String> PROCESS_EVENTS = List.of(
+            "jdk.JVMInformation",
+            "jdk.OSInformation",
+            "jdk.CPUInformation",
+            "jdk.ContainerConfiguration",
+            "jdk.InitialSystemProperty",
+            "jdk.InitialEnvironmentVariable");
+
     static Path recording(Path dir, int count) throws IOException {
         Path file = dir.resolve("original-" + count + ".jfr");
         try (Recording recording = new Recording()) {
+            // Named as async-profiler names its recording, with the JDK's own events that describe the process.
+            recording.setName("async-profiler 0.0-test");
+            recording.enable("jdk.ActiveRecording");
+            for (String event : PROCESS_EVENTS) recording.enable(event);
             recording.enable(Capture.class);
             recording.enable(Sample.class).withStackTrace();
             recording.enable(Stats.class);

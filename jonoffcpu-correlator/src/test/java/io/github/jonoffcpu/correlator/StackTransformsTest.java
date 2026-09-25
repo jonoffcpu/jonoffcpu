@@ -49,7 +49,28 @@ class StackTransformsTest {
             List<StackTransforms.Sourced> collapseLeaf,
             boolean category) {
         return new StackTransforms(
-                false, hide, trimRoot, rootAt, false, leafAt, collapseLeaf, category, StackTransforms.ThreadFrame.NONE);
+                false,
+                hide,
+                trimRoot,
+                rootAt,
+                StackTransforms.UnmatchedRoot.BUCKET,
+                leafAt,
+                collapseLeaf,
+                category,
+                StackTransforms.ThreadFrame.NONE);
+    }
+
+    private static StackTransforms rootAt(StackTransforms.UnmatchedRoot unmatched, List<StackTransforms.Sourced> hide) {
+        return new StackTransforms(
+                false,
+                hide,
+                List.of(),
+                inline("^x\\."),
+                unmatched,
+                List.of(),
+                List.of(),
+                false,
+                StackTransforms.ThreadFrame.NONE);
     }
 
     private static String apply(StackTransforms transforms, String stack) {
@@ -65,8 +86,9 @@ class StackTransformsTest {
         List<StackTransforms.Sourced> none = List.of();
         StackTransforms trim = transforms(none, inline("^(A|B|C)$"), none, none, none, false);
         StackTransforms rootAt = transforms(none, none, inline("^x\\."), none, none, false);
-        StackTransforms keep = new StackTransforms(
-                false, none, none, inline("^x\\."), true, none, none, false, StackTransforms.ThreadFrame.NONE);
+        StackTransforms keep = rootAt(StackTransforms.UnmatchedRoot.KEEP, none);
+        StackTransforms hideUnmatched = rootAt(StackTransforms.UnmatchedRoot.HIDE, none);
+        StackTransforms dispatch = rootAt(StackTransforms.UnmatchedRoot.HIDE, preset("jvm-dispatch"));
         StackTransforms leafAt = transforms(none, none, none, inline("^x\\."), none, false);
         StackTransforms hide = transforms(inline("^y\\."), none, none, none, none, false);
         List<StackTransforms.Sourced> machinery = preset("jvm-wait-machinery");
@@ -97,6 +119,27 @@ class StackTransformsTest {
                 Arguments.of(
                         "root-at without an application frame", rootAt, "T;L1", StackTransforms.NO_APPLICATION_FRAME),
                 Arguments.of("root-at keeping unmatched", keep, "T;L1", "T;L1"),
+                // Hidden, the stack is empty: the caller leaves the entry out and counts it apart.
+                Arguments.of("root-at hiding unmatched", hideUnmatched, "T;L1", ""),
+                Arguments.of("root-at hiding, matched", hideUnmatched, "T;x.App.a;L1", "x.App.a;L1"),
+                // jvm-dispatch hides the executors and the lambda bridge, so the root is the lambda's body.
+                Arguments.of(
+                        "jvm-dispatch roots at the work",
+                        dispatch,
+                        "java.lang.Thread.run;java.util.concurrent.FutureTask.run;"
+                                + "java.util.concurrent.Executors$RunnableAdapter.call;x.Pool$$Lambda.0x0000000081a06030.run;"
+                                + "x.Pool.lambda$submit$0;L1",
+                        "x.Pool.lambda$submit$0;L1"),
+                Arguments.of(
+                        "jvm-dispatch hides a canonical lambda, any method",
+                        dispatch,
+                        "T;x.Client$$Lambda.operationComplete;x.Client.lambda$write$5;L1",
+                        "x.Client.lambda$write$5;L1"),
+                Arguments.of(
+                        "jvm-dispatch hides mid-stack too",
+                        dispatch,
+                        "x.App.a;java.util.concurrent.FutureTask.run;x.App.b",
+                        "x.App.a;x.App.b"),
                 Arguments.of("leaf-at", leafAt, "T;x.App.a;y.Lib.b;x.App.c;L1;L2", "T;x.App.a;y.Lib.b;x.App.c"),
                 Arguments.of("leaf-at without an application frame", leafAt, "T;L1", "T;L1"),
                 Arguments.of("hide", hide, "T;x.App.a;y.Lib.b;x.App.c", "T;x.App.a;x.App.c"),
@@ -133,6 +176,23 @@ class StackTransformsTest {
         assertThat(apply(transforms, stack))
                 .as("%s must become %s", stack, expected)
                 .isEqualTo(expected);
+    }
+
+    @Test
+    void hiddenOnlyWhenANonEmptyStackBecomesEmpty() {
+        StackTransforms.Compiled hide =
+                rootAt(StackTransforms.UnmatchedRoot.HIDE, List.of()).compile();
+        List<StackProfile.Frame> unmatched = java("T", "L1");
+        assertThat(StackTransforms.hidden(unmatched, hide.apply(unmatched))).isTrue();
+        List<StackProfile.Frame> matched = java("T", "x.App.a");
+        assertThat(StackTransforms.hidden(matched, hide.apply(matched))).isFalse();
+        assertThat(StackTransforms.hidden(List.of(), hide.apply(List.of())))
+                .as("An empty stack has nothing to hide")
+                .isFalse();
+        assertThat(rootAt(StackTransforms.UnmatchedRoot.HIDE, List.of())
+                        .report()
+                        .getRootAtUnmatched())
+                .isEqualTo("hide");
     }
 
     @Test
@@ -204,7 +264,7 @@ class StackTransformsTest {
                         "pool-1-thread-2",
                         3,
                         3000),
-                entry(java("java.lang.Thread.run", "io.netty.Idle.wait"), "event-loop-7", 5, 7000),
+                entry(java("java.lang.Thread.run", "io.netty.Waiting.wait"), "event-loop-7", 5, 7000),
                 entry(java("x.Other$$Lambda.0x0000000081a06030.run", "x.App.n"), "worker-1", 1, 1000),
                 entry(java("x.Other$$Lambda.0x00000000819ed250.run", "x.App.n"), "worker-2", 1, 1500));
         Path profile = dir.resolve("profile.pb");
@@ -302,7 +362,7 @@ class StackTransformsTest {
                 profile.toString(),
                 "--canonical-names",
                 "--hide",
-                "Idle",
+                "Waiting",
                 "--trim-root-from",
                 "preset:jvm-infra",
                 "--root-at",
@@ -340,21 +400,125 @@ class StackTransformsTest {
         assertThat(listing.code()).as("--list-presets failed: %s", listing).isZero();
         assertThat(listing.out())
                 .as("--list-presets must list every preset")
-                .contains("preset:jvm-infra", "preset:jvm-wait-machinery", "preset:jvm-idle");
-        String idle = stacks(
-                dir, "idle", "--profile", profile.toString(), "--exclude-from", "preset:jvm-idle", "--include", "x\\.");
-        assertThat(idle)
-                .as("preset:jvm-idle must be accepted by --exclude-from")
+                .contains("preset:jvm-infra", "preset:jvm-wait-machinery", "preset:jvm-waiting", "preset:jvm-dispatch");
+        String waiting = stacks(
+                dir,
+                "waiting",
+                "--profile",
+                profile.toString(),
+                "--exclude-from",
+                "preset:jvm-waiting",
+                "--include",
+                "x\\.");
+        assertThat(waiting)
+                .as("preset:jvm-waiting must be accepted by --exclude-from")
                 .isNotEmpty();
-        assertThatThrownBy(() -> stacks(dir, "unknown", "--profile", profile.toString(), "--hide-from", "preset:nope"))
-                .as("An unknown preset must be refused")
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Unknown preset: nope");
         CommandLineFixture.usageError(
                 "Give exactly one of --profile and --collapsed-input",
                 "stacks",
                 "--output",
                 dir.resolve("neither").toString());
+    }
+
+    /**
+     * {@code --root-at-unmatched hide} is the one transform that removes weight: the lines and totals leave the
+     * unmatched entries out, the summary reports them, and kept plus hidden is the unhidden total exactly.
+     */
+    @Test
+    void rootAtUnmatchedHide(@TempDir Path dir) throws Exception {
+        List<StackProfile.Entry> entries = List.of(
+                entry(java("java.lang.Thread.run", "x.App.m", "x.App.park"), "pool-1-thread-1", 2, 2000),
+                entry(java("java.lang.Thread.run", "io.netty.Waiting.wait"), "event-loop-7", 5, 7000),
+                entry(java("libjvm.so.ZDriver::run"), "ZDriverMinor", 1, 500));
+        Path profile = dir.resolve("profile.pb");
+        new StackProfile(
+                        new StackProfile.Header(List.of(), List.of("reason", "thread"), false, null, "", List.of()),
+                        entries)
+                .write(profile);
+        Path bucketSummary = dir.resolve("bucket.json");
+        String bucketed = stacks(
+                dir,
+                "bucket",
+                "--profile",
+                profile.toString(),
+                "--root-at",
+                "^x\\.App\\.",
+                "--summary",
+                bucketSummary.toString());
+        assertThat(bucketed)
+                .as("The default still buckets")
+                .isEqualTo("[no application frame] 8\nx.App.m;x.App.park 2\n");
+        assertThat(json(bucketSummary).hasRootAtUnmatchedHidden())
+                .as("Only hide reports hidden time")
+                .isFalse();
+
+        Path summary = dir.resolve("hide.json");
+        CommandLineFixture.Invocation invocation = CommandLineFixture.invoke(
+                "stacks",
+                "--output",
+                dir.resolve("hide.collapsed").toString(),
+                "--profile",
+                profile.toString(),
+                "--root-at",
+                "^x\\.App\\.",
+                "--root-at-unmatched",
+                "hide",
+                "--summary",
+                summary.toString());
+        assertThat(invocation.code()).as("stacks failed: %s", invocation).isZero();
+        assertThat(Files.readString(dir.resolve("hide.collapsed")))
+                .as("Unmatched entries are left out")
+                .isEqualTo("x.App.m;x.App.park 2\n");
+        AnalysisProto.SliceSummary hidden = json(summary);
+        assertThat(hidden.getTotalNanos())
+                .as("The totals exclude hidden time: %s", hidden)
+                .isEqualTo("2000");
+        assertThat(hidden.getIntervals())
+                .as("The totals exclude hidden time: %s", hidden)
+                .isEqualTo(2);
+        assertThat(hidden.getRootAtUnmatchedHidden())
+                .as("The hidden time is reported, and adds up to the unhidden total")
+                .isEqualTo(AnalysisProto.FilteredSlice.newBuilder()
+                        .setIntervals(6)
+                        .setTotalNanos("7500")
+                        .build());
+        assertThat(hidden.getTransforms().getRootAtUnmatched()).isEqualTo("hide");
+        assertThat(hidden.getTransforms().getNoApplicationFrame().getWeight())
+                .as("The transforms report the hidden weight as the time without an application frame")
+                .isEqualTo("7500");
+
+        Path input = Files.writeString(
+                dir.resolve("input.collapsed"), "java.lang.Thread.run;x.App.m 5\njava.lang.Thread.run;y.Other.n 2.5\n");
+        Path collapsedSummary = dir.resolve("collapsed.json");
+        String collapsed = stacks(
+                dir,
+                "collapsed-hide",
+                "--collapsed-input",
+                input.toString(),
+                "--root-at",
+                "^x\\.",
+                "--root-at-unmatched",
+                "hide",
+                "--summary",
+                collapsedSummary.toString());
+        assertThat(collapsed).isEqualTo("x.App.m 5\n");
+        AnalysisProto.CollapsedSliceSummary collapsedJson = collapsedJson(collapsedSummary);
+        assertThat(collapsedJson.getTotalWeight()).isEqualTo("5");
+        assertThat(collapsedJson.getRootAtUnmatchedHidden())
+                .isEqualTo(AnalysisProto.FilteredLines.newBuilder()
+                        .setInputLines(1)
+                        .setTotalWeight("2.5")
+                        .build());
+
+        CommandLineFixture.usageError(
+                "--root-at-unmatched hide needs --root-at",
+                "stacks",
+                "--profile",
+                profile.toString(),
+                "--root-at-unmatched",
+                "hide",
+                "--output",
+                dir.resolve("refused").toString());
     }
 
     /** Any collapsed file: the converter's markers and slashes are normalised, and reason options are refused. */

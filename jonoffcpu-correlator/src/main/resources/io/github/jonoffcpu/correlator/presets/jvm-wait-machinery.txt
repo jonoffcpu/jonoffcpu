@@ -5,6 +5,8 @@
 #
 # The libjvm.so and libc.so.6 lines match only symbolized native frames (glibc images). On musl
 # every native frame is /lib/ld-musl-<arch>.so.1, which the ld-musl line matches instead.
+#
+# options: collapse-leaf, machinery
 ^java\.util\.concurrent\.locks\.
 ^java\.util\.concurrent\.ForkJoinPool\.(managedBlock|unmanagedBlock)$
 ^java\.util\.concurrent\.CompletableFuture\$Signaller\.block$
