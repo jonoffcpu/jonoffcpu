@@ -67,6 +67,14 @@ final class Cli {
             @SuppressWarnings("unchecked")
             Callable<Integer> callable = (Callable<Integer>) command;
             return callable.call();
+        } catch (Presets.Unusable unusable) {
+            // A preset the option cannot use is a mistake on the command line, not a failed analysis.
+            err.println(unusable.getMessage());
+            List<CommandLine> chain = commandLine.getParseResult() == null
+                    ? List.of(commandLine)
+                    : commandLine.getParseResult().asCommandLineList();
+            chain.get(chain.size() - 1).usage(err);
+            return USAGE;
         } catch (ParameterException usage) {
             err.println(usage.getMessage());
             if (usage instanceof UnmatchedArgumentException unmatched) {
@@ -329,7 +337,7 @@ final class Cli {
                 names = "--waiting-from",
                 paramLabel = "FILE",
                 description = "Read --waiting patterns from a file or preset:NAME; repeatable. Default, when no waiting"
-                        + " pattern is given: preset:jvm-waiting.")
+                        + " pattern is given: preset:*, the bundled waiting presets (preset:jvm-waiting).")
         List<String> waitingFrom = new ArrayList<>();
 
         @Option(
@@ -392,16 +400,16 @@ final class Cli {
                 names = "--hide-from",
                 paramLabel = "FILE",
                 description = "Read --hide patterns from a file or preset:NAME; repeatable. Default, with --app and"
-                        + " no hide pattern: preset:jvm-dispatch.")
+                        + " no hide pattern: preset:*, the bundled dispatch presets (preset:jvm-dispatch).")
         List<String> hideFrom = new ArrayList<>();
 
         boolean given() {
             return !hide.isEmpty() || !hideFrom.isEmpty();
         }
 
-        /** The patterns, or with an application pattern and none given, {@code preset:jvm-dispatch}. */
+        /** The patterns, or with an application pattern and none given, the bundled hide presets. */
         List<StackTransforms.Sourced> patterns(boolean app) throws IOException {
-            if (app && !given()) return sourced(List.of(), "--hide-from", List.of("preset:jvm-dispatch"));
+            if (app && !given()) return sourced(List.of(), "--hide-from", List.of(Presets.ALL));
             return sourced(hide, "--hide-from", hideFrom);
         }
     }
@@ -640,8 +648,10 @@ final class Cli {
             patterns.add(new StackTransforms.Sourced(pattern, "inline"));
         }
         for (String file : files) {
-            for (String pattern : OffCpuCorrelator.patternFile(fromOption, file)) {
-                patterns.add(new StackTransforms.Sourced(pattern, file));
+            for (String source : Presets.expand(fromOption, file)) {
+                for (String pattern : OffCpuCorrelator.patternFile(fromOption, source)) {
+                    patterns.add(new StackTransforms.Sourced(pattern, source, file));
+                }
             }
         }
         return patterns;
@@ -808,7 +818,7 @@ final class Cli {
                 Digest.Options digestDefaults = Digest.defaults(
                         waitingGiven
                                 ? sourced(options.waiting, "--waiting-from", options.waitingFrom)
-                                : sourced(List.of(), "--waiting-from", List.of("preset:jvm-waiting")));
+                                : sourced(List.of(), "--waiting-from", List.of(Presets.ALL)));
                 digest = new Digest.Options(
                         sourced(options.app, "--app-from", options.appFrom),
                         digestDefaults.waiting(),
@@ -857,7 +867,8 @@ final class Cli {
                         + " --collapse-leaf, then --package-names and --thread-frame as display. Filters see the"
                         + " untransformed stacks, and lines that transform alike merge, so totals never change,"
                         + " except that --root-at-unmatched hide moves unmatched entries to a total of their own."
-                        + " Every -from option also takes preset:NAME; --list-presets prints them."
+                        + " Every -from option also takes preset:NAME, or preset:* for every bundled preset meant"
+                        + " for it (quote it for the shell); --list-presets prints them with their options."
             })
     static final class Stacks implements Callable<Integer> {
         @Spec
@@ -1119,14 +1130,16 @@ final class Cli {
                 paramLabel = "FILE",
                 description =
                         "Read --waiting patterns from a file or preset:NAME, such as preset:jvm-waiting; repeatable."
-                                + " Default for summarize, when no waiting pattern is given: preset:jvm-waiting.")
+                                + " Default for summarize, when no waiting pattern is given: preset:*, the bundled"
+                                + " waiting presets.")
         List<String> waitingFrom = new ArrayList<>();
 
         @Option(
                 names = "--machinery-from",
                 paramLabel = "FILE",
                 description = "The wait machinery below a boundary whose entry frame is the blocker, from a file or"
-                        + " preset:NAME; repeatable. Default: preset:jvm-wait-machinery.")
+                        + " preset:NAME; repeatable. Default: preset:*, the bundled wait machinery presets"
+                        + " (preset:jvm-wait-machinery).")
         List<String> machineryFrom = new ArrayList<>();
 
         @Option(
@@ -1142,16 +1155,14 @@ final class Cli {
 
         List<StackTransforms.Sourced> waiting(boolean defaultPreset) throws IOException {
             if (defaultPreset && waiting.isEmpty() && waitingFrom.isEmpty()) {
-                return sourced(List.of(), "--waiting-from", List.of("preset:jvm-waiting"));
+                return sourced(List.of(), "--waiting-from", List.of(Presets.ALL));
             }
             return sourced(waiting, "--waiting-from", waitingFrom);
         }
 
         List<StackTransforms.Sourced> machinery() throws IOException {
             return sourced(
-                    List.of(),
-                    "--machinery-from",
-                    machineryFrom.isEmpty() ? List.of("preset:jvm-wait-machinery") : machineryFrom);
+                    List.of(), "--machinery-from", machineryFrom.isEmpty() ? List.of(Presets.ALL) : machineryFrom);
         }
     }
 

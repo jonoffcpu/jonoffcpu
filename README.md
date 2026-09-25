@@ -805,7 +805,12 @@ or its pool. Each has a `-from FILE` form, and every `-from` option, the
 filters' included, also takes a bundled `preset:jvm-infra`,
 `preset:jvm-wait-machinery`, `preset:jvm-waiting` or `preset:jvm-dispatch`, the
 lambda bridges and executor adapters that only forward to a task, for `--hide`
-(`stacks --list-presets` prints them).
+(`stacks --list-presets` prints them). `preset:*` stands for every bundled
+preset meant for the option it is given to, as the preset's `# options:` line
+says: `--hide-from 'preset:*' --hide-from my-hide.txt` keeps jonoffcpu's
+patterns and adds yours, and picks up a preset a later release adds. An option
+without presets (`--include-from`, `--root-at-from`, `--leaf-at-from`,
+`--app-from`) refuses it. Quote it, so the shell does not glob it.
 Filters always see the untransformed stack. On an Apache Pulsar broker's blocked
 waits, `--root-at` with `--collapse-leaf` turns 164 lines at a mean depth of 23
 frames into 78 lines of about 4. `--collapsed-input FILE` applies the same

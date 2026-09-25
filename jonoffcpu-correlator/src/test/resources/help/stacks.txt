@@ -90,4 +90,5 @@ Per kept entry, in this order: --canonical-names, --hide, --trim-root, --root-at
 --collapse-leaf, then --package-names and --thread-frame as display. Filters see the untransformed
 stacks, and lines that transform alike merge, so totals never change, except that
 --root-at-unmatched hide moves unmatched entries to a total of their own. Every -from option also
-takes preset:NAME; --list-presets prints them.
+takes preset:NAME, or preset:* for every bundled preset meant for it (quote it for the shell);
+--list-presets prints them with their options.

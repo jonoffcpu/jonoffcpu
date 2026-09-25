@@ -64,10 +64,10 @@ Each row is a thread pool: the thread name with every run of digits as #.
 ```bash
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --by self \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --limit 20 \
   --format md
 ```
@@ -77,10 +77,10 @@ java -jar jonoffcpu-correlator.jar top \
 ```bash
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --by pool \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --limit 20 \
   --format md
 ```
@@ -90,9 +90,9 @@ java -jar jonoffcpu-correlator.jar top \
 ```bash
 java -jar jonoffcpu-correlator.jar stacks \
   --profile run.pb \
-  --exclude-from preset:jvm-waiting \
-  --trim-root-from preset:jvm-infra \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --exclude-from 'preset:*' \
+  --trim-root-from 'preset:*' \
+  --collapse-leaf-from 'preset:*' \
   --canonical-names \
   --package-names drop \
   --output blocked.collapsed
@@ -103,7 +103,7 @@ java -jar jonoffcpu-correlator.jar stacks \
 ```bash
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --by pool \
   --limit 20 \

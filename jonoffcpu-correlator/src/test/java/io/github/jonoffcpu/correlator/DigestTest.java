@@ -337,6 +337,9 @@ class DigestTest {
                         "- **Self time**",
                         "- **Observed seconds**:")
                 .doesNotContain("**In the run queue**");
+        assertThat(about)
+                .as("The default waiting patterns: the reproduce commands keep preset:*, the notes name its presets")
+                .contains("  --waiting-from 'preset:*' \\\n", "  - `preset:jvm-waiting`\n");
     }
 
     /** The reading rules: no busy or idle, one sentence under each table, commands only in wrapped bash blocks. */

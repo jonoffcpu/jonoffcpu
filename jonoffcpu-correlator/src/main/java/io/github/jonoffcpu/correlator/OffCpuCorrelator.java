@@ -489,6 +489,10 @@ public final class OffCpuCorrelator {
      */
     static List<String> patternFile(String option, String file) throws IOException {
         List<String> patterns = new java.util.ArrayList<>();
+        if (file.equals(Presets.ALL)) {
+            for (String preset : Presets.all(option)) patterns.addAll(patternFile(option, preset));
+            return patterns;
+        }
         List<String> lines = file.startsWith(Presets.PREFIX)
                 ? Presets.lines(file.substring(Presets.PREFIX.length()))
                 : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8);

@@ -388,7 +388,16 @@ classes' methods, `Executors$RunnableAdapter.call`, `FutureTask.run` and
 tasks: frames that only forward to the code a task runs, for `--hide`, so that
 `--root-at` lands on the work; hidden anywhere in the stack, since they carry
 no information mid-stack either); `stacks --list-presets` prints them with
-their caveats. When any transform is in effect the `--summary` file gains a
+their caveats and the options each is meant for. `preset:*` stands for every
+bundled preset whose header's `# options:` line names the option it is given
+to: `jvm-dispatch` for `--hide-from`, `jvm-waiting` for `--waiting-from` and
+`--exclude-from`, `jvm-infra` for `--trim-root-from`, and `jvm-wait-machinery`
+for `--collapse-leaf-from` and `--machinery-from`. An option's default preset
+is exactly its `preset:*`. `--include-from`, `--root-at-from`, `--leaf-at-from`
+and `--app-from` have no presets and refuse `preset:*` (exit status 64), as
+every option refuses an unknown preset. Summaries and the digest's notes record
+the presets `preset:*` expanded to, and the digest's reproduce commands repeat
+`'preset:*'` as given. When any transform is in effect the `--summary` file gains a
 `transforms` object: each option with its patterns and their source (`inline`, a
 file, or `preset:NAME`), `linesBefore`/`linesAfter`, the weight-averaged depth
 `framesBefore`/`framesAfter`, and for `--root-at` the `noApplicationFrame`

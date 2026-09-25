@@ -27,8 +27,16 @@ record StackTransforms(
         boolean categoryLabel,
         ThreadFrame threadFrame) {
 
-    /** A pattern and where it came from: {@code inline}, a file path, or {@code preset:NAME}. */
-    record Sourced(String pattern, String source) {
+    /**
+     * A pattern and where it came from: {@code inline}, a file path, or {@code preset:NAME}. {@code given} is the
+     * {@code -from} argument as written, which differs from {@code source} for {@code preset:*}: reproduce commands
+     * repeat what was given, and summaries record the preset it expanded to.
+     */
+    record Sourced(String pattern, String source, String given) {
+        Sourced(String pattern, String source) {
+            this(pattern, source, source);
+        }
+
         Pattern compiled() {
             return Pattern.compile(pattern);
         }

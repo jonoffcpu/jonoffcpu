@@ -50,10 +50,10 @@ breaks blocked time without an application frame down by thread pool.
                                tables. Repeatable.
       --waiting-from=FILE    Read --waiting patterns from a file or preset:NAME, such as preset:
                                jvm-waiting; repeatable. Default for summarize, when no waiting
-                               pattern is given: preset:jvm-waiting.
+                               pattern is given: preset:*, the bundled waiting presets.
       --machinery-from=FILE  The wait machinery below a boundary whose entry frame is the blocker,
-                               from a file or preset:NAME; repeatable. Default: preset:
-                               jvm-wait-machinery.
+                               from a file or preset:NAME; repeatable. Default: preset:*, the
+                               bundled wait machinery presets (preset:jvm-wait-machinery).
       --limit=N              Rows per table. Default: 20.
       --format=FORMAT        md, json or csv. Default: md.
       --output=FILE          Write to this file instead of stdout.

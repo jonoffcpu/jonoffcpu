@@ -91,12 +91,12 @@ Each row is a thread pool whose blocked time has no application frame.
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
   --app '^x\.' \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --hide-from preset:jvm-dispatch \
   --root-at '^x\.' \
   --root-at-unmatched hide \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --by boundary \
   --limit 20 \
   --format md
@@ -108,12 +108,12 @@ java -jar jonoffcpu-correlator.jar top \
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
   --app '^x\.' \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --hide-from preset:jvm-dispatch \
   --root-at '^x\.' \
   --root-at-unmatched hide \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --by root \
   --limit 20 \
   --format md
@@ -125,12 +125,12 @@ java -jar jonoffcpu-correlator.jar top \
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
   --app '^x\.' \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --hide-from preset:jvm-dispatch \
   --root-at '^x\.' \
   --root-at-unmatched hide \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --by app-method \
   --limit 20 \
   --format md
@@ -141,12 +141,12 @@ java -jar jonoffcpu-correlator.jar top \
 ```bash
 java -jar jonoffcpu-correlator.jar stacks \
   --profile run.pb \
-  --exclude-from preset:jvm-waiting \
+  --exclude-from 'preset:*' \
   --canonical-names \
   --hide-from preset:jvm-dispatch \
   --root-at '^x\.' \
   --root-at-unmatched hide \
-  --collapse-leaf-from preset:jvm-wait-machinery \
+  --collapse-leaf-from 'preset:*' \
   --output blocked-app.collapsed
 ```
 
@@ -155,7 +155,7 @@ java -jar jonoffcpu-correlator.jar stacks \
 ```bash
 java -jar jonoffcpu-correlator.jar top \
   --profile run.pb \
-  --waiting-from preset:jvm-waiting \
+  --waiting-from 'preset:*' \
   --canonical-names \
   --by pool \
   --limit 20 \

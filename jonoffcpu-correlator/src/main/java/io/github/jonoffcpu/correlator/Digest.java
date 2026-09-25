@@ -70,9 +70,9 @@ final class Digest {
 
     private Digest() {}
 
-    /** The default options: {@code preset:jvm-waiting}, {@code preset:jvm-wait-machinery}, no application pattern. */
+    /** The default options: the waiting and wait machinery presets ({@code preset:*}), no application pattern. */
     static Options defaults() throws IOException {
-        return defaults(Cli.sourced(List.of(), "--waiting-from", List.of("preset:jvm-waiting")));
+        return defaults(Cli.sourced(List.of(), "--waiting-from", List.of(Presets.ALL)));
     }
 
     /** The default options with the given waiting patterns, as correlation writes the digest. */
@@ -80,7 +80,7 @@ final class Digest {
         return new Options(
                 List.of(),
                 waiting,
-                Cli.sourced(List.of(), "--machinery-from", List.of("preset:jvm-wait-machinery")),
+                Cli.sourced(List.of(), "--machinery-from", List.of(Presets.ALL)),
                 List.of(),
                 20,
                 false);
@@ -147,7 +147,7 @@ final class Digest {
         }
         List<String> command = new ArrayList<>(List.of(Cli.NAME, "stacks", "--profile", profilePath));
         command.addAll(patternOptions("--exclude", "--exclude-from", options.waiting()));
-        command.addAll(List.of("--trim-root-from", "preset:jvm-infra"));
+        command.addAll(List.of("--trim-root-from", Presets.ALL));
         command.addAll(patternOptions("--collapse-leaf", "--collapse-leaf-from", options.machinery()));
         command.addAll(List.of("--canonical-names", "--package-names", "drop", "--output", "blocked.collapsed"));
         digest.setFlameGraphCommand(Top.shell(command));
@@ -245,7 +245,7 @@ final class Digest {
     }
 
     private static boolean isDefaultMachinery(List<StackTransforms.Sourced> machinery) {
-        return machinery.stream().allMatch(pattern -> pattern.source().equals("preset:jvm-wait-machinery"));
+        return machinery.stream().allMatch(pattern -> pattern.given().equals(Presets.ALL));
     }
 
     private static Top.Options topOptions(Top.By by, Options options, StackTransforms transforms) {
@@ -327,9 +327,10 @@ final class Digest {
         for (StackTransforms.Sourced pattern : patterns) {
             if (pattern.source().equals("inline")) {
                 words.addAll(List.of(inline, pattern.pattern()));
-            } else if (!sources.contains(pattern.source())) {
-                sources.add(pattern.source());
-                words.addAll(List.of(fromFile, pattern.source()));
+            } else if (!sources.contains(pattern.given())) {
+                // As given on the command line, so preset:* stays preset:* in the reproduce commands.
+                sources.add(pattern.given());
+                words.addAll(List.of(fromFile, pattern.given()));
             }
         }
         return words;

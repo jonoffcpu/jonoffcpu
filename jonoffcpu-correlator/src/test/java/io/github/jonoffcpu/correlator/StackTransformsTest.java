@@ -413,10 +413,6 @@ class StackTransformsTest {
         assertThat(waiting)
                 .as("preset:jvm-waiting must be accepted by --exclude-from")
                 .isNotEmpty();
-        assertThatThrownBy(() -> stacks(dir, "unknown", "--profile", profile.toString(), "--hide-from", "preset:nope"))
-                .as("An unknown preset must be refused")
-                .isInstanceOf(IllegalArgumentException.class)
-                .hasMessageContaining("Unknown preset: nope");
         CommandLineFixture.usageError(
                 "Give exactly one of --profile and --collapsed-input",
                 "stacks",

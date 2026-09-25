@@ -10,6 +10,8 @@
 # - The libjvm.so and libasyncProfiler.so lines match only symbolized native frames (glibc
 #   images). On musl every native frame is /lib/ld-musl-<arch>.so.1, so these lines never match
 #   and the JVM's GC and compiler threads waiting for work count as blocked.
+#
+# options: waiting, exclude
 ^io\.netty\.channel\.epoll\.Native\.epollWait0?$
 ^io\.netty\.util\.HashedWheelTimer\$Worker\.waitForNextTick$
 ^sun\.nio\.ch\.SelectorImpl\.select$

@@ -24,16 +24,17 @@ it with other patterns.
                               tables. Repeatable.
       --waiting-from=FILE   Read --waiting patterns from a file or preset:NAME, such as preset:
                               jvm-waiting; repeatable. Default for summarize, when no waiting
-                              pattern is given: preset:jvm-waiting.
+                              pattern is given: preset:*, the bundled waiting presets.
       --machinery-from=FILE The wait machinery below a boundary whose entry frame is the blocker,
-                              from a file or preset:NAME; repeatable. Default: preset:
-                              jvm-wait-machinery.
+                              from a file or preset:NAME; repeatable. Default: preset:*, the
+                              bundled wait machinery presets (preset:jvm-wait-machinery).
       --limit=N             Rows per table. Default: 20.
       --hide=REGEX          For the digest with --app: remove matching frames, such as executors
                               that only run a task, before each stack is rooted at the application.
                               Repeatable.
       --hide-from=FILE      Read --hide patterns from a file or preset:NAME; repeatable. Default,
-                              with --app and no hide pattern: preset:jvm-dispatch.
+                              with --app and no hide pattern: preset:*, the bundled dispatch
+                              presets (preset:jvm-dispatch).
       --process-details=true|false
                             Show the target's command line, system properties and environment
                               variables, when the report holds them (correlate --process-details

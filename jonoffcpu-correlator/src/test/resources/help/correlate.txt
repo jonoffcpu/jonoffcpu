@@ -69,7 +69,8 @@ Correlates a capture with its JFR into a new output directory (the default comma
                                wait for work, and the digest's tables and stacks leave it out. The
                                other outputs keep every interval. Repeatable.
       --waiting-from=FILE    Read --waiting patterns from a file or preset:NAME; repeatable.
-                               Default, when no waiting pattern is given: preset:jvm-waiting.
+                               Default, when no waiting pattern is given: preset:*, the bundled
+                               waiting presets (preset:jvm-waiting).
       --app=REGEX            For the digest: a frame of your application. Its tables then start
                                each stack at the first one and name the last one before each wait,
                                and count blocked time without one apart, by pool. Repeatable.
@@ -78,7 +79,8 @@ Correlates a capture with its JFR into a new output directory (the default comma
                                that only run a task, before each stack is rooted at the
                                application. Repeatable.
       --hide-from=FILE       Read --hide patterns from a file or preset:NAME; repeatable. Default,
-                               with --app and no hide pattern: preset:jvm-dispatch.
+                               with --app and no hide pattern: preset:*, the bundled dispatch
+                               presets (preset:jvm-dispatch).
       --process-details=true|false
                              Keep the target's command line, system properties and environment
                                variables from the JFR in the report and show them in the digest.
