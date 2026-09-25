@@ -31,10 +31,10 @@ queued.
 
 [![Thread states seen by the scheduler](images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
-From the Java side, the same three states split further by where the thread
-is: running Java code or native code, waiting for a CPU in either, waiting in
-native code, or blocked at the Java level on a monitor or a park. The kernel
-sees only running, runnable and blocked, and for a blocked thread the
+From the Java side, these states split further: a thread runs Java code or
+native code, waits for a CPU in either, or is blocked in native code or at the
+Java level, on a monitor or a park. The kernel sees only running, runnable and
+blocked, and for a blocked thread the
 *mechanism* of the wait, never its *reason*. A thread never blocks "on the
 storage layer": with a synchronous client it sleeps in a socket read; with an
 asynchronous client, a pool or any `Future.get()` it parks on a condition, a
@@ -112,9 +112,24 @@ and `jonoffcpu` records it on every interval:
 
 | Reason | What the scheduler saw | Typical cause |
 | --- | --- | --- |
-| `blocked` | The thread left in a waiting state (`TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, …) | A futex (lock, `park`, `Future.get()`), a socket or `epoll` wait, a timer, disk I/O, a page fault |
+| `blocked` | The thread left in a waiting state (`TASK_INTERRUPTIBLE`, `TASK_UNINTERRUPTIBLE`, …) | A futex (lock, `park`, `Future.get()`), a socket or `epoll` wait, a timer, disk I/O, a [page fault](https://en.wikipedia.org/wiki/Page_fault) |
 | `runnable` | The thread left at an ordinary scheduling point while still `TASK_RUNNING` | **Preemption of running Java code**: a thread preempted by the scheduler tick is switched out on its return to user mode, where the kernel sees an ordinary `schedule()` — and `sched_yield` |
 | `preempted` | The kernel preempted the thread at a preemption point inside the kernel | Preemption while the thread was in a system call or a page fault |
+
+`blocked` covers three situations that the kernel cannot tell apart:
+
+- **Waiting for work:** an idle event loop in `epoll_wait`, or a pool worker
+  waiting for its next task.
+- **Blocked while it had work to do:** a contended lock or monitor, a reply
+  from another service, a disk write, a future.
+- **Blocked by the OS or the JVM:** a page fault that reads from disk, or a JVM
+  [safepoint](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint)
+  such as a GC pause.
+
+The Java stack tells them apart. The analysis recognizes waits for work by
+their frames (`--waiting-from`, by default the bundled `preset:jvm-waiting`),
+sets them apart as *waiting*, and ranks the rest as *blocked*; see
+[Correlate](analysis.md#correlate).
 
 `runnable` and `preempted` are both time spent *waiting for a CPU*: a stack
 that is wide under them is where execution stopped, not what the thread was

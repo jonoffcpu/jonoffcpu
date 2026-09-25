@@ -46,30 +46,31 @@ graphs and ranked reports whose numbers are real durations.
 
 ## What is off-CPU profiling
 
-At any moment, a Java thread is doing one of three things:
+At any moment, a Java thread is running on a CPU, waiting for one, or blocked:
 
-- **Running on a CPU**, in Java code or in native code: the JVM itself, a JNI
-  library, or the kernel working on the thread's behalf.
-- **Ready to run but waiting for a CPU**, in the scheduler's run queue,
-  because other threads hold every CPU it may use.
-- **Blocked until something happens**: a lock is released, data arrives on a
-  socket, a disk write completes, a timer fires, or a task is queued for it. In
-  Java this shows as a monitor, a `park`, or blocking I/O. Underneath, the
-  thread sleeps in the kernel on a futex, a socket or a timer.
+| The thread is | For example | jonoffcpu records it as |
+| --- | --- | --- |
+| **Running on a CPU** | Java code, the JVM itself, a JNI library, or the kernel working on the thread's behalf | Not off-CPU time; async-profiler's `event=cpu` samples it |
+| **Waiting for a CPU** | Preempted while running, or woken up while every CPU it may use is busy | Run-queue time: an interval of reason `runnable` or `preempted`, or a `blocked` interval after its wakeup |
+| **Blocked, waiting for work** | An idle event loop in `epoll_wait`, or a pool worker waiting for its next task | Reason `blocked`, set apart as *waiting* by the analysis |
+| **Blocked while it has work to do** | A contended lock or monitor, a reply from another service, a disk write, a future | Reason `blocked`, ranked as *blocked* by the analysis |
+| **Blocked by the OS or the JVM** | A [page fault](https://en.wikipedia.org/wiki/Page_fault) that reads from disk, or a JVM [safepoint](https://openjdk.org/groups/hotspot/docs/HotSpotGlossary.html#safepoint) such as a GC pause | Reason `blocked`, ranked as *blocked* by the analysis |
 
 [![Thread states seen by the scheduler](docs/images/offcpu-timeline.svg)](https://raw.githubusercontent.com/jonoffcpu/jonoffcpu/main/docs/images/offcpu-timeline.svg)
 
-A CPU profiler samples only the first state. Everything else is *off-CPU
-time*, and in most services it is where the latency goes. The Linux scheduler
-sees every transition: a thread is switched out when it blocks or is
-preempted, and switched back in when it gets a CPU again. Off-CPU profiling
-measures each of those intervals and attributes it to the code that was
-waiting. jonoffcpu takes the interval's duration, and why it began, from the
-scheduler through eBPF. It takes the Java stack from async-profiler. Kernel
-tools cannot walk JIT-compiled Java frames, and a JVM's wall-clock sampler
-cannot tell how long a wait lasted; jonoffcpu joins the two.
-[Off-CPU profiling](docs/off-cpu-profiling.md) explains the concepts in
-depth.
+A CPU profiler samples only the first row. Everything else is *off-CPU time*,
+and in most services it is where the latency goes. The Linux scheduler sees
+every transition, and why the thread left the CPU: it blocked, or it was still
+runnable and another thread took its place. It cannot see what a blocked
+thread waited for: a contended lock, a future and a safepoint all look like a
+sleep on a [futex](https://en.wikipedia.org/wiki/Futex). That is in the Java
+stack.
+jonoffcpu takes each interval's duration and reason from the scheduler
+through eBPF, and the Java stack from async-profiler. Kernel tools cannot walk
+JIT-compiled Java frames, and a JVM's wall-clock sampler cannot tell how long
+a wait lasted; jonoffcpu joins the two.
+[Off-CPU profiling](docs/off-cpu-profiling.md) explains the states and the
+reasons in depth.
 
 ## Why jonoffcpu
 
