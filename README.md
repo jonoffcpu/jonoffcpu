@@ -268,7 +268,7 @@ Download the three JARs of the latest
 gh release download -p '*.jar' -R jonoffcpu/jonoffcpu
 ```
 
-Pass a tag such as `v0.7.0` after `download` to pick a specific release
+Pass a tag such as `v0.8.0` after `download` to pick a specific release
 instead of the latest one.
 
 | JAR | What it is |
@@ -383,15 +383,15 @@ The artifacts are published to Maven Central under the group id
 
 ```kotlin
 dependencies {
-    implementation("io.github.jonoffcpu:jonoffcpu-agent:0.7.0")
-    implementation("io.github.jonoffcpu:jonoffcpu-correlator:0.7.0")
-    implementation("io.github.jonoffcpu:jonoffcpu-jfr-converter:0.7.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-agent:0.8.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-correlator:0.8.0")
+    implementation("io.github.jonoffcpu:jonoffcpu-jfr-converter:0.8.0")
 }
 ```
 
 ```xml
 <properties>
-  <jonoffcpu.version>0.7.0</jonoffcpu.version>
+  <jonoffcpu.version>0.8.0</jonoffcpu.version>
 </properties>
 
 <dependencies>
